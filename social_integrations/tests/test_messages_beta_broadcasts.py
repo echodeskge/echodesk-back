@@ -227,3 +227,95 @@ class TestBroadcastsAreBestEffort(SocialIntegrationTestCase):
                 user=self.agent,
             )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+
+
+# ---------------------------------------------------------------------------
+# PR F — `conversation_deleted` broadcasts.
+# ---------------------------------------------------------------------------
+
+class TestConversationDeletedBroadcasts(SocialIntegrationTestCase):
+    """PR F additive broadcast: delete-conversation + clear-platform-history.
+
+    The legacy /messages page does `switch (data.type) {...; default: noop}`
+    so emitting a new type is provably safe. /messages-beta consumes the
+    frame and removes the conversation from the sidebar (or every row on
+    that platform, when conversation_id=None).
+    """
+
+    def setUp(self):
+        super().setUp()
+        # delete-conversation is staff-only; clear-platform-history requires
+        # CanManageSocialConnections (which an admin satisfies via is_staff).
+        self.admin = self.create_admin(email="del-bcast-admin@test.com")
+
+    def test_delete_conversation_broadcasts_conversation_deleted(self):
+        conn = self.create_fb_connection()
+        msg = self.create_fb_message(page_connection=conn, is_from_page=False)
+
+        channel_layer = _make_async_channel_layer()
+        with patch("social_integrations.consumers.get_channel_layer", return_value=channel_layer):
+            client = self.authenticated_client(self.admin)
+            resp = client.delete(
+                "/api/social/delete-conversation/",
+                data={"platform": "facebook", "conversation_id": msg.sender_id},
+                content_type="application/json",
+                HTTP_HOST="tenant.test.com",
+            )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+
+        types = _types_sent(channel_layer)
+        self.assertIn("conversation_deleted", types)
+        # Tenant-wide group so every connected agent's sidebar drops the row.
+        for group in _groups_sent(channel_layer):
+            self.assertTrue(group.startswith("messages_"), f"unexpected group: {group}")
+
+        frame = next(
+            call.args[1]
+            for call in channel_layer.group_send.call_args_list
+            if call.args[1].get("type") == "conversation_deleted"
+        )
+        self.assertEqual(frame["platform"], "facebook")
+        self.assertEqual(frame["conversation_id"], msg.sender_id)
+        self.assertEqual(frame["by_user_id"], self.admin.id)
+
+    def test_clear_platform_history_broadcasts_bulk_conversation_deleted(self):
+        # Two senders → only one bulk frame (conversation_id=None), not N.
+        conn = self.create_fb_connection()
+        self.create_fb_message(page_connection=conn, sender_id="sender_a", is_from_page=False)
+        self.create_fb_message(page_connection=conn, sender_id="sender_b", is_from_page=False)
+
+        channel_layer = _make_async_channel_layer()
+        with patch("social_integrations.consumers.get_channel_layer", return_value=channel_layer):
+            resp = self.api_post(
+                "/api/social/clear-history/",
+                {"platform": "facebook"},
+                user=self.admin,
+            )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+
+        deleted_frames = [
+            call.args[1]
+            for call in channel_layer.group_send.call_args_list
+            if call.args[1].get("type") == "conversation_deleted"
+        ]
+        self.assertEqual(len(deleted_frames), 1, "expected exactly one bulk frame")
+        self.assertEqual(deleted_frames[0]["platform"], "facebook")
+        self.assertIsNone(deleted_frames[0]["conversation_id"])
+        self.assertEqual(deleted_frames[0]["by_user_id"], self.admin.id)
+
+    def test_delete_conversation_still_returns_200_when_broadcast_fails(self):
+        """Broadcast is best-effort — a Channels failure must not block delete."""
+        conn = self.create_fb_connection()
+        msg = self.create_fb_message(page_connection=conn, is_from_page=False)
+
+        boom = AsyncMock()
+        boom.group_send.side_effect = RuntimeError("redis is on fire")
+        with patch("social_integrations.consumers.get_channel_layer", return_value=boom):
+            client = self.authenticated_client(self.admin)
+            resp = client.delete(
+                "/api/social/delete-conversation/",
+                data={"platform": "facebook", "conversation_id": msg.sender_id},
+                content_type="application/json",
+                HTTP_HOST="tenant.test.com",
+            )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)

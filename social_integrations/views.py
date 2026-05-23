@@ -1233,6 +1233,22 @@ def clear_platform_history(request):
 
         logger.info(f"✅ Cleared {platform} history: {deleted_count} messages deleted, {archive_count} archives removed")
 
+        # PR F — bulk-variant `conversation_deleted` broadcast.
+        # conversation_id=None tells beta clients "every row on this
+        # platform is gone" so they can do one pass instead of N.
+        try:
+            from django.db import connection
+            from .consumers import send_conversation_deleted
+            async_to_sync(send_conversation_deleted)(
+                connection.schema_name,
+                platform=platform,
+                conversation_id=None,
+                account_id=None,
+                by_user_id=request.user.id,
+            )
+        except Exception as exc:  # noqa: BLE001 — broadcast is best-effort.
+            logger.warning('conversation_deleted (bulk) broadcast failed: %s', exc)
+
         return Response({
             'status': 'cleared',
             'platform': platform,
@@ -6801,6 +6817,25 @@ def delete_conversation(request):
             }, status=status.HTTP_400_BAD_REQUEST)
 
         logger.info(f"Staff user {request.user.email} soft-deleted {deleted_count} messages for {platform} conversation {conversation_id}")
+
+        # PR F — emit `conversation_deleted` so every connected agent's
+        # /messages-beta sidebar drops the row live. Legacy /messages
+        # ignores the unknown event via switch-default; safe-by-default.
+        # account_id is unknown at this layer (the view doesn't take one);
+        # the beta store scans rows by (platform, conversationKey) and
+        # removes all matches, mirroring the soft-delete's loose scope.
+        try:
+            from django.db import connection
+            from .consumers import send_conversation_deleted
+            async_to_sync(send_conversation_deleted)(
+                connection.schema_name,
+                platform=platform,
+                conversation_id=conversation_id,
+                account_id=None,
+                by_user_id=request.user.id,
+            )
+        except Exception as exc:  # noqa: BLE001 — broadcast is best-effort.
+            logger.warning('conversation_deleted broadcast failed: %s', exc)
 
         return Response({
             'success': True,

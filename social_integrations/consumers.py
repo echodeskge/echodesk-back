@@ -201,6 +201,26 @@ class MessagesConsumer(AsyncWebsocketConsumer):
             'timestamp': event.get('timestamp'),
         }))
 
+    async def conversation_deleted(self, event):
+        """Pushed by delete-conversation + clear-platform-history views.
+
+        Beta clients drop the conversation row from their sidebar + deselect
+        the chat if it was active. Legacy clients ignore the unknown event
+        type via their switch-default branch (safe-by-default contract).
+
+        When `conversation_id` is null, the frame is the bulk variant from
+        `clear_platform_history` — every conversation on the given platform
+        should be removed at once.
+        """
+        await self.send(text_data=json.dumps({
+            'type': 'conversation_deleted',
+            'platform': event.get('platform'),
+            'conversation_id': event.get('conversation_id'),
+            'account_id': event.get('account_id'),
+            'by_user_id': event.get('by_user_id'),
+            'timestamp': event.get('timestamp'),
+        }))
+
 
 class WidgetVisitorConsumer(AsyncWebsocketConsumer):
     """
@@ -715,6 +735,35 @@ async def send_archive_update(
         'account_id': account_id,
         'archived': bool(archived),
         'archived_at': archived_at,
+        'by_user_id': by_user_id,
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+    })
+
+
+async def send_conversation_deleted(
+    tenant_schema,
+    *,
+    platform,
+    conversation_id,
+    account_id=None,
+    by_user_id=None,
+):
+    """Broadcast that a conversation has been deleted.
+
+    `conversation_id=None` is the bulk variant from clear_platform_history
+    — it instructs beta clients to drop every conversation on the platform
+    in one frame instead of N per-conversation messages.
+
+    Legacy /messages ignores `conversation_deleted` via the switch-default
+    branch, so this stays purely additive on the wire.
+    """
+    from datetime import datetime, timezone
+
+    await _safe_group_send(tenant_schema, {
+        'type': 'conversation_deleted',
+        'platform': platform,
+        'conversation_id': conversation_id,
+        'account_id': account_id,
         'by_user_id': by_user_id,
         'timestamp': datetime.now(timezone.utc).isoformat(),
     })
