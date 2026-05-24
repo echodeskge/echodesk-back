@@ -2329,17 +2329,19 @@ def facebook_webhook(request):
                                                     is_read=True
                                                 ).values_list('id', flat=True))
 
-                                                read_receipt_data = {
-                                                    'type': 'read_receipt',
-                                                    'sender_id': sender_id,
-                                                    'watermark': watermark,
-                                                    'message_ids': updated_message_ids,
-                                                    'updated_count': updated_count,
-                                                    'timestamp': timezone.now().isoformat()
-                                                }
-                                                # Conversation ID is the sender_id (the customer who read the messages)
-                                                ws_conversation_id = sender_id
-                                                send_websocket_notification(current_schema, read_receipt_data, ws_conversation_id)
+                                                # Typed status frame so /messages-beta flips the
+                                                # READ pips on the agent's outgoing bubbles. (Was
+                                                # previously wrapped as new_message and dropped by
+                                                # the platform guard.)
+                                                from .consumers import send_message_status_update
+                                                async_to_sync(send_message_status_update)(
+                                                    current_schema,
+                                                    platform='facebook',
+                                                    conversation_id=sender_id,
+                                                    account_id=page_id,
+                                                    message_ids=updated_message_ids,
+                                                    status='read',
+                                                )
 
                                     except Exception as e:
                                         logger.error(f"❌ Failed to process read receipt: {e}")
@@ -2386,17 +2388,16 @@ def facebook_webhook(request):
                                                     is_delivered=True
                                                 ).values_list('id', flat=True))
 
-                                                delivery_receipt_data = {
-                                                    'type': 'delivery_receipt',
-                                                    'sender_id': sender_id,
-                                                    'watermark': watermark,
-                                                    'message_ids': updated_message_ids,
-                                                    'updated_count': updated_count,
-                                                    'timestamp': timezone.now().isoformat()
-                                                }
-                                                # Conversation ID is the sender_id (the customer who received the messages)
-                                                ws_conversation_id = sender_id
-                                                send_websocket_notification(current_schema, delivery_receipt_data, ws_conversation_id)
+                                                # Typed status frame → DELIVERED pips on beta.
+                                                from .consumers import send_message_status_update
+                                                async_to_sync(send_message_status_update)(
+                                                    current_schema,
+                                                    platform='facebook',
+                                                    conversation_id=sender_id,
+                                                    account_id=page_id,
+                                                    message_ids=updated_message_ids,
+                                                    status='delivered',
+                                                )
 
                                     except Exception as e:
                                         logger.error(f"❌ Failed to process delivery receipt: {e}")
@@ -2443,19 +2444,18 @@ def facebook_webhook(request):
                                             from django.db import connection
                                             current_schema = getattr(connection, 'schema_name', None)
                                             if current_schema:
-                                                reaction_notification_data = {
-                                                    'type': 'message_reaction',
-                                                    'message_id': fb_message.id,
-                                                    'facebook_message_id': message_id,
-                                                    'action': action,
-                                                    'reaction': reaction,
-                                                    'emoji': emoji,
-                                                    'reacted_by': sender_id,
-                                                    'timestamp': timezone.now().isoformat()
-                                                }
-                                                # Get conversation ID from the message
+                                                # Typed reaction frame so beta patches the bubble's
+                                                # reactionEmoji live. null emoji = reaction removed.
                                                 ws_conversation_id = fb_message.sender_id if fb_message.sender_id != page_id else fb_message.recipient_id
-                                                send_websocket_notification(current_schema, reaction_notification_data, ws_conversation_id)
+                                                from .consumers import send_reaction_update
+                                                async_to_sync(send_reaction_update)(
+                                                    current_schema,
+                                                    platform='facebook',
+                                                    conversation_id=ws_conversation_id,
+                                                    account_id=page_id,
+                                                    message_id=fb_message.id,
+                                                    reaction_emoji=(emoji if action == 'react' else None),
+                                                )
                                         else:
                                             logger.warning(f"⚠️ Message not found for reaction: {message_id}")
 
@@ -8245,15 +8245,18 @@ def whatsapp_webhook(request):
                                 logger.info(f"🚫 Removed reaction from WhatsApp message: {reacted_msg_id}")
                             existing_msg.save()
 
-                            # Send WebSocket notification for reaction update
-                            ws_reaction_data = {
-                                'type': 'reaction_update',
-                                'message_id': reacted_msg_id,
-                                'reaction_emoji': existing_msg.reaction_emoji,
-                                'reacted_by': existing_msg.reacted_by,
-                                'reacted_at': existing_msg.reacted_at.isoformat() if existing_msg.reacted_at else None,
-                            }
-                            send_websocket_notification(tenant_schema, ws_reaction_data, from_number)
+                            # Typed reaction frame so beta patches the bubble live.
+                            # WA matches by platform message id (reacted_msg_id).
+                            from .consumers import send_reaction_update
+                            _waba_id = getattr(getattr(existing_msg, 'business_account', None), 'waba_id', None) or account.waba_id
+                            async_to_sync(send_reaction_update)(
+                                tenant_schema,
+                                platform='whatsapp',
+                                conversation_id=from_number,
+                                account_id=_waba_id,
+                                message_id=reacted_msg_id,
+                                reaction_emoji=existing_msg.reaction_emoji,
+                            )
                         except WhatsAppMessage.DoesNotExist:
                             logger.warning(f"Cannot find message for reaction: {reacted_msg_id}")
                         continue

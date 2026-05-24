@@ -115,14 +115,41 @@ class MessagesConsumer(AsyncWebsocketConsumer):
         }))
     
     async def message_status_update(self, event):
-        """Send message status update to WebSocket"""
+        """Send a message-status (sent/delivered/read) update to the client.
+
+        Carries a `message_ids` batch + the (platform, conversation_id,
+        account_id) triple so /messages-beta can resolve the chat and flip
+        the status pips on the matching bubbles. Falls back to a single
+        `message_id` for any legacy caller.
+        """
+        message_ids = event.get('message_ids')
+        if not message_ids and event.get('message_id') is not None:
+            message_ids = [event['message_id']]
         await self.send(text_data=json.dumps({
             'type': 'message_status',
-            'message_id': event['message_id'],
-            'status': event['status'],
-            'timestamp': event['timestamp']
+            'platform': event.get('platform'),
+            'conversation_id': event.get('conversation_id'),
+            'account_id': event.get('account_id'),
+            'message_ids': message_ids or [],
+            'status': event.get('status'),
+            'timestamp': event.get('timestamp'),
         }))
-    
+
+    async def reaction_update(self, event):
+        """Send a message-reaction add/remove to the client.
+
+        `reaction_emoji` is null/empty when a reaction was removed.
+        """
+        await self.send(text_data=json.dumps({
+            'type': 'reaction_update',
+            'platform': event.get('platform'),
+            'conversation_id': event.get('conversation_id'),
+            'account_id': event.get('account_id'),
+            'message_id': event.get('message_id'),
+            'reaction_emoji': event.get('reaction_emoji'),
+            'timestamp': event.get('timestamp'),
+        }))
+
     async def conversation_update(self, event):
         """Send conversation update to WebSocket"""
         await self.send(text_data=json.dumps({
@@ -765,5 +792,65 @@ async def send_conversation_deleted(
         'conversation_id': conversation_id,
         'account_id': account_id,
         'by_user_id': by_user_id,
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+    })
+
+
+async def send_message_status_update(
+    tenant_schema,
+    *,
+    platform,
+    conversation_id,
+    account_id,
+    message_ids,
+    status,
+):
+    """Broadcast a batch message-status change (delivered / read).
+
+    `message_ids` are the DB ids (FB/IG) or platform message ids (WA) of
+    the messages whose status flipped; `status` is 'delivered' or 'read'.
+    /messages-beta resolves the chat from (platform, account_id,
+    conversation_id) and upgrades the matching bubbles' status pips.
+
+    Additive — legacy /messages ignores `message_status` via its switch
+    default, so this is safe to emit unconditionally.
+    """
+    from datetime import datetime, timezone
+
+    await _safe_group_send(tenant_schema, {
+        'type': 'message_status_update',
+        'platform': platform,
+        'conversation_id': conversation_id,
+        'account_id': account_id,
+        'message_ids': list(message_ids or []),
+        'status': status,
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+    })
+
+
+async def send_reaction_update(
+    tenant_schema,
+    *,
+    platform,
+    conversation_id,
+    account_id,
+    message_id,
+    reaction_emoji,
+):
+    """Broadcast a reaction add/remove on a single message.
+
+    `reaction_emoji` is null/empty when the reaction was removed. Beta
+    patches the matching bubble's reactionEmoji; legacy ignores the
+    unknown `reaction_update` type.
+    """
+    from datetime import datetime, timezone
+
+    await _safe_group_send(tenant_schema, {
+        'type': 'reaction_update',
+        'platform': platform,
+        'conversation_id': conversation_id,
+        'account_id': account_id,
+        'message_id': message_id,
+        'reaction_emoji': reaction_emoji,
         'timestamp': datetime.now(timezone.utc).isoformat(),
     })
