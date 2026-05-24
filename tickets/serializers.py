@@ -510,7 +510,8 @@ class TicketListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Ticket
         fields = [
-            'id', 'title', 'status', 'priority', 'is_closed', 'column', 'position_in_column',
+            'id', 'title', 'description', 'description_format',
+            'status', 'priority', 'is_closed', 'column', 'position_in_column',
             'created_at', 'updated_at', 'created_by', 'assigned_to', 'assigned_users',
             'assigned_groups', 'assignments', 'tags', 'comments_count'
         ]
