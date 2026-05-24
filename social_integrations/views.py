@@ -4528,11 +4528,23 @@ def end_session(request):
                 )
 
     # Archive the conversation (move to history)
-    ConversationArchive.objects.get_or_create(
+    archive_obj, _archive_created = ConversationArchive.objects.get_or_create(
         platform=platform,
         conversation_id=conversation_id,
         account_id=account_id,
         defaults={'archived_by': request.user}
+    )
+    # Broadcast archive_update so /messages-beta clients move the chat into
+    # History. Without this the only frame end_session emitted was the
+    # unassign (assignment_update), which sent the chat back to the All tab
+    # instead of History. Mirrors the archive view's broadcast.
+    _broadcast_archive_change(
+        request,
+        platform=platform,
+        conversation_id=conversation_id,
+        account_id=account_id,
+        archived=True,
+        archived_at=getattr(archive_obj, 'archived_at', None) or timezone.now(),
     )
 
     # Widget-specific: close the underlying WidgetSession and broadcast
