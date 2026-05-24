@@ -6177,6 +6177,68 @@ def unified_conversations(request):
     end_idx = start_idx + page_size
     paginated_conversations = all_conversations[start_idx:end_idx]
 
+    # Per-page assignment + archive enrichment.
+    #
+    # Added for /messages-beta: the beta page can't make a second round-trip
+    # for these slices, and the legacy page doesn't depend on them being on
+    # this payload — so we attach them here, bounded to the visible page
+    # only (two extra queries scoped by the 50-row tuple set, not the whole
+    # tenant). Keys are (platform, account_id, conversation_id) so the
+    # platform-prefixed dict slugs we built above match the lookup.
+    if paginated_conversations:
+        page_keys = [
+            (c['platform'], c['account_id'], c['sender_id'])
+            for c in paginated_conversations
+        ]
+        # Assignment lookup — only fetches rows for chats on this page.
+        from django.db.models import Q as _Q
+        _assignment_q = _Q()
+        for plat, acct, sid in page_keys:
+            _assignment_q |= _Q(platform=plat, account_id=acct, conversation_id=sid)
+        assignment_lookup = {}
+        if page_keys:
+            for a in ChatAssignment.objects.filter(_assignment_q).select_related('assigned_user'):
+                assignment_lookup[(a.platform, a.account_id, a.conversation_id)] = a
+
+        # Archive lookup — same tuple key. ConversationArchive doesn't have
+        # a composite index, so we pre-filter by the platform set.
+        archive_lookup = {}
+        if page_keys:
+            page_platforms = {plat for plat, _, _ in page_keys}
+            for ar in ConversationArchive.objects.filter(platform__in=page_platforms):
+                archive_lookup[(ar.platform, ar.account_id, ar.conversation_id)] = ar
+
+        for c in paginated_conversations:
+            key = (c['platform'], c['account_id'], c['sender_id'])
+            assignment = assignment_lookup.get(key)
+            if assignment and assignment.assigned_user:
+                full_name = (
+                    assignment.assigned_user.get_full_name()
+                    or assignment.assigned_user.email
+                )
+                c['assigned_user_id'] = assignment.assigned_user_id
+                c['assigned_user_name'] = full_name
+                c['assignment_status'] = assignment.status
+                c['session_started_at'] = assignment.session_started_at
+                c['session_ended_at'] = assignment.session_ended_at
+            else:
+                # Always emit the keys (even when null) so the frontend's
+                # serializer-defined shape matches its TypeScript interface
+                # without `?` everywhere.
+                c['assigned_user_id'] = None
+                c['assigned_user_name'] = None
+                c['assignment_status'] = None
+                c['session_started_at'] = None
+                c['session_ended_at'] = None
+
+            archive = archive_lookup.get(key)
+            if archive:
+                c['is_archived'] = True
+                c['archived_at'] = archive.archived_at
+            else:
+                c['is_archived'] = False
+                c['archived_at'] = None
+
     # Build pagination URLs
     base_url = request.build_absolute_uri().split('?')[0]
     params = request.query_params.copy()

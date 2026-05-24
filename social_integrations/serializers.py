@@ -1280,6 +1280,17 @@ class UnifiedConversationSerializer(serializers.Serializer):
     account_id = serializers.CharField()
     # Email-specific field
     subject = serializers.CharField(allow_null=True, allow_blank=True, required=False)
+    # Assignment + archive fields (added for /messages-beta bootstrap parity).
+    # All nullable: legacy /messages page doesn't read them and is unaffected
+    # by their presence; beta consumes them directly so the Assigned tab +
+    # History view + composer gating boot correctly without a second round-trip.
+    assigned_user_id = serializers.IntegerField(allow_null=True, required=False)
+    assigned_user_name = serializers.CharField(allow_null=True, allow_blank=True, required=False)
+    assignment_status = serializers.CharField(allow_null=True, allow_blank=True, required=False)
+    session_started_at = serializers.DateTimeField(allow_null=True, required=False)
+    session_ended_at = serializers.DateTimeField(allow_null=True, required=False)
+    is_archived = serializers.BooleanField(required=False, default=False)
+    archived_at = serializers.DateTimeField(allow_null=True, required=False)
 
 
 class PaginatedUnifiedConversationSerializer(serializers.Serializer):
