@@ -195,49 +195,20 @@ def send_websocket_notification(tenant_schema, message_data, conversation_id, as
 
 
 def find_tenant_by_page_id(page_id):
-    """Find which tenant schema contains the given Facebook page ID"""
-    from django.db import connection
-    from tenants.models import Tenant
-    from tenant_schemas.utils import schema_context
+    """Find which tenant schema owns the given Facebook page ID.
 
-    # Get all tenant schemas
-    tenants = Tenant.objects.all()
-
-    for tenant in tenants:
-        try:
-            # Switch to tenant schema and check if page exists
-            with schema_context(tenant.schema_name):
-                from social_integrations.models import FacebookPageConnection
-                if FacebookPageConnection.objects.filter(page_id=page_id, is_active=True).exists():
-                    return tenant.schema_name
-        except Exception as e:
-            # Skip tenant if there's an error (e.g., table doesn't exist)
-            continue
-
-    return None
+    O(1) lookup against the public-schema SocialPlatformRoute table, with a
+    self-healing fallback to the legacy full scan. See
+    ``social_integrations.platform_routing.resolve_tenant``.
+    """
+    from social_integrations.platform_routing import resolve_tenant
+    return resolve_tenant("facebook", page_id)
 
 
 def find_tenant_by_whatsapp_phone_number_id(phone_number_id):
-    """Find which tenant schema contains the given WhatsApp phone number ID"""
-    from django.db import connection
-    from tenants.models import Tenant
-    from tenant_schemas.utils import schema_context
-
-    # Get all tenant schemas
-    tenants = Tenant.objects.all()
-
-    for tenant in tenants:
-        try:
-            # Switch to tenant schema and check if WhatsApp account exists
-            with schema_context(tenant.schema_name):
-                from social_integrations.models import WhatsAppBusinessAccount
-                if WhatsAppBusinessAccount.objects.filter(phone_number_id=phone_number_id, is_active=True).exists():
-                    return tenant.schema_name
-        except Exception as e:
-            # Skip tenant if there's an error (e.g., table doesn't exist)
-            continue
-
-    return None
+    """Find which tenant schema owns the given WhatsApp phone number ID (O(1) + fallback)."""
+    from social_integrations.platform_routing import resolve_tenant
+    return resolve_tenant("whatsapp", phone_number_id)
 
 
 # ============================================================================
@@ -356,14 +327,42 @@ def process_auto_reply(platform, account_id, conversation_id, sender_name, conne
 
 
 def send_auto_reply(platform, recipient_id, message_text, connection):
-    """Send auto-reply message via platform API"""
-    if platform == 'facebook':
-        return send_facebook_auto_reply(recipient_id, message_text, connection)
-    elif platform == 'instagram':
-        return send_instagram_auto_reply(recipient_id, message_text, connection)
-    elif platform == 'whatsapp':
-        return send_whatsapp_auto_reply(recipient_id, message_text, connection)
-    return False
+    """Queue an auto-reply for asynchronous delivery.
+
+    Returns ``True`` when the reply was successfully *enqueued* — the inbound
+    webhook no longer blocks on the outbound Graph/WhatsApp API call. Actual
+    delivery + DB persistence happen in ``send_auto_reply_task`` (with retry on
+    transient connection failures). Tracking timestamps in ``process_auto_reply``
+    are therefore set optimistically, which is the desired behaviour for
+    welcome/away messages (better to under-send than to spam on a retry storm).
+
+    Falls back to a synchronous send if the task can't be enqueued (e.g. broker
+    unavailable) so auto-replies still work in degraded conditions.
+    """
+    from django.db import connection as db_connection
+
+    if platform not in ('facebook', 'instagram', 'whatsapp'):
+        return False
+
+    schema = getattr(db_connection, 'schema_name', None)
+    if not schema or schema == 'public':
+        return False
+
+    try:
+        from social_integrations.tasks import send_auto_reply_task
+        send_auto_reply_task.delay(
+            schema, platform, recipient_id, message_text, connection.pk
+        )
+        return True
+    except Exception as e:  # noqa: BLE001 — broker down / eager error → degrade to sync
+        logger.warning(f"Auto-reply enqueue failed ({e}); sending synchronously")
+        if platform == 'facebook':
+            return send_facebook_auto_reply(recipient_id, message_text, connection)
+        elif platform == 'instagram':
+            return send_instagram_auto_reply(recipient_id, message_text, connection)
+        elif platform == 'whatsapp':
+            return send_whatsapp_auto_reply(recipient_id, message_text, connection)
+        return False
 
 
 def send_facebook_auto_reply(recipient_id, message_text, page_connection):
@@ -3247,25 +3246,9 @@ def instagram_send_message(request):
 
 
 def find_tenant_by_instagram_account_id(instagram_account_id):
-    """Find which tenant schema contains the given Instagram account ID"""
-    from django.db import connection
-    from tenants.models import Tenant
-    from tenant_schemas.utils import schema_context
-
-    # Get all tenant schemas
-    tenants = Tenant.objects.all()
-
-    for tenant in tenants:
-        try:
-            # Switch to tenant schema and check if account exists
-            with schema_context(tenant.schema_name):
-                if InstagramAccountConnection.objects.filter(instagram_account_id=instagram_account_id, is_active=True).exists():
-                    return tenant.schema_name
-        except Exception as e:
-            # Skip tenant if there's an error (e.g., table doesn't exist)
-            continue
-
-    return None
+    """Find which tenant schema owns the given Instagram account ID (O(1) + fallback)."""
+    from social_integrations.platform_routing import resolve_tenant
+    return resolve_tenant("instagram", instagram_account_id)
 
 
 @csrf_exempt
@@ -10211,23 +10194,9 @@ def email_assignment_delete(request, assignment_id):
 # =============================================================================
 
 def find_tenant_by_tiktok_shop_id(shop_id):
-    """
-    Find the tenant schema that owns a TikTok Shop account by shop_id.
-
-    Args:
-        shop_id: TikTok shop_id from webhook payloads
-
-    Returns:
-        Tenant schema name or None if not found
-    """
-    from tenants.models import Tenant
-
-    tenants = Tenant.objects.exclude(schema_name='public')
-    for tenant in tenants:
-        with schema_context(tenant.schema_name):
-            if TikTokShopAccount.objects.filter(shop_id=shop_id, is_active=True).exists():
-                return tenant.schema_name
-    return None
+    """Find the tenant schema that owns a TikTok Shop account by shop_id (O(1) + fallback)."""
+    from social_integrations.platform_routing import resolve_tenant
+    return resolve_tenant("tiktok", shop_id)
 
 
 @api_view(['GET'])

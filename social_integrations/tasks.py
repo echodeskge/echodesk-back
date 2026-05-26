@@ -1,10 +1,67 @@
 import logging
 
+import requests
 from celery import shared_task
 from django.core.management import call_command
 from io import StringIO
 
 logger = logging.getLogger(__name__)
+
+
+@shared_task(
+    bind=True,
+    autoretry_for=(requests.RequestException,),
+    retry_kwargs={"max_retries": 3},
+    retry_backoff=True,
+    soft_time_limit=60,
+    time_limit=90,
+)
+def send_auto_reply_task(self, schema_name, platform, recipient_id, message_text, connection_id):
+    """Send a platform auto-reply off the webhook request thread.
+
+    Auto-replies used to be sent synchronously inside the inbound webhook,
+    blocking the request on the outbound Graph/WhatsApp API call. This task
+    moves that work to a worker and retries transient *connection* failures
+    (``requests.RequestException``). The underlying senders return ``False`` on
+    a non-200 response without raising, so a genuine API rejection is logged
+    but not retried (avoids spamming a recipient).
+    """
+    from tenant_schemas.utils import schema_context
+
+    with schema_context(schema_name):
+        from social_integrations.models import (
+            FacebookPageConnection,
+            InstagramAccountConnection,
+            WhatsAppBusinessAccount,
+        )
+        from social_integrations import views
+
+        model_map = {
+            "facebook": FacebookPageConnection,
+            "instagram": InstagramAccountConnection,
+            "whatsapp": WhatsAppBusinessAccount,
+        }
+        sender_map = {
+            "facebook": views.send_facebook_auto_reply,
+            "instagram": views.send_instagram_auto_reply,
+            "whatsapp": views.send_whatsapp_auto_reply,
+        }
+        Model = model_map.get(platform)
+        sender = sender_map.get(platform)
+        if Model is None or sender is None:
+            logger.warning("send_auto_reply_task: unsupported platform %s", platform)
+            return False
+
+        try:
+            conn = Model.objects.get(pk=connection_id)
+        except Model.DoesNotExist:
+            logger.warning(
+                "send_auto_reply_task: %s connection %s gone in %s",
+                platform, connection_id, schema_name,
+            )
+            return False
+
+        return sender(recipient_id, message_text, conn)
 
 
 @shared_task

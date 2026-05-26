@@ -1222,3 +1222,63 @@ class TenantIPWhitelist(models.Model):
         ip_display = f"{self.ip_address}/{self.cidr_notation}" if self.cidr_notation else self.ip_address
         status = "Active" if self.is_active else "Inactive"
         return f"{self.tenant.name} - {ip_display} ({status})"
+
+
+class SocialPlatformRoute(models.Model):
+    """Public-schema lookup table mapping a social platform's external account
+    id (Facebook page id, Instagram account id, WhatsApp phone-number id,
+    TikTok shop id, …) to the tenant schema that owns it.
+
+    Inbound webhooks arrive with no tenant context. Historically each webhook
+    resolved its tenant by iterating *every* tenant schema and querying the
+    per-platform connection model until a match was found — an O(N-tenants)
+    scan that runs on every inbound message and becomes a scaling/DB-load
+    landmine as the customer base grows. This table replaces that scan with a
+    single O(1) lookup in the public schema.
+
+    Kept eventually-consistent with the per-tenant connection models by signals
+    in ``social_integrations.platform_routing`` (and a one-shot
+    ``backfill_platform_routes`` command). The webhook resolver still falls
+    back to the legacy scan + self-heals this table if a row is missing, so a
+    stale/empty table never drops a message.
+
+    Mirrors the established ``widget_registry.WidgetConnection`` pattern: a
+    plain ``tenant_schema`` string rather than a cross-schema FK.
+    """
+
+    PLATFORM_FACEBOOK = 'facebook'
+    PLATFORM_INSTAGRAM = 'instagram'
+    PLATFORM_WHATSAPP = 'whatsapp'
+    PLATFORM_TIKTOK = 'tiktok'
+    PLATFORM_WECHAT = 'wechat'
+    PLATFORM_CHOICES = [
+        (PLATFORM_FACEBOOK, 'Facebook'),
+        (PLATFORM_INSTAGRAM, 'Instagram'),
+        (PLATFORM_WHATSAPP, 'WhatsApp'),
+        (PLATFORM_TIKTOK, 'TikTok'),
+        (PLATFORM_WECHAT, 'WeChat'),
+    ]
+
+    platform = models.CharField(max_length=20, choices=PLATFORM_CHOICES, db_index=True)
+    external_id = models.CharField(
+        max_length=255,
+        db_index=True,
+        help_text='Platform account id used in webhook payloads (page_id, '
+                  'instagram_account_id, phone_number_id, shop_id, …)',
+    )
+    tenant_schema = models.CharField(max_length=63, db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'tenants_social_platform_route'
+        verbose_name = 'Social Platform Route'
+        verbose_name_plural = 'Social Platform Routes'
+        unique_together = [['platform', 'external_id']]
+        indexes = [
+            models.Index(fields=['platform', 'external_id', 'is_active']),
+        ]
+
+    def __str__(self):
+        return f"{self.platform}:{self.external_id} → {self.tenant_schema}"

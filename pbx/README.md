@@ -19,6 +19,11 @@ Start here if you're figuring out how EchoDesk talks to Asterisk.
   stability.
 
 ### Engineering / architecture
+- **[../docs/ARCHITECTURE_PBX.md](../docs/ARCHITECTURE_PBX.md)** — the
+  **code-side** architecture: how Django keeps Asterisk in sync
+  (`AsteriskStateSync`), the runtime per-tenant DB-alias mechanism, the
+  `asterisk_state` shadow models, what triggers a sync, the AMI client, and
+  an operate/debug section. Start here if you're changing calling code.
 - **[CUTOVER_RUNBOOK.md](CUTOVER_RUNBOOK.md)** — the Phase 1 shared-
   schema realtime cutover. Still the canonical reference for *why each
   config line exists* (sorcery blocks, extconfig `[settings]` merge,
@@ -63,8 +68,10 @@ Read `BYO_PROVISIONING.md` § Troubleshooting. Common causes:
 - Token expired (24h TTL).
 
 ### "I'm building a new feature that touches the realtime tables."
-1. Read `CLAUDE.md` § *Asterisk realtime (ARA)* in the repo root for
-   architecture and the `AsteriskStateSync.prefix()` convention.
+1. Read **[../docs/ARCHITECTURE_PBX.md](../docs/ARCHITECTURE_PBX.md)** for the
+   full code-side flow (signals → `AsteriskStateSync` → runtime alias → shadow
+   tables → router), then `CLAUDE.md` § *Asterisk realtime (ARA)* in the repo
+   root for the `AsteriskStateSync.prefix()` convention.
 2. For a schema change, add a migration under
    `echodesk-back/asterisk_state/migrations/` and ship it via
    `python manage.py migrate_asterisk --all` in `build_production.sh`.
