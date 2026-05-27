@@ -20,10 +20,42 @@ class FacebookPageConnectionSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 
+def _quoted_reply_text(obj):
+    """Text (or a media label) of the message a reply is quoting.
+
+    Returned directly by the message serializers so the frontend can render
+    the reply preview without having to locate the quoted message in whatever
+    page of history happens to be loaded.
+    """
+    r = getattr(obj, 'reply_to', None)
+    if not r:
+        return None
+    if getattr(r, 'message_text', ''):
+        return r.message_text
+    at = (getattr(r, 'attachment_type', '') or getattr(r, 'message_type', '') or '').lower()
+    labels = {
+        'image': '📷 Photo', 'sticker': '📷 Sticker', 'video': '🎬 Video',
+        'audio': '🎵 Audio', 'file': '📎 File', 'document': '📄 Document',
+    }
+    return labels.get(at, '📎 Attachment') if at else None
+
+
+def _quoted_reply_sender(obj):
+    """Display name of the quoted message's sender ('You' for our own)."""
+    r = getattr(obj, 'reply_to', None)
+    if not r:
+        return None
+    if getattr(r, 'is_from_page', False) or getattr(r, 'is_from_business', False):
+        return 'You'
+    return getattr(r, 'sender_name', None) or None
+
+
 class FacebookMessageSerializer(serializers.ModelSerializer):
     page_id = serializers.CharField(source='page_connection.page_id', read_only=True)
     page_name = serializers.CharField(source='page_connection.page_name', read_only=True)
     reply_to_id = serializers.PrimaryKeyRelatedField(source='reply_to', read_only=True)
+    reply_to_text = serializers.SerializerMethodField()
+    reply_to_sender_name = serializers.SerializerMethodField()
     sent_by_name = serializers.SerializerMethodField()
     recipient_name = serializers.SerializerMethodField()
 
@@ -38,7 +70,7 @@ class FacebookMessageSerializer(serializers.ModelSerializer):
             # Reaction fields
             'reaction', 'reaction_emoji', 'reacted_by', 'reacted_at',
             # Reply fields
-            'reply_to_message_id', 'reply_to_id',
+            'reply_to_message_id', 'reply_to_id', 'reply_to_text', 'reply_to_sender_name',
             # Source tracking fields
             'source', 'is_echo', 'sent_by', 'sent_by_name',
             # Recipient tracking for outgoing messages
@@ -46,13 +78,19 @@ class FacebookMessageSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'is_delivered', 'delivered_at', 'is_read', 'read_at', 'created_at',
                            'reaction', 'reaction_emoji', 'reacted_by', 'reacted_at',
-                           'reply_to_message_id', 'reply_to_id',
+                           'reply_to_message_id', 'reply_to_id', 'reply_to_text', 'reply_to_sender_name',
                            'source', 'is_echo', 'sent_by', 'sent_by_name', 'recipient_name']
 
     def get_sent_by_name(self, obj):
         if obj.sent_by:
             return f"{obj.sent_by.first_name} {obj.sent_by.last_name}".strip() or obj.sent_by.email
         return None
+
+    def get_reply_to_text(self, obj):
+        return _quoted_reply_text(obj)
+
+    def get_reply_to_sender_name(self, obj):
+        return _quoted_reply_sender(obj)
 
     def get_recipient_name(self, obj):
         """Get recipient name for outgoing messages (from page to customer)"""
@@ -217,6 +255,8 @@ class WhatsAppMessageSerializer(serializers.ModelSerializer):
     template_name = serializers.CharField(source='template.name', read_only=True, allow_null=True)
     sent_by_name = serializers.SerializerMethodField()
     reply_to_id = serializers.PrimaryKeyRelatedField(source='reply_to', read_only=True)
+    reply_to_text = serializers.SerializerMethodField()
+    reply_to_sender_name = serializers.SerializerMethodField()
 
     class Meta:
         model = WhatsAppMessage
@@ -232,14 +272,14 @@ class WhatsAppMessageSerializer(serializers.ModelSerializer):
             # Author tracking
             'sent_by', 'sent_by_name',
             # Reply fields
-            'reply_to_message_id', 'reply_to_id',
+            'reply_to_message_id', 'reply_to_id', 'reply_to_text', 'reply_to_sender_name',
             'created_at'
         ]
         read_only_fields = [
             'id', 'status', 'is_delivered', 'delivered_at', 'is_read', 'read_at',
             'source', 'is_echo', 'is_edited', 'edited_at', 'original_text', 'is_revoked', 'revoked_at',
             'sent_by', 'sent_by_name',
-            'reply_to_message_id', 'reply_to_id',
+            'reply_to_message_id', 'reply_to_id', 'reply_to_text', 'reply_to_sender_name',
             'created_at'
         ]
 
@@ -247,6 +287,12 @@ class WhatsAppMessageSerializer(serializers.ModelSerializer):
         if obj.sent_by:
             return f"{obj.sent_by.first_name} {obj.sent_by.last_name}".strip() or obj.sent_by.email
         return None
+
+    def get_reply_to_text(self, obj):
+        return _quoted_reply_text(obj)
+
+    def get_reply_to_sender_name(self, obj):
+        return _quoted_reply_sender(obj)
 
 
 class WhatsAppSendMessageSerializer(serializers.Serializer):
