@@ -1646,6 +1646,8 @@ def facebook_send_message(request):
                         'is_from_page': True,
                         'page_id': page_id,
                         'sent_by': request.user.email if request.user else None,
+                        'reply_to_message_id': row.reply_to_message_id,
+                        'reply_to_id': row.reply_to_id if row.reply_to_id else None,
                     }
                     async_to_sync(send_new_message_notification)(tenant_schema, recipient_id, ws_message_data)
             except Exception as e:
