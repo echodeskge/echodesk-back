@@ -3027,6 +3027,7 @@ def instagram_send_message(request):
         message_text = validated_data.get('message', '')
         instagram_account_id = validated_data['instagram_account_id']
         media_file = request.FILES.get('media')
+        reply_to_message_id = (request.data.get('reply_to_message_id') or '').strip()
 
         # Validate: must have text or media
         if not message_text and not media_file:
@@ -3107,6 +3108,8 @@ def instagram_send_message(request):
                     'message': {'text': message_text},
                     'messaging_type': 'RESPONSE'
                 }
+                if reply_to_message_id:
+                    text_payload['reply_to'] = {'mid': reply_to_message_id}
                 requests.post(send_url, json=text_payload,
                               headers={'Content-Type': 'application/json'}, params=params)
 
@@ -3134,6 +3137,8 @@ def instagram_send_message(request):
                 'message': {'text': message_text},
                 'messaging_type': 'RESPONSE'
             }
+            if reply_to_message_id:
+                message_data['reply_to'] = {'mid': reply_to_message_id}
 
             response = requests.post(
                 send_url,
@@ -3154,6 +3159,10 @@ def instagram_send_message(request):
                 from django.db import connection
 
                 timestamp = datetime.now()
+                reply_to_obj = (
+                    InstagramMessage.objects.filter(message_id=reply_to_message_id).first()
+                    if reply_to_message_id else None
+                )
                 create_kwargs = dict(
                     account_connection=account_connection,
                     message_id=message_id or f"sent_{timestamp.timestamp()}",
@@ -3165,6 +3174,8 @@ def instagram_send_message(request):
                     source='echodesk',
                     is_echo=False,
                     sent_by=request.user,
+                    reply_to_message_id=reply_to_message_id or None,
+                    reply_to=reply_to_obj,
                 )
                 if attachments_meta:
                     create_kwargs['attachments'] = attachments_meta
@@ -3219,6 +3230,8 @@ def instagram_send_message(request):
                     'is_from_business': True,
                     'account_id': instagram_account_id,
                     'sent_by': request.user.email if request.user else None,
+                    'reply_to_message_id': ig_message.reply_to_message_id,
+                    'reply_to_id': ig_message.reply_to_id if ig_message.reply_to_id else None,
                 }
                 async_to_sync(send_new_message_notification)(tenant_schema, recipient_id, message_data)
             except Exception as e:
