@@ -302,6 +302,18 @@ class InstagramMessage(models.Model):
         help_text='Staff member who sent this message via EchoDesk'
     )
 
+    # Reply fields (for message replies) — Instagram sends reply_to.mid in the
+    # webhook, same shape as Facebook.
+    reply_to_message_id = models.CharField(max_length=255, blank=True, null=True, help_text='Message ID this is a reply to')
+    reply_to = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='replies',
+        help_text='Reference to the message this is replying to'
+    )
+
     class Meta:
         ordering = ['-timestamp']
         indexes = [

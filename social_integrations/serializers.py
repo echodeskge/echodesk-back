@@ -162,6 +162,9 @@ class InstagramMessageSerializer(serializers.ModelSerializer):
     account_username = serializers.CharField(source='account_connection.username', read_only=True)
     sent_by_name = serializers.SerializerMethodField()
     recipient_name = serializers.SerializerMethodField()
+    reply_to_id = serializers.PrimaryKeyRelatedField(source='reply_to', read_only=True)
+    reply_to_text = serializers.SerializerMethodField()
+    reply_to_sender_name = serializers.SerializerMethodField()
 
     class Meta:
         model = InstagramMessage
@@ -171,18 +174,27 @@ class InstagramMessageSerializer(serializers.ModelSerializer):
             'timestamp', 'is_from_business', 'is_delivered', 'delivered_at', 'is_read', 'read_at',
             'is_read_by_staff', 'read_by_staff_at',
             'account_id', 'account_username', 'created_at',
+            # Reply fields
+            'reply_to_message_id', 'reply_to_id', 'reply_to_text', 'reply_to_sender_name',
             # Source tracking fields
             'source', 'is_echo', 'sent_by', 'sent_by_name',
             # Recipient tracking for outgoing messages
             'recipient_name',
         ]
         read_only_fields = ['id', 'is_delivered', 'delivered_at', 'is_read', 'read_at', 'created_at',
+                           'reply_to_message_id', 'reply_to_id', 'reply_to_text', 'reply_to_sender_name',
                            'source', 'is_echo', 'sent_by', 'sent_by_name', 'recipient_name']
 
     def get_sent_by_name(self, obj):
         if obj.sent_by:
             return f"{obj.sent_by.first_name} {obj.sent_by.last_name}".strip() or obj.sent_by.email
         return None
+
+    def get_reply_to_text(self, obj):
+        return _quoted_reply_text(obj)
+
+    def get_reply_to_sender_name(self, obj):
+        return _quoted_reply_sender(obj)
 
     def get_recipient_name(self, obj):
         """Get recipient name for outgoing messages (from business to customer)"""

@@ -2842,7 +2842,7 @@ class InstagramMessageViewSet(viewsets.ReadOnlyModelViewSet):
         base_queryset = InstagramMessage.objects.filter(
             account_connection__in=tenant_accounts,
             is_deleted=False
-        ).select_related('account_connection', 'sent_by')
+        ).select_related('account_connection', 'sent_by', 'reply_to')
 
         # Apply account_id filter from query params (support both formats)
         account_id = self.request.query_params.get('account_id')
@@ -3619,6 +3619,15 @@ def instagram_webhook(request):
 
                                 logger.info(f"💾 Saving Instagram message from sender_id: {sender_id}, username: {sender_username}")
 
+                                # Extract reply_to (message replies) — Instagram
+                                # sends reply_to.mid just like Facebook.
+                                ig_reply = message_data.get('reply_to') or {}
+                                ig_reply_mid = ig_reply.get('mid')
+                                ig_reply_obj = (
+                                    InstagramMessage.objects.filter(message_id=ig_reply_mid).first()
+                                    if ig_reply_mid else None
+                                )
+
                                 if message_id and not InstagramMessage.objects.filter(message_id=message_id).exists():
                                     try:
                                         message_obj = InstagramMessage.objects.create(
@@ -3633,7 +3642,9 @@ def instagram_webhook(request):
                                             attachment_url=attachment_url,
                                             attachments=attachments,
                                             timestamp=convert_facebook_timestamp(message_event.get('timestamp', 0)),
-                                            is_from_business=False
+                                            is_from_business=False,
+                                            reply_to_message_id=ig_reply_mid,
+                                            reply_to=ig_reply_obj,
                                         )
                                         logger.info(f"✅ Saved Instagram message from {sender_username}: {message_text[:50] if message_text else f'[{attachment_type}]'}")
 
@@ -3681,6 +3692,8 @@ def instagram_webhook(request):
                                                 'platform': 'instagram',
                                                 'account_id': account_connection.instagram_account_id,
                                                 'chat_id': f'ig_{account_connection.instagram_account_id}_{sender_id}',
+                                                'reply_to_message_id': message_obj.reply_to_message_id,
+                                                'reply_to_id': message_obj.reply_to_id if message_obj.reply_to_id else None,
                                             }
                                             # Conversation ID is the sender_id (the customer)
                                             ws_conversation_id = sender_id
