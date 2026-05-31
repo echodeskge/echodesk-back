@@ -8414,6 +8414,31 @@ def whatsapp_webhook(request):
                             'url': media_url,
                             'mime_type': media_mime_type,
                         })
+                    elif message_type == 'location':
+                        # Shared location: lat/long (+ optional name/address).
+                        # No media to fetch — stored as a structured attachment
+                        # the frontend renders as an "Open in Maps" card. We
+                        # also drop a Google Maps URL into message_text so the
+                        # sidebar preview + any non-location-aware surface still
+                        # shows something useful.
+                        loc = message.get('location', {})
+                        lat = loc.get('latitude')
+                        lng = loc.get('longitude')
+                        loc_name = loc.get('name', '') or ''
+                        loc_address = loc.get('address', '') or ''
+                        maps_url = (
+                            f"https://www.google.com/maps?q={lat},{lng}"
+                            if lat is not None and lng is not None else ''
+                        )
+                        message_text = loc_name or loc_address or maps_url
+                        attachments.append({
+                            'type': 'location',
+                            'latitude': lat,
+                            'longitude': lng,
+                            'name': loc_name,
+                            'address': loc_address,
+                            'url': maps_url,
+                        })
 
                     # Get contact name
                     contacts = value.get('contacts', [])
