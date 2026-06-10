@@ -367,7 +367,7 @@ def deploy_tenant_frontend_netlify(tenant) -> Dict[str, Any]:
         {"key": "NEXT_PUBLIC_CONTACT_ADDRESS", "value": getattr(tenant, 'address', '')},
         {"key": "NEXT_PUBLIC_GA_ID", "value": ""},
         {"key": "NEXT_PUBLIC_GTM_ID", "value": ""},
-        {"key": "NEXT_PUBLIC_IMAGE_HOSTNAMES", "value": "echodesk-spaces.fra1.digitaloceanspaces.com"},
+        {"key": "NEXT_PUBLIC_IMAGE_HOSTNAMES", "value": settings.AWS_S3_CUSTOM_DOMAIN},
         # NextAuth.js configuration (required for authentication)
         {"key": "NEXTAUTH_SECRET", "value": nextauth_secret},
         {"key": "NEXTAUTH_URL", "value": frontend_url},

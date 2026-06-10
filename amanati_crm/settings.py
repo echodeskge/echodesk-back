@@ -267,7 +267,10 @@ AWS_S3_OBJECT_PARAMETERS = {
 AWS_LOCATION = 'media'
 # IMPORTANT: Must be 'public-read' with HYPHEN, not 'public_read' with underscore
 AWS_DEFAULT_ACL = 'public-read'
-AWS_S3_CUSTOM_DOMAIN = f'{AWS_STORAGE_BUCKET_NAME}.{AWS_S3_REGION_NAME}.digitaloceanspaces.com'
+AWS_S3_CUSTOM_DOMAIN = config(
+    'DO_SPACES_CUSTOM_DOMAIN',
+    default=f'{AWS_STORAGE_BUCKET_NAME}.{AWS_S3_REGION_NAME}.digitaloceanspaces.com'
+)
 
 # Use DigitalOcean Spaces for media file storage
 DEFAULT_FILE_STORAGE = 'storages.backends.s3boto3.S3Boto3Storage'
