@@ -11,7 +11,10 @@ gunicorn>=21.2.0
 whitenoise>=6.5.0
 requests>=2.31.0
 celery>=5.3.0
-redis>=5.0.0
+# Pin to 5.x: redis-py 8.x breaks channels_redis 4.3.0's blocking bzpopmin read
+# (causes "Timeout reading from redis" on WebSockets). channels_redis declares
+# only redis>=4.6 with no upper bound, so an unpinned build pulls an incompatible 8.x.
+redis>=5.0.0,<6.0.0
 django-redis>=5.4.0
 channels>=4.0.0
 channels-redis>=4.1.0
