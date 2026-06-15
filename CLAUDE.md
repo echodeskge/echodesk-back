@@ -143,17 +143,24 @@ is isolated.
 
 ## Deployment workflow
 
-- **Backend** auto-deploys on push to `main` via DigitalOcean App Platform.
-- `build_production.sh` runs:
-  1. `python manage.py check --deploy`
-  2. `python manage.py collectstatic --noinput`
-  3. `python manage.py migrate_schemas --shared`
-  4. `python manage.py migrate_asterisk` *(new — applies realtime schema
-     changes through the native migrate command, bypassing the
-     tenant-schemas wrapper)*
-- Tenant-schema migrations are run **manually** before pushing via
-  `python manage.py migrate_schemas --tenant`. The production DB is the only
-  DB; there's no separate staging, so migrations should be reviewed carefully.
+**Now hosted on a self-managed Hetzner server (migrated off DigitalOcean App
+Platform 2026-06).** Backend auto-deploys on push to `main` via GitHub Actions
+→ SSH → `echodesk-infra/scripts/deploy-backend.sh`, which runs:
+  1. `git checkout -B main origin/main && git reset --hard origin/main`
+  2. `docker compose build backend`
+  3. `python manage.py check --deploy`
+  4. `python manage.py migrate_schemas --shared`
+  5. `python manage.py migrate_schemas --tenant` *(now AUTOMATIC — applies
+     migrations to every tenant schema on each deploy; no longer a manual
+     pre-push step)*
+  6. `docker compose up -d backend celery-worker celery-beat` + health-gate
+  7. Telegram notification on success/failure
+
+- `collectstatic` runs in the backend container start command.
+- The production DB is the only DB; no separate staging, so review migrations
+  carefully before pushing to `main` (they apply to all tenants automatically).
+- `migrate_asterisk` is NOT in the deploy flow (PBX still on the DO Postgres;
+  see `echodesk-infra/PBX_DB_CONNECTION.md`).
 
 ## Conventions / gotchas
 
