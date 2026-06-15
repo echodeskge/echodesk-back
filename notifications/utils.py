@@ -119,18 +119,34 @@ def send_push_notification(
         return True
 
     except WebPushException as e:
-        logger.error(f"WebPush error for subscription {subscription.id}: {str(e)}")
+        # 4xx from the push service is per-subscription (expired / revoked /
+        # VAPID-key mismatch), NOT a code bug — log it at warning level so
+        # Sentry doesn't get flooded by every dead subscription. 5xx is the
+        # push service misbehaving, so keep that at error.
+        status_code = getattr(e.response, 'status_code', None) if e.response else None
+        if status_code and 400 <= status_code < 500:
+            logger.warning(
+                f"WebPush {status_code} for subscription {subscription.id}: {str(e)}"
+            )
+        else:
+            logger.error(
+                f"WebPush error for subscription {subscription.id}: {str(e)}"
+            )
 
         # Update log
         log.status = 'failed'
         log.error_message = str(e)
         log.save()
 
-        # If subscription is gone (410) or endpoint not found (404), mark as inactive
-        if e.response and e.response.status_code in [404, 410]:
+        # 404 = subscription not found, 410 = unsubscribed/expired, 403 =
+        # endpoint refuses our VAPID identity (key rotated or wrong project).
+        # All three are permanent for THIS subscription — deactivate so it
+        # stops being retried on every event (was generating 9k+ Sentry
+        # events/14d before this guard).
+        if status_code in (403, 404, 410):
             subscription.is_active = False
             subscription.save()
-            logger.info(f"Marked subscription {subscription.id} as inactive")
+            logger.info(f"Marked subscription {subscription.id} as inactive ({status_code})")
 
         return False
 

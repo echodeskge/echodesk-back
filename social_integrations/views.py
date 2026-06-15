@@ -6328,21 +6328,28 @@ def unread_messages_count(request):
         # so the sidebar badge doesn't count messages in chats that are in history.
         # Platform IDs (sender_id / from_number / thread_id) are effectively unique
         # within a platform, so scoping by conversation_id alone is safe in practice.
-        archived_fb_ids = list(ConversationArchive.objects.filter(
-            platform='facebook'
-        ).values_list('conversation_id', flat=True))
-        archived_ig_ids = list(ConversationArchive.objects.filter(
-            platform='instagram'
-        ).values_list('conversation_id', flat=True))
-        archived_wa_numbers = list(ConversationArchive.objects.filter(
-            platform='whatsapp'
-        ).values_list('conversation_id', flat=True))
-        archived_email_threads = list(ConversationArchive.objects.filter(
-            platform='email'
-        ).values_list('conversation_id', flat=True))
-        archived_widget_sessions = list(ConversationArchive.objects.filter(
-            platform='widget'
-        ).values_list('conversation_id', flat=True))
+        #
+        # One query, bucketed in Python. Previously this was five separate
+        # SELECTs (one per platform) which Sentry flagged as the top backend
+        # performance issue at ~6k events/14d. We also drop the default
+        # `-archived_at` ordering — we only need the ids, the sort was
+        # unused and expensive.
+        archived_by_platform = {
+            'facebook': [], 'instagram': [], 'whatsapp': [],
+            'email': [], 'widget': [],
+        }
+        for platform, conv_id in (
+            ConversationArchive.objects
+            .filter(platform__in=archived_by_platform.keys())
+            .order_by()
+            .values_list('platform', 'conversation_id')
+        ):
+            archived_by_platform[platform].append(conv_id)
+        archived_fb_ids = archived_by_platform['facebook']
+        archived_ig_ids = archived_by_platform['instagram']
+        archived_wa_numbers = archived_by_platform['whatsapp']
+        archived_email_threads = archived_by_platform['email']
+        archived_widget_sessions = archived_by_platform['widget']
 
         # Check if chat assignment filtering is enabled
         settings_obj = get_social_settings(request)
