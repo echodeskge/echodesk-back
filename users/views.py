@@ -190,6 +190,44 @@ class UserViewSet(viewsets.ModelViewSet):
         except Exception as e:
             logger.error(f'Error sending invitation email to {user.email}: {str(e)}')
     
+    def _reset_password_and_notify(self, user):
+        """Generate a fresh temporary password for ``user``, store it, require a
+        change on next login, and email it to the user's current address.
+
+        Returns True if the email was sent. Used both by the send_new_password
+        action and by perform_update when an admin changes a user's email.
+        """
+        alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+        new_password = ''.join(secrets.choice(alphabet) for _ in range(12))
+
+        user.set_password(new_password)
+        user.temporary_password = new_password
+        user.password_change_required = True
+        user.save()
+
+        tenant = self.request.tenant if hasattr(self.request, 'tenant') else None
+        tenant_name = tenant.name if tenant else "EchoDesk"
+        frontend_url = tenant.frontend_url if tenant else settings.MAIN_DOMAIN
+        language = tenant.preferred_language if tenant else 'en'
+
+        try:
+            email_sent = email_service.send_new_password_email(
+                user_email=user.email,
+                user_name=user.get_full_name(),
+                tenant_name=tenant_name,
+                new_password=new_password,
+                frontend_url=frontend_url,
+                language=language
+            )
+            if email_sent:
+                logger.info(f'New password email sent to {user.email}')
+            else:
+                logger.warning(f'Failed to send new password email to {user.email}')
+            return email_sent
+        except Exception as e:
+            logger.error(f'Error sending new password email to {user.email}: {str(e)}')
+            return False
+
     def perform_update(self, serializer):
         # Check if user has permission to manage users or is updating their own profile
         user_being_updated = self.get_object()
@@ -200,14 +238,21 @@ class UserViewSet(viewsets.ModelViewSet):
         if not is_privileged and user_being_updated != self.request.user:
             raise PermissionDenied("You don't have permission to manage users")
 
-        # If user is updating themselves and is not privileged, restrict to safe fields
+        # If user is updating themselves and is not privileged, restrict to safe
+        # fields (email is intentionally excluded, so only admins can change it).
         if not is_privileged and user_being_updated == self.request.user:
             safe_fields = {'first_name', 'last_name', 'phone_number', 'job_title'}
             for field in list(serializer.validated_data.keys()):
                 if field not in safe_fields:
                     serializer.validated_data.pop(field)
 
-        serializer.save()
+        old_email = user_being_updated.email
+        user = serializer.save()
+
+        # When an admin changes a user's email, the email is their login
+        # identity, so issue a fresh password and send it to the NEW address.
+        if user.email and user.email != old_email:
+            self._reset_password_and_notify(user)
     
     def perform_destroy(self, instance):
         # Check if user has permission to manage users
@@ -293,48 +338,14 @@ class UserViewSet(viewsets.ModelViewSet):
             raise PermissionDenied('You do not have permission to manage users')
 
         user = self.get_object()
+        email_sent = self._reset_password_and_notify(user)
 
-        # Generate new temporary password (12 characters)
-        alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
-        new_password = ''.join(secrets.choice(alphabet) for _ in range(12))
-
-        # Update user
-        user.set_password(new_password)
-        user.temporary_password = new_password
-        user.password_change_required = True
-        user.save()
-
-        # Get tenant info and language
-        tenant = request.tenant if hasattr(request, 'tenant') else None
-        tenant_name = tenant.name if tenant else "EchoDesk"
-        frontend_url = tenant.frontend_url if tenant else settings.MAIN_DOMAIN
-        language = tenant.preferred_language if tenant else 'en'
-
-        try:
-            email_sent = email_service.send_new_password_email(
-                user_email=user.email,
-                user_name=user.get_full_name(),
-                tenant_name=tenant_name,
-                new_password=new_password,
-                frontend_url=frontend_url,
-                language=language
-            )
-
-            if email_sent:
-                logger.info(f'New password email sent to {user.email}')
-                return Response({'message': 'New password sent successfully'})
-            else:
-                logger.warning(f'Failed to send new password email to {user.email}')
-                return Response(
-                    {'error': 'Failed to send email'},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
-        except Exception as e:
-            logger.error(f'Error sending new password email to {user.email}: {str(e)}')
-            return Response(
-                {'error': 'Failed to send email'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        if email_sent:
+            return Response({'message': 'New password sent successfully'})
+        return Response(
+            {'error': 'Failed to send email'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 class TenantGroupViewSet(viewsets.ModelViewSet):

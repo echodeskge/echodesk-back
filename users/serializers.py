@@ -267,7 +267,27 @@ class UserSerializer(serializers.ModelSerializer):
         return instance
 
 
-class UserCreateSerializer(serializers.ModelSerializer):
+class EmailUniquenessMixin:
+    """Reject an email that already belongs to another user in this tenant.
+
+    The DB already enforces exact uniqueness (User.email is unique=True, scoped
+    to the tenant schema), but the check here is case-insensitive and returns a
+    clean 400 instead of an IntegrityError, and excludes the instance being
+    updated so an admin can save a user without changing their email.
+    """
+
+    def validate_email(self, value):
+        qs = User.objects.filter(email__iexact=value)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError(
+                "A user with this email already exists."
+            )
+        return value
+
+
+class UserCreateSerializer(EmailUniquenessMixin, serializers.ModelSerializer):
     """Serializer for creating users - password is auto-generated and sent via email"""
     department_id = serializers.IntegerField(required=False, allow_null=True)
     group_ids = serializers.ListField(
@@ -314,7 +334,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
         return user
 
 
-class UserUpdateSerializer(serializers.ModelSerializer):
+class UserUpdateSerializer(EmailUniquenessMixin, serializers.ModelSerializer):
     """Serializer for updating users"""
     group_ids = serializers.ListField(
         child=serializers.IntegerField(),
@@ -335,10 +355,15 @@ class UserUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
-            'first_name', 'last_name', 'role', 'status', 
+            'email', 'first_name', 'last_name', 'role', 'status',
             'phone_number', 'job_title', 'is_active',
             'group_ids', 'tenant_group_ids', 'user_permission_ids'
         ]
+        extra_kwargs = {
+            # PATCH is the only update path used by the UI; keep email optional
+            # so other-field updates don't have to resend it.
+            'email': {'required': False},
+        }
     
     def update(self, instance, validated_data):
         group_ids = validated_data.pop('group_ids', None)

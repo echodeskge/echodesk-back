@@ -192,6 +192,93 @@ class TestUserUpdate(EchoDeskTenantTestCase):
         self.assertEqual(self.agent.role, 'agent')  # not escalated
         self.assertTrue(self.agent.is_active)  # not deactivated
 
+    @patch('users.views.email_service')
+    def test_admin_can_change_email(self, mock_email):
+        mock_email.send_new_password_email.return_value = True
+        resp = self.api_patch(
+            detail_url(self.agent.id),
+            {'email': 'newaddr@test.com'},
+            user=self.admin,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.agent.refresh_from_db()
+        self.assertEqual(self.agent.email, 'newaddr@test.com')
+
+    @patch('users.views.email_service')
+    def test_email_change_resets_password_and_emails_new_address(self, mock_email):
+        mock_email.send_new_password_email.return_value = True
+        old_hash = self.agent.password
+
+        resp = self.api_patch(
+            detail_url(self.agent.id),
+            {'email': 'moved@test.com'},
+            user=self.admin,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        self.agent.refresh_from_db()
+        # A fresh password is issued and a change is required on next login.
+        self.assertNotEqual(self.agent.password, old_hash)
+        self.assertTrue(self.agent.password_change_required)
+        # The new credentials are emailed to the NEW address.
+        mock_email.send_new_password_email.assert_called_once()
+        self.assertEqual(
+            mock_email.send_new_password_email.call_args.kwargs['user_email'],
+            'moved@test.com',
+        )
+
+    @patch('users.views.email_service')
+    def test_non_email_update_does_not_reset_password(self, mock_email):
+        old_hash = self.agent.password
+        resp = self.api_patch(
+            detail_url(self.agent.id),
+            {'first_name': 'NoReset'},
+            user=self.admin,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.agent.refresh_from_db()
+        self.assertEqual(self.agent.password, old_hash)
+        mock_email.send_new_password_email.assert_not_called()
+
+    def test_duplicate_email_rejected(self):
+        resp = self.api_patch(
+            detail_url(self.agent.id),
+            {'email': self.other_agent.email},
+            user=self.admin,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('email', resp.data)
+
+    def test_duplicate_email_case_insensitive_rejected(self):
+        resp = self.api_patch(
+            detail_url(self.agent.id),
+            {'email': self.other_agent.email.upper()},
+            user=self.admin,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_unchanged_email_is_allowed(self):
+        """Resending the user's own email must not trip the uniqueness check."""
+        resp = self.api_patch(
+            detail_url(self.agent.id),
+            {'email': self.agent.email, 'first_name': 'Same'},
+            user=self.admin,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    @patch('users.views.email_service')
+    def test_self_update_cannot_change_email(self, mock_email):
+        original = self.agent.email
+        resp = self.api_patch(
+            detail_url(self.agent.id),
+            {'email': 'selfchange@test.com'},
+            user=self.agent,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.agent.refresh_from_db()
+        self.assertEqual(self.agent.email, original)  # email change stripped
+        mock_email.send_new_password_email.assert_not_called()
+
 
 class TestUserDelete(EchoDeskTenantTestCase):
     """Tests for deleting users."""
