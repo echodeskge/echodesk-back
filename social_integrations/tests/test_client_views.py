@@ -1,6 +1,8 @@
 """
 Tests for Client/SocialClient-related views and Quick Reply views.
 """
+from unittest.mock import patch
+
 from rest_framework import status
 from social_integrations.tests.conftest import SocialIntegrationTestCase
 
@@ -137,3 +139,53 @@ class TestQuickReplyViewSet(SocialIntegrationTestCase):
     def test_unauthenticated_denied(self):
         resp = self.client.get(self.url, HTTP_HOST='tenant.test.com')
         self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    # ── Cross-user access: any user with social access can manage the shared
+    #    quick-reply library, even without the social_integrations feature.
+    #    (The base class patches has_feature→True, so these force it False to
+    #    reproduce the real-world case where access comes from a permission
+    #    toggle, not the subscription-feature intersection.) ──
+
+    def test_social_permission_user_can_update_others_quick_reply(self):
+        """A non-staff user with a social permission (no feature) can edit a
+        quick reply created by someone else — the Liza case."""
+        qr = self.create_quick_reply(created_by=self.admin)
+        liza = self.create_user(
+            email='qr-liza@test.com', role='agent', can_send_social_messages=True
+        )
+        with patch('users.models.User.has_feature', return_value=False):
+            resp = self.api_patch(
+                f'{self.url}{qr.id}/', {'title': 'Edited by Liza'}, user=liza
+            )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        qr.refresh_from_db()
+        self.assertEqual(qr.title, 'Edited by Liza')
+
+    def test_social_permission_user_can_delete_others_quick_reply(self):
+        qr = self.create_quick_reply(created_by=self.admin)
+        liza = self.create_user(
+            email='qr-liza2@test.com', role='agent', can_view_social_messages=True
+        )
+        with patch('users.models.User.has_feature', return_value=False):
+            resp = self.api_delete(f'{self.url}{qr.id}/', user=liza)
+        self.assertIn(
+            resp.status_code, [status.HTTP_204_NO_CONTENT, status.HTTP_200_OK]
+        )
+
+    def test_user_without_social_access_denied(self):
+        """A non-staff user with neither the feature nor any social permission
+        is forbidden from managing quick replies."""
+        qr = self.create_quick_reply(created_by=self.admin)
+        nobody = self.create_user(email='qr-nosocial@test.com', role='agent')
+        with patch('users.models.User.has_feature', return_value=False):
+            resp = self.api_patch(
+                f'{self.url}{qr.id}/', {'title': 'nope'}, user=nobody
+            )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_create_stamps_created_by(self):
+        resp = self.api_post(self.url, {
+            'title': 'Stamped', 'message': 'hi',
+        }, user=self.agent)
+        self.assertIn(resp.status_code, [status.HTTP_201_CREATED, status.HTTP_200_OK])
+        self.assertEqual(resp.data['created_by'], self.agent.id)

@@ -58,7 +58,8 @@ from .serializers import (
 from .pagination import SocialMessagePagination
 from .permissions import (
     CanManageSocialConnections, CanViewSocialMessages,
-    CanSendSocialMessages, CanManageSocialSettings, IsSuperAdmin, IsStaffUser
+    CanSendSocialMessages, CanManageSocialSettings, IsSuperAdmin, IsStaffUser,
+    CanAccessSocial
 )
 
 # Initialize logger
@@ -10805,9 +10806,16 @@ def email_signature_view(request):
 # =============================================================================
 
 class QuickReplyViewSet(viewsets.ModelViewSet):
-    """ViewSet for managing quick reply templates"""
+    """ViewSet for managing quick reply templates.
+
+    Quick replies are a SHARED team library (get_queryset returns all rows;
+    created_by is audit/display only). Any user with social access — staff, the
+    social_integrations feature, or an explicit social permission toggle — can
+    create/edit/delete them, so agents aren't blocked by a group whose
+    feature-key set happens to omit social_integrations.
+    """
     serializer_class = QuickReplySerializer
-    permission_classes = [IsAuthenticated, CanSendSocialMessages]
+    permission_classes = [IsAuthenticated, CanAccessSocial]
 
     def get_queryset(self):
         queryset = QuickReply.objects.select_related('created_by').order_by('position', '-use_count', 'title')

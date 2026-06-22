@@ -88,6 +88,43 @@ class CanManageSocialSettings(permissions.BasePermission):
         )
 
 
+class CanAccessSocial(permissions.BasePermission):
+    """
+    Broad social-access gate for shared, low-risk team resources (e.g. quick
+    reply templates) that any user involved in social messaging should be able
+    to manage.
+
+    Grants access when the user is staff/superuser, OR has the
+    `social_integrations` subscription feature, OR has any explicit social
+    permission toggle (view/send messages, manage settings/connections).
+
+    Unlike CanSendSocialMessages — which checks ONLY the subscription feature
+    (the intersection of the tenant's plan and the user's group feature-keys) —
+    this honors the per-user/group permission toggles an admin actually sets, so
+    an agent granted social-message permissions isn't blocked just because their
+    group's feature-key set omits `social_integrations`.
+    """
+    message = "You do not have permission to manage social features."
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+
+        if user.is_staff or user.is_superuser:
+            return True
+
+        if user.has_feature('social_integrations'):
+            return True
+
+        return (
+            user.has_permission('view_social_messages') or
+            user.has_permission('send_social_messages') or
+            user.has_permission('manage_social_settings') or
+            user.has_permission('manage_social_connections')
+        )
+
+
 class IsSuperAdmin(permissions.BasePermission):
     """
     Permission that only allows superadmins (is_superuser=True)
