@@ -10816,6 +10816,11 @@ class QuickReplyViewSet(viewsets.ModelViewSet):
     """
     serializer_class = QuickReplySerializer
     permission_classes = [IsAuthenticated, CanAccessSocial]
+    # Quick replies are a small picker library — return the whole set in one
+    # response. With the global 20/page pagination the composer's selector only
+    # ever fetched page 1, so newly created replies that sort past the first 20
+    # (e.g. Georgian titles, which collate after Latin) were invisible.
+    pagination_class = None
 
     def get_queryset(self):
         queryset = QuickReply.objects.select_related('created_by').order_by('position', '-use_count', 'title')

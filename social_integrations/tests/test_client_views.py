@@ -189,3 +189,15 @@ class TestQuickReplyViewSet(SocialIntegrationTestCase):
         }, user=self.agent)
         self.assertIn(resp.status_code, [status.HTTP_201_CREATED, status.HTTP_200_OK])
         self.assertEqual(resp.data['created_by'], self.agent.id)
+
+    def test_list_returns_all_without_pagination(self):
+        """The picker must return the whole library in one response, not just
+        the first paginated page (regression: replies past page 1 — e.g. new
+        ones — were invisible in the composer)."""
+        for i in range(25):
+            self.create_quick_reply(title=f'QR {i:02d}', created_by=self.admin)
+        resp = self.api_get(self.url, user=self.agent)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        # Unpaginated → a plain list containing every reply (well past 20/page).
+        self.assertIsInstance(resp.data, list)
+        self.assertGreaterEqual(len(resp.data), 25)
