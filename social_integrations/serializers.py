@@ -405,6 +405,12 @@ class WhatsAppTemplateSendSerializer(serializers.Serializer):
         allow_null=True,
         help_text="Template parameters as key-value pairs (e.g., {'name': 'John', 'order_id': '12345'})"
     )
+    opt_in_confirmed = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Agent's confirmation that the recipient opted in. Required for "
+                  "business-initiated sends (when the 24h customer-service window is closed)."
+    )
 
     def validate_to_number(self, value):
         """Ensure phone number starts with +"""

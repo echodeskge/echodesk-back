@@ -27,7 +27,7 @@ from .models import (
     FacebookPageConnection, FacebookMessage, OrphanedFacebookMessage,
     InstagramAccountConnection, InstagramMessage,
     WhatsAppBusinessAccount, WhatsAppMessage, WhatsAppMessageTemplate,
-    WhatsAppContact, SocialIntegrationSettings, ConversationAutoReply,
+    WhatsAppContact, WhatsAppOutboundConsentLog, SocialIntegrationSettings, ConversationAutoReply,
     ChatAssignment, ChatRating, ConversationArchive,
     EmailConnection, EmailMessage, EmailDraft, EmailConnectionUserAssignment,
     TikTokShopAccount, TikTokMessage,
@@ -8954,16 +8954,49 @@ def whatsapp_delete_template(request, template_id):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+def _render_template_body(template, parameters):
+    """Render a template's BODY component with {{n}} placeholders substituted,
+    using the same param ordering Meta receives. Falls back to the template name
+    when the template has no BODY text."""
+    import re
+    parameters = parameters or {}
+    body_text = ''
+    for component in (template.components or []):
+        if component.get('type') == 'BODY':
+            body_text = component.get('text', '') or ''
+            break
+    if not body_text:
+        return f"Template: {template.name}"
+
+    keys = list(parameters.keys())
+
+    def _sub(match):
+        idx = int(match.group(1))  # 1-based placeholder index
+        key = f'param{idx}' if f'param{idx}' in parameters else (keys[idx - 1] if len(keys) >= idx else None)
+        if key is not None and key in parameters:
+            return str(parameters[key])
+        return match.group(0)
+
+    return re.sub(r'\{\{(\d+)\}\}', _sub, body_text)
+
+
 @extend_schema(
     summary="Send WhatsApp template message",
-    description="Send a message using a WhatsApp message template with parameters",
+    description="Send a message using a WhatsApp message template with parameters. "
+                "Also used to initiate a brand-new conversation with a number that "
+                "has not messaged the business.",
     request=WhatsAppTemplateSendSerializer,
     responses={200: WhatsAppMessageSerializer}
 )
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanSendSocialMessages])
 def whatsapp_send_template_message(request):
-    """Send a WhatsApp message using a template"""
+    """Send a WhatsApp template message (also used to initiate new conversations)."""
+    from .services.whatsapp_errors import (
+        map_graph_error, error_response_body,
+        OPT_IN_REQUIRED, TEMPLATE_NOT_APPROVED, US_MARKETING_PAUSED, SEND_FAILED_GENERIC,
+    )
+
     tenant_schema = request.tenant.schema_name
 
     with schema_context(tenant_schema):
@@ -8971,113 +9004,169 @@ def whatsapp_send_template_message(request):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+        waba_id = serializer.validated_data['waba_id']
+        template_id = serializer.validated_data['template_id']
+        to_number = serializer.validated_data['to_number']
+        parameters = serializer.validated_data.get('parameters') or {}
+        opt_in_confirmed = serializer.validated_data.get('opt_in_confirmed', False)
+        # The rest of the pipeline (conversation key, archive/assignment, broadcast)
+        # keys on the BARE number, matching the normal send path and the wa_ chatId.
+        normalized_to = to_number.lstrip('+')
+
         try:
-            waba_id = serializer.validated_data['waba_id']
-            template_id = serializer.validated_data['template_id']
-            to_number = serializer.validated_data['to_number']
-            parameters = serializer.validated_data.get('parameters', {})
-
-            # Get WABA and template
             waba = WhatsAppBusinessAccount.objects.get(waba_id=waba_id)
+        except WhatsAppBusinessAccount.DoesNotExist:
+            return Response({'error': 'WhatsApp Business Account not found'},
+                            status=status.HTTP_404_NOT_FOUND)
+        try:
             template = WhatsAppMessageTemplate.objects.get(id=template_id)
+        except WhatsAppMessageTemplate.DoesNotExist:
+            return Response({'error': 'Template not found'}, status=status.HTTP_404_NOT_FOUND)
 
-            # Check template status
-            if template.status != 'APPROVED':
-                return Response({
-                    'error': f'Template status is {template.status}. Only APPROVED templates can be sent.'
-                }, status=status.HTTP_400_BAD_REQUEST)
+        def _audit(outcome, error_code=''):
+            """Append one compliance row per send attempt (never breaks the send)."""
+            try:
+                WhatsAppOutboundConsentLog.objects.create(
+                    business_account=waba,
+                    agent=request.user if request.user.is_authenticated else None,
+                    to_number=to_number,
+                    template=template,
+                    opt_in_confirmed=opt_in_confirmed,
+                    outcome=outcome,
+                    error_code=error_code or '',
+                )
+            except Exception as e:
+                logger.warning(f"Failed to write WhatsApp consent log: {e}")
 
+        # --- Opt-in guard: a business-initiated send (24h window closed) needs an ack ---
+        last_inbound = WhatsAppMessage.objects.filter(
+            business_account=waba,
+            from_number=normalized_to,
+            is_from_business=False,
+        ).order_by('-timestamp').first()
+        window_open = bool(
+            last_inbound and (timezone.now() - last_inbound.timestamp).total_seconds() <= 24 * 3600
+        )
+        if not window_open and not opt_in_confirmed:
+            _audit('blocked', OPT_IN_REQUIRED)
+            return Response(error_response_body(OPT_IN_REQUIRED), status=status.HTTP_400_BAD_REQUEST)
+
+        # --- Pre-Graph guards (instant feedback, no API round-trip) ---
+        if template.status != 'APPROVED':
+            _audit('blocked', TEMPLATE_NOT_APPROVED)
+            return Response(error_response_body(TEMPLATE_NOT_APPROVED), status=status.HTTP_400_BAD_REQUEST)
+
+        # Meta paused MARKETING template delivery to US numbers (Apr 2025). +1 is the
+        # NANP code (also Canada) — we block conservatively to avoid a guaranteed-fail send.
+        if (template.category or '').upper() == 'MARKETING' and normalized_to.startswith('1'):
+            _audit('blocked', US_MARKETING_PAUSED)
+            return Response(error_response_body(US_MARKETING_PAUSED), status=status.HTTP_400_BAD_REQUEST)
+
+        try:
             # Build template components with parameters
             components = []
             for component in template.components:
                 if component.get('type') == 'BODY' and parameters:
-                    # Extract parameter placeholders from body text
-                    body_text = component.get('text', '')
                     import re
+                    body_text = component.get('text', '')
                     param_placeholders = re.findall(r'\{\{(\d+)\}\}', body_text)
-
-                    # Build parameters array
                     body_parameters = []
                     for i, placeholder in enumerate(param_placeholders, 1):
-                        param_key = f'param{i}' if f'param{i}' in parameters else list(parameters.keys())[i-1] if len(parameters) >= i else None
+                        param_key = f'param{i}' if f'param{i}' in parameters else (list(parameters.keys())[i-1] if len(parameters) >= i else None)
                         if param_key and param_key in parameters:
-                            body_parameters.append({
-                                'type': 'text',
-                                'text': str(parameters[param_key])
-                            })
-
+                            body_parameters.append({'type': 'text', 'text': str(parameters[param_key])})
                     if body_parameters:
-                        components.append({
-                            'type': 'body',
-                            'parameters': body_parameters
-                        })
+                        components.append({'type': 'body', 'parameters': body_parameters})
 
-            # Send via WhatsApp Cloud API
             fb_api_version = settings.FACEBOOK_APP_VERSION
             send_url = f"https://graph.facebook.com/{fb_api_version}/{waba.phone_number_id}/messages"
-
             message_payload = {
                 'messaging_product': 'whatsapp',
-                'to': to_number.lstrip('+'),
+                'to': normalized_to,
                 'type': 'template',
-                'template': {
-                    'name': template.name,
-                    'language': {
-                        'code': template.language
-                    }
-                }
+                'template': {'name': template.name, 'language': {'code': template.language}},
             }
-
             if components:
                 message_payload['template']['components'] = components
-
-            headers = {
-                'Authorization': f'Bearer {waba.access_token}',
-                'Content-Type': 'application/json'
-            }
+            headers = {'Authorization': f'Bearer {waba.access_token}', 'Content-Type': 'application/json'}
 
             response = requests.post(send_url, json=message_payload, headers=headers)
+            try:
+                response_data = response.json()
+            except ValueError:
+                response_data = {}
 
-            if response.status_code != 200:
-                return Response({
-                    'error': 'Failed to send template message',
-                    'details': response.json()
-                }, status=response.status_code)
+            if response.status_code != 200 or (isinstance(response_data, dict) and 'error' in response_data):
+                meta_error = response_data.get('error', {}) if isinstance(response_data, dict) else {}
+                error_code, http_status = map_graph_error(meta_error)
+                logger.error(f"Failed to send WhatsApp template: {meta_error.get('message', response.text[:200])}")
+                _audit('failed', error_code)
+                return Response(error_response_body(error_code, meta_error.get('code')), status=http_status)
 
-            meta_response = response.json()
-            message_id = meta_response.get('messages', [{}])[0].get('id', '')
+            message_id = response_data.get('messages', [{}])[0].get('id', '')
+            rendered_text = _render_template_body(template, parameters)
 
-            # Save to database
             message = WhatsAppMessage.objects.create(
                 business_account=waba,
                 message_id=message_id,
                 from_number=waba.phone_number,
-                to_number=to_number,
-                message_text=f"Template: {template.name}",
+                to_number=normalized_to,
+                message_text=rendered_text,
                 message_type='template',
                 template=template,
                 template_parameters=parameters,
                 timestamp=timezone.now(),
                 is_from_business=True,
-                status='sent'
+                status='sent',
+                sent_by=request.user,
             )
+            _audit('sent')
 
-            response_serializer = WhatsAppMessageSerializer(message)
-            return Response(response_serializer.data, status=status.HTTP_200_OK)
+            # Surface the (possibly brand-new) conversation in the inbox, exactly like
+            # the normal send path: unarchive, clear a completed assignment, broadcast.
+            try:
+                ConversationArchive.objects.filter(
+                    platform='whatsapp', conversation_id=normalized_to, account_id=waba_id,
+                ).delete()
+                ChatAssignment.objects.filter(
+                    platform='whatsapp', conversation_id=normalized_to, account_id=waba_id, status='completed',
+                ).delete()
+            except Exception as e:
+                logger.warning(f"Failed to unarchive/clear assignment for template send: {e}")
 
-        except WhatsAppBusinessAccount.DoesNotExist:
-            return Response({
-                'error': 'WhatsApp Business Account not found'
-            }, status=status.HTTP_404_NOT_FOUND)
-        except WhatsAppMessageTemplate.DoesNotExist:
-            return Response({
-                'error': 'Template not found'
-            }, status=status.HTTP_404_NOT_FOUND)
+            try:
+                from .consumers import send_new_message_notification
+                recipient_name = None
+                previous_msg = WhatsAppMessage.objects.filter(
+                    business_account=waba, from_number=normalized_to, is_from_business=False,
+                ).order_by('-timestamp').first()
+                if previous_msg and previous_msg.contact_name:
+                    recipient_name = previous_msg.contact_name
+                message_data = {
+                    'id': message.id,
+                    'message_id': message.message_id,
+                    'platform': 'whatsapp',
+                    'from_number': waba.phone_number,
+                    'to_number': normalized_to,
+                    'contact_name': recipient_name,
+                    'recipient_name': recipient_name,
+                    'message_text': rendered_text,
+                    'message_type': 'template',
+                    'timestamp': message.timestamp.isoformat(),
+                    'is_from_business': True,
+                    'waba_id': waba_id,
+                    'sent_by': request.user.email if request.user else None,
+                }
+                async_to_sync(send_new_message_notification)(tenant_schema, normalized_to, message_data)
+            except Exception as e:
+                logger.warning(f"Failed to broadcast sent template message: {e}")
+
+            return Response(WhatsAppMessageSerializer(message).data, status=status.HTTP_200_OK)
+
         except Exception as e:
             logger.error(f"Error sending WhatsApp template message: {e}")
-            return Response({
-                'error': str(e)
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            _audit('failed', SEND_FAILED_GENERIC)
+            return Response(error_response_body(SEND_FAILED_GENERIC), status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 # =============================================================================

@@ -683,6 +683,67 @@ class WhatsAppContact(models.Model):
         return f"{self.profile_name or self.wa_id} - {self.account.business_name}"
 
 
+class WhatsAppOutboundConsentLog(models.Model):
+    """
+    Append-only audit record for business-initiated WhatsApp sends (template
+    messages an agent starts toward a number, including cold outreach to people
+    who never messaged us).
+
+    Exactly one row is written per send attempt — on success, when blocked by
+    the opt-in guard, and on send failure — capturing who confirmed opt-in,
+    when, to whom, with which template, and the outcome. This is the compliance
+    trail WhatsApp policy effectively requires for opt-in. Never updated/deleted.
+    """
+    OUTCOME_CHOICES = [
+        ('sent', 'Sent'),
+        ('blocked', 'Blocked'),
+        ('failed', 'Failed'),
+    ]
+
+    business_account = models.ForeignKey(
+        WhatsAppBusinessAccount,
+        on_delete=models.CASCADE,
+        related_name='outbound_consent_logs'
+    )
+    agent = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='whatsapp_outbound_consent_logs',
+        help_text="Agent who initiated the send"
+    )
+    to_number = models.CharField(max_length=20, help_text="Recipient phone number")
+    template = models.ForeignKey(
+        WhatsAppMessageTemplate,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='outbound_consent_logs'
+    )
+    opt_in_confirmed = models.BooleanField(
+        default=False,
+        help_text="Whether the agent confirmed the recipient opted in"
+    )
+    outcome = models.CharField(max_length=20, choices=OUTCOME_CHOICES)
+    error_code = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="Stable error code when outcome is blocked/failed"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['business_account', '-created_at']),
+            models.Index(fields=['to_number']),
+        ]
+
+    def __str__(self):
+        return f"{self.outcome} -> {self.to_number} ({self.created_at:%Y-%m-%d})"
+
+
 class SocialIntegrationSettings(models.Model):
     """Stores tenant-specific settings for social integrations"""
     # Singleton pattern - only one settings object per tenant
