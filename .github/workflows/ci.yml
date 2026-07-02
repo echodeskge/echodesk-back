@@ -212,10 +212,16 @@ jobs:
           path: api-schema.current.json
 
   deploy:
-    # Production deploy is gated on every CI job passing. It only runs on a
-    # direct push to main (not on PRs or the qa branch), so a red suite can
-    # never ship to production.
-    needs: [lint, check, test, schema]
+    # Production deploy is gated on the deterministic CI jobs passing (lint,
+    # Django check + migrations, and the full test suite). It only runs on a
+    # direct push to main (not PRs or qa), so a red test suite can't ship.
+    #
+    # `schema` is intentionally NOT in this gate: the OpenAPI snapshot check is
+    # environment-sensitive (unpinned drf-spectacular + exact Python version,
+    # and generation emits non-fatal errors), so it's kept as an informational
+    # job rather than a deploy blocker. Re-add it here once it's made
+    # deterministic (pin drf-spectacular, run snapshot regen in a matching env).
+    needs: [lint, check, test]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     concurrency:
