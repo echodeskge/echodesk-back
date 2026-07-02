@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from drf_spectacular.utils import extend_schema_field
 from .models import (
     Language,
     AttributeDefinition,
@@ -219,6 +220,7 @@ class ProductListSerializer(serializers.ModelSerializer):
     def get_image(self, obj):
         return _first_image_url(obj.image)
 
+    @extend_schema_field(ProductImageSerializer(many=True))
     def get_images(self, obj):
         return _merged_product_images(obj)
 
@@ -246,6 +248,7 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     def get_image(self, obj):
         return _first_image_url(obj.image)
 
+    @extend_schema_field(ProductImageSerializer(many=True))
     def get_images(self, obj):
         return _merged_product_images(obj)
 
