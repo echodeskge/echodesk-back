@@ -319,10 +319,10 @@ class CallLogViewSet(viewsets.ModelViewSet):
         # Use select_related to avoid N+1 queries when serializer accesses client and sip_configuration
         if hasattr(self.request, 'tenant'):
             # Filter by tenant through the handled_by user's association with tenant tables
-            return CallLog.objects.select_related('client', 'sip_configuration', 'handled_by', 'recording').prefetch_related('events').all()
+            return CallLog.objects.select_related('client', 'social_client', 'transferred_to_user', 'sip_configuration', 'handled_by', 'recording').prefetch_related('events').all()
         else:
             # Fallback for public schema or when tenant is not available
-            return CallLog.objects.select_related('client', 'sip_configuration', 'handled_by', 'recording').prefetch_related('events').all()
+            return CallLog.objects.select_related('client', 'social_client', 'transferred_to_user', 'sip_configuration', 'handled_by', 'recording').prefetch_related('events').all()
     
     def get_serializer_class(self):
         if self.action == 'create':
@@ -2080,6 +2080,7 @@ def extension_status(request):
     legacy shared-pbx2 path alive during the BYO migration window.
     """
     import requests as http_requests
+    from django.core.cache import cache
     from crm.asterisk_db import get_active_pbx_for_current_tenant
 
     try:
@@ -2097,10 +2098,19 @@ def extension_status(request):
         if not pbx_host:
             return Response({'extensions': []})
 
+        # Cache the PBX response briefly so a polling "who's online" UI doesn't
+        # hit (and block a worker on) the PBX on every request.
+        cache_key = f'pbx_extension_status:{pbx_host}'
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached)
+
         resp = http_requests.get(
             f'http://{pbx_host}:8081/api/extensions/status', timeout=3
         )
-        return Response(resp.json())
+        data = resp.json()
+        cache.set(cache_key, data, timeout=5)
+        return Response(data)
     except Exception:
         return Response({'extensions': []})
 

@@ -12,7 +12,7 @@ from django.conf import settings
 import secrets
 import string
 import logging
-from tenants.email_service import email_service
+from .tasks import send_user_invitation_email_task, send_new_password_email_task
 from .models import Department, TenantGroup, Notification, NotificationPreference, UserOnlineStatus, TeamChatConversation, TeamChatMessage, HiddenTeamChatConversation
 from .serializers import (
     UserSerializer, UserCreateSerializer, UserUpdateSerializer,
@@ -165,30 +165,26 @@ class UserViewSet(viewsets.ModelViewSet):
         user.set_password(temporary_password)
         user.save()
 
-        # Send invitation email
+        # Send invitation email off the request cycle (SendGrid can take
+        # seconds / time out) — queued to Celery with retries.
         try:
-            # Get tenant info and language
             tenant = self.request.tenant if hasattr(self.request, 'tenant') else None
             tenant_name = tenant.name if tenant else "EchoDesk"
             frontend_url = tenant.frontend_url if tenant else settings.MAIN_DOMAIN
             language = tenant.preferred_language if tenant else 'en'
 
-            email_sent = email_service.send_user_invitation_email(
+            send_user_invitation_email_task.delay(
                 user_email=user.email,
                 user_name=user.get_full_name(),
                 tenant_name=tenant_name,
                 temporary_password=temporary_password,
                 frontend_url=frontend_url,
                 invited_by=self.request.user.get_full_name(),
-                language=language
+                language=language,
             )
-
-            if email_sent:
-                logger.info(f'Invitation email sent to {user.email}')
-            else:
-                logger.warning(f'Failed to send invitation email to {user.email}')
+            logger.info(f'Queued invitation email to {user.email}')
         except Exception as e:
-            logger.error(f'Error sending invitation email to {user.email}: {str(e)}')
+            logger.error(f'Error queuing invitation email to {user.email}: {str(e)}')
     
     def _reset_password_and_notify(self, user):
         """Generate a fresh temporary password for ``user``, store it, require a
@@ -210,22 +206,22 @@ class UserViewSet(viewsets.ModelViewSet):
         frontend_url = tenant.frontend_url if tenant else settings.MAIN_DOMAIN
         language = tenant.preferred_language if tenant else 'en'
 
+        # The password is already persisted above; only the (slow) email send is
+        # offloaded to Celery. Returns whether the task was queued, not whether
+        # SendGrid ultimately accepted it (the task retries on failure).
         try:
-            email_sent = email_service.send_new_password_email(
+            send_new_password_email_task.delay(
                 user_email=user.email,
                 user_name=user.get_full_name(),
                 tenant_name=tenant_name,
                 new_password=new_password,
                 frontend_url=frontend_url,
-                language=language
+                language=language,
             )
-            if email_sent:
-                logger.info(f'New password email sent to {user.email}')
-            else:
-                logger.warning(f'Failed to send new password email to {user.email}')
-            return email_sent
+            logger.info(f'Queued new password email to {user.email}')
+            return True
         except Exception as e:
-            logger.error(f'Error sending new password email to {user.email}: {str(e)}')
+            logger.error(f'Error queuing new password email to {user.email}: {str(e)}')
             return False
 
     def perform_update(self, serializer):

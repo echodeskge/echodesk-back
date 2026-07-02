@@ -692,6 +692,23 @@ class TestCancelConsultation(CrmTestCase):
 
 class TestMergeConference(CrmTestCase):
 
+    def setUp(self):
+        super().setUp()
+        # merge_conference resolves the tenant's PbxServer (BYO-PBX migration)
+        # for AMI credentials before touching Asterisk. Mock it to a configured
+        # server so the tests exercise the AMI path; individual tests can set
+        # ``self.mock_get_pbx.return_value = None`` to test the no-PBX branch.
+        patcher = patch('crm.asterisk_db.get_active_pbx_for_current_tenant')
+        self.mock_get_pbx = patcher.start()
+        self.addCleanup(patcher.stop)
+        fake_pbx = MagicMock()
+        fake_pbx.ami_host = 'pbx.test.com'
+        fake_pbx.fqdn = 'pbx.test.com'
+        fake_pbx.ami_username = 'amiuser'
+        fake_pbx.ami_password = 'amipass'
+        fake_pbx.ami_port = 5038
+        self.mock_get_pbx.return_value = fake_pbx
+
     def _setup_attended_transfer(self):
         """Create original + consultation with transfer_type='attended' on the original."""
         admin = self.create_admin()
@@ -849,13 +866,13 @@ class TestMergeConference(CrmTestCase):
 
     @patch('crm.views._ami_redirect_to_confbridge')
     @patch('crm.views._ami_get_channels')
-    def test_merge_conference_no_sip_config(self, mock_channels, mock_redirect):
-        """Rejects if original call has no SIP configuration."""
+    def test_merge_conference_no_pbx_configured(self, mock_channels, mock_redirect):
+        """Returns 503 when the tenant has no PbxServer configured for AMI."""
+        self.mock_get_pbx.return_value = None
         admin = self.create_admin()
         original = self.create_call_log(
             handled_by=admin, status='on_hold',
             transfer_type='attended',
-            # no sip_config
         )
         consultation = self.create_call_log(
             handled_by=admin, status='answered',
@@ -866,4 +883,4 @@ class TestMergeConference(CrmTestCase):
             {'consultation_log_id': consultation.id},
             user=admin,
         )
-        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.status_code, 503)

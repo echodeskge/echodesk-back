@@ -481,7 +481,7 @@ LOGGING = {
 
 # Frontend Configuration
 FRONTEND_BASE_URL = config('FRONTEND_BASE_URL', default='echodesk.ge')
-REVALIDATION_SECRET = config('REVALIDATION_SECRET', default='your-secret-key-here')
+REVALIDATION_SECRET = config('REVALIDATION_SECRET', default='')
 
 # Optional: For advanced deployments
 VERCEL_TOKEN = config('VERCEL_TOKEN', default='')
@@ -520,7 +520,7 @@ SOCIAL_INTEGRATIONS = {
     'FACEBOOK_APP_ID': FACEBOOK_APP_ID,
     'FACEBOOK_APP_SECRET': FACEBOOK_APP_SECRET,
     'FACEBOOK_API_VERSION': FACEBOOK_APP_VERSION,
-    'FACEBOOK_VERIFY_TOKEN': config('FACEBOOK_WEBHOOK_VERIFY_TOKEN', default='echodesk_webhook_token_2024'),
+    'FACEBOOK_VERIFY_TOKEN': config('FACEBOOK_WEBHOOK_VERIFY_TOKEN', default=''),
     'FACEBOOK_SCOPES': [
         'business_management',  # Essential for accessing Pages and Business assets
         'pages_messaging',  # Read and send messages on behalf of pages
@@ -591,10 +591,12 @@ CACHES = {
     }
 }
 
-# VAPID Keys for Web Push Notifications
-VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY', 'wmgsQK3QWTB7Y865L-lq5OwG7WCkf5H9yMmqB0Mkioo')
-VAPID_PUBLIC_KEY = os.environ.get('VAPID_PUBLIC_KEY', 'BGOrh5k3nz3tzE5r4P0Yc1ER-3b7IppjUeV2BatYZTxa3X77GOVVJthQCPxUt5ZfzEAG1p-1DlZHUeRiR0Eeu98')
-VAPID_ADMIN_EMAIL = os.environ.get('VAPID_ADMIN_EMAIL', 'mailto:info@echodesk.ge')
+# VAPID Keys for Web Push Notifications.
+# No hardcoded default for the private key — a committed key can be used to
+# forge Web Push notifications to every user. Must be supplied via env.
+VAPID_PRIVATE_KEY = config('VAPID_PRIVATE_KEY', default='')
+VAPID_PUBLIC_KEY = config('VAPID_PUBLIC_KEY', default='')
+VAPID_ADMIN_EMAIL = config('VAPID_ADMIN_EMAIL', default='mailto:info@echodesk.ge')
 
 # Celery Configuration (Redis DB 2)
 if redis_password:
@@ -652,6 +654,11 @@ CELERY_BEAT_SCHEDULE = {
     'check-low-stock': {
         'task': 'ecommerce_crm.tasks.check_low_stock_products',
         'schedule': crontab(hour=8, minute=0),  # Daily at 8 AM
+    },
+    # Restore stock reserved by abandoned/never-paid card orders.
+    'cancel-unpaid-orders': {
+        'task': 'ecommerce_crm.tasks.cancel_unpaid_orders',
+        'schedule': crontab(minute=0, hour='*/6'),  # Every 6 hours
     },
     # Blog: draft pending topics into BlogPost(review) via Claude.
     # Daily at 06:00 UTC = 10:00 Tbilisi. Drafts BLOG_DAILY_POST_LIMIT posts.

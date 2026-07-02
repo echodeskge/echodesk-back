@@ -12,6 +12,7 @@ from .models import (
 )
 from ecommerce_crm.models import EcommerceClient
 from tickets.models import ListItem
+from django.db import transaction
 from django.utils import timezone
 from datetime import timedelta
 
@@ -274,59 +275,62 @@ class InvoiceCreateUpdateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         """Create invoice with line items"""
         line_items_data = validated_data.pop('line_items', [])
-        client_id = validated_data.pop('client')
+        validated_data.pop('client', None)  # client is resolved from context below
 
         # Get client info from context (set in validate_client)
         client_type = self.context.get('client_type')
         client_obj = self.context.get('client_obj')
 
-        # Get invoice settings to generate invoice number
-        try:
-            settings = InvoiceSettings.objects.first()
+        # The whole create runs in one transaction so a failure part-way (bad
+        # line item, totals error) can't leave a half-built invoice behind, and
+        # so number generation + insert are atomic.
+        with transaction.atomic():
+            # Lock the settings singleton so concurrent invoice creations
+            # serialize on number generation. invoice_number is unique=True;
+            # without this lock two racing creates produce the same number and
+            # one of them 500s on the unique constraint.
+            settings = InvoiceSettings.objects.select_for_update().first()
             if not settings:
-                # Create default settings if none exist
                 settings = InvoiceSettings.objects.create()
-        except Exception:
-            settings = InvoiceSettings.objects.create()
 
-        # Generate invoice number
-        invoice_number = settings.get_next_invoice_number()
+            # Generate invoice number (under the settings lock)
+            invoice_number = settings.get_next_invoice_number()
 
-        # Set due date if not provided
-        if 'due_date' not in validated_data:
-            validated_data['due_date'] = validated_data.get('issue_date', timezone.now().date()) + timedelta(days=settings.default_due_days)
+            # Set due date if not provided
+            if 'due_date' not in validated_data:
+                validated_data['due_date'] = validated_data.get('issue_date', timezone.now().date()) + timedelta(days=settings.default_due_days)
 
-        # Set currency if not provided
-        if 'currency' not in validated_data:
-            validated_data['currency'] = settings.default_currency
+            # Set currency if not provided
+            if 'currency' not in validated_data:
+                validated_data['currency'] = settings.default_currency
 
-        # Set terms and conditions if not provided
-        if not validated_data.get('terms_and_conditions'):
-            validated_data['terms_and_conditions'] = settings.default_terms
+            # Set terms and conditions if not provided
+            if not validated_data.get('terms_and_conditions'):
+                validated_data['terms_and_conditions'] = settings.default_terms
 
-        # Set client fields based on type
-        if client_type == 'itemlist':
-            validated_data['client_itemlist_item'] = client_obj
-            validated_data['client'] = None
-            validated_data['client_name'] = client_obj.label
-        else:
-            validated_data['client'] = client_obj
-            validated_data['client_itemlist_item'] = None
-            validated_data['client_name'] = f"{client_obj.first_name} {client_obj.last_name}".strip() or client_obj.email
+            # Set client fields based on type
+            if client_type == 'itemlist':
+                validated_data['client_itemlist_item'] = client_obj
+                validated_data['client'] = None
+                validated_data['client_name'] = client_obj.label
+            else:
+                validated_data['client'] = client_obj
+                validated_data['client_itemlist_item'] = None
+                validated_data['client_name'] = f"{client_obj.first_name} {client_obj.last_name}".strip() or client_obj.email
 
-        # Create invoice
-        invoice = Invoice.objects.create(
-            invoice_number=invoice_number,
-            **validated_data
-        )
+            # Create invoice
+            invoice = Invoice.objects.create(
+                invoice_number=invoice_number,
+                **validated_data
+            )
 
-        # Create line items
-        for item_data in line_items_data:
-            InvoiceLineItem.objects.create(invoice=invoice, **item_data)
+            # Create line items
+            for item_data in line_items_data:
+                InvoiceLineItem.objects.create(invoice=invoice, **item_data)
 
-        # Calculate totals
-        invoice.calculate_totals()
-        invoice.save()
+            # Calculate totals
+            invoice.calculate_totals()
+            invoice.save()
 
         return invoice
 

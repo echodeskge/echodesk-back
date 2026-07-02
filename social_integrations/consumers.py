@@ -6,6 +6,7 @@ import json
 import asyncio
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
+from channels.layers import get_channel_layer
 from django.contrib.auth.models import AnonymousUser
 from tenant_schemas.utils import schema_context
 from .models import FacebookMessage, FacebookPageConnection
@@ -20,11 +21,22 @@ class MessagesConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         self.tenant_schema = self.scope['url_route']['kwargs']['tenant_schema']
         self.user = self.scope.get('user', AnonymousUser())
-        
-        # For now, allow all connections to test WebSocket functionality
-        # TODO: Add proper authentication when WebSocket auth is configured
+
         print(f"[WebSocket] Connection attempt - User: {self.user}, Tenant: {self.tenant_schema}")
-        
+
+        # This group carries the tenant's entire live agent message feed, so
+        # only authenticated tenant users may join it.
+        if self.user.is_anonymous:
+            print(f"[WebSocket] Rejecting connection - User not authenticated")
+            await self.accept()
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': 'Authentication required',
+                'code': 'UNAUTHENTICATED'
+            }))
+            await self.close(code=4001)
+            return
+
         # Join the messages group for this tenant
         self.messages_group_name = f'messages_{self.tenant_schema}'
         
@@ -475,6 +487,33 @@ class WidgetVisitorConsumer(AsyncWebsocketConsumer):
             'ended_at': event.get('ended_at'),
         }))
 
+    # ------------------------------------------------------------------
+    # Agent-facing events that are also broadcast to the shared
+    # ``messages_<tenant>`` group but are irrelevant to a visitor iframe.
+    # Channels raises "No handler for message type ..." (killing the socket)
+    # if a group_send type has no matching method, so we swallow these
+    # explicitly instead of leaking agent-side state to visitors.
+    async def conversation_update(self, event):
+        return
+
+    async def assignment_update(self, event):
+        return
+
+    async def read_state_update(self, event):
+        return
+
+    async def archive_update(self, event):
+        return
+
+    async def conversation_deleted(self, event):
+        return
+
+    async def message_status_update(self, event):
+        return
+
+    async def reaction_update(self, event):
+        return
+
 
 class TypingConsumer(AsyncWebsocketConsumer):
     """
@@ -610,8 +649,6 @@ async def send_new_message_notification(tenant_schema, conversation_id, message_
     Send new message notification to all connected clients.
     Call this from views when a new message is received or sent.
     """
-    from channels.layers import get_channel_layer
-    
     channel_layer = get_channel_layer()
     
     # Send to general messages group
@@ -642,8 +679,6 @@ async def send_conversation_update(tenant_schema, conversation_id, last_message_
     Send conversation update notification.
     Call this when a conversation's last message changes.
     """
-    from channels.layers import get_channel_layer
-
     channel_layer = get_channel_layer()
 
     await channel_layer.group_send(
@@ -671,7 +706,6 @@ _realtime_logger = logging.getLogger(__name__)
 
 
 async def _safe_group_send(tenant_schema, payload):
-    from channels.layers import get_channel_layer
     try:
         channel_layer = get_channel_layer()
         if channel_layer is None:

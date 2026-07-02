@@ -830,7 +830,7 @@ def facebook_oauth_callback(request):
         
         logger.info(f"Exchanging Facebook code for access token using URL: {token_url}")
         logger.info(f"Token exchange parameters: {dict(token_params, client_secret='[HIDDEN]')}")
-        token_response = requests.get(token_url, params=token_params)
+        token_response = requests.get(token_url, params=token_params, timeout=30)
         token_data = token_response.json()
         
         if 'error' in token_data:
@@ -857,7 +857,7 @@ def facebook_oauth_callback(request):
         logger.info(f"Pages API URL: {pages_url}")
         logger.info(f"Pages API params: {dict(pages_params, access_token='[HIDDEN]')}")
         
-        pages_response = requests.get(pages_url, params=pages_params)
+        pages_response = requests.get(pages_url, params=pages_params, timeout=30)
         pages_data = pages_response.json()
         
         logger.info(f"Pages API response status: {pages_response.status_code}")
@@ -881,7 +881,7 @@ def facebook_oauth_callback(request):
                 'access_token': user_access_token,
                 'fields': 'id,name,email'
             }
-            user_info_response = requests.get(user_info_url, params=user_info_params)
+            user_info_response = requests.get(user_info_url, params=user_info_params, timeout=30)
             user_info_data = user_info_response.json()
             
             return JsonResponse({
@@ -969,7 +969,7 @@ def facebook_oauth_callback(request):
                             'access_token': page_access_token
                         }
                         logger.info(f"📡 Subscribing page {page_name} ({page_id}) to webhooks...")
-                        subscribe_response = requests.post(subscribe_url, params=subscribe_params)
+                        subscribe_response = requests.post(subscribe_url, params=subscribe_params, timeout=30)
                         subscribe_data = subscribe_response.json()
 
                         if subscribe_response.status_code == 200 and subscribe_data.get('success'):
@@ -986,7 +986,7 @@ def facebook_oauth_callback(request):
                             'fields': 'instagram_business_account',
                             'access_token': page_access_token
                         }
-                        instagram_response = requests.get(instagram_url, params=instagram_params)
+                        instagram_response = requests.get(instagram_url, params=instagram_params, timeout=30)
 
                         if instagram_response.status_code == 200:
                             instagram_data = instagram_response.json()
@@ -1001,7 +1001,7 @@ def facebook_oauth_callback(request):
                                     'fields': 'id,username,profile_picture_url',
                                     'access_token': page_access_token
                                 }
-                                ig_details_response = requests.get(ig_details_url, params=ig_details_params)
+                                ig_details_response = requests.get(ig_details_url, params=ig_details_params, timeout=30)
 
                                 if ig_details_response.status_code == 200:
                                     ig_details = ig_details_response.json()
@@ -1458,7 +1458,7 @@ def facebook_send_message(request):
                     send_url,
                     json=text_payload,
                     headers={'Content-Type': 'application/json'},
-                    params=params,
+                    params=params, timeout=30,
                 )
                 text_sent_separately = True
                 if text_response.status_code == 200:
@@ -1484,7 +1484,7 @@ def facebook_send_message(request):
                     'messaging_type': 'RESPONSE',
                 },
                 params=params
-            )
+            , timeout=30)
 
             attachments_meta = [{
                 'mime_type': media_mime_type,
@@ -1507,7 +1507,7 @@ def facebook_send_message(request):
                 json=message_data,
                 headers={'Content-Type': 'application/json'},
                 params=params
-            )
+            , timeout=30)
 
         logger.info(f"Sending message to {recipient_id} via {page_connection.page_name}")
 
@@ -1694,10 +1694,10 @@ def facebook_webhook(request):
         challenge = request.GET.get('hub.challenge')
         
         # Verify token from settings
-        verify_token = getattr(settings, 'SOCIAL_INTEGRATIONS', {}).get('FACEBOOK_VERIFY_TOKEN', 'echodesk_webhook_token_2024')
+        verify_token = getattr(settings, 'SOCIAL_INTEGRATIONS', {}).get('FACEBOOK_VERIFY_TOKEN', '')
         
         # Verify the mode and token
-        if mode == 'subscribe' and token == verify_token:
+        if mode == 'subscribe' and verify_token and token == verify_token:
             # Return the challenge as plain text (not JSON)
             return HttpResponse(challenge, content_type='text/plain')
         else:
@@ -2666,7 +2666,7 @@ def test_facebook_api_access(request):
                 'access_token': access_token,
                 'fields': 'id,name,email'
             }
-            user_response = requests.get(user_url, params=user_params)
+            user_response = requests.get(user_url, params=user_params, timeout=30)
             results['user_info'] = {
                 'status_code': user_response.status_code,
                 'data': user_response.json()
@@ -2678,7 +2678,7 @@ def test_facebook_api_access(request):
         try:
             permissions_url = f"https://graph.facebook.com/{api_version}/me/permissions"
             permissions_params = {'access_token': access_token}
-            permissions_response = requests.get(permissions_url, params=permissions_params)
+            permissions_response = requests.get(permissions_url, params=permissions_params, timeout=30)
             results['permissions'] = {
                 'status_code': permissions_response.status_code,
                 'data': permissions_response.json()
@@ -2693,7 +2693,7 @@ def test_facebook_api_access(request):
                 'access_token': access_token,
                 'fields': 'id,name,access_token,category,about,is_published,tasks'
             }
-            accounts_response = requests.get(accounts_url, params=accounts_params)
+            accounts_response = requests.get(accounts_url, params=accounts_params, timeout=30)
             results['me_accounts'] = {
                 'status_code': accounts_response.status_code,
                 'data': accounts_response.json()
@@ -2708,7 +2708,7 @@ def test_facebook_api_access(request):
                 'access_token': access_token,
                 'fields': 'id,name,verification_status'
             }
-            businesses_response = requests.get(businesses_url, params=businesses_params)
+            businesses_response = requests.get(businesses_url, params=businesses_params, timeout=30)
             results['businesses'] = {
                 'status_code': businesses_response.status_code,
                 'data': businesses_response.json()
@@ -2725,7 +2725,7 @@ def test_facebook_api_access(request):
                     'access_token': access_token,
                     'fields': 'id,name,category,about'
                 }
-                business_pages_response = requests.get(business_pages_url, params=business_pages_params)
+                business_pages_response = requests.get(business_pages_url, params=business_pages_params, timeout=30)
                 results['business_pages'] = {
                     'status_code': business_pages_response.status_code,
                     'data': business_pages_response.json()
@@ -3113,8 +3113,14 @@ def instagram_send_message(request):
                 }
                 if reply_to_message_id:
                     text_payload['reply_to'] = {'mid': reply_to_message_id}
-                requests.post(send_url, json=text_payload,
-                              headers={'Content-Type': 'application/json'}, params=params)
+                text_resp = requests.post(send_url, json=text_payload,
+                              headers={'Content-Type': 'application/json'}, params=params, timeout=30)
+                # Don't silently drop the text half of a text+media reply.
+                if text_resp.status_code >= 400:
+                    logger.error(
+                        'Failed to send text part of text+media reply: %s - %s',
+                        text_resp.status_code, text_resp.text[:300]
+                    )
 
             # Send media attachment using form data upload
             response = requests.post(
@@ -3126,7 +3132,7 @@ def instagram_send_message(request):
                     'messaging_type': 'RESPONSE',
                 },
                 params=params
-            )
+            , timeout=30)
 
             attachments_meta = [{
                 'mime_type': media_mime_type,
@@ -3148,7 +3154,7 @@ def instagram_send_message(request):
                 json=message_data,
                 headers={'Content-Type': 'application/json'},
                 params=params
-            )
+            , timeout=30)
 
         print(f"📤 Instagram API Response: {response.status_code} - {response.text}")
 
@@ -3280,10 +3286,10 @@ def instagram_webhook(request):
         challenge = request.GET.get('hub.challenge')
 
         # Verify token from settings (same as Facebook)
-        verify_token = getattr(settings, 'SOCIAL_INTEGRATIONS', {}).get('FACEBOOK_VERIFY_TOKEN', 'echodesk_webhook_token_2024')
+        verify_token = getattr(settings, 'SOCIAL_INTEGRATIONS', {}).get('FACEBOOK_VERIFY_TOKEN', '')
 
         # Verify the mode and token
-        if mode == 'subscribe' and token == verify_token:
+        if mode == 'subscribe' and verify_token and token == verify_token:
             # Return the challenge as plain text
             return HttpResponse(challenge, content_type='text/plain')
         else:
@@ -3900,7 +3906,7 @@ def webhook_status(request):
         with open(test_log, 'r') as f:
             test_event_count = f.read().count('WEBHOOK TEST RECEIVED')
 
-    verify_token = getattr(settings, 'SOCIAL_INTEGRATIONS', {}).get('FACEBOOK_VERIFY_TOKEN', 'echodesk_webhook_token_2024')
+    verify_token = getattr(settings, 'SOCIAL_INTEGRATIONS', {}).get('FACEBOOK_VERIFY_TOKEN', '')
 
     return Response({
         'status': 'configured',
@@ -4672,7 +4678,7 @@ def send_rating_request_facebook(conversation_id, page_id, message):
             "message": {"text": message}
         }
         headers = {"Authorization": f"Bearer {page.page_access_token}"}
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
         if response.ok:
             message_id = response.json().get('message_id')
             timestamp = datetime.now()
@@ -4732,7 +4738,7 @@ def send_rating_request_instagram(conversation_id, account_id, message):
             "access_token": account.facebook_page.page_access_token,
             "platform": "instagram"
         }
-        response = requests.post(url, json=payload, headers=headers, params=params)
+        response = requests.post(url, json=payload, headers=headers, params=params, timeout=30)
         if response.ok:
             message_id = response.json().get('message_id')
             timestamp = datetime.now()
@@ -4790,7 +4796,7 @@ def send_rating_request_whatsapp(conversation_id, waba_id, message):
             "Authorization": f"Bearer {account.access_token}",
             "Content-Type": "application/json"
         }
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
         if response.ok:
             data = response.json()
             message_id = data.get('messages', [{}])[0].get('id')
@@ -7442,7 +7448,7 @@ def whatsapp_embedded_signup_callback(request):
         logger.info(f"Token params: {token_params}")
 
         # Make the request and log the exact URL being called
-        token_response = requests.get(token_url, params=token_params)
+        token_response = requests.get(token_url, params=token_params, timeout=30)
         logger.info(f"Actual request URL: {token_response.url}")
 
         token_data = token_response.json()
@@ -7472,7 +7478,7 @@ def whatsapp_embedded_signup_callback(request):
 
         waba_ids = []
         try:
-            debug_response = requests.get(debug_url, params=debug_params)
+            debug_response = requests.get(debug_url, params=debug_params, timeout=30)
             debug_data = debug_response.json()
             logger.info(f"🔍 Token debug info: {debug_data}")
 
@@ -7511,7 +7517,7 @@ def whatsapp_embedded_signup_callback(request):
                 'fields': 'id,name,timezone_id,message_template_namespace'
             }
 
-            waba_response = requests.get(waba_url, params=waba_params)
+            waba_response = requests.get(waba_url, params=waba_params, timeout=30)
             waba_data = waba_response.json()
 
             if 'error' in waba_data:
@@ -7542,7 +7548,7 @@ def whatsapp_embedded_signup_callback(request):
                     'fields': 'id,verified_name,display_phone_number,quality_rating,is_on_biz_app,platform_type'
                 }
 
-                phone_response = requests.get(phone_url, params=phone_params)
+                phone_response = requests.get(phone_url, params=phone_params, timeout=30)
                 phone_data = phone_response.json()
 
                 phones = phone_data.get('data', [])
@@ -7607,7 +7613,7 @@ def whatsapp_embedded_signup_callback(request):
                             'Authorization': f'Bearer {access_token}',
                             'Content-Type': 'application/json'
                         }
-                        register_response = requests.post(register_url, headers=register_headers, json=register_data)
+                        register_response = requests.post(register_url, headers=register_headers, json=register_data, timeout=30)
                         if register_response.status_code == 200:
                             logger.info(f"✅ Registered phone number {phone_number_id}")
                         else:
@@ -7649,7 +7655,7 @@ def whatsapp_embedded_signup_callback(request):
                             'access_token': access_token,
                             'subscribed_fields': ','.join(webhook_fields)
                         }
-                        webhook_response = requests.post(webhook_url, params=webhook_params)
+                        webhook_response = requests.post(webhook_url, params=webhook_params, timeout=30)
                         if webhook_response.status_code == 200:
                             logger.info(f"✅ Subscribed WABA {waba_id} to webhooks with fields: {', '.join(webhook_fields)}")
                         else:
@@ -8024,7 +8030,7 @@ def whatsapp_send_message(request):
         headers = {**auth_headers, 'Content-Type': 'application/json'}
 
         logger.info(f"Sending WhatsApp {message_type} message to {to_number} from {account.display_phone_number}")
-        response = requests.post(send_url, json=message_payload, headers=headers)
+        response = requests.post(send_url, json=message_payload, headers=headers, timeout=30)
         response_data = response.json()
 
         if response.status_code != 200 or 'error' in response_data:
@@ -8145,9 +8151,9 @@ def whatsapp_webhook(request):
         token = request.GET.get('hub.verify_token')
         challenge = request.GET.get('hub.challenge')
 
-        verify_token = getattr(settings, 'SOCIAL_INTEGRATIONS', {}).get('WHATSAPP_VERIFY_TOKEN', 'echodesk_whatsapp_webhook_token_2024')
+        verify_token = getattr(settings, 'SOCIAL_INTEGRATIONS', {}).get('WHATSAPP_VERIFY_TOKEN', '')
 
-        if mode == 'subscribe' and token == verify_token:
+        if mode == 'subscribe' and verify_token and token == verify_token:
             logger.info("✅ WhatsApp webhook verified successfully")
             return HttpResponse(challenge, content_type='text/plain')
         else:
@@ -8785,7 +8791,7 @@ def whatsapp_sync_templates(request, waba_id):
                 'limit': 100
             }
 
-            response = requests.get(templates_url, params=params)
+            response = requests.get(templates_url, params=params, timeout=30)
 
             if response.status_code != 200:
                 return Response({
@@ -8869,7 +8875,7 @@ def whatsapp_create_template(request):
                 'Content-Type': 'application/json'
             }
 
-            response = requests.post(create_url, json=payload, headers=headers)
+            response = requests.post(create_url, json=payload, headers=headers, timeout=30)
 
             if response.status_code not in [200, 201]:
                 return Response({
@@ -8930,7 +8936,7 @@ def whatsapp_delete_template(request, template_id):
                     'name': template.name
                 }
 
-                response = requests.delete(delete_url, params=params)
+                response = requests.delete(delete_url, params=params, timeout=30)
 
                 if response.status_code not in [200, 204]:
                     logger.warning(f"Failed to delete template from Meta: {response.json()}")
@@ -9090,7 +9096,7 @@ def whatsapp_send_template_message(request):
                 message_payload['template']['components'] = components
             headers = {'Authorization': f'Bearer {waba.access_token}', 'Content-Type': 'application/json'}
 
-            response = requests.post(send_url, json=message_payload, headers=headers)
+            response = requests.post(send_url, json=message_payload, headers=headers, timeout=30)
             try:
                 response_data = response.json()
             except ValueError:

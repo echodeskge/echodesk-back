@@ -10,6 +10,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from django.http import FileResponse, HttpResponse
+from django.db import transaction
 from django.db.models import Q, Sum, Count, Prefetch
 from datetime import datetime, timedelta
 
@@ -563,19 +564,24 @@ class InvoiceViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def mark_paid(self, request, pk=None):
         """Quick mark invoice as paid"""
-        invoice = self.get_object()
+        with transaction.atomic():
+            # Lock the invoice row so a double-submit (or concurrent request)
+            # can't each insert a full-balance payment and over-pay the invoice.
+            invoice = Invoice.objects.select_for_update().get(pk=self.get_object().pk)
 
-        # Create payment record
-        InvoicePayment.objects.create(
-            invoice=invoice,
-            amount=invoice.total - invoice.paid_amount,
-            payment_method=request.data.get('payment_method', 'bank_transfer'),
-            payment_date=timezone.now(),
-            recorded_by=request.user,
-            notes=request.data.get('notes', '')
-        )
-
-        invoice.mark_as_paid()
+            # Idempotent: if it's already fully paid, don't add another payment.
+            if invoice.status != 'paid':
+                balance = invoice.total - invoice.paid_amount
+                if balance > 0:
+                    InvoicePayment.objects.create(
+                        invoice=invoice,
+                        amount=balance,
+                        payment_method=request.data.get('payment_method', 'bank_transfer'),
+                        payment_date=timezone.now(),
+                        recorded_by=request.user,
+                        notes=request.data.get('notes', '')
+                    )
+                invoice.mark_as_paid()
 
         serializer = self.get_serializer(invoice)
         return Response(serializer.data)
@@ -585,9 +591,20 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         """Duplicate an existing invoice"""
         original = self.get_object()
 
+        # Resolve the client id from whichever client field the original used.
+        # Invoices created via the ItemList flow have client=None and
+        # client_itemlist_item set, so dereferencing original.client.id blindly
+        # would 500. The create serializer re-resolves the type from settings.
+        client_value = original.client_itemlist_item_id or original.client_id
+        if not client_value:
+            return Response(
+                {'error': 'Original invoice has no client to copy.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         # Create new invoice with copied data
         new_invoice_data = {
-            'client': original.client.id,
+            'client': client_value,
             'currency': original.currency,
             'discount_amount': original.discount_amount,
             'notes': original.notes,
@@ -668,6 +685,11 @@ class InvoiceLineItemViewSet(viewsets.ModelViewSet):
         if invoice_id:
             queryset = queryset.filter(invoice_id=invoice_id)
 
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
@@ -676,10 +698,11 @@ class InvoiceLineItemViewSet(viewsets.ModelViewSet):
         """Reorder line items"""
         items = request.data.get('items', [])
 
-        for item_data in items:
-            item = InvoiceLineItem.objects.get(id=item_data['id'])
-            item.position = item_data['position']
-            item.save()
+        by_id = {item['id']: item['position'] for item in items}
+        to_update = list(InvoiceLineItem.objects.filter(id__in=by_id.keys()))
+        for item in to_update:
+            item.position = by_id[item.id]
+        InvoiceLineItem.objects.bulk_update(to_update, ['position'])
 
         return Response({'message': 'Line items reordered successfully'})
 
@@ -699,6 +722,11 @@ class InvoicePaymentViewSet(viewsets.ModelViewSet):
         invoice_id = request.query_params.get('invoice_id')
         if invoice_id:
             queryset = queryset.filter(invoice_id=invoice_id)
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
 
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
@@ -776,13 +804,13 @@ class ClientViewSet(viewsets.ReadOnlyModelViewSet):
                 is_active=True
             ).select_related('item_list')
             self.search_fields = ['label']
-            logger.info(f"[ClientViewSet] Returning ListItem queryset, count={queryset.count()}")
+            logger.info("[ClientViewSet] Returning ListItem queryset")
             return queryset
         else:
             # Fallback to EcommerceClient for backward compatibility
             queryset = EcommerceClient.objects.filter(is_active=True)
             self.search_fields = ['first_name', 'last_name', 'email']
-            logger.info(f"[ClientViewSet] Returning EcommerceClient queryset, count={queryset.count()}")
+            logger.info("[ClientViewSet] Returning EcommerceClient queryset")
             return queryset
 
 

@@ -296,6 +296,58 @@ class TestInvoiceActions(InvoiceTestCase):
         # Payment record should be created
         self.assertTrue(InvoicePayment.objects.filter(invoice=invoice).exists())
 
+    def test_mark_paid_double_submit_is_idempotent(self):
+        """A second mark_paid must not create a second full-balance payment or
+        push paid_amount past the total."""
+        user = self.create_invoice_user()
+        ecom_client = self.create_ecommerce_client()
+        invoice = self.create_invoice(
+            created_by=user, client=ecom_client,
+            status='sent', total=Decimal('500.00'),
+        )
+        first = self.api_post(
+            f'/api/invoices/invoices/{invoice.id}/mark_paid/',
+            {'payment_method': 'cash'}, user=user,
+        )
+        self.assertEqual(first.status_code, 200)
+        second = self.api_post(
+            f'/api/invoices/invoices/{invoice.id}/mark_paid/',
+            {'payment_method': 'cash'}, user=user,
+        )
+        self.assertEqual(second.status_code, 200)
+
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, 'paid')
+        self.assertEqual(invoice.paid_amount, Decimal('500.00'))
+        # Exactly one payment, not two.
+        self.assertEqual(InvoicePayment.objects.filter(invoice=invoice).count(), 1)
+
+    def test_duplicate_itemlist_client_invoice(self):
+        """Duplicating an invoice whose client came from an ItemList must not
+        500 on original.client.id (client is None for that flow)."""
+        user = self.create_invoice_user()
+        item_list = self.create_item_list(title='Clients', created_by=user)
+        list_item = self.create_list_item(item_list, label='Acme Ltd', created_by=user)
+        settings = InvoiceSettings.objects.get_or_create()[0]
+        settings.client_itemlist = item_list
+        settings.save()
+
+        invoice = self.create_invoice(
+            created_by=user, status='sent', total=Decimal('120.00'),
+            client_itemlist_item=list_item, client_name='Acme Ltd',
+        )
+        self.create_line_item(invoice, description='Service')
+
+        resp = self.api_post(
+            f'/api/invoices/invoices/{invoice.id}/duplicate/', user=user,
+        )
+        self.assertEqual(resp.status_code, 201)
+        # The duplicate carries the itemlist client, not a null-deref crash.
+        new_id = resp.data['id']
+        dup = Invoice.objects.get(id=new_id)
+        self.assertEqual(dup.client_itemlist_item_id, list_item.id)
+        self.assertIsNone(dup.client_id)
+
     def test_finalize_draft(self):
         user = self.create_invoice_user()
         ecom_client = self.create_ecommerce_client()
@@ -388,7 +440,9 @@ class TestInvoiceLineItemViewSet(InvoiceTestCase):
             f'/api/invoices/line-items/?invoice_id={invoice.id}', user=user,
         )
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(resp.data), 2)
+        # Endpoint is paginated: results live under 'results'.
+        self.assertEqual(resp.data['count'], 2)
+        self.assertEqual(len(resp.data['results']), 2)
 
     def test_delete_line_item(self):
         user = self.create_invoice_user()
@@ -436,7 +490,9 @@ class TestInvoicePaymentViewSet(InvoiceTestCase):
             f'/api/invoices/payments/?invoice_id={invoice.id}', user=user,
         )
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(resp.data), 1)
+        # Endpoint is paginated: results live under 'results'.
+        self.assertEqual(resp.data['count'], 1)
+        self.assertEqual(len(resp.data['results']), 1)
 
     def test_create_payment(self):
         user = self.create_invoice_user()

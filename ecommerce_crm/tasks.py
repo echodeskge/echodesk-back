@@ -458,6 +458,15 @@ def book_quickshipper_courier(self, schema_name, order_id):
                 raise self.retry(exc=exc)
 
             qs_order_id = resp.get('orderId')
+            # Persist the tracking number IMMEDIATELY, before assembling metadata.
+            # The Quickshipper order already exists at this point; if anything
+            # below throws and the task retries, the tracking_number guard above
+            # must already see it so we don't double-book the courier.
+            if qs_order_id is not None:
+                order.tracking_number = str(qs_order_id)
+                order.courier_provider = 'quickshipper'
+                order.save(update_fields=['tracking_number', 'courier_provider', 'updated_at'])
+
             tracking_url = resp.get('trackingUrl')
             metadata = order.payment_metadata or {}
             metadata['quickshipper'] = {
@@ -467,10 +476,8 @@ def book_quickshipper_courier(self, schema_name, order_id):
                 'delivery_fee': resp.get('deliveryFee'),
                 'create_date': resp.get('createDate'),
             }
-            order.tracking_number = str(qs_order_id) if qs_order_id is not None else order.tracking_number
-            order.courier_provider = 'quickshipper'
             order.payment_metadata = metadata
-            order.save(update_fields=['tracking_number', 'courier_provider', 'payment_metadata', 'updated_at'])
+            order.save(update_fields=['payment_metadata', 'updated_at'])
             logger.info(
                 'book_quickshipper_courier: order %s booked, tracking=%s',
                 order.id, order.tracking_number,
@@ -478,3 +485,56 @@ def book_quickshipper_courier(self, schema_name, order_id):
     except Exception as exc:
         logger.error('book_quickshipper_courier failed: %s', exc)
         raise self.retry(exc=exc)
+
+
+# Orders unpaid after this many hours are treated as abandoned and cancelled,
+# restoring their reserved stock. Mirrors booking_management's grace window.
+UNPAID_ORDER_GRACE_HOURS = 24
+
+
+@shared_task
+def cancel_unpaid_orders():
+    """Cancel card orders that were never paid, restoring reserved inventory.
+
+    Stock is decremented at checkout, so an abandoned card order (customer closed
+    the BOG page) would otherwise reserve that stock forever. This runs across all
+    tenants and cancels+restocks orders still awaiting payment past the grace
+    window. Restock-on-failure is done here (grace-based) rather than immediately
+    on a 'rejected' webhook so a customer retrying payment can't be oversold.
+    """
+    from tenant_schemas.utils import schema_context
+    from tenants.models import Tenant
+
+    total_cancelled = 0
+    for tenant in Tenant.objects.exclude(schema_name='public'):
+        try:
+            with schema_context(tenant.schema_name):
+                total_cancelled += _cancel_unpaid_orders_for_tenant()
+        except Exception:
+            logger.exception('cancel_unpaid_orders failed for tenant %s', tenant.schema_name)
+    logger.info('cancel_unpaid_orders completed: %d orders cancelled', total_cancelled)
+    return total_cancelled
+
+
+def _cancel_unpaid_orders_for_tenant():
+    from datetime import timedelta
+    from django.utils import timezone
+    from .models import Order
+
+    cutoff = timezone.now() - timedelta(hours=UNPAID_ORDER_GRACE_HOURS)
+    # Only cash-up-front card orders that never got paid. Cash-on-delivery orders
+    # are excluded (payment_method), and paid/cancelled orders are skipped.
+    candidates = Order.objects.filter(
+        status='pending',
+        payment_status__in=['pending', 'failed'],
+        created_at__lt=cutoff,
+    ).exclude(payment_method='cash_on_delivery')
+
+    cancelled = 0
+    for order in candidates:
+        try:
+            if order.cancel(reason='Auto-cancelled: unpaid after grace period'):
+                cancelled += 1
+        except Exception:
+            logger.exception('Failed to auto-cancel unpaid order %s', order.id)
+    return cancelled

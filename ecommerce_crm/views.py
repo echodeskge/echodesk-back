@@ -4,7 +4,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiParameter, inline_serializer
 from django_filters.rest_framework import DjangoFilterBackend, FilterSet, CharFilter, NumberFilter, BooleanFilter
-from django.db.models import Q, F, Count
+from django.db.models import Q, F, Count, Avg
 from django.core.cache import cache
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import never_cache
@@ -286,6 +286,10 @@ class ProductViewSet(NoCacheMixin, viewsets.ModelViewSet):
             'images',
             'attribute_values__attribute',
             'variants__attribute_values__attribute'
+        ).annotate(
+            # Serializers read these instead of firing an AVG + COUNT per row.
+            _avg_rating=Avg('reviews__rating', filter=Q(reviews__is_approved=True)),
+            _review_count=Count('reviews', filter=Q(reviews__is_approved=True), distinct=True),
         )
 
         if self.action == 'list':
@@ -1600,8 +1604,11 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
             'client',
             'delivery_address'
         )
-        # Only prefetch items for detail views
-        if self.action != 'list':
+        # Only prefetch items for detail views. For the list, annotate the item
+        # count so the serializer doesn't fire a COUNT per order row.
+        if self.action == 'list':
+            queryset = queryset.annotate(_items_count=Count('items'))
+        else:
             queryset = queryset.prefetch_related(
                 'items__product',
                 'items__variant'
@@ -1659,39 +1666,23 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
             response_data['message'] = 'Order will be paid on delivery'
             return Response(response_data, status=status.HTTP_201_CREATED)
 
-        # Get BOG credentials and configure service
+        # Build the BOG service with the tenant's own merchant credentials (or
+        # the platform's when unset). If the tenant HAS credentials but they
+        # can't be loaded, refuse rather than silently using the platform account.
+        from .payment_utils import get_tenant_bog_service, BogCredentialError
         try:
-            from .models import EcommerceSettings
-            from tenants.bog_payment import BOGPaymentService
-
-            ecommerce_settings = EcommerceSettings.objects.get(tenant=request.tenant)
-
-            if ecommerce_settings.has_bog_credentials:
-                # User provided their own credentials
-                client_id = ecommerce_settings.bog_client_id
-                client_secret = ecommerce_settings.get_bog_secret()
-                auth_url = settings.BOG_AUTH_URL
-                api_base_url = settings.BOG_API_BASE_URL
-            else:
-                # No credentials provided - use platform credentials from env
-                client_id = settings.BOG_CLIENT_ID
-                client_secret = settings.BOG_CLIENT_SECRET
-                auth_url = settings.BOG_AUTH_URL
-                api_base_url = settings.BOG_API_BASE_URL
-        except:
-            # Fallback to platform credentials from env
-            client_id = settings.BOG_CLIENT_ID
-            client_secret = settings.BOG_CLIENT_SECRET
-            auth_url = settings.BOG_AUTH_URL
-            api_base_url = settings.BOG_API_BASE_URL
-
-        # Create BOG service instance with the appropriate credentials
-        from tenants.bog_payment import BOGPaymentService
-        bog_service_instance = BOGPaymentService()
-        bog_service_instance.client_id = client_id
-        bog_service_instance.client_secret = client_secret
-        bog_service_instance.auth_url = auth_url
-        bog_service_instance.base_url = api_base_url
+            bog_service_instance = get_tenant_bog_service(request.tenant)
+        except BogCredentialError:
+            import logging
+            logging.getLogger(__name__).exception(
+                'BOG credential error for tenant %s on order %s',
+                getattr(request.tenant, 'schema_name', request.tenant), order.order_number
+            )
+            order.cancel(reason='Payment configuration error')
+            return Response(
+                {'error': 'Payment is temporarily unavailable. Please try again later.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
 
         # Create BOG payment
         try:
@@ -2347,6 +2338,40 @@ def ecommerce_payment_webhook(request):
                 logger.error('Missing external_order_id in webhook payload')
                 return Response({'error': 'Invalid payload'}, status=status.HTTP_400_BAD_REQUEST)
 
+            if not bog_order_id:
+                logger.error('Missing BOG order_id in webhook payload')
+                return Response({'error': 'Invalid payload'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # SECURITY: never trust the webhook body. Ask BOG directly whether
+            # this order actually completed before treating it as paid — a forged
+            # POST claiming "completed" will not survive this check.
+            from .payment_utils import get_tenant_bog_service, BogCredentialError
+            try:
+                bog_service = get_tenant_bog_service(getattr(request, 'tenant', None))
+                confirmation = bog_service.check_payment_status(bog_order_id)
+            except BogCredentialError:
+                logger.exception('Cannot verify BOG payment %s — tenant credential error', bog_order_id)
+                return Response({'error': 'verification_unavailable'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+            except Exception:
+                logger.exception('BOG status re-query failed for %s', bog_order_id)
+                return Response({'error': 'verification_unavailable'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+            if confirmation.get('status') in ('error', 'unknown'):
+                # Couldn't reach a verdict — ask BOG to retry the callback later.
+                logger.warning('BOG status inconclusive for %s: %s', bog_order_id, confirmation.get('error'))
+                return Response({'error': 'verification_unavailable'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+            confirmed = (
+                confirmation.get('bog_status') == 'completed'
+                and str(confirmation.get('response_code')) == '100'
+            )
+            if not confirmed:
+                logger.warning(
+                    'BOG did NOT confirm payment for %s (bog_status=%s) — ignoring webhook',
+                    bog_order_id, confirmation.get('bog_status')
+                )
+                return Response({'status': 'ignored', 'message': 'Payment not confirmed by BOG'}, status=status.HTTP_200_OK)
+
             # Check if this is a card validation transaction (order_id starts with 'card_')
             if external_order_id.startswith('card_'):
                 # Extract client ID from order_id format: card_{client_id}_{random}
@@ -2396,50 +2421,69 @@ def ecommerce_payment_webhook(request):
                     logger.error(f'Error processing card validation: {e}')
                     return Response({'error': 'Invalid card validation order'}, status=status.HTTP_400_BAD_REQUEST)
 
-            try:
-                order = Order.objects.get(order_number=external_order_id)
-            except Order.DoesNotExist:
-                logger.error(f'Order not found: {external_order_id}')
-                return Response({'error': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
-            
-            # Check if already processed (idempotency)
-            if order.payment_status == 'paid' and order.paid_at:
-                logger.info(f'Webhook already processed for order: {external_order_id}')
-                return Response({
-                    'status': 'success',
-                    'message': 'Payment already processed'
-                }, status=status.HTTP_200_OK)
-            
-            # Update order payment status
-            order.payment_status = 'paid'
-            order.paid_at = timezone.now()
-            order.status = 'confirmed'  # Auto-confirm order when paid
-            order.confirmed_at = timezone.now()
-            order.payment_metadata.update({
-                'bog_order_id': bog_order_id,
-                'transaction_id': transaction_id,
-                'response_code': response_code,
-                'paid_at': timezone.now().isoformat()
-            })
-            order.save()
-            
+            from django.db import connection, transaction
+
+            with transaction.atomic():
+                try:
+                    order = Order.objects.select_for_update().get(order_number=external_order_id)
+                except Order.DoesNotExist:
+                    logger.error(f'Order not found: {external_order_id}')
+                    return Response({'error': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
+
+                # Idempotency, re-checked under the row lock so concurrent
+                # duplicate callbacks can't both run the side effects.
+                if order.payment_status == 'paid' and order.paid_at:
+                    logger.info(f'Webhook already processed for order: {external_order_id}')
+                    return Response({
+                        'status': 'success',
+                        'message': 'Payment already processed'
+                    }, status=status.HTTP_200_OK)
+
+                # BOG confirmed payment but we had cancelled the order (e.g. the
+                # abandoned-order sweeper already restocked it). Money moved, so
+                # don't silently confirm or silently drop — escalate for a human.
+                if order.status == 'cancelled':
+                    logger.error(
+                        'BOG CONFIRMED payment for CANCELLED order %s (bog_order_id=%s) — '
+                        'manual reconciliation required', external_order_id, bog_order_id
+                    )
+                    return Response({
+                        'status': 'conflict',
+                        'message': 'Order was cancelled; manual reconciliation required'
+                    }, status=status.HTTP_200_OK)
+
+                # Mark paid + auto-confirm.
+                order.payment_status = 'paid'
+                order.paid_at = timezone.now()
+                order.status = 'confirmed'
+                order.confirmed_at = timezone.now()
+                order.payment_metadata.update({
+                    'bog_order_id': bog_order_id,
+                    'transaction_id': transaction_id,
+                    'response_code': response_code,
+                    'paid_at': timezone.now().isoformat()
+                })
+                order.save()
+
+                # Dispatch side effects only AFTER the paid state commits, so the
+                # worker sees the paid order and a rollback can't orphan tasks.
+                _schema = connection.schema_name
+                _order_id = order.id
+
+                def _dispatch_post_payment():
+                    from .tasks import send_order_email, book_quickshipper_courier
+                    try:
+                        send_order_email.delay(_schema, _order_id, 'confirmation')
+                    except Exception:
+                        logger.exception('Failed to queue confirmation email for order %s', _order_id)
+                    try:
+                        book_quickshipper_courier.delay(_schema, _order_id)
+                    except Exception:
+                        logger.exception('Failed to queue courier booking for order %s', _order_id)
+
+                transaction.on_commit(_dispatch_post_payment)
+
             logger.info(f'Payment completed for order: {external_order_id}')
-
-            # Send order confirmation email
-            try:
-                from .tasks import send_order_email
-                from django.db import connection
-                send_order_email.delay(connection.schema_name, order.id, 'confirmation')
-            except Exception:
-                pass
-
-            # Book the Quickshipper courier (no-op if not configured for tenant)
-            try:
-                from .tasks import book_quickshipper_courier
-                from django.db import connection
-                book_quickshipper_courier.delay(connection.schema_name, order.id)
-            except Exception:
-                pass
 
             return Response({
                 'status': 'success',
@@ -2454,17 +2498,27 @@ def ecommerce_payment_webhook(request):
     # Handle failed payment (BOG status: 'rejected')
     elif bog_status == 'rejected':
         logger.warning(f'Payment failed: order_number={external_order_id}, code={response_code}')
-        
-        # Update order status if exists
+        from django.db import transaction
+
         try:
-            order = Order.objects.get(order_number=external_order_id)
-            order.payment_status = 'failed'
-            order.payment_metadata.update({
-                'bog_status': bog_status,
-                'response_code': response_code,
-                'failed_at': timezone.now().isoformat()
-            })
-            order.save()
+            with transaction.atomic():
+                order = Order.objects.select_for_update().get(order_number=external_order_id)
+                # Never downgrade an order BOG already confirmed as paid — a late
+                # or duplicated 'rejected' must not corrupt a paid order.
+                if order.payment_status == 'paid':
+                    logger.warning('Ignoring rejected webhook for already-paid order %s', external_order_id)
+                    return Response({'status': 'ignored', 'message': 'Order already paid'}, status=status.HTTP_200_OK)
+                order.payment_status = 'failed'
+                order.payment_metadata.update({
+                    'bog_status': bog_status,
+                    'response_code': response_code,
+                    'failed_at': timezone.now().isoformat()
+                })
+                order.save(update_fields=['payment_status', 'payment_metadata', 'updated_at'])
+            # Stock is intentionally NOT restored here: the customer may retry
+            # payment on this order, and restoring now would let a later success
+            # oversell. Never-paid orders are restocked by the cancel_unpaid_orders
+            # sweeper after a grace period.
         except Order.DoesNotExist:
             logger.error(f'Order not found for failed payment: {external_order_id}')
     
@@ -2521,49 +2575,70 @@ def tbc_payment_webhook(request):
         return Response({'error': 'Missing merchantPaymentId'}, status=status.HTTP_400_BAD_REQUEST)
 
     # Handle successful payment
+    # NOTE: TBC callbacks are not signature-verified and this handler does not
+    # yet re-query TBC's status API server-side, so it still trusts the body.
+    # The structural hardening below (row lock, idempotency, state guards) fixes
+    # the duplicate/resurrection/downgrade bugs; adding a server-side re-query
+    # via TBCPaymentProvider.check_payment_status is a scoped follow-up.
     if tbc_status in ('succeeded', 'completed'):
+        from django.db import connection, transaction
         try:
-            order = Order.objects.get(order_number=merchant_payment_id)
+            with transaction.atomic():
+                try:
+                    order = Order.objects.select_for_update().get(order_number=merchant_payment_id)
+                except Order.DoesNotExist:
+                    logger.error(f'Order not found for TBC webhook: {merchant_payment_id}')
+                    return Response({'error': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
 
-            # Idempotency check
-            if order.payment_status == 'paid' and order.paid_at:
-                logger.info(f'TBC webhook already processed for order: {merchant_payment_id}')
-                return Response({
-                    'status': 'success',
-                    'message': 'Payment already processed'
-                }, status=status.HTTP_200_OK)
+                # Idempotency, re-checked under the row lock.
+                if order.payment_status == 'paid' and order.paid_at:
+                    logger.info(f'TBC webhook already processed for order: {merchant_payment_id}')
+                    return Response({
+                        'status': 'success',
+                        'message': 'Payment already processed'
+                    }, status=status.HTTP_200_OK)
 
-            order.payment_status = 'paid'
-            order.paid_at = timezone.now()
-            order.status = 'confirmed'
-            order.confirmed_at = timezone.now()
-            order.payment_metadata.update({
-                'tbc_pay_id': pay_id,
-                'tbc_status': tbc_status,
-                'tbc_amount': amount_data,
-                'paid_at': timezone.now().isoformat(),
-            })
-            order.save()
+                if order.status == 'cancelled':
+                    logger.error(
+                        'TBC confirmed payment for CANCELLED order %s — manual reconciliation required',
+                        merchant_payment_id
+                    )
+                    return Response({
+                        'status': 'conflict',
+                        'message': 'Order was cancelled; manual reconciliation required'
+                    }, status=status.HTTP_200_OK)
+
+                order.payment_status = 'paid'
+                order.paid_at = timezone.now()
+                order.status = 'confirmed'
+                order.confirmed_at = timezone.now()
+                order.payment_metadata.update({
+                    'tbc_pay_id': pay_id,
+                    'tbc_status': tbc_status,
+                    'tbc_amount': amount_data,
+                    'paid_at': timezone.now().isoformat(),
+                })
+                order.save()
+
+                _schema = connection.schema_name
+                _order_id = order.id
+
+                def _dispatch_courier():
+                    from .tasks import book_quickshipper_courier
+                    try:
+                        book_quickshipper_courier.delay(_schema, _order_id)
+                    except Exception:
+                        logger.exception('Failed to queue courier booking for order %s', _order_id)
+
+                transaction.on_commit(_dispatch_courier)
 
             logger.info(f'TBC payment completed for order: {merchant_payment_id}')
-
-            # Book Quickshipper courier (no-op if not configured for tenant)
-            try:
-                from .tasks import book_quickshipper_courier
-                from django.db import connection as _db_conn
-                book_quickshipper_courier.delay(_db_conn.schema_name, order.id)
-            except Exception:
-                pass
-
             return Response({
                 'status': 'success',
                 'action': 'payment_completed',
                 'order_number': order.order_number,
             })
 
-        except Order.DoesNotExist:
-            logger.error(f'Order not found for TBC webhook: {merchant_payment_id}')
-            return Response({'error': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
             logger.error(f'Error processing TBC webhook: {e}')
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -2571,15 +2646,20 @@ def tbc_payment_webhook(request):
     # Handle failed payment
     elif tbc_status in ('failed', 'rejected', 'expired'):
         logger.warning(f'TBC payment failed: merchantPaymentId={merchant_payment_id}, status={tbc_status}')
+        from django.db import transaction
         try:
-            order = Order.objects.get(order_number=merchant_payment_id)
-            order.payment_status = 'failed'
-            order.payment_metadata.update({
-                'tbc_pay_id': pay_id,
-                'tbc_status': tbc_status,
-                'failed_at': timezone.now().isoformat(),
-            })
-            order.save()
+            with transaction.atomic():
+                order = Order.objects.select_for_update().get(order_number=merchant_payment_id)
+                if order.payment_status == 'paid':
+                    logger.warning('Ignoring failed TBC webhook for already-paid order %s', merchant_payment_id)
+                    return Response({'status': 'ignored', 'message': 'Order already paid'}, status=status.HTTP_200_OK)
+                order.payment_status = 'failed'
+                order.payment_metadata.update({
+                    'tbc_pay_id': pay_id,
+                    'tbc_status': tbc_status,
+                    'failed_at': timezone.now().isoformat(),
+                })
+                order.save(update_fields=['payment_status', 'payment_metadata', 'updated_at'])
         except Order.DoesNotExist:
             logger.error(f'Order not found for failed TBC payment: {merchant_payment_id}')
 
@@ -2636,69 +2716,87 @@ def flitt_payment_webhook(request):
         logger.error('Flitt webhook missing order_id')
         return Response({'error': 'Missing order_id'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Verify signature if possible
-    if received_signature:
-        try:
-            from tenants.payment_providers.flitt import FlittPaymentProvider
-            provider = FlittPaymentProvider()
-            body_bytes = request.body if hasattr(request, 'body') else b''
-            if not provider.verify_webhook({}, body_bytes):
-                logger.warning(f'Flitt webhook signature verification failed for order: {order_id}')
-                # Log but don't reject - some edge cases may have different signature format
-        except Exception as e:
-            logger.warning(f'Flitt signature verification error: {e}')
+    # Verify signature. Flitt signs every callback with an HMAC-SHA1 over the
+    # request params, so a genuine callback always carries a valid signature.
+    # Reject a missing or invalid one — that's what stops a forged "approved".
+    try:
+        from tenants.payment_providers.flitt import FlittPaymentProvider
+        provider = FlittPaymentProvider()
+        body_bytes = request.body if hasattr(request, 'body') else b''
+        signature_ok = bool(received_signature) and provider.verify_webhook({}, body_bytes)
+    except Exception as e:
+        logger.warning(f'Flitt signature verification error: {e}')
+        signature_ok = False
+
+    if not signature_ok:
+        logger.warning(f'Flitt webhook signature verification failed for order: {order_id}')
+        return Response({'error': 'Invalid signature'}, status=status.HTTP_403_FORBIDDEN)
 
     # Handle successful payment
     if order_status_value == 'approved':
+        from django.db import connection, transaction
         try:
-            order = Order.objects.get(order_number=order_id)
+            with transaction.atomic():
+                try:
+                    order = Order.objects.select_for_update().get(order_number=order_id)
+                except Order.DoesNotExist:
+                    logger.error(f'Order not found for Flitt webhook: {order_id}')
+                    return Response({'error': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
 
-            # Idempotency check
-            if order.payment_status == 'paid' and order.paid_at:
-                logger.info(f'Flitt webhook already processed for order: {order_id}')
-                return Response({
-                    'status': 'success',
-                    'message': 'Payment already processed'
-                }, status=status.HTTP_200_OK)
+                # Idempotency, re-checked under the row lock.
+                if order.payment_status == 'paid' and order.paid_at:
+                    logger.info(f'Flitt webhook already processed for order: {order_id}')
+                    return Response({
+                        'status': 'success',
+                        'message': 'Payment already processed'
+                    }, status=status.HTTP_200_OK)
 
-            order.payment_status = 'paid'
-            order.paid_at = timezone.now()
-            order.status = 'confirmed'
-            order.confirmed_at = timezone.now()
+                if order.status == 'cancelled':
+                    logger.error(
+                        'Flitt confirmed payment for CANCELLED order %s — manual reconciliation required',
+                        order_id
+                    )
+                    return Response({
+                        'status': 'conflict',
+                        'message': 'Order was cancelled; manual reconciliation required'
+                    }, status=status.HTTP_200_OK)
 
-            # Store Flitt-specific metadata
-            flitt_meta = {
-                'flitt_payment_id': payment_id,
-                'flitt_order_status': order_status_value,
-                'paid_at': timezone.now().isoformat(),
-            }
-            # Include rectoken if present (for recurring payments)
-            rectoken = data.get('rectoken')
-            if rectoken:
-                flitt_meta['flitt_rectoken'] = rectoken
+                order.payment_status = 'paid'
+                order.paid_at = timezone.now()
+                order.status = 'confirmed'
+                order.confirmed_at = timezone.now()
 
-            order.payment_metadata.update(flitt_meta)
-            order.save()
+                flitt_meta = {
+                    'flitt_payment_id': payment_id,
+                    'flitt_order_status': order_status_value,
+                    'paid_at': timezone.now().isoformat(),
+                }
+                rectoken = data.get('rectoken')
+                if rectoken:
+                    flitt_meta['flitt_rectoken'] = rectoken
+
+                order.payment_metadata.update(flitt_meta)
+                order.save()
+
+                _schema = connection.schema_name
+                _order_id = order.id
+
+                def _dispatch_courier():
+                    from .tasks import book_quickshipper_courier
+                    try:
+                        book_quickshipper_courier.delay(_schema, _order_id)
+                    except Exception:
+                        logger.exception('Failed to queue courier booking for order %s', _order_id)
+
+                transaction.on_commit(_dispatch_courier)
 
             logger.info(f'Flitt payment completed for order: {order_id}')
-
-            # Book Quickshipper courier (no-op if not configured for tenant)
-            try:
-                from .tasks import book_quickshipper_courier
-                from django.db import connection as _db_conn
-                book_quickshipper_courier.delay(_db_conn.schema_name, order.id)
-            except Exception:
-                pass
-
             return Response({
                 'status': 'success',
                 'action': 'payment_completed',
                 'order_number': order.order_number,
             })
 
-        except Order.DoesNotExist:
-            logger.error(f'Order not found for Flitt webhook: {order_id}')
-            return Response({'error': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
             logger.error(f'Error processing Flitt webhook: {e}')
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -2706,15 +2804,20 @@ def flitt_payment_webhook(request):
     # Handle failed/declined payment
     elif order_status_value in ('declined', 'expired', 'reversed'):
         logger.warning(f'Flitt payment failed: order_id={order_id}, status={order_status_value}')
+        from django.db import transaction
         try:
-            order = Order.objects.get(order_number=order_id)
-            order.payment_status = 'failed'
-            order.payment_metadata.update({
-                'flitt_payment_id': payment_id,
-                'flitt_order_status': order_status_value,
-                'failed_at': timezone.now().isoformat(),
-            })
-            order.save()
+            with transaction.atomic():
+                order = Order.objects.select_for_update().get(order_number=order_id)
+                if order.payment_status == 'paid':
+                    logger.warning('Ignoring failed Flitt webhook for already-paid order %s', order_id)
+                    return Response({'status': 'ignored', 'message': 'Order already paid'}, status=status.HTTP_200_OK)
+                order.payment_status = 'failed'
+                order.payment_metadata.update({
+                    'flitt_payment_id': payment_id,
+                    'flitt_order_status': order_status_value,
+                    'failed_at': timezone.now().isoformat(),
+                })
+                order.save(update_fields=['payment_status', 'payment_metadata', 'updated_at'])
         except Order.DoesNotExist:
             logger.error(f'Order not found for failed Flitt payment: {order_id}')
 

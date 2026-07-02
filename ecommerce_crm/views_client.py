@@ -978,39 +978,25 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
             response_data['message'] = 'Order will be paid on delivery'
             return Response(response_data, status=status.HTTP_201_CREATED)
 
-        # Get BOG credentials and configure service
+        # Build the BOG service with the tenant's own merchant credentials (or
+        # the platform's when the tenant hasn't set any). If the tenant HAS
+        # credentials configured but they can't be loaded, this raises rather
+        # than silently charging the customer into the platform's BOG account.
+        from .models import EcommerceSettings
+        from .payment_utils import get_tenant_bog_service, BogCredentialError
         try:
-            from .models import EcommerceSettings
-            from tenants.bog_payment import BOGPaymentService
-
-            ecommerce_settings = EcommerceSettings.objects.get(tenant=request.tenant)
-
-            if ecommerce_settings.has_bog_credentials:
-                # Tenant provided their own credentials
-                client_id = ecommerce_settings.bog_client_id
-                client_secret = ecommerce_settings.get_bog_secret()
-                auth_url = settings.BOG_AUTH_URL
-                api_base_url = settings.BOG_API_BASE_URL
-            else:
-                # Use credentials from environment variables
-                client_id = settings.BOG_CLIENT_ID
-                client_secret = settings.BOG_CLIENT_SECRET
-                auth_url = settings.BOG_AUTH_URL
-                api_base_url = settings.BOG_API_BASE_URL
-        except:
-            # Fallback to environment variables
-            client_id = settings.BOG_CLIENT_ID
-            client_secret = settings.BOG_CLIENT_SECRET
-            auth_url = settings.BOG_AUTH_URL
-            api_base_url = settings.BOG_API_BASE_URL
-
-        # Create BOG service instance with the appropriate credentials
-        from tenants.bog_payment import BOGPaymentService
-        bog_service_instance = BOGPaymentService()
-        bog_service_instance.client_id = client_id
-        bog_service_instance.client_secret = client_secret
-        bog_service_instance.auth_url = auth_url
-        bog_service_instance.base_url = api_base_url
+            bog_service_instance = get_tenant_bog_service(request.tenant)
+        except BogCredentialError:
+            import logging
+            logging.getLogger(__name__).exception(
+                'BOG credential error for tenant %s on order %s',
+                getattr(request.tenant, 'schema_name', request.tenant), order.order_number
+            )
+            order.cancel(reason='Payment configuration error')
+            return Response(
+                {'error': 'Payment is temporarily unavailable. Please try again later.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
 
         # Check if a card_id was provided in the request for charging
         card_id = request.data.get('card_id')
@@ -1117,23 +1103,21 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
             return Response(response_data, status=status.HTTP_201_CREATED)
 
         except Exception as e:
-            # If payment creation fails, return order without payment URL
+            # Payment initialization failed. The order and its stock reservation
+            # already exist, so cancel (restock) it and report the failure rather
+            # than returning 201 with a stranded, unpayable order that would hold
+            # inventory hostage.
             import logging
-            import requests
             logger = logging.getLogger(__name__)
-
-            # Try to get server's public IP for debugging
+            logger.exception('BOG payment init failed for order %s: %s', order.order_number, e)
             try:
-                server_ip = requests.get('https://api.ipify.org', timeout=5).text
-                logger.error(f'BOG payment failed. Server IP: {server_ip}. Error: {str(e)}')
-            except:
-                logger.error(f'BOG payment failed. Error: {str(e)}')
-
-            output_serializer = OrderSerializer(order)
-            response_data = output_serializer.data
-            response_data['payment_error'] = str(e)
-            response_data['message'] = 'Order created but payment initialization failed'
-            return Response(response_data, status=status.HTTP_201_CREATED)
+                order.cancel(reason='Payment initialization failed')
+            except Exception:
+                logger.exception('Failed to restock after payment-init failure for order %s', order.order_number)
+            return Response(
+                {'error': 'Payment could not be initialized. Please try again.', 'details': str(e)},
+                status=status.HTTP_402_PAYMENT_REQUIRED
+            )
 
     @extend_schema(
         tags=['Ecommerce Client - Orders'],
@@ -1151,17 +1135,9 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        from django.db import transaction
-
-        with transaction.atomic():
-            # Restore stock for inventory-tracked products
-            for item in order.items.select_related('product'):
-                if item.product.track_inventory:
-                    item.product.quantity += item.quantity
-                    item.product.save(update_fields=['quantity'])
-
-            order.status = 'cancelled'
-            order.save(update_fields=['status'])
+        # Order.cancel restocks atomically (F() update) and releases the promo
+        # use, under a row lock so it can't race the abandoned-order sweeper.
+        order.cancel(reason=request.data.get('reason', 'Cancelled by customer'))
 
         serializer = OrderSerializer(order)
         return Response(serializer.data)

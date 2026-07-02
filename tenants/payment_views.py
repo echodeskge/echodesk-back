@@ -407,25 +407,52 @@ def bog_webhook(request):
                 logger.error('Missing external_order_id in webhook payload')
                 return Response({'error': 'Invalid payload'}, status=status.HTTP_400_BAD_REQUEST)
 
+            if not bog_order_id:
+                logger.error('Missing BOG order_id in webhook payload')
+                return Response({'error': 'Invalid payload'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # SECURITY: don't trust the webhook body — confirm with BOG directly
+            # before provisioning a paid subscription. A forged "completed" POST
+            # will not survive this check.
             try:
-                payment_order = PaymentOrder.objects.get(order_id=external_order_id)
-            except PaymentOrder.DoesNotExist:
-                logger.error(f'Payment order not found: {external_order_id}')
-                return Response({'error': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
+                confirmation = bog_service.check_payment_status(bog_order_id)
+            except Exception:
+                logger.exception('BOG status re-query failed for %s', bog_order_id)
+                return Response({'error': 'verification_unavailable'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-            # Check if already processed (idempotency - handle duplicate webhooks)
-            if payment_order.status == 'paid' and payment_order.tenant is not None:
-                logger.info(f'Webhook already processed for order: {external_order_id}, returning success')
-                return Response({
-                    'status': 'success',
-                    'message': 'Payment already processed'
-                }, status=status.HTTP_200_OK)
+            if confirmation.get('status') in ('error', 'unknown'):
+                logger.warning('BOG status inconclusive for %s: %s', bog_order_id, confirmation.get('error'))
+                return Response({'error': 'verification_unavailable'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-            # Update payment order status
-            payment_order.status = 'paid'
-            payment_order.paid_at = timezone.now()
-            payment_order.bog_order_id = bog_order_id  # Save BOG's order ID
-            payment_order.save()
+            if not (confirmation.get('bog_status') == 'completed' and str(confirmation.get('response_code')) == '100'):
+                logger.warning(
+                    'BOG did NOT confirm payment for %s (bog_status=%s) — ignoring webhook',
+                    bog_order_id, confirmation.get('bog_status')
+                )
+                return Response({'status': 'ignored', 'message': 'Payment not confirmed by BOG'}, status=status.HTTP_200_OK)
+
+            # Lock the payment order and re-check idempotency under the lock so
+            # concurrent duplicate callbacks can't both mark it paid.
+            with transaction.atomic():
+                try:
+                    payment_order = PaymentOrder.objects.select_for_update().get(order_id=external_order_id)
+                except PaymentOrder.DoesNotExist:
+                    logger.error(f'Payment order not found: {external_order_id}')
+                    return Response({'error': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
+
+                # Check if already processed (idempotency - handle duplicate webhooks)
+                if payment_order.status == 'paid' and payment_order.tenant is not None:
+                    logger.info(f'Webhook already processed for order: {external_order_id}, returning success')
+                    return Response({
+                        'status': 'success',
+                        'message': 'Payment already processed'
+                    }, status=status.HTTP_200_OK)
+
+                # Update payment order status
+                payment_order.status = 'paid'
+                payment_order.paid_at = timezone.now()
+                payment_order.bog_order_id = bog_order_id  # Save BOG's order ID
+                payment_order.save()
 
             # Determine if this is a retry attempt
             is_retry_payment = external_order_id.startswith('RETRY-')

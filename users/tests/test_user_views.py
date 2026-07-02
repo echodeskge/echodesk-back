@@ -76,9 +76,8 @@ class TestUserCreate(EchoDeskTenantTestCase):
         self.admin = self.create_admin()
         self.agent = self.create_user(email='agent1@test.com')
 
-    @patch('users.views.email_service')
+    @patch('users.views.send_user_invitation_email_task')
     def test_create_user_as_admin(self, mock_email):
-        mock_email.send_user_invitation_email.return_value = True
         resp = self.api_post(USERS_URL, {
             'email': 'newuser@test.com',
             'first_name': 'New',
@@ -88,7 +87,7 @@ class TestUserCreate(EchoDeskTenantTestCase):
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
         self.assertTrue(User.objects.filter(email='newuser@test.com').exists())
 
-    @patch('users.views.email_service')
+    @patch('users.views.send_user_invitation_email_task')
     def test_create_user_as_agent_denied(self, mock_email):
         """BUG 1 regression: permission check uses 'manage_users' not 'can_manage_users'."""
         resp = self.api_post(USERS_URL, {
@@ -98,9 +97,8 @@ class TestUserCreate(EchoDeskTenantTestCase):
         }, user=self.agent)
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
 
-    @patch('users.views.email_service')
+    @patch('users.views.send_user_invitation_email_task')
     def test_create_user_generates_temp_password(self, mock_email):
-        mock_email.send_user_invitation_email.return_value = True
         resp = self.api_post(USERS_URL, {
             'email': 'temppass@test.com',
             'role': 'agent',
@@ -110,9 +108,8 @@ class TestUserCreate(EchoDeskTenantTestCase):
         self.assertIsNotNone(user.temporary_password)
         self.assertTrue(len(user.temporary_password) >= 12)
 
-    @patch('users.views.email_service')
+    @patch('users.views.send_user_invitation_email_task')
     def test_create_user_sets_password_change_required(self, mock_email):
-        mock_email.send_user_invitation_email.return_value = True
         resp = self.api_post(USERS_URL, {
             'email': 'pcrequired@test.com',
             'role': 'agent',
@@ -192,9 +189,8 @@ class TestUserUpdate(EchoDeskTenantTestCase):
         self.assertEqual(self.agent.role, 'agent')  # not escalated
         self.assertTrue(self.agent.is_active)  # not deactivated
 
-    @patch('users.views.email_service')
+    @patch('users.views.send_new_password_email_task')
     def test_admin_can_change_email(self, mock_email):
-        mock_email.send_new_password_email.return_value = True
         resp = self.api_patch(
             detail_url(self.agent.id),
             {'email': 'newaddr@test.com'},
@@ -204,9 +200,8 @@ class TestUserUpdate(EchoDeskTenantTestCase):
         self.agent.refresh_from_db()
         self.assertEqual(self.agent.email, 'newaddr@test.com')
 
-    @patch('users.views.email_service')
+    @patch('users.views.send_new_password_email_task')
     def test_email_change_resets_password_and_emails_new_address(self, mock_email):
-        mock_email.send_new_password_email.return_value = True
         old_hash = self.agent.password
 
         resp = self.api_patch(
@@ -221,13 +216,13 @@ class TestUserUpdate(EchoDeskTenantTestCase):
         self.assertNotEqual(self.agent.password, old_hash)
         self.assertTrue(self.agent.password_change_required)
         # The new credentials are emailed to the NEW address.
-        mock_email.send_new_password_email.assert_called_once()
+        mock_email.delay.assert_called_once()
         self.assertEqual(
-            mock_email.send_new_password_email.call_args.kwargs['user_email'],
+            mock_email.delay.call_args.kwargs['user_email'],
             'moved@test.com',
         )
 
-    @patch('users.views.email_service')
+    @patch('users.views.send_new_password_email_task')
     def test_non_email_update_does_not_reset_password(self, mock_email):
         old_hash = self.agent.password
         resp = self.api_patch(
@@ -238,7 +233,7 @@ class TestUserUpdate(EchoDeskTenantTestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.agent.refresh_from_db()
         self.assertEqual(self.agent.password, old_hash)
-        mock_email.send_new_password_email.assert_not_called()
+        mock_email.delay.assert_not_called()
 
     def test_duplicate_email_rejected(self):
         resp = self.api_patch(
@@ -266,7 +261,7 @@ class TestUserUpdate(EchoDeskTenantTestCase):
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
-    @patch('users.views.email_service')
+    @patch('users.views.send_new_password_email_task')
     def test_self_update_cannot_change_email(self, mock_email):
         original = self.agent.email
         resp = self.api_patch(
@@ -277,7 +272,7 @@ class TestUserUpdate(EchoDeskTenantTestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.agent.refresh_from_db()
         self.assertEqual(self.agent.email, original)  # email change stripped
-        mock_email.send_new_password_email.assert_not_called()
+        mock_email.delay.assert_not_called()
 
 
 class TestUserDelete(EchoDeskTenantTestCase):
@@ -430,9 +425,8 @@ class TestSendNewPassword(EchoDeskTenantTestCase):
         self.admin = self.create_admin()
         self.agent = self.create_user(email='snpagent@test.com')
 
-    @patch('users.views.email_service')
+    @patch('users.views.send_new_password_email_task')
     def test_send_new_password_as_admin(self, mock_email):
-        mock_email.send_new_password_email.return_value = True
         resp = self.api_post(
             f'{detail_url(self.agent.id)}send_new_password/',
             {},
@@ -442,7 +436,7 @@ class TestSendNewPassword(EchoDeskTenantTestCase):
         self.agent.refresh_from_db()
         self.assertTrue(self.agent.password_change_required)
 
-    @patch('users.views.email_service')
+    @patch('users.views.send_new_password_email_task')
     def test_send_new_password_as_agent_denied(self, mock_email):
         resp = self.api_post(
             f'{detail_url(self.admin.id)}send_new_password/',

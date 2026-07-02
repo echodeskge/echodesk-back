@@ -525,8 +525,7 @@ class Invoice(models.Model):
 
     def generate_invoice_number(self):
         """Generate a unique invoice number"""
-        from datetime import datetime
-        date_str = datetime.now().strftime('%Y%m')
+        date_str = timezone.now().strftime('%Y%m')
         # Find the last invoice for this month
         last_invoice = Invoice.objects.filter(
             invoice_number__startswith=f'INV-{date_str}'
@@ -545,10 +544,29 @@ class Invoice(models.Model):
         return f'INV-{date_str}-{new_seq:04d}'
 
     def save(self, *args, **kwargs):
-        # Auto-generate invoice number if not set
-        if not self.invoice_number:
+        # If a number is already set, save normally.
+        if self.invoice_number:
+            return super().save(*args, **kwargs)
+
+        # Auto-generate a unique invoice number. There is no settings singleton
+        # to lock on for this public-schema invoice, and locking the matching
+        # rows can't serialize the first-of-month insert (empty set). So instead
+        # retry on the unique-constraint collision: each attempt regenerates from
+        # the current max, so a loser simply picks the next free number. Each
+        # attempt is its own savepoint so a collision doesn't poison an
+        # enclosing transaction (e.g. the payment webhook's atomic block).
+        from django.db import IntegrityError, transaction
+        last_error = None
+        for _ in range(5):
             self.invoice_number = self.generate_invoice_number()
-        super().save(*args, **kwargs)
+            try:
+                with transaction.atomic():
+                    return super().save(*args, **kwargs)
+            except IntegrityError as exc:
+                last_error = exc
+                self.invoice_number = None
+                continue
+        raise last_error
 
 
 class PendingRegistration(models.Model):

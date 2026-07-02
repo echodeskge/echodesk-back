@@ -501,3 +501,46 @@ class TestOrderModelProperties(OrderTestMixin, EchoDeskTenantTestCase):
         valid = [choice[0] for choice in Order.PAYMENT_STATUS_CHOICES]
         expected = ['pending', 'paid', 'failed', 'refunded', 'partially_refunded']
         self.assertEqual(valid, expected)
+
+
+# ============================================================================
+# Order.cancel() — inventory restore + idempotency
+# ============================================================================
+
+class TestOrderCancelMethod(OrderTestMixin, EchoDeskTenantTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='cancel-order-admin@test.com')
+
+    def test_cancel_restores_stock_and_sets_status(self):
+        product = self._make_product('CANCEL-PROD-001', quantity=100, track_inventory=True)
+        order = self._make_order_with_items(product=product, status='pending')
+        # Simulate the checkout stock decrement (2 units ordered).
+        product.quantity -= 2
+        product.save(update_fields=['quantity'])
+        self.assertEqual(product.quantity, 98)
+
+        self.assertTrue(order.cancel(reason='test'))
+
+        order.refresh_from_db()
+        product.refresh_from_db()
+        self.assertEqual(order.status, 'cancelled')
+        self.assertIsNotNone(order.cancelled_at)
+        self.assertEqual(product.quantity, 100)  # stock restored
+
+    def test_cancel_is_idempotent(self):
+        """A second cancel must not restock again (double-refund of inventory)."""
+        product = self._make_product('CANCEL-PROD-002', quantity=100, track_inventory=True)
+        order = self._make_order_with_items(product=product, status='pending')
+        product.quantity -= 2
+        product.save(update_fields=['quantity'])
+
+        self.assertTrue(order.cancel())
+        product.refresh_from_db()
+        self.assertEqual(product.quantity, 100)
+
+        # Second call is a no-op and must NOT push stock to 102.
+        self.assertFalse(order.cancel())
+        product.refresh_from_db()
+        self.assertEqual(product.quantity, 100)

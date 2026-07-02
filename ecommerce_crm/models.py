@@ -961,6 +961,54 @@ class Order(models.Model):
             self.public_token = _secrets.token_urlsafe(32)
         super().save(*args, **kwargs)
 
+    def cancel(self, reason='', restock=True):
+        """Cancel this order, restoring inventory and releasing the promo use.
+
+        Idempotent and concurrency-safe: takes a row lock and re-checks status
+        so a double cancel (or a cancel racing the abandoned-order sweeper) can't
+        restock twice. Stock is restored with an atomic ``F()`` update so it can't
+        lose a concurrent checkout decrement. Returns True if it cancelled, False
+        if the order was already cancelled.
+        """
+        from django.db import transaction
+        from django.db.models import F
+        from django.utils import timezone
+
+        if self.status == 'cancelled':
+            return False
+
+        with transaction.atomic():
+            order = Order.objects.select_for_update().get(pk=self.pk)
+            if order.status == 'cancelled':
+                return False
+
+            if restock:
+                for item in order.items.select_related('product'):
+                    product = item.product
+                    if product and product.track_inventory:
+                        Product.objects.filter(pk=product.pk).update(
+                            quantity=F('quantity') + item.quantity
+                        )
+                # Free the promo usage this order had consumed.
+                if order.promo_code_id:
+                    PromoCode.objects.filter(
+                        pk=order.promo_code_id, times_used__gt=0
+                    ).update(times_used=F('times_used') - 1)
+
+            order.status = 'cancelled'
+            order.cancelled_at = timezone.now()
+            if reason:
+                note = f"[cancelled] {reason}"
+                order.admin_notes = f"{order.admin_notes}\n{note}".strip() if order.admin_notes else note
+            order.save(update_fields=['status', 'cancelled_at', 'admin_notes', 'updated_at'])
+
+            # Keep the in-memory instance consistent for the caller.
+            self.status = order.status
+            self.cancelled_at = order.cancelled_at
+            self.admin_notes = order.admin_notes
+
+        return True
+
 
 class OrderItem(models.Model):
     """

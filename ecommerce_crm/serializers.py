@@ -160,13 +160,34 @@ def _merged_product_images(obj):
             'sort_order': idx,
             'created_at': obj.updated_at,
         })
-    rows = obj.images.all().order_by('sort_order', 'id')
+    # Sort in Python so a prefetched `images` cache is reused. Calling
+    # .order_by() on the related manager would clone the queryset and force a
+    # fresh per-product query, defeating the prefetch.
+    rows = sorted(obj.images.all(), key=lambda r: (r.sort_order, r.id))
     for row in rows:
         if row.image in seen:
             continue
         seen.add(row.image)
         out.append(ProductImageSerializer(row).data)
     return out
+
+
+def _annotated_average_rating(obj):
+    """Read the ``_avg_rating`` annotation set by ProductViewSet.get_queryset,
+    falling back to a query when the object wasn't loaded through it."""
+    if hasattr(obj, '_avg_rating'):
+        avg = obj._avg_rating
+    else:
+        from django.db.models import Avg
+        avg = obj.reviews.filter(is_approved=True).aggregate(avg=Avg('rating'))['avg']
+    return round(avg, 1) if avg else None
+
+
+def _annotated_review_count(obj):
+    """Read the ``_review_count`` annotation, falling back to a COUNT query."""
+    if hasattr(obj, '_review_count'):
+        return obj._review_count or 0
+    return obj.reviews.filter(is_approved=True).count()
 
 
 class ProductListSerializer(serializers.ModelSerializer):
@@ -202,12 +223,10 @@ class ProductListSerializer(serializers.ModelSerializer):
         return _merged_product_images(obj)
 
     def get_average_rating(self, obj):
-        from django.db.models import Avg
-        result = obj.reviews.filter(is_approved=True).aggregate(avg=Avg('rating'))
-        return round(result['avg'], 1) if result['avg'] else None
+        return _annotated_average_rating(obj)
 
     def get_review_count(self, obj):
-        return obj.reviews.filter(is_approved=True).count()
+        return _annotated_review_count(obj)
 
 
 class ProductDetailSerializer(serializers.ModelSerializer):
@@ -256,12 +275,10 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         return None
 
     def get_average_rating(self, obj):
-        from django.db.models import Avg
-        result = obj.reviews.filter(is_approved=True).aggregate(avg=Avg('rating'))
-        return round(result['avg'], 1) if result['avg'] else None
+        return _annotated_average_rating(obj)
 
     def get_review_count(self, obj):
-        return obj.reviews.filter(is_approved=True).count()
+        return _annotated_review_count(obj)
 
 
 class ProductCreateUpdateSerializer(serializers.ModelSerializer):
@@ -738,7 +755,10 @@ class OrderListSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'order_number', 'created_at']
 
     def get_total_items(self, obj):
-        return obj.items.count()
+        # Reads the annotation from OrderViewSet.get_queryset (list action);
+        # falls back to a COUNT for other callers.
+        count = getattr(obj, '_items_count', None)
+        return count if count is not None else obj.items.count()
 
 
 class ShippingMethodSerializer(serializers.ModelSerializer):
@@ -1249,10 +1269,16 @@ class OrderCreateSerializer(serializers.Serializer):
                     price=cart_item.price_at_add
                 )
 
-            # Increment promo code usage
+            # Increment promo code usage atomically, re-checking the cap under a
+            # row lock so concurrent checkouts can't push a limited promo past
+            # max_uses (the earlier validation is outside this transaction).
             if promo and discount_amount > 0:
-                promo.times_used += 1
-                promo.save(update_fields=['times_used'])
+                from django.db.models import F
+                locked_promo = PromoCode.objects.select_for_update().get(pk=promo.pk)
+                if locked_promo.max_uses is not None and locked_promo.times_used >= locked_promo.max_uses:
+                    raise serializers.ValidationError('This promo code has reached its usage limit.')
+                locked_promo.times_used = F('times_used') + 1
+                locked_promo.save(update_fields=['times_used'])
 
             # Mark cart as converted
             cart.status = 'converted'

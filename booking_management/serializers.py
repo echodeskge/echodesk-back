@@ -157,12 +157,17 @@ class ServiceCategorySerializer(serializers.ModelSerializer):
 
 class UserMinimalSerializer(serializers.ModelSerializer):
     """Minimal User serializer for staff display"""
-    full_name = serializers.ReadOnlyField()
+    # The User model exposes get_full_name(), not a `full_name` attribute, so a
+    # bare ReadOnlyField() silently drops the field. Point it at the method.
+    full_name = serializers.CharField(source='get_full_name', read_only=True)
 
     class Meta:
         model = User
         fields = ['id', 'email', 'first_name', 'last_name', 'full_name']
         read_only_fields = fields
+        # Distinct component name so drf-spectacular doesn't collide this with
+        # tickets.serializers.UserMinimalSerializer (different field set).
+        ref_name = 'BookingUserMinimal'
 
 
 class ServiceMinimalSerializer(serializers.ModelSerializer):

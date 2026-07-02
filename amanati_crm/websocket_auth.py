@@ -1,21 +1,14 @@
 """
 WebSocket Authentication Middleware for Django Channels
-Supports both JWT and Django Token authentication
+
+Authenticates connections with per-tenant DRF opaque tokens. SimpleJWT access
+tokens are deliberately NOT accepted here — see get_user_from_token for why.
 """
 from channels.db import database_sync_to_async
 from channels.middleware import BaseMiddleware
 from django.contrib.auth.models import AnonymousUser
 from urllib.parse import parse_qs
-from users.models import User
 from tenant_schemas.utils import schema_context
-
-# Try to import JWT support
-try:
-    from rest_framework_simplejwt.tokens import AccessToken
-    from rest_framework_simplejwt.exceptions import TokenError
-    JWT_AVAILABLE = True
-except ImportError:
-    JWT_AVAILABLE = False
 
 # Try to import Django Token authentication
 try:
@@ -38,21 +31,19 @@ def get_user_from_token(token_string, tenant_schema=None):
         print(f"[WebSocket Auth] No tenant schema provided")
         return AnonymousUser()
 
-    # Query within tenant schema context
+    # Query within tenant schema context.
+    #
+    # NOTE: dashboard clients authenticate with DRF opaque tokens, whose
+    # `authtoken_token` table is per-schema (authtoken is in TENANT_APPS), so the
+    # lookup below is genuinely scoped to this tenant. We intentionally do NOT
+    # accept SimpleJWT access tokens here: those are signed with the shared
+    # SECRET_KEY and carry only a `user_id` claim, which — because tenant user PKs
+    # are per-schema autoincrement — would let a token minted for user N in tenant
+    # A authenticate as the unrelated user N in tenant B. There is no tenant claim
+    # to bind against, and nothing in the dashboard mints such tokens, so the JWT
+    # path is removed rather than "fixed". (Client portals mint their own JWTs with
+    # a `client_id` claim; those are validated elsewhere, not here.)
     with schema_context(tenant_schema):
-        # Try JWT first if available
-        if JWT_AVAILABLE:
-            try:
-                token = AccessToken(token_string)
-                user_id = token.payload.get('user_id')
-                if user_id:
-                    user = User.objects.get(id=user_id)
-                    print(f"[WebSocket Auth] JWT authentication successful for user: {user.email}")
-                    return user
-            except (TokenError, User.DoesNotExist, Exception) as e:
-                print(f"[WebSocket Auth] JWT validation failed: {e}")
-
-        # Try Django Token authentication if available
         if DJANGO_TOKEN_AVAILABLE:
             try:
                 token_obj = DjangoToken.objects.select_related('user').get(key=token_string)
