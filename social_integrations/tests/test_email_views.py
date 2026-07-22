@@ -207,6 +207,67 @@ class TestEmailMessageViewSet(SocialIntegrationTestCase):
         results = data.get('results', data)
         self.assertGreaterEqual(len(results), 3)
 
+    def test_has_business_reply_true_when_thread_answered(self):
+        """A customer message whose thread has a business-sent message is
+        flagged has_business_reply=True (answered from EchoDesk or synced
+        from the external client's Sent folder)."""
+        conn = self.create_email_connection()
+        customer_msg = self.create_email_message(
+            connection=conn,
+            thread_id='thread_answered',
+            folder='INBOX',
+            is_from_business=False,
+        )
+        self.create_email_message(
+            connection=conn,
+            thread_id='thread_answered',
+            folder='Sent',
+            from_email=conn.email_address,
+            is_from_business=True,
+        )
+        resp = self.api_get(f'{self.url}?folder=INBOX', user=self.agent)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        results = resp.json()['results']
+        row = next(r for r in results if r['id'] == customer_msg.id)
+        self.assertTrue(row['has_business_reply'])
+
+    def test_has_business_reply_false_when_unanswered(self):
+        conn = self.create_email_connection()
+        msg = self.create_email_message(
+            connection=conn,
+            thread_id='thread_unanswered',
+            folder='INBOX',
+            is_from_business=False,
+        )
+        resp = self.api_get(self.url, user=self.agent)
+        results = resp.json()['results']
+        row = next(r for r in results if r['id'] == msg.id)
+        self.assertFalse(row['has_business_reply'])
+
+    def test_has_business_reply_ignores_other_threads_and_connections(self):
+        conn = self.create_email_connection()
+        other_conn = self.create_email_connection()
+        msg = self.create_email_message(
+            connection=conn,
+            thread_id='thread_x',
+            folder='INBOX',
+            is_from_business=False,
+        )
+        # Business reply in a DIFFERENT thread on the same connection
+        self.create_email_message(
+            connection=conn, thread_id='thread_y', folder='Sent',
+            is_from_business=True,
+        )
+        # Business reply in the SAME thread id but a different connection
+        self.create_email_message(
+            connection=other_conn, thread_id='thread_x', folder='Sent',
+            is_from_business=True,
+        )
+        resp = self.api_get(f'{self.url}?connection_id={conn.id}', user=self.agent)
+        results = resp.json()['results']
+        row = next(r for r in results if r['id'] == msg.id)
+        self.assertFalse(row['has_business_reply'])
+
     def test_filter_by_folder(self):
         """folder query param filters messages by IMAP folder."""
         conn = self.create_email_connection()

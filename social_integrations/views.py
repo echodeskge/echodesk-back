@@ -9,7 +9,7 @@ from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from tenant_schemas.utils import schema_context
 from django.db import IntegrityError, ProgrammingError
-from django.db.models import F, Q, Max, Count, Subquery, OuterRef, Case, When, Value, CharField
+from django.db.models import F, Q, Max, Count, Subquery, OuterRef, Case, When, Value, CharField, Exists
 from django.http import JsonResponse, HttpResponse
 from django.utils import timezone
 from django.shortcuts import redirect
@@ -9994,7 +9994,20 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         queryset = EmailMessage.objects.filter(
             is_deleted=False
-        ).select_related('connection', 'deleted_by').order_by('-timestamp')
+        ).select_related('connection', 'deleted_by').annotate(
+            # True if the business has sent at least one message in this
+            # thread — from EchoDesk (stored on send) or from an external
+            # email client (imported via Sent-folder sync). Backed by the
+            # (connection, thread_id) index.
+            has_business_reply=Exists(
+                EmailMessage.objects.filter(
+                    connection=OuterRef('connection'),
+                    thread_id=OuterRef('thread_id'),
+                    is_from_business=True,
+                    is_deleted=False,
+                )
+            )
+        ).order_by('-timestamp')
 
         # Filter by connection_id (specific email account)
         connection_id = self.request.query_params.get('connection_id')

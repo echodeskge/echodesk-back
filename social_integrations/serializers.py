@@ -650,6 +650,12 @@ class EmailMessageSerializer(serializers.ModelSerializer):
     connection_id = serializers.IntegerField(source='connection.id', read_only=True)
     connection_email = serializers.EmailField(source='connection.email_address', read_only=True)
     connection_display_name = serializers.CharField(source='connection.display_name', read_only=True)
+    # Annotated by EmailMessageViewSet.get_queryset; defaults False when the
+    # instance comes from a non-annotated queryset (e.g. single-message paths).
+    has_business_reply = serializers.SerializerMethodField()
+
+    def get_has_business_reply(self, obj) -> bool:
+        return bool(getattr(obj, 'has_business_reply', False))
 
     class Meta:
         model = EmailMessage
@@ -659,6 +665,7 @@ class EmailMessageSerializer(serializers.ModelSerializer):
             'subject', 'body_text', 'body_html', 'attachments',
             'timestamp', 'folder', 'uid',
             'is_from_business', 'is_read', 'is_starred', 'is_answered', 'is_draft', 'labels',
+            'has_business_reply',
             'is_read_by_staff', 'read_by_staff_at',
             'is_deleted', 'deleted_at',
             'connection_id', 'connection_email', 'connection_display_name',

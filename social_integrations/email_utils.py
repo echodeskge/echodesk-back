@@ -1162,10 +1162,21 @@ def sync_imap_messages(connection, max_messages: int = 500) -> int:
                             raw_folder_name = parts[-2]  # Keep raw for IMAP operations
                             display_folder_name = decode_imap_utf7(raw_folder_name) or raw_folder_name  # Decode for display/DB
                             all_folders.append(display_folder_name)
-                            # Skip Drafts, All Mail, Trash, Sent, and Spam
-                            skip_folders = ['Drafts', '[Gmail]/Drafts', '[Gmail]/All Mail', 'Trash', '[Gmail]/Trash', 'Deleted', 'Deleted Items', 'Deleted Messages', 'Sent', '[Gmail]/Sent Mail', 'Sent Items', 'Sent Messages', 'Spam', '[Gmail]/Spam', 'Junk', 'Junk E-mail']
+                            # Skip Drafts, All Mail, Trash, and Spam. Sent IS synced
+                            # (normalized to the 'Sent' DB folder) so replies the
+                            # business sends from an external email client are
+                            # detectable — EchoDesk-sent mail auto-saved to the
+                            # server's Sent folder dedupes on the unique
+                            # message_id, since send_email_smtp stores the real
+                            # Message-ID header.
+                            skip_folders = ['Drafts', '[Gmail]/Drafts', '[Gmail]/All Mail', 'Trash', '[Gmail]/Trash', 'Deleted', 'Deleted Items', 'Deleted Messages', 'Spam', '[Gmail]/Spam', 'Junk', 'Junk E-mail']
+                            sent_folders = ['Sent', '[Gmail]/Sent Mail', 'Sent Items', 'Sent Messages']
                             if any(skip.lower() == display_folder_name.lower() for skip in skip_folders):
                                 skipped_folders.append(display_folder_name)
+                            elif any(sent.lower() == display_folder_name.lower() for sent in sent_folders):
+                                # Normalize provider-specific sent folder names so
+                                # all business-sent mail lives in folder='Sent'.
+                                folders_to_sync.append((raw_folder_name, 'Sent'))
                             else:
                                 # Store tuple of (raw_name, display_name)
                                 folders_to_sync.append((raw_folder_name, display_folder_name))
