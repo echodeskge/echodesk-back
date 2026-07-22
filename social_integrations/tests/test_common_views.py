@@ -190,6 +190,35 @@ class TestSocialSettings(SocialIntegrationTestCase):
         resp = self.api_put(self.url, {'refresh_interval': 3000}, user=self.agent)
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_stale_reminder_defaults(self):
+        resp = self.api_get(self.url, user=self.agent)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = resp.json()
+        self.assertFalse(data['stale_assignment_reminder_enabled'])
+        self.assertEqual(data['stale_assignment_reminder_minutes'], 60)
+
+    def test_stale_reminder_roundtrip_admin(self):
+        resp = self.api_patch(self.url, {
+            'stale_assignment_reminder_enabled': True,
+            'stale_assignment_reminder_minutes': 45,
+        }, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = self.api_get(self.url, user=self.agent).json()
+        self.assertTrue(data['stale_assignment_reminder_enabled'])
+        self.assertEqual(data['stale_assignment_reminder_minutes'], 45)
+
+    def test_stale_reminder_agent_write_denied(self):
+        resp = self.api_patch(
+            self.url, {'stale_assignment_reminder_enabled': True}, user=self.agent
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_stale_reminder_minutes_rejects_invalid(self):
+        resp = self.api_patch(
+            self.url, {'stale_assignment_reminder_minutes': 0}, user=self.admin
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
 
 class TestUnifiedConversations(SocialIntegrationTestCase):
 
@@ -205,6 +234,38 @@ class TestUnifiedConversations(SocialIntegrationTestCase):
     def test_unauthenticated_denied(self):
         resp = self.client.get(self.url, HTTP_HOST='tenant.test.com')
         self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_assigned_true_scoped_to_current_user(self):
+        from social_integrations.models import ChatAssignment
+
+        user_a = self.create_user(email='assigned-a@test.com')
+        user_b = self.create_user(email='assigned-b@test.com')
+        conn = self.create_fb_connection()
+        self.create_fb_message(page_connection=conn, sender_id='cust_a')
+        self.create_fb_message(page_connection=conn, sender_id='cust_b')
+        self.create_fb_message(page_connection=conn, sender_id='cust_c')
+        ChatAssignment.objects.create(
+            platform='facebook', conversation_id='cust_a', account_id=conn.page_id,
+            assigned_user=user_a, status='in_session',
+        )
+        ChatAssignment.objects.create(
+            platform='facebook', conversation_id='cust_b', account_id=conn.page_id,
+            assigned_user=user_b, status='active',
+        )
+        # Completed assignments must not appear in the assigned list.
+        ChatAssignment.objects.create(
+            platform='facebook', conversation_id='cust_c', account_id=conn.page_id,
+            assigned_user=user_a, status='completed',
+        )
+
+        resp = self.api_get(f'{self.url}?assigned=true', user=user_a)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        ids_a = {r['conversation_id'] for r in resp.json()['results']}
+        self.assertEqual(ids_a, {f'fb_{conn.page_id}_cust_a'})
+
+        resp_b = self.api_get(f'{self.url}?assigned=true', user=user_b)
+        ids_b = {r['conversation_id'] for r in resp_b.json()['results']}
+        self.assertEqual(ids_b, {f'fb_{conn.page_id}_cust_b'})
 
 
 class TestChatAssignmentViews(SocialIntegrationTestCase):

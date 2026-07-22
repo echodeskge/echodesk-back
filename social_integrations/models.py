@@ -776,6 +776,17 @@ class SocialIntegrationSettings(models.Model):
         help_text="When enabled, customers will be asked to rate the session after it ends."
     )
 
+    # Stale assignment reminders
+    stale_assignment_reminder_enabled = models.BooleanField(
+        default=False,
+        help_text="When enabled, agents get a popup reminder about assigned chats with no recent activity."
+    )
+    stale_assignment_reminder_minutes = models.PositiveIntegerField(
+        default=60,
+        validators=[MinValueValidator(5), MaxValueValidator(10080)],
+        help_text="Minutes of inactivity before an assigned chat is considered stale (5–10080)."
+    )
+
     # Link-based rating settings
     link_based_rating_enabled = models.BooleanField(
         default=False,

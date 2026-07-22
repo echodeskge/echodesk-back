@@ -426,6 +426,9 @@ class SocialIntegrationSettingsSerializer(serializers.ModelSerializer):
             'id', 'refresh_interval',
             'chat_assignment_enabled', 'session_management_enabled',
             'hide_assigned_chats', 'collect_customer_rating',
+            # Stale assignment reminders
+            'stale_assignment_reminder_enabled',
+            'stale_assignment_reminder_minutes',
             # Link-based rating settings
             'link_based_rating_enabled',
             'rating_request_message_template_ka',
