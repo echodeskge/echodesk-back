@@ -237,6 +237,40 @@ class TestChatAssignmentViews(SocialIntegrationTestCase):
         resp = self.api_get('/api/social/assignments/status/', user=self.agent)
         self.assertNotEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_get_assignment_status_includes_archive_state(self):
+        from social_integrations.models import ConversationArchive
+        ConversationArchive.objects.create(
+            platform='facebook',
+            conversation_id='sender_1',
+            account_id='page_1',
+            archived_by=self.agent,
+        )
+        resp = self.api_get(
+            '/api/social/assignments/status/'
+            '?platform=facebook&conversation_id=sender_1&account_id=page_1',
+            user=self.agent,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = resp.json()
+        self.assertTrue(data['is_archived'])
+        self.assertIsNotNone(data['archived_at'])
+        self.assertEqual(data['archived_by_id'], self.agent.id)
+        # Backward-compat: original keys still present
+        self.assertIn('assignment', data)
+        self.assertIn('settings', data)
+
+    def test_get_assignment_status_not_archived(self):
+        resp = self.api_get(
+            '/api/social/assignments/status/'
+            '?platform=facebook&conversation_id=sender_2&account_id=page_1',
+            user=self.agent,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = resp.json()
+        self.assertFalse(data['is_archived'])
+        self.assertIsNone(data['archived_at'])
+        self.assertIsNone(data['archived_by_id'])
+
 
 class TestWebhookDebugViews(SocialIntegrationTestCase):
 

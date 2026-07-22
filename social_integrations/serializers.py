@@ -529,6 +529,23 @@ class ChatAssignmentSerializer(serializers.ModelSerializer):
         return obj.assigned_user.email
 
 
+class AssignmentSettingsFlagsSerializer(serializers.Serializer):
+    """Tenant social-settings flags returned alongside assignment status"""
+    chat_assignment_enabled = serializers.BooleanField()
+    session_management_enabled = serializers.BooleanField()
+    hide_assigned_chats = serializers.BooleanField()
+    collect_customer_rating = serializers.BooleanField()
+
+
+class AssignmentStatusResponseSerializer(serializers.Serializer):
+    """Response for the single-conversation assignment/archive status endpoint"""
+    assignment = ChatAssignmentSerializer(allow_null=True)
+    settings = AssignmentSettingsFlagsSerializer()
+    is_archived = serializers.BooleanField()
+    archived_at = serializers.DateTimeField(allow_null=True)
+    archived_by_id = serializers.IntegerField(allow_null=True)
+
+
 class ChatAssignmentCreateSerializer(serializers.Serializer):
     """Serializer for assigning a chat"""
     platform = serializers.ChoiceField(choices=['facebook', 'instagram', 'whatsapp', 'email', 'widget'])

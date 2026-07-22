@@ -43,6 +43,7 @@ from .serializers import (
     WhatsAppMessageTemplateSerializer, WhatsAppTemplateCreateSerializer, WhatsAppTemplateSendSerializer,
     WhatsAppContactSerializer, SocialIntegrationSettingsSerializer,
     ChatAssignmentSerializer, ChatAssignmentCreateSerializer, ChatRatingSerializer,
+    AssignmentStatusResponseSerializer,
     PublicRatingInfoSerializer, PublicRatingSubmitSerializer,
     EmailConnectionSerializer, EmailConnectionCreateSerializer, EmailMessageSerializer,
     EmailSendSerializer, EmailDraftSerializer, EmailMessageActionSerializer, EmailFolderSerializer,
@@ -4619,6 +4620,39 @@ def end_session(request):
     })
 
 
+@extend_schema(
+    summary="Get assignment and archive status for one conversation",
+    description="""
+    Returns the current chat assignment (or null), the tenant's assignment
+    settings flags, and whether the conversation is archived (in History).
+    Used by the messages UI to resolve the true state of a deep-linked chat.
+    """,
+    parameters=[
+        OpenApiParameter(
+            name='platform',
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            description='Platform (facebook, instagram, whatsapp, email, widget)',
+            required=True,
+        ),
+        OpenApiParameter(
+            name='conversation_id',
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            description='Conversation key within the account (e.g. sender PSID)',
+            required=True,
+        ),
+        OpenApiParameter(
+            name='account_id',
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            description='Account id (page id / WABA phone id / connection id)',
+            required=True,
+        ),
+    ],
+    responses={200: AssignmentStatusResponseSerializer},
+    tags=['Social - Chat Assignment'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def get_assignment_status(request):
@@ -4642,6 +4676,17 @@ def get_assignment_status(request):
         'collect_customer_rating': settings_obj.collect_customer_rating if settings_obj else False,
     }
 
+    archive_row = ConversationArchive.objects.filter(
+        platform=platform,
+        conversation_id=conversation_id,
+        account_id=account_id,
+    ).first()
+    archive_data = {
+        'is_archived': archive_row is not None,
+        'archived_at': archive_row.archived_at if archive_row else None,
+        'archived_by_id': archive_row.archived_by_id if archive_row else None,
+    }
+
     try:
         assignment = ChatAssignment.objects.select_related('assigned_user').get(
             platform=platform,
@@ -4650,12 +4695,14 @@ def get_assignment_status(request):
         )
         return Response({
             'assignment': ChatAssignmentSerializer(assignment).data,
-            'settings': settings_data
+            'settings': settings_data,
+            **archive_data,
         })
     except ChatAssignment.DoesNotExist:
         return Response({
             'assignment': None,
-            'settings': settings_data
+            'settings': settings_data,
+            **archive_data,
         })
 
 
