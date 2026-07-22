@@ -156,3 +156,69 @@ class TestClearPlatformHistory(SocialIntegrationTestCase):
     def test_agent_cannot_clear(self):
         resp = self.api_post(self.url, {'platform': 'facebook'}, user=self.agent)
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class TestFacebookWebhookNameRecovery(SocialIntegrationTestCase):
+    """When the Graph API refuses the message `from` lookup (400), the
+    webhook must reuse the name already known for the PSID instead of
+    renaming the conversation to 'Messenger User'."""
+
+    def setUp(self):
+        super().setUp()
+        self.url = '/api/social/facebook/webhook/'
+        self.conn = self.create_fb_connection()
+
+    def _post_webhook(self, sender_id, mid):
+        payload = {
+            'object': 'page',
+            'entry': [{
+                'id': self.conn.page_id,
+                'time': 1753200000000,
+                'messaging': [{
+                    'sender': {'id': sender_id},
+                    'recipient': {'id': self.conn.page_id},
+                    'timestamp': 1753200000000,
+                    'message': {'mid': mid, 'text': 'hello'},
+                }],
+            }],
+        }
+        failed = MagicMock(status_code=400)
+        failed.json.return_value = {'error': {'code': 100}}
+        with patch('social_integrations.views.find_tenant_by_page_id', return_value=self.tenant.schema_name), \
+             patch('social_integrations.views.requests.get', return_value=failed), \
+             patch('social_integrations.views.send_websocket_notification'):
+            return self.client.post(
+                self.url, data=payload, format='json', HTTP_HOST='tenant.test.com'
+            )
+
+    def test_recovers_name_from_social_account(self):
+        from social_integrations.models import FacebookMessage
+        self.create_social_account(
+            platform='facebook',
+            platform_id='psid_recover_1',
+            account_connection_id=self.conn.page_id,
+            display_name='Salome Testishvili',
+        )
+        resp = self._post_webhook('psid_recover_1', '<mid_recover_1>')
+        self.assertEqual(resp.status_code, 200)
+        msg = FacebookMessage.objects.get(message_id='<mid_recover_1>')
+        self.assertEqual(msg.sender_name, 'Salome Testishvili')
+
+    def test_recovers_name_from_prior_message(self):
+        from social_integrations.models import FacebookMessage
+        self.create_fb_message(
+            page_connection=self.conn,
+            sender_id='psid_recover_2',
+            sender_name='Levan Testishvili',
+        )
+        resp = self._post_webhook('psid_recover_2', '<mid_recover_2>')
+        self.assertEqual(resp.status_code, 200)
+        msg = FacebookMessage.objects.get(message_id='<mid_recover_2>')
+        self.assertEqual(msg.sender_name, 'Levan Testishvili')
+
+    def test_falls_back_when_nothing_known(self):
+        from social_integrations.models import FacebookMessage
+        resp = self._post_webhook('psid_unknown_3', '<mid_unknown_3>')
+        self.assertEqual(resp.status_code, 200)
+        msg = FacebookMessage.objects.get(message_id='<mid_unknown_3>')
+        self.assertEqual(msg.sender_name, 'Messenger User')

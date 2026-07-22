@@ -2125,6 +2125,28 @@ def facebook_webhook(request):
                                             except Exception as e:
                                                 logger.warning(f"Exception fetching message info: {e}")
 
+                                        # Last resort before the generic fallback sticks: reuse the
+                                        # name we already know for this PSID. Meta increasingly 400s
+                                        # the message-object `from` lookup (EU privacy), and one
+                                        # failed fetch would otherwise rename the whole conversation
+                                        # to "Messenger User" in the list (which shows the latest
+                                        # incoming message's stored name).
+                                        if sender_name == 'Messenger User':
+                                            known = SocialAccount.objects.filter(
+                                                platform='facebook',
+                                                platform_id=sender_id,
+                                            ).exclude(display_name='').values_list('display_name', flat=True).first()
+                                            if not known or known.startswith(('Messenger User', 'Facebook User')):
+                                                known = FacebookMessage.objects.filter(
+                                                    sender_id=sender_id,
+                                                    is_from_page=False,
+                                                ).exclude(sender_name__in=['', 'Messenger User']).order_by(
+                                                    '-timestamp'
+                                                ).values_list('sender_name', flat=True).first()
+                                            if known and not known.startswith(('Messenger User', 'Facebook User')):
+                                                sender_name = known
+                                                logger.info(f"👤 Recovered sender name from prior data: {sender_name}")
+
                                         # Fetch profile picture for the sender
                                         try:
                                             profile_pic_url_api = f"https://graph.facebook.com/v23.0/{sender_id}/picture"
