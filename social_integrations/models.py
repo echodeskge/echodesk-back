@@ -1965,6 +1965,38 @@ class SocialAccount(models.Model):
         return f"{self.client.name} - {self.platform}: {self.display_name or self.platform_id}"
 
 
+class CachedProfilePicture(models.Model):
+    """
+    Local cache of customer profile pictures fetched from social platforms.
+
+    One row per (platform, platform_id). The image bytes are copied to our
+    own storage so conversations never lose avatars when Meta's CDN URLs
+    expire, and so webhooks don't spend Graph API rate budget re-fetching
+    the same picture on every incoming message.
+
+    An empty image_url with a recent fetched_at is a negative cache entry:
+    the platform reported no visible picture, so don't ask again until the
+    entry goes stale.
+    """
+    platform = models.CharField(max_length=20)
+    platform_id = models.CharField(max_length=255)
+    image_url = models.URLField(max_length=500, blank=True)  # URL on our storage
+    storage_path = models.CharField(max_length=500, blank=True)  # path in default_storage
+    display_name = models.CharField(max_length=255, blank=True)  # cached IG name
+    username = models.CharField(max_length=255, blank=True)  # cached IG username
+    fetched_at = models.DateTimeField(null=True, blank=True)  # null = never fetched
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [['platform', 'platform_id']]
+        verbose_name = "Cached Profile Picture"
+        verbose_name_plural = "Cached Profile Pictures"
+
+    def __str__(self):
+        return f"{self.platform}:{self.platform_id}"
+
+
 class ConversationArchive(models.Model):
     """
     Tracks archived conversations across all platforms.

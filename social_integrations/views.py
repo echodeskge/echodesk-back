@@ -56,6 +56,7 @@ from .serializers import (
     UnifiedConversationSerializer, PaginatedUnifiedConversationSerializer,
     AutoPostSettingsSerializer, AutoPostContentSerializer,
 )
+from .services.profile_pic_cache import get_facebook_profile_pic, get_instagram_profile
 from .pagination import SocialMessagePagination
 from .permissions import (
     CanManageSocialConnections, CanViewSocialMessages,
@@ -2088,6 +2089,12 @@ def facebook_webhook(request):
                                     # Get message_id for API calls
                                     message_id = message_data.get('mid', '')
 
+                                    # Duplicate webhook delivery (Meta retries): the message and its
+                                    # profile picture were already processed — skip all Graph API work.
+                                    if message_id and FacebookMessage.objects.filter(message_id=message_id).exists():
+                                        logger.warning(f"⚠️ Message {message_id} already exists, skipping save")
+                                        continue
+
                                     if sender_id != page_id:  # Don't fetch profile for page itself
                                         # First try: Extract customer information from webhook
                                         customer_info = extract_customer_information(message_event)
@@ -2147,20 +2154,12 @@ def facebook_webhook(request):
                                                 sender_name = known
                                                 logger.info(f"👤 Recovered sender name from prior data: {sender_name}")
 
-                                        # Fetch profile picture for the sender
+                                        # Fetch profile picture for the sender (copied to our own
+                                        # storage; hits the Graph API only when the cache is stale)
                                         try:
-                                            profile_pic_url_api = f"https://graph.facebook.com/v23.0/{sender_id}/picture"
-                                            profile_pic_params = {
-                                                'type': 'large',
-                                                'redirect': 'false',
-                                                'access_token': page_connection.page_access_token
-                                            }
-                                            profile_pic_response = requests.get(profile_pic_url_api, params=profile_pic_params, timeout=10)
-                                            if profile_pic_response.status_code == 200:
-                                                pic_data = profile_pic_response.json().get('data', {})
-                                                if not pic_data.get('is_silhouette', True):
-                                                    profile_pic_url = pic_data.get('url')
-                                                    logger.info(f"👤 Fetched profile picture for {sender_name}")
+                                            profile_pic_url = get_facebook_profile_pic(
+                                                sender_id, page_connection.page_access_token
+                                            )
                                         except Exception as e:
                                             logger.warning(f"Exception fetching profile picture: {e}")
 
@@ -3572,61 +3571,31 @@ def instagram_webhook(request):
 
                                     continue
 
+                                # Duplicate webhook delivery (Meta retries): the message and its
+                                # profile picture were already processed — skip all Graph API work.
+                                dedup_mid = message_data.get('mid', '')
+                                if dedup_mid and InstagramMessage.objects.filter(message_id=dedup_mid).exists():
+                                    logger.warning(f"⚠️ Instagram message {dedup_mid} already exists, skipping save")
+                                    continue
+
                                 # Get sender info - fetch from Instagram Graph API
                                 sender_name = ''  # Display name
                                 sender_username = sender_id  # Use the ID as username by default
                                 sender_profile_pic = None
 
-                                # Try to fetch the sender's Instagram username, name, and profile picture
+                                # Fetch the sender's Instagram name, username and profile picture
+                                # (copied to our own storage; hits the Graph API only when the
+                                # cache is stale)
                                 if sender_id != instagram_account_id:  # Don't fetch profile for business account itself
                                     try:
-                                        # Use Instagram Graph API to get user info
-                                        profile_url = f"https://graph.facebook.com/v23.0/{sender_id}"
-                                        profile_params = {
-                                            'fields': 'name,username,profile_pic',
-                                            'access_token': account_connection.access_token
-                                        }
-                                        logger.info(f"👤 Fetching Instagram profile for sender {sender_id}")
-                                        profile_response = requests.get(profile_url, params=profile_params, timeout=10)
-
-                                        logger.info(f"👤 Instagram profile fetch response: status={profile_response.status_code}")
-                                        if profile_response.status_code == 200:
-                                            profile_data = profile_response.json()
-                                            logger.info(f"👤 Instagram profile data received: {profile_data}")
-                                            sender_name = profile_data.get('name', '')
-                                            sender_username = profile_data.get('username', sender_id)
-                                            sender_profile_pic = profile_data.get('profile_pic')
-                                            logger.info(f"👤 Set sender_name to: {sender_name}, sender_username to: {sender_username}, profile_pic: {sender_profile_pic is not None}")
-
-                                            # Validate URL length to prevent database errors
-                                            if sender_profile_pic and len(sender_profile_pic) > 500:
-                                                logger.warning(f"Instagram profile pic URL too long ({len(sender_profile_pic)} chars), truncating")
-                                                sender_profile_pic = None
-                                        else:
-                                            error_data = profile_response.json() if profile_response.content else {}
-                                            logger.warning(f"⚠️ Failed to fetch Instagram profile for {sender_id}: status={profile_response.status_code}, error={error_data}")
-
+                                        profile = get_instagram_profile(
+                                            sender_id, account_connection.access_token
+                                        )
+                                        sender_name = profile.get('name') or ''
+                                        sender_username = profile.get('username') or sender_id
+                                        sender_profile_pic = profile.get('profile_pic')
                                     except Exception as e:
                                         logger.error(f"❌ Exception fetching Instagram profile for {sender_id}: {type(e).__name__}: {e}")
-
-                                    # Try fetching profile picture separately (like Facebook) if not available from profile
-                                    if not sender_profile_pic:
-                                        try:
-                                            # Try the Facebook-style picture endpoint
-                                            pic_url = f"https://graph.facebook.com/v23.0/{sender_id}/picture"
-                                            pic_params = {
-                                                'type': 'large',
-                                                'redirect': 'false',
-                                                'access_token': account_connection.access_token
-                                            }
-                                            pic_response = requests.get(pic_url, params=pic_params, timeout=10)
-                                            if pic_response.status_code == 200:
-                                                pic_data = pic_response.json().get('data', {})
-                                                if not pic_data.get('is_silhouette', True):
-                                                    sender_profile_pic = pic_data.get('url')
-                                                    logger.info(f"👤 Fetched Instagram profile picture via /picture endpoint")
-                                        except Exception as e:
-                                            logger.warning(f"Could not fetch Instagram profile picture via /picture endpoint: {e}")
 
                                 # Save the message
                                 message_id = message_data.get('mid', '')

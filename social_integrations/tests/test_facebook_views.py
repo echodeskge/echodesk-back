@@ -186,6 +186,7 @@ class TestFacebookWebhookNameRecovery(SocialIntegrationTestCase):
         failed.json.return_value = {'error': {'code': 100}}
         with patch('social_integrations.views.find_tenant_by_page_id', return_value=self.tenant.schema_name), \
              patch('social_integrations.views.requests.get', return_value=failed), \
+             patch('social_integrations.views.get_facebook_profile_pic', return_value=None), \
              patch('social_integrations.views.send_websocket_notification'):
             return self.client.post(
                 self.url, data=payload, format='json', HTTP_HOST='tenant.test.com'
@@ -222,3 +223,56 @@ class TestFacebookWebhookNameRecovery(SocialIntegrationTestCase):
         self.assertEqual(resp.status_code, 200)
         msg = FacebookMessage.objects.get(message_id='<mid_unknown_3>')
         self.assertEqual(msg.sender_name, 'Messenger User')
+
+
+class TestFacebookWebhookProfilePicCache(SocialIntegrationTestCase):
+    """Incoming messages store the cached (our-storage) picture URL, and
+    duplicate webhook deliveries skip Graph API work entirely."""
+
+    def setUp(self):
+        super().setUp()
+        self.url = '/api/social/facebook/webhook/'
+        self.conn = self.create_fb_connection()
+
+    def _post_webhook(self, sender_id, mid, pic='https://spaces.test/media/x.jpg'):
+        payload = {
+            'object': 'page',
+            'entry': [{
+                'id': self.conn.page_id,
+                'time': 1753200000000,
+                'messaging': [{
+                    'sender': {'id': sender_id},
+                    'recipient': {'id': self.conn.page_id},
+                    'timestamp': 1753200000000,
+                    'message': {'mid': mid, 'text': 'hello'},
+                }],
+            }],
+        }
+        failed = MagicMock(status_code=400)
+        failed.json.return_value = {'error': {'code': 100}}
+        with patch('social_integrations.views.find_tenant_by_page_id', return_value=self.tenant.schema_name), \
+             patch('social_integrations.views.requests.get', return_value=failed), \
+             patch('social_integrations.views.get_facebook_profile_pic', return_value=pic) as mock_pic, \
+             patch('social_integrations.views.send_websocket_notification'):
+            resp = self.client.post(
+                self.url, data=payload, format='json', HTTP_HOST='tenant.test.com'
+            )
+        return resp, mock_pic
+
+    def test_message_stores_cached_picture_url(self):
+        from social_integrations.models import FacebookMessage
+        resp, mock_pic = self._post_webhook('psid_pic_1', '<mid_pic_1>')
+        self.assertEqual(resp.status_code, 200)
+        msg = FacebookMessage.objects.get(message_id='<mid_pic_1>')
+        self.assertEqual(msg.profile_pic_url, 'https://spaces.test/media/x.jpg')
+        mock_pic.assert_called_once_with('psid_pic_1', self.conn.page_access_token)
+
+    def test_duplicate_delivery_skips_graph_work(self):
+        from social_integrations.models import FacebookMessage
+        self._post_webhook('psid_pic_2', '<mid_pic_2>')
+        resp, mock_pic = self._post_webhook('psid_pic_2', '<mid_pic_2>')
+        self.assertEqual(resp.status_code, 200)
+        mock_pic.assert_not_called()
+        self.assertEqual(
+            FacebookMessage.objects.filter(message_id='<mid_pic_2>').count(), 1
+        )
