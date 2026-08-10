@@ -29,6 +29,28 @@ class FacebookPageConnection(models.Model):
         help_text='Whether this connection has been granted publishing scopes (pages_manage_posts, instagram_content_publish)'
     )
 
+    # Who granted this connection — used for auditing and to scope the OAuth
+    # stale-page sweep to the same Facebook user (so one person's OAuth can
+    # never deactivate pages someone else connected).
+    connected_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='connected_facebook_pages',
+        help_text='EchoDesk user whose session initiated the OAuth connect',
+    )
+    connected_by_fb_user_id = models.CharField(
+        max_length=64,
+        blank=True,
+        default='',
+        help_text='App-scoped Facebook user id that granted the page token',
+    )
+    webhook_subscribed = models.BooleanField(
+        default=True,
+        help_text='Whether the subscribed_apps webhook subscription succeeded at connect time',
+    )
+
     # Deactivation tracking
     deactivated_at = models.DateTimeField(null=True, blank=True, help_text='When the page was deactivated')
     deactivation_reason = models.CharField(

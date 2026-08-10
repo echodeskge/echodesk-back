@@ -1,7 +1,7 @@
 import os
 import requests
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlencode, quote_plus
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
@@ -212,6 +212,27 @@ def find_tenant_by_whatsapp_phone_number_id(phone_number_id):
     """Find which tenant schema owns the given WhatsApp phone number ID (O(1) + fallback)."""
     from social_integrations.platform_routing import resolve_tenant
     return resolve_tenant("whatsapp", phone_number_id)
+
+
+# ── Messaging window helpers ────────────────────────────────────────────────
+
+STANDARD_MESSAGING_WINDOW = timedelta(hours=24)
+HUMAN_AGENT_WINDOW = timedelta(days=7)
+
+
+def choose_messaging_params(last_incoming_timestamp):
+    """
+    Pick Send API params for an agent reply.
+
+    Within 24 hours of the customer's last message a plain RESPONSE is
+    allowed. Beyond that, Meta requires a message tag — we use HUMAN_AGENT
+    (approved Human Agent feature), which permits agent replies for up to
+    7 days. Past 7 days the tag is still sent and Meta's own error is
+    surfaced to the agent.
+    """
+    if last_incoming_timestamp and timezone.now() - last_incoming_timestamp > STANDARD_MESSAGING_WINDOW:
+        return {'messaging_type': 'MESSAGE_TAG', 'tag': 'HUMAN_AGENT'}
+    return {'messaging_type': 'RESPONSE'}
 
 
 # ============================================================================
@@ -904,9 +925,23 @@ def facebook_oauth_callback(request):
                 }
             })
         
+        # Identify the Facebook user who granted this token — recorded on
+        # each connection and used to scope the stale-page sweep below.
+        fb_user_id = ''
+        try:
+            me_response = requests.get(
+                f"https://graph.facebook.com/{getattr(settings, 'SOCIAL_INTEGRATIONS', {}).get('FACEBOOK_API_VERSION', 'v23.0')}/me",
+                params={'access_token': user_access_token, 'fields': 'id'},
+                timeout=30,
+            )
+            if me_response.status_code == 200:
+                fb_user_id = me_response.json().get('id', '') or ''
+        except requests.RequestException as me_err:
+            logger.warning(f"Could not fetch connecting Facebook user id: {me_err}")
+
         # Import tenant schema context for multi-tenant database operations
         from tenant_schemas.utils import schema_context
-        
+
         # Save page connections to database with proper tenant context.
         # IMPORTANT: do NOT wipe existing connections first. FacebookMessage has
         # on_delete=CASCADE to FacebookPageConnection, so a tenant-wide
@@ -922,6 +957,7 @@ def facebook_oauth_callback(request):
             # Create new connections for all pages from callback
             saved_instagram_accounts = 0
             returned_page_ids: set[str] = set()
+            unsubscribed_pages: list[str] = []
             for page in pages:
                 page_id = page.get('id')
                 page_name = page.get('name')
@@ -934,6 +970,8 @@ def facebook_oauth_callback(request):
                                 'page_name': page_name,
                                 'page_access_token': page_access_token,
                                 'is_active': True,
+                                'connected_by_id': user_id,
+                                'connected_by_fb_user_id': fb_user_id,
                             }
                     if is_publishing_upgrade:
                         page_defaults['has_publishing_permission'] = True
@@ -950,6 +988,8 @@ def facebook_oauth_callback(request):
                             page_connection.page_name = page_name
                             page_connection.page_access_token = page_access_token
                             page_connection.is_active = True
+                            page_connection.connected_by_id = user_id
+                            page_connection.connected_by_fb_user_id = fb_user_id
                             if is_publishing_upgrade:
                                 page_connection.has_publishing_permission = True
                             page_connection.save()
@@ -976,10 +1016,19 @@ def facebook_oauth_callback(request):
 
                         if subscribe_response.status_code == 200 and subscribe_data.get('success'):
                             logger.info(f"✅ Subscribed page {page_name} ({page_id}) to webhooks")
+                            if not page_connection.webhook_subscribed:
+                                page_connection.webhook_subscribed = True
+                                page_connection.save(update_fields=['webhook_subscribed'])
                         else:
                             logger.error(f"❌ Failed to subscribe page {page_name} to webhooks: {subscribe_data}")
+                            unsubscribed_pages.append(page_name)
+                            page_connection.webhook_subscribed = False
+                            page_connection.save(update_fields=['webhook_subscribed'])
                     except Exception as subscribe_error:
                         logger.error(f"❌ Error subscribing page {page_name} to webhooks: {subscribe_error}")
+                        unsubscribed_pages.append(page_name)
+                        page_connection.webhook_subscribed = False
+                        page_connection.save(update_fields=['webhook_subscribed'])
 
                     # Try to fetch Instagram Business Account connected to this page
                     try:
@@ -1028,11 +1077,25 @@ def facebook_oauth_callback(request):
                 else:
                     logger.warning(f"⚠️ Skipped page with missing data: {page}")
 
-            # Pages the tenant previously connected but Meta no longer returns
-            # for this user (revoked, removed from Business Portfolio, etc.):
+            # Pages this same Facebook user previously connected but Meta no
+            # longer returns (revoked, removed from Business Portfolio, etc.):
             # deactivate them so webhooks/send-message stop, but keep messages.
-            stale_pages = FacebookPageConnection.objects.filter(is_active=True).exclude(page_id__in=returned_page_ids)
-            stale_count = stale_pages.update(is_active=False) if returned_page_ids else 0
+            # Scoped to the granting FB user so one person's OAuth can never
+            # deactivate pages someone else connected (e.g. an App Review
+            # tester connecting their own test page must not kill the
+            # tenant's real pages). Legacy rows without a recorded granting
+            # user are left untouched.
+            stale_count = 0
+            if returned_page_ids and fb_user_id:
+                stale_pages = FacebookPageConnection.objects.filter(
+                    is_active=True,
+                    connected_by_fb_user_id=fb_user_id,
+                ).exclude(page_id__in=returned_page_ids)
+                stale_count = stale_pages.update(
+                    is_active=False,
+                    deactivated_at=timezone.now(),
+                    deactivation_reason='permission_revoked',
+                )
             if stale_count:
                 logger.info(
                     "Deactivated %d Facebook page connection(s) not returned by /me/accounts in schema %s",
@@ -1044,6 +1107,13 @@ def facebook_oauth_callback(request):
             success_msg = f"Successfully connected {saved_pages} Facebook page(s) and {saved_instagram_accounts} Instagram account(s)"
         else:
             success_msg = f"Successfully connected {saved_pages} Facebook page(s)"
+        if unsubscribed_pages:
+            # A connection without a webhook subscription looks connected but
+            # never receives messages — tell the user instead of hiding it.
+            success_msg += (
+                f". WARNING: webhook subscription failed for: {', '.join(unsubscribed_pages)}"
+                " — incoming messages will NOT arrive for these pages. Reconnect to retry."
+            )
         logger.info(f"Facebook OAuth completed successfully: {saved_pages} pages and {saved_instagram_accounts} Instagram accounts saved")
         
         # Redirect to tenant frontend with success parameters
@@ -1078,7 +1148,9 @@ def facebook_connection_status(request):
                 'page_id': page.page_id,
                 'page_name': page.page_name,
                 'is_active': page.is_active,
-                'connected_at': page.created_at.isoformat()
+                'connected_at': page.created_at.isoformat(),
+                'webhook_subscribed': page.webhook_subscribed,
+                'connected_by': page.connected_by.email if page.connected_by else None,
             })
 
         return Response({
@@ -1315,6 +1387,9 @@ def check_messaging_window(request):
         return Response({
             'window_open': False,
             'hours_remaining': None,
+            'human_agent_window_open': False,
+            'human_agent_hours_remaining': None,
+            'can_reply': False,
             'message': 'No messages from user found'
         })
 
@@ -1324,9 +1399,24 @@ def check_messaging_window(request):
     window_open = hours_passed <= 24
     hours_remaining = max(0, round(24 - hours_passed, 1)) if window_open else 0
 
+    # Beyond the standard 24h window, Facebook and Instagram replies are
+    # still possible for 7 days using the HUMAN_AGENT tag (approved Human
+    # Agent feature). WhatsApp has no human-agent equivalent — replies
+    # outside 24h require template messages instead.
+    human_agent_hours = HUMAN_AGENT_WINDOW.total_seconds() / 3600
+    human_agent_window_open = (
+        platform in ('facebook', 'instagram') and hours_passed <= human_agent_hours
+    )
+    human_agent_hours_remaining = (
+        max(0, round(human_agent_hours - hours_passed, 1)) if human_agent_window_open else 0
+    )
+
     return Response({
         'window_open': window_open,
         'hours_remaining': hours_remaining,
+        'human_agent_window_open': human_agent_window_open,
+        'human_agent_hours_remaining': human_agent_hours_remaining,
+        'can_reply': window_open or human_agent_window_open,
         'last_user_message_at': last_user_message.timestamp.isoformat(),
         'hours_passed': round(hours_passed, 1)
     })
@@ -1411,8 +1501,9 @@ def facebook_send_message(request):
                 'error_code': 'no_conversation',
                 'details': 'Facebook requires the user to initiate the conversation before you can send messages.'
             }, status=status.HTTP_400_BAD_REQUEST)
-        # Note: 24-hour window enforcement is handled by Facebook's API.
-        # If the window is expired, Facebook will return an error which we surface to the user.
+        # Inside the 24h window we send a plain RESPONSE; beyond it we use
+        # the HUMAN_AGENT tag (7-day window for human agent replies).
+        messaging_params = choose_messaging_params(last_user_message.timestamp)
 
         send_url = f"https://graph.facebook.com/v23.0/me/messages"
         params = {'access_token': page_connection.page_access_token}
@@ -1452,7 +1543,7 @@ def facebook_send_message(request):
                 text_payload = {
                     'recipient': {'id': recipient_id},
                     'message': {'text': message_text},
-                    'messaging_type': 'RESPONSE'
+                    **messaging_params,
                 }
                 if reply_to_message_id:
                     text_payload['reply_to'] = {'mid': reply_to_message_id}
@@ -1470,20 +1561,13 @@ def facebook_send_message(request):
                         text_message_id = None
 
             # Send media attachment using form data upload
-            message_payload = {
-                'recipient': '{"id":"' + recipient_id + '"}',
-                'message': '{"attachment":{"type":"' + attachment_type + '","payload":{"is_reusable":true}}}',
-                'messaging_type': 'RESPONSE',
-                'filedata': (media_filename, media_file, media_mime_type),
-            }
-
             response = requests.post(
                 send_url,
                 files={'filedata': (media_filename, media_file, media_mime_type)},
                 data={
                     'recipient': '{"id":"' + recipient_id + '"}',
                     'message': '{"attachment":{"type":"' + attachment_type + '","payload":{"is_reusable":true}}}',
-                    'messaging_type': 'RESPONSE',
+                    **messaging_params,
                 },
                 params=params
             , timeout=30)
@@ -1498,7 +1582,7 @@ def facebook_send_message(request):
             message_data = {
                 'recipient': {'id': recipient_id},
                 'message': {'text': message_text},
-                'messaging_type': 'RESPONSE'
+                **messaging_params,
             }
             if reply_to_message_id:
                 message_data['reply_to'] = {'mid': reply_to_message_id}
@@ -3091,8 +3175,9 @@ def instagram_send_message(request):
                 'error': 'Cannot send message: No conversation found with this user. The user must message you first on Instagram.',
                 'details': 'Instagram requires the user to initiate the conversation before you can send messages.'
             }, status=status.HTTP_400_BAD_REQUEST)
-        # Note: 24-hour window enforcement is handled by Instagram's API.
-        # If the window is expired, the API will return an error which we surface to the user.
+        # Inside the 24h window we send a plain RESPONSE; beyond it we use
+        # the HUMAN_AGENT tag (7-day window for human agent replies).
+        messaging_params = choose_messaging_params(recent_messages.first().timestamp)
 
         # Instagram messaging through Messenger Platform API
         # Use Page ID in URL and specify platform=instagram in params
@@ -3131,7 +3216,7 @@ def instagram_send_message(request):
                 text_payload = {
                     'recipient': {'id': recipient_id},
                     'message': {'text': message_text},
-                    'messaging_type': 'RESPONSE'
+                    **messaging_params,
                 }
                 if reply_to_message_id:
                     text_payload['reply_to'] = {'mid': reply_to_message_id}
@@ -3151,7 +3236,7 @@ def instagram_send_message(request):
                 data={
                     'recipient': '{"id":"' + recipient_id + '"}',
                     'message': '{"attachment":{"type":"' + attachment_type + '","payload":{"is_reusable":true}}}',
-                    'messaging_type': 'RESPONSE',
+                    **messaging_params,
                 },
                 params=params
             , timeout=30)
@@ -3166,7 +3251,7 @@ def instagram_send_message(request):
             message_data = {
                 'recipient': {'id': recipient_id},
                 'message': {'text': message_text},
-                'messaging_type': 'RESPONSE'
+                **messaging_params,
             }
             if reply_to_message_id:
                 message_data['reply_to'] = {'mid': reply_to_message_id}
