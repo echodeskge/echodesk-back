@@ -33,9 +33,16 @@ def image_response(content=b'imgbytes', content_type='image/jpeg'):
     return resp
 
 
+def throttled_response(status_code=403, code=4):
+    resp = MagicMock(status_code=status_code)
+    resp.json.return_value = {'error': {'code': code, 'message': 'rate limit'}}
+    return resp
+
+
 class ProfilePicCacheTestCase(SocialIntegrationTestCase):
     def setUp(self):
         super().setUp()
+        profile_pic_cache._throttle_state['at'] = None
         storage = MagicMock()
         storage.save.side_effect = lambda path, content: path
         storage.url.side_effect = lambda path: f'https://spaces.test/media/{path}'
@@ -121,6 +128,35 @@ class TestFacebookProfilePic(ProfilePicCacheTestCase):
 
         self.assertEqual(url, 'https://spaces.test/media/old.jpg')
 
+    def test_throttle_is_not_negative_cached(self):
+        stale = timezone.now() - timedelta(days=30)
+        CachedProfilePicture.objects.create(
+            platform='facebook', platform_id='psid_7',
+            image_url='https://spaces.test/media/old.jpg',
+            fetched_at=stale,
+        )
+        with patch.object(profile_pic_cache.requests, 'get',
+                          return_value=throttled_response()):
+            url = get_facebook_profile_pic('psid_7', 'token')
+
+        self.assertEqual(url, 'https://spaces.test/media/old.jpg')
+        entry = CachedProfilePicture.objects.get(platform='facebook', platform_id='psid_7')
+        # A throttled response says nothing about the sender: fetched_at
+        # must NOT advance, so a later message retries after the window.
+        self.assertEqual(entry.fetched_at, stale)
+        self.assertTrue(profile_pic_cache.recently_throttled())
+
+    def test_throttle_creates_no_negative_cache_row_for_unknown_sender(self):
+        with patch.object(profile_pic_cache.requests, 'get',
+                          return_value=throttled_response()):
+            url = get_facebook_profile_pic('psid_8', 'token')
+        self.assertIsNone(url)
+        self.assertFalse(
+            CachedProfilePicture.objects.filter(
+                platform='facebook', platform_id='psid_8', fetched_at__isnull=False
+            ).exists()
+        )
+
     def test_network_error_returns_stale_and_retries_later(self):
         stale = timezone.now() - timedelta(days=30)
         CachedProfilePicture.objects.create(
@@ -169,6 +205,25 @@ class TestInstagramProfile(ProfilePicCacheTestCase):
 
         self.assertEqual(profile['name'], 'Nika')
         self.assertTrue(profile['profile_pic'].endswith('/instagram/ig_2.jpg'))
+
+    def test_throttled_profile_keeps_identity_and_skips_fallback(self):
+        stale = timezone.now() - timedelta(days=30)
+        CachedProfilePicture.objects.create(
+            platform='instagram', platform_id='ig_4',
+            image_url='https://spaces.test/media/old.jpg',
+            display_name='Old Name', username='old.username',
+            fetched_at=stale,
+        )
+        with patch.object(profile_pic_cache.requests, 'get',
+                          return_value=throttled_response()) as mock_get:
+            profile = get_instagram_profile('ig_4', 'token')
+
+        # Only the profile call was made — no /picture fallback while throttled.
+        self.assertEqual(mock_get.call_count, 1)
+        self.assertEqual(profile['name'], 'Old Name')
+        self.assertEqual(profile['profile_pic'], 'https://spaces.test/media/old.jpg')
+        entry = CachedProfilePicture.objects.get(platform='instagram', platform_id='ig_4')
+        self.assertEqual(entry.fetched_at, stale)
 
     def test_refused_profile_keeps_cached_identity(self):
         stale = timezone.now() - timedelta(days=30)

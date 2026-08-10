@@ -43,8 +43,13 @@ from social_integrations.services.profile_pic_cache import (
     get_facebook_profile_pic,
     get_instagram_profile,
     is_cached_url,
+    recently_throttled,
     store_picture_copy,
 )
+
+
+class GraphThrottledAbort(Exception):
+    """Raised to stop the whole run once the Graph API starts rate-limiting."""
 
 
 class Command(BaseCommand):
@@ -71,6 +76,7 @@ class Command(BaseCommand):
         self.delay = options['delay']
         self.dry_run = options['dry_run']
         self.totals = {'reused': 0, 'rescued': 0, 'graph_fetched': 0, 'skipped': 0, 'failed': 0}
+        self.throttle_strikes = 0
 
         if options['all']:
             from tenants.models import Tenant
@@ -80,11 +86,17 @@ class Command(BaseCommand):
         else:
             schemas = [options['schema']]
 
-        for schema in schemas:
-            self.stdout.write(f"\n=== Tenant: {schema} ===")
-            with schema_context(schema):
-                self.process_facebook()
-                self.process_instagram()
+        try:
+            for schema in schemas:
+                self.stdout.write(f"\n=== Tenant: {schema} ===")
+                with schema_context(schema):
+                    self.process_facebook()
+                    self.process_instagram()
+        except GraphThrottledAbort:
+            self.stdout.write(self.style.ERROR(
+                "\nGraph API is rate-limiting this app — aborting the run. "
+                "Re-run after the rolling one-hour window drains."
+            ))
 
         t = self.totals
         self.stdout.write(self.style.SUCCESS(
@@ -215,6 +227,16 @@ class Command(BaseCommand):
         self.graph_budget -= 1
         time.sleep(self.delay)
         url = graph_fetch()
+        if recently_throttled():
+            # The service does not negative-cache throttled responses, so
+            # this sender stays retryable — but keeping going would just
+            # deepen the rate-limit hole. Stop after a few strikes.
+            self.throttle_strikes += 1
+            self.totals['skipped'] += 1
+            if self.throttle_strikes >= 3:
+                raise GraphThrottledAbort()
+            return None
+        self.throttle_strikes = 0
         if url:
             self.totals['graph_fetched'] += 1
             return url

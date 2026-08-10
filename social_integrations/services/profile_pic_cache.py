@@ -40,6 +40,34 @@ _CONTENT_TYPE_EXT = {
     'image/webp': 'webp',
 }
 
+# Graph error codes meaning "rate limited" (app/user/page throttling) — see
+# https://developers.facebook.com/docs/graph-api/overview/rate-limiting
+# A throttled response says nothing about the sender's picture, so it must
+# never be negative-cached; the entry stays stale and a later call retries.
+_THROTTLE_ERROR_CODES = {4, 17, 32, 613, 80001, 80002, 80006}
+
+_throttle_state = {'at': None}
+
+
+def _note_if_throttled(resp):
+    """Return True (and remember when) if resp is a rate-limit rejection."""
+    code = None
+    try:
+        code = resp.json().get('error', {}).get('code')
+    except Exception:
+        pass
+    if code in _THROTTLE_ERROR_CODES or resp.status_code == 429:
+        _throttle_state['at'] = timezone.now()
+        return True
+    return False
+
+
+def recently_throttled(within_seconds=30):
+    """True if a Graph call was rate-limited in the last within_seconds.
+    Bulk callers (the backfill command) use this to stop hammering."""
+    at = _throttle_state['at']
+    return at is not None and (timezone.now() - at).total_seconds() < within_seconds
+
 
 def is_cached_url(url):
     """True if the URL already points at our own storage."""
@@ -124,6 +152,11 @@ def get_facebook_profile_pic(sender_id, access_token):
             store_picture_copy(entry, data['url'])
         # else: no visible picture — keep any existing copy; a row with an
         # empty image_url acts as a negative cache entry.
+    elif _note_if_throttled(resp):
+        # Rate limited: says nothing about this sender — keep everything
+        # as-is and let a later message retry once the window drains.
+        logger.warning(f"Graph API throttled picture fetch for facebook/{sender_id}")
+        return entry.image_url or None
     else:
         logger.warning(
             f"Graph API refused picture for facebook/{sender_id}: status={resp.status_code}"
@@ -152,6 +185,12 @@ def get_instagram_profile(sender_id, access_token):
     if entry is None:
         entry = CachedProfilePicture(platform='instagram', platform_id=sender_id)
 
+    stale_result = {
+        'name': entry.display_name,
+        'username': entry.username,
+        'profile_pic': entry.image_url or None,
+    }
+
     pic_source = None
     try:
         resp = requests.get(
@@ -164,17 +203,18 @@ def get_instagram_profile(sender_id, access_token):
             entry.display_name = data.get('name', '') or entry.display_name
             entry.username = data.get('username', '') or entry.username
             pic_source = data.get('profile_pic')
+        elif _note_if_throttled(resp):
+            # Rate limited: the /picture fallback would be throttled too —
+            # keep everything as-is and let a later message retry.
+            logger.warning(f"Graph API throttled profile fetch for instagram/{sender_id}")
+            return stale_result
         else:
             logger.warning(
                 f"Graph API refused profile for instagram/{sender_id}: status={resp.status_code}"
             )
     except requests.RequestException as e:
         logger.warning(f"Instagram profile fetch failed for {sender_id}: {e}")
-        return {
-            'name': entry.display_name,
-            'username': entry.username,
-            'profile_pic': entry.image_url or None,
-        }
+        return stale_result
 
     if not pic_source:
         # Same fallback the webhook used before: the Facebook-style
@@ -189,6 +229,17 @@ def get_instagram_profile(sender_id, access_token):
                 pic_data = pic_resp.json().get('data', {})
                 if pic_data.get('url') and not pic_data.get('is_silhouette', True):
                     pic_source = pic_data['url']
+            elif _note_if_throttled(pic_resp) and not entry.image_url:
+                # Profile data came through but the picture is unknown and
+                # we hold no copy — don't negative-cache the throttle; save
+                # the identity fields and retry the picture on a later call.
+                logger.warning(f"Graph API throttled /picture fallback for instagram/{sender_id}")
+                _save_entry(entry)
+                return {
+                    'name': entry.display_name,
+                    'username': entry.username,
+                    'profile_pic': None,
+                }
         except requests.RequestException as e:
             logger.warning(f"Instagram /picture fallback failed for {sender_id}: {e}")
 
