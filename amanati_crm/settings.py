@@ -618,9 +618,29 @@ CELERY_TASK_TIME_LIMIT = 600
 from celery.schedules import crontab
 
 CELERY_BEAT_SCHEDULE = {
-    # Payment tasks (process_recurring_payments, check_subscription_status,
-    # process_trial_expirations, process_payment_retries) removed —
-    # handled by DO Functions to prevent double-charging.
+    # Payment tasks — owned by Celery beat again since 2026-08-12. They were
+    # previously removed in favor of DO Functions cron triggers (to prevent
+    # double-charging while both existed); those Functions died with the
+    # DigitalOcean account in the June 2026 Hetzner migration, which silently
+    # stopped all recurring billing. Schedules mirror the old DO cadence.
+    # process_recurring_payments has a 25-day recent-bill guard, so a stray
+    # double trigger cannot double-charge.
+    'process-recurring-payments': {
+        'task': 'tenants.tasks.process_recurring_payments',
+        'schedule': crontab(hour=2, minute=0),
+    },
+    'check-subscription-status': {
+        'task': 'tenants.tasks.check_subscription_status',
+        'schedule': crontab(hour=3, minute=0),
+    },
+    'process-trial-expirations': {
+        'task': 'tenants.tasks.process_trial_expirations',
+        'schedule': crontab(hour=9, minute=0),
+    },
+    'process-payment-retries': {
+        'task': 'tenants.tasks.process_payment_retries',
+        'schedule': crontab(minute=30),  # hourly; only acts on due retry rows
+    },
     'calculate-platform-metrics': {
         'task': 'tenants.tasks.calculate_platform_metrics',
         'schedule': crontab(minute=30, hour=0),
