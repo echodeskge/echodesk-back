@@ -5,6 +5,7 @@ Run daily via cron:
 0 2 * * * cd /path/to/project && python manage.py process_recurring_payments
 """
 
+from django.core.cache import cache
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 from django.db import transaction
@@ -15,6 +16,12 @@ import logging
 import uuid
 
 logger = logging.getLogger(__name__)
+
+# Overlap lock: two concurrent runs (beat firing while a slow run is still
+# iterating, or a manual run next to the scheduled one) must never both
+# charge the same subscriptions. cache.add is atomic on Redis.
+RUN_LOCK_KEY = 'process-recurring-payments-lock'
+RUN_LOCK_TTL = 3600  # seconds; well above any realistic run duration
 
 
 class Command(BaseCommand):
@@ -34,6 +41,18 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        if not cache.add(RUN_LOCK_KEY, timezone.now().isoformat(), RUN_LOCK_TTL):
+            self.stdout.write(self.style.ERROR(
+                'Another recurring-payment run is already in progress — aborting to avoid double-charging.'
+            ))
+            logger.warning('process_recurring_payments: run skipped, lock held by a concurrent run')
+            return
+        try:
+            self._process(*args, **options)
+        finally:
+            cache.delete(RUN_LOCK_KEY)
+
+    def _process(self, *args, **options):
         dry_run = options['dry_run']
         days_before = options['days_before']
 
@@ -73,6 +92,31 @@ class Command(BaseCommand):
                     self.stdout.write(self.style.WARNING(
                         f'⚠️  {tenant.schema_name}: No saved card (parent_order_id), skipping'
                     ))
+                    skipped_count += 1
+                    continue
+
+                # Webhook-independent double-charge guard. The recent-bill
+                # exclusion in the queryset keys on last_billed_at, which only
+                # the payment webhook advances — when a webhook is lost, the
+                # sub stays eligible and the next daily run re-charges (the
+                # April 2026 double-charge incident). Our own PaymentOrder
+                # rows don't depend on the webhook: a recurring order created
+                # in the last 25 days that isn't failed/cancelled means the
+                # charge already went out — never fire another one.
+                recent_charge = PaymentOrder.objects.filter(
+                    tenant=tenant,
+                    order_id__startswith='REC-',
+                    created_at__gte=recent_bill_cutoff,
+                ).exclude(status__in=('failed', 'cancelled')).exists()
+                if recent_charge:
+                    self.stdout.write(self.style.WARNING(
+                        f'⚠️  {tenant.schema_name}: recurring charge already sent in the last 25 days '
+                        f'(billing dates not advanced — check the payment webhook), skipping'
+                    ))
+                    logger.warning(
+                        f'process_recurring_payments: skipping {tenant.schema_name} — '
+                        f'recent recurring PaymentOrder exists but last_billed_at was not advanced'
+                    )
                     skipped_count += 1
                     continue
 
