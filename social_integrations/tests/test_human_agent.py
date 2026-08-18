@@ -13,11 +13,23 @@ from unittest.mock import MagicMock, patch
 from django.utils import timezone
 from rest_framework import status
 
+from social_integrations import views as social_views
 from social_integrations.views import choose_messaging_params
 from .conftest import SocialIntegrationTestCase
 
 
 class TestChooseMessagingParams(SocialIntegrationTestCase):
+    def setUp(self):
+        super().setUp()
+        # Tests run in the 'test' schema; lift the per-tenant gate so the
+        # window logic itself is what's under test here.
+        self._gate = patch.object(social_views, 'HUMAN_AGENT_TAG_SCHEMAS', None)
+        self._gate.start()
+
+    def tearDown(self):
+        self._gate.stop()
+        super().tearDown()
+
     def test_within_24h_uses_response(self):
         ts = timezone.now() - timedelta(hours=23)
         self.assertEqual(choose_messaging_params(ts), {'messaging_type': 'RESPONSE'})
@@ -33,12 +45,46 @@ class TestChooseMessagingParams(SocialIntegrationTestCase):
         self.assertEqual(choose_messaging_params(None), {'messaging_type': 'RESPONSE'})
 
 
+class TestHumanAgentTenantGate(SocialIntegrationTestCase):
+    """Until Meta grants Advanced access, only allowlisted schemas may send
+    the HUMAN_AGENT tag — everyone else stays on RESPONSE even beyond 24h
+    (a tagged send would be rejected outright at Standard access)."""
+
+    def test_non_allowlisted_schema_stays_on_response(self):
+        ts = timezone.now() - timedelta(hours=30)
+        with patch.object(social_views, 'HUMAN_AGENT_TAG_SCHEMAS', {'groot'}):
+            # current schema is 'test', not in the allowlist
+            self.assertEqual(choose_messaging_params(ts), {'messaging_type': 'RESPONSE'})
+
+    def test_allowlisted_schema_gets_the_tag(self):
+        ts = timezone.now() - timedelta(hours=30)
+        with patch.object(social_views, 'HUMAN_AGENT_TAG_SCHEMAS', {'test'}):
+            self.assertEqual(
+                choose_messaging_params(ts),
+                {'messaging_type': 'MESSAGE_TAG', 'tag': 'HUMAN_AGENT'},
+            )
+
+    def test_none_allowlist_enables_everywhere(self):
+        ts = timezone.now() - timedelta(hours=30)
+        with patch.object(social_views, 'HUMAN_AGENT_TAG_SCHEMAS', None):
+            self.assertEqual(
+                choose_messaging_params(ts),
+                {'messaging_type': 'MESSAGE_TAG', 'tag': 'HUMAN_AGENT'},
+            )
+
+
 class TestFacebookSendUsesHumanAgentTag(SocialIntegrationTestCase):
     def setUp(self):
         super().setUp()
+        self._gate = patch.object(social_views, 'HUMAN_AGENT_TAG_SCHEMAS', None)
+        self._gate.start()
         self.agent = self.create_user(email='ha-agent@test.com')
         self.conn = self.create_fb_connection()
         self.url = '/api/social/facebook/send-message/'
+
+    def tearDown(self):
+        self._gate.stop()
+        super().tearDown()
 
     def _send(self, message_age):
         self.create_fb_message(

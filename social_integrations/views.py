@@ -219,6 +219,14 @@ def find_tenant_by_whatsapp_phone_number_id(phone_number_id):
 STANDARD_MESSAGING_WINDOW = timedelta(hours=24)
 HUMAN_AGENT_WINDOW = timedelta(days=7)
 
+# Tenants allowed to send HUMAN_AGENT-tagged replies. The Human Agent
+# feature only has Standard access so far, which Meta honors solely for
+# pages whose admins hold roles on the app — in practice the groot demo
+# page used for App Review. On other tenants a tagged send is rejected
+# outright, so they keep plain RESPONSE until Advanced access is granted.
+# ONCE META APPROVES ADVANCED ACCESS: set to None to enable everywhere.
+HUMAN_AGENT_TAG_SCHEMAS = {'groot'}
+
 
 def choose_messaging_params(last_incoming_timestamp):
     """
@@ -226,10 +234,15 @@ def choose_messaging_params(last_incoming_timestamp):
 
     Within 24 hours of the customer's last message a plain RESPONSE is
     allowed. Beyond that, Meta requires a message tag — we use HUMAN_AGENT
-    (approved Human Agent feature), which permits agent replies for up to
-    7 days. Past 7 days the tag is still sent and Meta's own error is
-    surfaced to the agent.
+    (Human Agent feature), which permits agent replies for up to 7 days.
+    Past 7 days the tag is still sent and Meta's own error is surfaced to
+    the agent. Gated per tenant schema until Advanced access is approved
+    (see HUMAN_AGENT_TAG_SCHEMAS).
     """
+    if HUMAN_AGENT_TAG_SCHEMAS is not None:
+        from django.db import connection as db_connection
+        if getattr(db_connection, 'schema_name', None) not in HUMAN_AGENT_TAG_SCHEMAS:
+            return {'messaging_type': 'RESPONSE'}
     if last_incoming_timestamp and timezone.now() - last_incoming_timestamp > STANDARD_MESSAGING_WINDOW:
         return {'messaging_type': 'MESSAGE_TAG', 'tag': 'HUMAN_AGENT'}
     return {'messaging_type': 'RESPONSE'}
@@ -8721,6 +8734,28 @@ def whatsapp_webhook(request):
 
                         message_obj.save()
                         logger.info(f"✅ Updated WhatsApp message status: {message_id} -> {status_value}")
+
+                        # Push the status flip to open chats so agents see
+                        # delivery failures (and pips) live — a silent
+                        # 'failed' looks identical to a sent message.
+                        if status_value in ('delivered', 'read', 'failed'):
+                            try:
+                                from .consumers import send_message_status_update
+                                conversation_number = (
+                                    message_obj.to_number
+                                    if message_obj.is_from_business
+                                    else message_obj.from_number
+                                )
+                                async_to_sync(send_message_status_update)(
+                                    tenant_schema,
+                                    platform='whatsapp',
+                                    conversation_id=conversation_number,
+                                    account_id=message_obj.business_account.waba_id,
+                                    message_ids=[message_obj.message_id],
+                                    status=status_value,
+                                )
+                            except Exception as ws_err:
+                                logger.warning(f"WhatsApp status broadcast failed: {ws_err}")
                     except WhatsAppMessage.DoesNotExist:
                         logger.warning(f"Message not found for status update: {message_id}")
 
