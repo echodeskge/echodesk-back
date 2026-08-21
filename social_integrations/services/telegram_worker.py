@@ -383,6 +383,10 @@ async def _broadcast_new_message(schema, account_key, peer_id, serialized, assig
     payload['conversation_id'] = str(peer_id)
     payload['sender_id'] = str(peer_id)
     payload['sender_name'] = serialized.get('peer_name') or serialized.get('peer_username') or str(peer_id)
+    # The serializer's sent_by is the raw user PK; the WS convention across
+    # platforms carries the display NAME in sent_by (frameToMessage prefers
+    # it) — leaking the pk renders a stray "1" as the author badge.
+    payload['sent_by'] = serialized.get('sent_by_name')
     try:
         await channel_layer.group_send(f'messages_{schema}', {
             'type': 'new_message',
