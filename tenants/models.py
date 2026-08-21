@@ -1269,12 +1269,14 @@ class SocialPlatformRoute(models.Model):
     PLATFORM_WHATSAPP = 'whatsapp'
     PLATFORM_TIKTOK = 'tiktok'
     PLATFORM_WECHAT = 'wechat'
+    PLATFORM_TELEGRAM = 'telegram'
     PLATFORM_CHOICES = [
         (PLATFORM_FACEBOOK, 'Facebook'),
         (PLATFORM_INSTAGRAM, 'Instagram'),
         (PLATFORM_WHATSAPP, 'WhatsApp'),
         (PLATFORM_TIKTOK, 'TikTok'),
         (PLATFORM_WECHAT, 'WeChat'),
+        (PLATFORM_TELEGRAM, 'Telegram'),
     ]
 
     platform = models.CharField(max_length=20, choices=PLATFORM_CHOICES, db_index=True)

@@ -33,6 +33,7 @@ PLATFORM_CONFIG = {
     "instagram": ("InstagramAccountConnection", "instagram_account_id"),
     "whatsapp": ("WhatsAppBusinessAccount", "phone_number_id"),
     "tiktok": ("TikTokShopAccount", "shop_id"),
+    "telegram": ("TelegramAccount", "telegram_user_id"),
 }
 
 

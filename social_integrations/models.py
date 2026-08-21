@@ -6,6 +6,8 @@ from django.core.validators import MinValueValidator, MaxValueValidator
 from django.utils import timezone
 import secrets
 
+from crm.fields import EncryptedCharField
+
 User = get_user_model()
 
 
@@ -872,6 +874,11 @@ class SocialIntegrationSettings(models.Model):
         default='default',
         help_text="Sound identifier for widget notifications."
     )
+    notification_sound_telegram = models.CharField(
+        max_length=64,
+        default='default',
+        help_text="Sound identifier for Telegram notifications."
+    )
 
     # Auto-Reply Settings - Timezone & Away Hours
     timezone = models.CharField(
@@ -928,6 +935,7 @@ class ConversationAutoReply(models.Model):
         ('facebook', 'Facebook'),
         ('instagram', 'Instagram'),
         ('whatsapp', 'WhatsApp'),
+        ('telegram', 'Telegram'),
     ]
 
     platform = models.CharField(
@@ -975,6 +983,7 @@ class ChatAssignment(models.Model):
         ('email', 'Email'),
         ('tiktok', 'TikTok'),
         ('widget', 'Website widget'),
+        ('telegram', 'Telegram'),
     ]
 
     STATUS_CHOICES = [
@@ -1055,7 +1064,7 @@ class ChatAssignment(models.Model):
         # tiktok -> tiktok_<account>_<conv>.
         if self.platform in ('email', 'widget', 'tiktok'):
             return f"{self.platform}_{self.account_id}_{self.conversation_id}"
-        prefix = {'facebook': 'fb', 'instagram': 'ig', 'whatsapp': 'wa'}.get(self.platform)
+        prefix = {'facebook': 'fb', 'instagram': 'ig', 'whatsapp': 'wa', 'telegram': 'tg'}.get(self.platform)
         if not prefix:
             # Defensive: future-proof against new platforms slipping in.
             return f"{self.platform}_{self.account_id}_{self.conversation_id}"
@@ -1657,6 +1666,7 @@ class QuickReply(models.Model):
         ('email', 'Email'),
         ('tiktok', 'TikTok'),
         ('widget', 'Website widget'),
+        ('telegram', 'Telegram'),
     ]
 
     # Content
@@ -1932,6 +1942,7 @@ class SocialAccount(models.Model):
         ('email', 'Email'),
         ('tiktok', 'TikTok'),
         ('widget', 'Website widget'),
+        ('telegram', 'Telegram'),
     ]
 
     client = models.ForeignKey(
@@ -2019,6 +2030,176 @@ class CachedProfilePicture(models.Model):
         return f"{self.platform}:{self.platform_id}"
 
 
+class TelegramAccount(models.Model):
+    """A tenant's connected Telegram account (personal/business, via MTProto).
+
+    The session_string is a full account credential (bypasses login + 2FA),
+    so it is stored with real Fernet encryption — never the Signer-based
+    pseudo-encryption used for legacy token fields in this app.
+    """
+
+    DEACTIVATION_REASONS = [
+        ('manual', 'Manually Disconnected'),
+        ('session_revoked', 'Session Revoked'),
+        ('flood_wait', 'Flood Wait'),
+        ('auth_error', 'Authentication Error'),
+        ('api_error', 'API Error'),
+    ]
+
+    telegram_user_id = models.BigIntegerField(unique=True, help_text="The account's own Telegram user id")
+    phone_number = models.CharField(max_length=20)
+    first_name = models.CharField(max_length=128, blank=True)
+    last_name = models.CharField(max_length=128, blank=True)
+    username = models.CharField(max_length=128, blank=True)
+    profile_pic_url = models.URLField(max_length=500, blank=True, null=True)
+
+    # MTProto StringSession, Fernet-encrypted at rest.
+    session_string = EncryptedCharField()
+
+    is_active = models.BooleanField(default=True)
+    deactivated_at = models.DateTimeField(null=True, blank=True)
+    deactivation_reason = models.CharField(
+        max_length=50, choices=DEACTIVATION_REASONS, null=True, blank=True,
+    )
+    deactivation_error = models.TextField(blank=True)
+
+    # Worker health (mirrors EmailConnection's auto-disable machinery)
+    last_seen_at = models.DateTimeField(null=True, blank=True, help_text='Last worker heartbeat for this account')
+    last_sync_error = models.TextField(blank=True)
+    auto_disabled_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Set when the system (not a human) disabled the account; requires re-login',
+    )
+    failure_count = models.PositiveIntegerField(default=0)
+
+    connected_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='connected_telegram_accounts',
+        help_text='EchoDesk user who performed the login',
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Telegram Account"
+        verbose_name_plural = "Telegram Accounts"
+
+    def __str__(self):
+        label = self.username or self.first_name or self.phone_number
+        return f"Telegram @{label} ({self.telegram_user_id})"
+
+
+class TelegramMessage(models.Model):
+    """Telegram DM, mirroring WhatsAppMessage's field set.
+
+    conversation key = peer_id (the customer's Telegram user id).
+    message_id is the composite '{telegram_user_id}_{telegram_msg_id}'
+    because Telegram message ids are only sequential per account.
+    """
+
+    MESSAGE_TYPE_CHOICES = [
+        ('text', 'Text'),
+        ('image', 'Image'),
+        ('video', 'Video'),
+        ('audio', 'Audio'),
+        ('voice', 'Voice'),
+        ('document', 'Document'),
+        ('sticker', 'Sticker'),
+    ]
+
+    STATUS_CHOICES = [
+        ('sent', 'Sent'),
+        ('delivered', 'Delivered'),
+        ('read', 'Read'),
+        ('failed', 'Failed'),
+    ]
+
+    SOURCE_CHOICES = [
+        ('echodesk', 'EchoDesk'),
+        ('telegram_app', 'Telegram App'),
+        ('synced', 'Synced from History'),
+    ]
+
+    account = models.ForeignKey(TelegramAccount, on_delete=models.CASCADE, related_name='messages')
+    message_id = models.CharField(max_length=100, unique=True)
+    telegram_msg_id = models.BigIntegerField(db_index=True, help_text='Raw Telegram message id (per-account sequential)')
+
+    peer_id = models.BigIntegerField(db_index=True, help_text="Customer's Telegram user id — the conversation key")
+    peer_access_hash = models.BigIntegerField(
+        null=True, blank=True,
+        help_text='Telegram access_hash for the peer; required to send after worker restarts',
+    )
+    peer_name = models.CharField(max_length=255, blank=True)
+    peer_username = models.CharField(max_length=128, blank=True)
+    profile_pic_url = models.URLField(max_length=500, blank=True, null=True)
+
+    message_text = models.TextField(blank=True)
+    message_type = models.CharField(max_length=20, choices=MESSAGE_TYPE_CHOICES, default='text')
+    media_url = models.URLField(max_length=1000, blank=True, null=True)
+    media_mime_type = models.CharField(max_length=100, blank=True)
+    attachments = models.JSONField(default=list, blank=True)
+
+    timestamp = models.DateTimeField()
+    is_from_business = models.BooleanField(default=False)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='sent')
+    is_delivered = models.BooleanField(default=False)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    is_read = models.BooleanField(default=False)
+    read_at = models.DateTimeField(null=True, blank=True)
+    is_read_by_staff = models.BooleanField(default=False)
+    read_by_staff_at = models.DateTimeField(null=True, blank=True)
+    error_message = models.TextField(blank=True)
+
+    source = models.CharField(
+        max_length=20, choices=SOURCE_CHOICES, default='telegram_app',
+        help_text='echodesk = sent from EchoDesk; telegram_app = echo of a message the owner sent from a Telegram client',
+    )
+    is_echo = models.BooleanField(default=False)
+    sent_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='sent_telegram_messages',
+    )
+
+    is_edited = models.BooleanField(default=False)
+    edited_at = models.DateTimeField(null=True, blank=True)
+    original_text = models.TextField(blank=True, null=True)
+    is_revoked = models.BooleanField(default=False)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    reaction_emoji = models.CharField(max_length=10, blank=True, null=True)
+    reacted_by = models.CharField(max_length=50, blank=True, null=True)
+    reacted_at = models.DateTimeField(null=True, blank=True)
+
+    reply_to_message_id = models.CharField(max_length=100, blank=True, null=True)
+    reply_to = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True, related_name='replies',
+    )
+
+    is_deleted = models.BooleanField(default=False, help_text='Soft deleted by staff')
+    deleted_at = models.DateTimeField(null=True, blank=True)
+    deleted_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='deleted_telegram_messages',
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-timestamp']
+        indexes = [
+            models.Index(fields=['account', 'timestamp']),
+            # Supports DISTINCT ON (peer_id) ORDER BY peer_id, -timestamp used
+            # by unified_conversations for the latest message per conversation.
+            models.Index(fields=['account', 'peer_id', '-timestamp']),
+        ]
+
+    def __str__(self):
+        direction = "to" if self.is_from_business else "from"
+        contact = self.peer_name or self.peer_username or self.peer_id
+        return f"Telegram {direction} {contact} - {self.message_text[:50]}"
+
+
 class ConversationArchive(models.Model):
     """
     Tracks archived conversations across all platforms.
@@ -2032,6 +2213,7 @@ class ConversationArchive(models.Model):
         ('email', 'Email'),
         ('tiktok', 'TikTok'),
         ('widget', 'Website widget'),
+        ('telegram', 'Telegram'),
     ]
 
     platform = models.CharField(max_length=20, choices=PLATFORM_CHOICES)

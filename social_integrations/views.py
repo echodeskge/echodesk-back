@@ -31,6 +31,7 @@ from .models import (
     ChatAssignment, ChatRating, ConversationArchive,
     EmailConnection, EmailMessage, EmailDraft, EmailConnectionUserAssignment,
     TikTokShopAccount, TikTokMessage,
+    TelegramAccount, TelegramMessage,
     EmailSignature, QuickReply,
     SocialClient, SocialClientCustomField, SocialClientCustomFieldValue, SocialAccount,
     AutoPostSettings, AutoPostContent,
@@ -378,7 +379,7 @@ def send_auto_reply(platform, recipient_id, message_text, connection):
     """
     from django.db import connection as db_connection
 
-    if platform not in ('facebook', 'instagram', 'whatsapp'):
+    if platform not in ('facebook', 'instagram', 'whatsapp', 'telegram'):
         return False
 
     schema = getattr(db_connection, 'schema_name', None)
@@ -501,6 +502,38 @@ def send_instagram_auto_reply(recipient_id, message_text, account_connection):
 
     except Exception as e:
         logger.error(f"❌ Instagram auto-reply exception: {e}")
+        return False
+
+
+def send_telegram_auto_reply(recipient_id, message_text, account):
+    """Send Telegram auto-reply via the telegram-worker service.
+
+    The worker persists the TelegramMessage row and broadcasts the WS
+    frame itself, so this function only fires the send.
+    """
+    try:
+        from django.conf import settings as dj_settings
+        from django.db import connection as _db_conn
+        from .channels import http as social_http
+
+        worker_url = f"{dj_settings.TELEGRAM_WORKER_URL.rstrip('/')}/send"
+        resp = social_http.post(worker_url, json={
+            'schema': getattr(_db_conn, 'schema_name', None),
+            'account_id': account.id,
+            'peer_id': int(recipient_id),
+            'text': message_text,
+            'reply_to_message_id': None,
+            'media': None,
+            'sent_by_id': None,
+            'is_auto_reply': True,
+        }, timeout=60)
+        if resp.status_code == 200:
+            logger.info(f"Telegram auto-reply sent to {recipient_id}")
+            return True
+        logger.error(f"Telegram auto-reply failed: {resp.status_code} {resp.text[:200]}")
+        return False
+    except Exception as e:
+        logger.error(f"Telegram auto-reply error: {e}")
         return False
 
 
@@ -4588,6 +4621,8 @@ def end_session(request):
                     message_id = send_rating_request_instagram(conversation_id, account_id, rating_message)
                 elif platform == 'whatsapp':
                     message_id = send_rating_request_whatsapp(conversation_id, account_id, rating_message)
+                elif platform == 'telegram':
+                    message_id = send_rating_request_telegram(conversation_id, account_id, rating_message)
             except Exception as e:
                 logger.error(f"Failed to send link-based rating request: {e}")
 
@@ -4618,6 +4653,8 @@ def end_session(request):
                     message_id = send_rating_request_instagram(conversation_id, account_id, rating_message)
                 elif platform == 'whatsapp':
                     message_id = send_rating_request_whatsapp(conversation_id, account_id, rating_message)
+                elif platform == 'telegram':
+                    message_id = send_rating_request_telegram(conversation_id, account_id, rating_message)
             except Exception as e:
                 logger.error(f"Failed to send rating request: {e}")
 
@@ -4909,6 +4946,37 @@ def send_rating_request_instagram(conversation_id, account_id, message):
     except Exception as e:
         logger.error(f"Failed to send IG rating request: {e}")
     return None
+
+
+def send_rating_request_telegram(conversation_id, account_id, message):
+    """Send a rating request via the telegram-worker service.
+
+    The worker persists the row and broadcasts WS itself; returns the
+    created message_id or None.
+    """
+    from django.db import connection as _db_conn
+    from .channels import http as social_http
+
+    try:
+        account = TelegramAccount.objects.get(telegram_user_id=account_id, is_active=True)
+        worker_url = f"{settings.TELEGRAM_WORKER_URL.rstrip('/')}/send"
+        resp = social_http.post(worker_url, json={
+            'schema': getattr(_db_conn, 'schema_name', None),
+            'account_id': account.id,
+            'peer_id': int(conversation_id),
+            'text': message,
+            'reply_to_message_id': None,
+            'media': None,
+            'sent_by_id': None,
+        }, timeout=60)
+        if resp.status_code == 200:
+            payload = resp.json().get('message') or {}
+            return payload.get('message_id')
+        logger.error(f"Telegram rating request failed: {resp.status_code} {resp.text[:200]}")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to send Telegram rating request: {e}")
+        return None
 
 
 def send_rating_request_whatsapp(conversation_id, waba_id, message):
@@ -5327,6 +5395,13 @@ def user_rating_sessions(request, user_id):
                 ).first()
                 if msg and msg.contact_name:
                     customer_name = msg.contact_name
+            elif rating.platform == 'telegram':
+                msg = TelegramMessage.objects.filter(
+                    peer_id=rating.conversation_id,
+                    is_from_business=False
+                ).first()
+                if msg and (msg.peer_name or msg.peer_username):
+                    customer_name = msg.peer_name or msg.peer_username
             elif rating.platform == 'widget':
                 # Widget conversation_id is `widget_<conn>_<session_id>`.
                 # Pull the visitor name off the WidgetSession so the table
@@ -5726,7 +5801,7 @@ def unified_conversations(request):
     - connection_id: Filter emails by specific email connection ID
     """
     # Parse query parameters
-    platforms_param = request.query_params.get('platforms', 'facebook,instagram,whatsapp,email,widget')
+    platforms_param = request.query_params.get('platforms', 'facebook,instagram,whatsapp,email,widget,telegram')
     enabled_platforms = [p.strip().lower() for p in platforms_param.split(',')]
     search_query = request.query_params.get('search', '').strip().lower()
     page = int(request.query_params.get('page', 1))
@@ -6352,6 +6427,97 @@ def unified_conversations(request):
         except Exception as e:
             logger.error(f"Error loading Widget conversations: {e}")
 
+    # Get Telegram conversations
+    if 'telegram' in enabled_platforms:
+        try:
+            from .models import TelegramAccount, TelegramMessage
+
+            for tg_account in TelegramAccount.objects.filter(is_active=True):
+                account_id = str(tg_account.telegram_user_id)
+
+                # Latest message per peer via index-backed DISTINCT ON.
+                latest_messages = (
+                    TelegramMessage.objects
+                    .filter(account=tg_account, is_deleted=False)
+                    .order_by('peer_id', '-timestamp')
+                    .distinct('peer_id')
+                )
+
+                # Search filter: match peers by name/username/text.
+                if search_query:
+                    matching_peers = set(
+                        TelegramMessage.objects.filter(account=tg_account, is_deleted=False)
+                        .filter(
+                            Q(peer_name__icontains=search_query)
+                            | Q(peer_username__icontains=search_query)
+                            | Q(message_text__icontains=search_query)
+                        )
+                        .values_list('peer_id', flat=True)
+                    )
+                    latest_messages = [m for m in latest_messages if m.peer_id in matching_peers]
+
+                # Batch unread counts (customer messages unread by staff).
+                unread_counts = {
+                    item['peer_id']: item['cnt']
+                    for item in (
+                        TelegramMessage.objects
+                        .filter(
+                            account=tg_account,
+                            is_from_business=False,
+                            is_read_by_staff=False,
+                            is_deleted=False,
+                        )
+                        .values('peer_id')
+                        .annotate(cnt=Count('id'))
+                    )
+                }
+
+                # Batch customer info from the latest incoming message per peer.
+                customer_info = {
+                    m.peer_id: m
+                    for m in (
+                        TelegramMessage.objects
+                        .filter(account=tg_account, is_from_business=False, is_deleted=False)
+                        .order_by('peer_id', '-timestamp')
+                        .distinct('peer_id')
+                    )
+                }
+
+                for last in latest_messages:
+                    peer_key = str(last.peer_id)
+                    if not is_conversation_visible('telegram', account_id, peer_key):
+                        continue
+
+                    info = customer_info.get(last.peer_id)
+                    sender_name = (
+                        (info.peer_name if info else '')
+                        or (info.peer_username if info else '')
+                        or last.peer_name or last.peer_username
+                        or f"Telegram User {last.peer_id}"
+                    )
+
+                    all_conversations.append({
+                        'conversation_id': f"tg_{account_id}_{last.peer_id}",
+                        'platform': 'telegram',
+                        'sender_id': peer_key,
+                        'sender_name': sender_name,
+                        'profile_pic_url': (info.profile_pic_url if info else None) or last.profile_pic_url,
+                        'last_message': {
+                            'id': str(last.id),
+                            'text': last.message_text,
+                            'timestamp': last.timestamp,
+                            'is_from_business': last.is_from_business,
+                            'attachment_type': last.message_type if last.message_type != 'text' else None,
+                            'platform_message_id': last.message_id,
+                        },
+                        'message_count': 0,
+                        'unread_count': unread_counts.get(last.peer_id, 0),
+                        'account_name': tg_account.username or tg_account.first_name or tg_account.phone_number,
+                        'account_id': account_id,
+                    })
+        except Exception as e:
+            logger.error(f"Error loading Telegram conversations: {e}")
+
     # Sort all conversations by last message timestamp (most recent first)
     all_conversations.sort(
         key=lambda x: x['last_message']['timestamp'],
@@ -6500,7 +6666,7 @@ def unread_messages_count(request):
         # unused and expensive.
         archived_by_platform = {
             'facebook': [], 'instagram': [], 'whatsapp': [],
-            'email': [], 'widget': [],
+            'email': [], 'widget': [], 'telegram': [],
         }
         for platform, conv_id in (
             ConversationArchive.objects
@@ -6514,6 +6680,7 @@ def unread_messages_count(request):
         archived_wa_numbers = archived_by_platform['whatsapp']
         archived_email_threads = archived_by_platform['email']
         archived_widget_sessions = archived_by_platform['widget']
+        archived_telegram_peers = archived_by_platform['telegram']
 
         # Check if chat assignment filtering is enabled
         settings_obj = get_social_settings(request)
@@ -6551,6 +6718,11 @@ def unread_messages_count(request):
                 platform='widget'
             ).values_list('conversation_id', flat=True)
 
+            my_telegram_assignments = active_assignments.filter(
+                assigned_user=request.user,
+                platform='telegram'
+            ).values_list('conversation_id', flat=True)
+
             # Get all active assignments by platform (to exclude others' chats)
             all_fb_assignments = active_assignments.filter(
                 platform='facebook'
@@ -6570,6 +6742,10 @@ def unread_messages_count(request):
 
             all_widget_assignments = active_assignments.filter(
                 platform='widget'
+            ).values_list('conversation_id', flat=True)
+
+            all_telegram_assignments = active_assignments.filter(
+                platform='telegram'
             ).values_list('conversation_id', flat=True)
 
             # Count unread Facebook messages - only mine or unassigned
@@ -6633,6 +6809,17 @@ def unread_messages_count(request):
                 Q(session__session_id__in=my_widget_assignments)
                 | ~Q(session__session_id__in=all_widget_assignments)
             ).count()
+
+            telegram_unread = TelegramMessage.objects.filter(
+                is_from_business=False,
+                is_read_by_staff=False,
+                is_deleted=False,
+            ).exclude(
+                peer_id__in=[int(p) for p in archived_telegram_peers if str(p).isdigit()]
+            ).filter(
+                Q(peer_id__in=[int(p) for p in my_telegram_assignments if str(p).isdigit()])
+                | ~Q(peer_id__in=[int(p) for p in all_telegram_assignments if str(p).isdigit()])
+            ).count()
         else:
             # Assignment not enabled - count all unread messages (original behavior)
             facebook_unread = FacebookMessage.objects.filter(
@@ -6667,9 +6854,17 @@ def unread_messages_count(request):
                 is_deleted=False,
             ).exclude(session__session_id__in=archived_widget_sessions).count()
 
+            telegram_unread = TelegramMessage.objects.filter(
+                is_from_business=False,
+                is_read_by_staff=False,
+                is_deleted=False,
+            ).exclude(
+                peer_id__in=[int(p) for p in archived_telegram_peers if str(p).isdigit()]
+            ).count()
+
         total_unread = (
             facebook_unread + instagram_unread + whatsapp_unread
-            + email_unread + widget_unread
+            + email_unread + widget_unread + telegram_unread
         )
 
         return Response({
@@ -6679,6 +6874,7 @@ def unread_messages_count(request):
             'whatsapp': whatsapp_unread,
             'email': email_unread,
             'widget': widget_unread,
+            'telegram': telegram_unread,
         })
 
     except Exception as e:
@@ -6763,6 +6959,15 @@ def mark_conversation_read(request):
             updated_count = WidgetMessage.objects.filter(
                 session__session_id=conversation_id,
                 is_from_visitor=True,
+                is_read_by_staff=False,
+            ).update(
+                is_read_by_staff=True,
+                read_by_staff_at=now,
+            )
+        elif platform == 'telegram':
+            updated_count = TelegramMessage.objects.filter(
+                peer_id=conversation_id,
+                is_from_business=False,
                 is_read_by_staff=False,
             ).update(
                 is_read_by_staff=True,
@@ -6932,6 +7137,17 @@ def mark_conversation_unread(request):
                 last_message.read_by_staff_at = None
                 last_message.save()
                 updated_count = 1
+        elif platform == 'telegram':
+            last_message = TelegramMessage.objects.filter(
+                peer_id=conversation_id,
+                is_from_business=False,
+                is_read_by_staff=True,
+            ).order_by('-timestamp').first()
+            if last_message:
+                last_message.is_read_by_staff = False
+                last_message.read_by_staff_at = None
+                last_message.save()
+                updated_count = 1
         else:
             return Response({
                 'error': f'Invalid platform: {platform}'
@@ -7066,6 +7282,12 @@ def delete_conversation(request):
                 session__session_id=conversation_id,
                 is_deleted=False,
             ).update(is_deleted=True)
+
+        elif platform == 'telegram':
+            deleted_count = TelegramMessage.objects.filter(
+                peer_id=conversation_id,
+                is_deleted=False,
+            ).update(is_deleted=True, deleted_at=now, deleted_by=request.user)
 
         else:
             return Response({
@@ -11621,12 +11843,24 @@ def mark_all_conversations_read(request):
             total_updated += count
             logger.info(f"Marked {count} Widget messages as read")
 
+        # Mark Telegram messages as read
+        if include_all or 'telegram' in platforms:
+            count = TelegramMessage.objects.filter(
+                is_from_business=False,
+                is_read_by_staff=False,
+            ).update(
+                is_read_by_staff=True,
+                read_by_staff_at=now,
+            )
+            total_updated += count
+            logger.info(f"Marked {count} Telegram messages as read")
+
         # Bulk read-state broadcast: beta clients treat conversation_id=None
         # as "clear all unread for the listed platform(s)" so the sidebar
         # badges drop instantly without a list refetch. Emitted once per
         # touched platform so handlers can keep platform-scoped logic clean.
         for plat in [p for p in platforms if p != 'all'] or (
-            ['facebook', 'instagram', 'whatsapp', 'email', 'widget'] if include_all else []
+            ['facebook', 'instagram', 'whatsapp', 'email', 'widget', 'telegram'] if include_all else []
         ):
             _broadcast_read_state(
                 request,
@@ -11730,6 +11964,12 @@ def archive_conversation(request):
                     thread_id=conversation_id,
                     is_from_business=False,
                     is_read_by_staff=False
+                ).update(is_read_by_staff=True, read_by_staff_at=now)
+            elif platform == 'telegram':
+                TelegramMessage.objects.filter(
+                    peer_id=conversation_id,
+                    is_from_business=False,
+                    is_read_by_staff=False,
                 ).update(is_read_by_staff=True, read_by_staff_at=now)
             elif platform == 'widget':
                 WidgetMessage.objects.filter(
@@ -12007,6 +12247,22 @@ def archive_all_conversations(request):
                             'platform': 'email',
                             'conversation_id': thread_id,
                             'account_id': str(connection.id)
+                        })
+
+        if include_all or 'telegram' in platforms:
+            for tg_account in TelegramAccount.objects.filter(is_active=True):
+                peer_ids = TelegramMessage.objects.filter(
+                    account=tg_account,
+                    is_deleted=False,
+                ).values_list('peer_id', flat=True).distinct()
+
+                for peer_id in peer_ids:
+                    key = ('telegram', str(peer_id), str(tg_account.telegram_user_id))
+                    if key not in existing_archives and key not in active_assignments:
+                        conversations_to_archive.append({
+                            'platform': 'telegram',
+                            'conversation_id': str(peer_id),
+                            'account_id': str(tg_account.telegram_user_id)
                         })
 
         # Bulk create archive records

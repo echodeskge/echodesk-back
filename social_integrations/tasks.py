@@ -32,6 +32,7 @@ def send_auto_reply_task(self, schema_name, platform, recipient_id, message_text
         from social_integrations.models import (
             FacebookPageConnection,
             InstagramAccountConnection,
+            TelegramAccount,
             WhatsAppBusinessAccount,
         )
         from social_integrations import views
@@ -40,11 +41,13 @@ def send_auto_reply_task(self, schema_name, platform, recipient_id, message_text
             "facebook": FacebookPageConnection,
             "instagram": InstagramAccountConnection,
             "whatsapp": WhatsAppBusinessAccount,
+            "telegram": TelegramAccount,
         }
         sender_map = {
             "facebook": views.send_facebook_auto_reply,
             "instagram": views.send_instagram_auto_reply,
             "whatsapp": views.send_whatsapp_auto_reply,
+            "telegram": views.send_telegram_auto_reply,
         }
         Model = model_map.get(platform)
         sender = sender_map.get(platform)

@@ -535,7 +535,14 @@ SOCIAL_INTEGRATIONS = {
     'TIKTOK_SHOP_APP_SECRET': TIKTOK_SHOP_APP_SECRET,
     'TIKTOK_SHOP_SERVICE_ID': TIKTOK_SHOP_SERVICE_ID,
     'TIKTOK_SHOP_REDIRECT_URI': TIKTOK_SHOP_REDIRECT_URI,
+    # Telegram MTProto (platform-wide app credentials from my.telegram.org;
+    # NOT the TELEGRAM_BOT_TOKEN used for deploy notifications)
+    'TELEGRAM_API_ID': config('TELEGRAM_API_ID', default='', cast=str),
+    'TELEGRAM_API_HASH': config('TELEGRAM_API_HASH', default=''),
 }
+
+# Internal URL of the telegram-worker service (Docker network)
+TELEGRAM_WORKER_URL = config('TELEGRAM_WORKER_URL', default='http://telegram-worker:8010')
 
 # ASGI Application for WebSocket support
 ASGI_APPLICATION = 'amanati_crm.asgi.application'

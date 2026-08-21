@@ -7,6 +7,7 @@ from .models import (
     ChatAssignment, ChatRating,
     EmailConnection, EmailMessage, EmailDraft, EmailConnectionUserAssignment,
     TikTokShopAccount, TikTokMessage,
+    TelegramAccount, TelegramMessage,
     EmailSignature, QuickReply,
     SocialClient, SocialClientCustomField, SocialClientCustomFieldValue, SocialAccount,
     AutoPostSettings, AutoPostContent,
@@ -436,7 +437,7 @@ class SocialIntegrationSettingsSerializer(serializers.ModelSerializer):
             'post_review_redirect_url',
             'notification_sound_facebook', 'notification_sound_instagram',
             'notification_sound_whatsapp', 'notification_sound_email',
-            'notification_sound_widget',
+            'notification_sound_widget', 'notification_sound_telegram',
             'notification_sound_team_chat', 'notification_sound_system',
             # Auto-reply settings
             'timezone', 'away_hours_enabled', 'away_hours_schedule',
@@ -551,7 +552,7 @@ class AssignmentStatusResponseSerializer(serializers.Serializer):
 
 class ChatAssignmentCreateSerializer(serializers.Serializer):
     """Serializer for assigning a chat"""
-    platform = serializers.ChoiceField(choices=['facebook', 'instagram', 'whatsapp', 'email', 'widget'])
+    platform = serializers.ChoiceField(choices=['facebook', 'instagram', 'whatsapp', 'email', 'widget', 'telegram'])
     conversation_id = serializers.CharField(max_length=255)
     account_id = serializers.CharField(max_length=255)
 
@@ -1332,7 +1333,7 @@ ClientCreateSerializer = SocialClientCreateSerializer
 
 class SocialAccountLinkSerializer(serializers.Serializer):
     """Serializer for linking/unlinking a social account to a client"""
-    platform = serializers.ChoiceField(choices=['facebook', 'instagram', 'whatsapp', 'email', 'tiktok', 'widget'])
+    platform = serializers.ChoiceField(choices=['facebook', 'instagram', 'whatsapp', 'email', 'tiktok', 'widget', 'telegram'])
     platform_id = serializers.CharField(max_length=255, help_text="Platform-specific ID (sender_id, wa_id, etc.)")
     account_connection_id = serializers.CharField(max_length=255, help_text="Account connection ID (page_id, waba_id, etc.)")
     display_name = serializers.CharField(max_length=255, required=False, allow_blank=True)
@@ -1360,7 +1361,7 @@ class LastMessageSerializer(serializers.Serializer):
 class UnifiedConversationSerializer(serializers.Serializer):
     """Serializer for unified conversation across all platforms"""
     conversation_id = serializers.CharField()
-    platform = serializers.ChoiceField(choices=['facebook', 'instagram', 'whatsapp', 'email', 'widget'])
+    platform = serializers.ChoiceField(choices=['facebook', 'instagram', 'whatsapp', 'email', 'widget', 'telegram'])
     sender_id = serializers.CharField()
     sender_name = serializers.CharField(allow_null=True, allow_blank=True)
     profile_pic_url = serializers.CharField(allow_null=True, allow_blank=True, required=False)
@@ -1444,3 +1445,120 @@ class AutoPostContentSerializer(serializers.ModelSerializer):
         if obj.rejected_by:
             return obj.rejected_by.get_full_name() or obj.rejected_by.email
         return None
+
+# ============================================================================
+# TELEGRAM SERIALIZERS
+# ============================================================================
+
+class TelegramAccountSerializer(serializers.ModelSerializer):
+    """Read-only serializer for Telegram accounts — NEVER exposes the session"""
+    connected_by_email = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TelegramAccount
+        fields = [
+            'id', 'telegram_user_id', 'phone_number', 'first_name', 'last_name',
+            'username', 'profile_pic_url', 'is_active',
+            'deactivated_at', 'deactivation_reason', 'auto_disabled_at',
+            'last_seen_at', 'connected_by_email', 'created_at', 'updated_at',
+        ]
+        read_only_fields = fields
+
+    def get_connected_by_email(self, obj):
+        return obj.connected_by.email if obj.connected_by else None
+
+
+class TelegramMessageSerializer(serializers.ModelSerializer):
+    """Serializer for Telegram messages"""
+    account_username = serializers.CharField(source='account.username', read_only=True)
+    account_id = serializers.CharField(source='account.telegram_user_id', read_only=True)
+    sent_by_name = serializers.SerializerMethodField()
+    reply_to_id = serializers.PrimaryKeyRelatedField(source='reply_to', read_only=True)
+    reply_to_text = serializers.SerializerMethodField()
+    reply_to_sender_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TelegramMessage
+        fields = [
+            'id', 'message_id', 'telegram_msg_id', 'peer_id', 'peer_name',
+            'peer_username', 'profile_pic_url',
+            'message_text', 'message_type', 'media_url', 'media_mime_type', 'attachments',
+            'timestamp', 'is_from_business', 'status',
+            'is_delivered', 'delivered_at', 'is_read', 'read_at',
+            'is_read_by_staff', 'read_by_staff_at', 'error_message',
+            'source', 'is_echo', 'sent_by', 'sent_by_name',
+            'is_edited', 'edited_at', 'original_text', 'is_revoked', 'revoked_at',
+            'reaction_emoji', 'reacted_by', 'reacted_at',
+            'reply_to_message_id', 'reply_to_id', 'reply_to_text', 'reply_to_sender_name',
+            'account_username', 'account_id', 'created_at',
+        ]
+        read_only_fields = fields
+
+    def get_sent_by_name(self, obj):
+        if obj.sent_by:
+            return obj.sent_by.get_full_name() or obj.sent_by.email
+        return None
+
+    def get_reply_to_text(self, obj):
+        return obj.reply_to.message_text[:200] if obj.reply_to else None
+
+    def get_reply_to_sender_name(self, obj):
+        if not obj.reply_to:
+            return None
+        if obj.reply_to.is_from_business:
+            return obj.reply_to.account.first_name or 'Business'
+        return obj.reply_to.peer_name or obj.reply_to.peer_username
+
+
+class TelegramConnectRequestSerializer(serializers.Serializer):
+    """Start Telegram login: request an auth code for the phone number"""
+    phone_number = serializers.RegexField(
+        regex=r'^\+\d{7,15}$',
+        help_text='Phone number in E.164 format, e.g. +995599123456',
+    )
+
+
+class TelegramConnectResponseSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=['code_sent'])
+    login_token = serializers.CharField()
+
+
+class TelegramVerifyRequestSerializer(serializers.Serializer):
+    """Complete Telegram login with the received code (+ 2FA password if set)"""
+    login_token = serializers.CharField()
+    code = serializers.CharField(required=False, allow_blank=True)
+    password = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+
+    def validate(self, data):
+        if not data.get('code') and not data.get('password'):
+            raise serializers.ValidationError('Either code or password is required')
+        return data
+
+
+class TelegramVerifyResponseSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=['connected', 'password_required'])
+    account = TelegramAccountSerializer(allow_null=True, required=False)
+
+
+class TelegramStatusSerializer(serializers.Serializer):
+    """Telegram connection status response"""
+    connected = serializers.BooleanField()
+    accounts = TelegramAccountSerializer(many=True)
+
+
+class TelegramDisconnectRequestSerializer(serializers.Serializer):
+    account_id = serializers.IntegerField(help_text='TelegramAccount pk to disconnect')
+
+
+class TelegramSendMessageSerializer(serializers.Serializer):
+    """Send a Telegram message (text and/or one media file per call)"""
+    account_id = serializers.CharField(help_text='telegram_user_id of the sending account')
+    peer_id = serializers.CharField(help_text="Recipient's Telegram user id")
+    message = serializers.CharField(required=False, allow_blank=True, help_text='Message text')
+    reply_to_message_id = serializers.CharField(required=False, allow_blank=True)
+
+
+class TelegramSendMessageResponseSerializer(serializers.Serializer):
+    success = serializers.BooleanField()
+    message = TelegramMessageSerializer(allow_null=True, required=False)
+    error = serializers.CharField(required=False)

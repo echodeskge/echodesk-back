@@ -43,3 +43,10 @@ sentry-sdk[django]>=2.0.0
 # Testing (for CI/CD)
 coverage>=7.2.0
 nplusone>=1.0.0
+
+# Telegram MTProto integration (telegram-worker service + login flow)
+telethon>=1.44,<2
+aiohttp>=3.9  # telegram-worker's internal send/control/health HTTP server
+# Explicit pin: EncryptedCharField (crm/fields.py) + Telegram session storage
+# depend on Fernet; cryptography was previously only a transitive dependency.
+cryptography>=42.0

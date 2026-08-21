@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from . import views, admin_views
+from . import views, admin_views, telegram_views
 
 # Create a router and register our viewsets with it
 router = DefaultRouter()
@@ -14,6 +14,7 @@ router.register(r'whatsapp-contacts', views.WhatsAppContactViewSet, basename='wh
 router.register(r'email-messages', views.EmailMessageViewSet, basename='email_messages')
 router.register(r'email-drafts', views.EmailDraftViewSet, basename='email_drafts')
 router.register(r'tiktok-messages', views.TikTokMessageViewSet, basename='tiktok_messages')
+router.register(r'telegram-messages', telegram_views.TelegramMessageViewSet, basename='telegram_messages')
 router.register(r'quick-replies', views.QuickReplyViewSet, basename='quick_replies')
 router.register(r'clients', views.SocialClientViewSet, basename='social_clients')
 router.register(r'clients/custom-fields', views.SocialClientCustomFieldViewSet, basename='social_client_custom_fields')
@@ -92,6 +93,13 @@ urlpatterns = [
     path('tiktok/webhook/', views.tiktok_webhook, name='tiktok_webhook'),
     path('tiktok/status/', views.tiktok_status, name='tiktok_status'),
     path('tiktok/disconnect/', views.tiktok_disconnect, name='tiktok_disconnect'),
+
+    # Telegram (MTProto) endpoints
+    path('telegram/connect/', telegram_views.telegram_connect, name='telegram_connect'),
+    path('telegram/verify/', telegram_views.telegram_verify, name='telegram_verify'),
+    path('telegram/status/', telegram_views.telegram_status, name='telegram_status'),
+    path('telegram/disconnect/', telegram_views.telegram_disconnect, name='telegram_disconnect'),
+    path('telegram/send-message/', telegram_views.telegram_send_message, name='telegram_send_message'),
     path('tiktok/send-message/', views.tiktok_send_message, name='tiktok_send_message'),
 
     # Webhook debugging endpoints
