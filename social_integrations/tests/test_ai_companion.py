@@ -364,6 +364,19 @@ class TestAiViews(AICompanionTestCase):
                               user=self.agent)
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_superuser_with_non_admin_role_can_write(self):
+        # Superusers commonly carry role='agent' — has_permission() returns
+        # True for them, so settings writes must succeed (regression: the
+        # write check used to require role=='admin' only, 403'ing superusers).
+        superuser = self.create_user(
+            email='ai-super@test.com', role='agent',
+            is_staff=True, is_superuser=True,
+        )
+        resp = self.api_patch('/api/social/ai/settings/', {'is_enabled': True},
+                              user=superuser)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertTrue(resp.data['is_enabled'])
+
     def test_summarize_endpoint(self):
         conn = self.create_fb_connection()
         self.create_fb_message(

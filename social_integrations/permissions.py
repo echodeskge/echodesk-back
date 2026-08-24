@@ -180,4 +180,10 @@ class CanManageAICompanion(permissions.BasePermission):
             return False
         if request.method in permissions.SAFE_METHODS:
             return True
-        return request.user.role == 'admin'
+        # Write access: admin role, or an explicit settings permission.
+        # `has_permission` returns True for superusers, matching how
+        # CanManageSocialSettings gates the rest of social settings.
+        return (
+            request.user.role == 'admin' or
+            request.user.has_permission('manage_social_settings')
+        )
