@@ -241,6 +241,12 @@ def _persist_incoming(account_id, data):
         except Exception:  # noqa: BLE001
             logger.exception('auto-reply hook failed')
         try:
+            from social_integrations.services import ai_companion
+
+            ai_companion.schedule_ai_reply('telegram', account_key, peer_key)
+        except Exception:  # noqa: BLE001
+            logger.exception('ai companion hook failed')
+        try:
             extras['assigned_user_id'] = social_views.get_assignment_for_conversation(
                 platform='telegram', conversation_id=peer_key, account_id=account_key,
             )

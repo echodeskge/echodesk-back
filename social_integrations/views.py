@@ -58,6 +58,7 @@ from .serializers import (
     AutoPostSettingsSerializer, AutoPostContentSerializer,
 )
 from .services.profile_pic_cache import get_facebook_profile_pic, get_instagram_profile
+from .services import ai_companion as ai_companion_service
 from .pagination import SocialMessagePagination
 from .permissions import (
     CanManageSocialConnections, CanViewSocialMessages,
@@ -280,6 +281,11 @@ def process_auto_reply(platform, account_id, conversation_id, sender_name, conne
         # Get platform-specific settings
         platform_settings = settings.auto_reply_settings.get(platform, {})
         if not platform_settings:
+            return False
+
+        # When the AI companion answers this channel, it replaces the
+        # canned welcome/away messages entirely.
+        if ai_companion_service.is_ai_active(platform, account_id, conversation_id):
             return False
 
         # Get or create conversation tracking
@@ -2387,6 +2393,11 @@ def facebook_webhook(request):
                                                     connection=page_connection
                                                 )
 
+                                                # AI companion auto-answer (debounced; no-op unless enabled)
+                                                ai_companion_service.schedule_ai_reply(
+                                                    'facebook', page_id, sender_id
+                                                )
+
                                             # Send WebSocket notification for real-time updates
                                             from django.db import connection
                                             current_schema = getattr(connection, 'schema_name', None)
@@ -3816,6 +3827,11 @@ def instagram_webhook(request):
                                             conversation_id=sender_id,
                                             sender_name=sender_name or sender_username,
                                             connection=account_connection
+                                        )
+
+                                        # AI companion auto-answer (debounced; no-op unless enabled)
+                                        ai_companion_service.schedule_ai_reply(
+                                            'instagram', account_connection.instagram_account_id, sender_id
                                         )
 
                                         # Send WebSocket notification for real-time updates
@@ -6561,6 +6577,16 @@ def unified_conversations(request):
             for ar in ConversationArchive.objects.filter(platform__in=page_platforms):
                 archive_lookup[(ar.platform, ar.account_id, ar.conversation_id)] = ar
 
+        # AI companion state lookup — only non-default modes matter
+        # (no row / mode 'ai' both render as "no badge").
+        ai_state_lookup = {}
+        if page_keys:
+            from .models import AIConversationState
+            for st in AIConversationState.objects.filter(
+                platform__in={plat for plat, _, _ in page_keys},
+            ).exclude(mode='ai'):
+                ai_state_lookup[(st.platform, st.account_id, st.conversation_id)] = st.mode
+
         for c in paginated_conversations:
             key = (c['platform'], c['account_id'], c['sender_id'])
             assignment = assignment_lookup.get(key)
@@ -6591,6 +6617,8 @@ def unified_conversations(request):
             else:
                 c['is_archived'] = False
                 c['archived_at'] = None
+
+            c['ai_state'] = ai_state_lookup.get(key)
 
     # Build pagination URLs
     base_url = request.build_absolute_uri().split('?')[0]
@@ -8888,6 +8916,11 @@ def whatsapp_webhook(request):
                         conversation_id=from_number,
                         sender_name=contact_name,
                         connection=account
+                    )
+
+                    # AI companion auto-answer (debounced; no-op unless enabled)
+                    ai_companion_service.schedule_ai_reply(
+                        'whatsapp', account.waba_id, from_number
                     )
 
                     # Send WebSocket notification

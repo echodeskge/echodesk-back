@@ -274,3 +274,70 @@ def create_social_message_notification(platform, sender_name, message_text,
                 metadata=meta,
                 link_url=base_link,
             )
+
+
+def create_ai_handoff_notification(platform, conversation_id, account_id,
+                                   sender_name, reason=''):
+    """
+    Notify agents that the AI companion escalated a conversation to a human.
+
+    Audience mirrors create_social_message_notification: the assigned user
+    if the chat is assigned, otherwise up to 10 active users. The link
+    deep-links into the exact chat so the agent lands where the AI stopped.
+    """
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+
+    display_name = sender_name or 'a customer'
+    title = f"AI needs a human: {platform} chat with {display_name}"
+    msg = (reason or 'The AI assistant asked for a human to take over.')[:200]
+    meta = {
+        'platform': platform,
+        'conversation_id': conversation_id,
+        'account_id': account_id,
+        'sender_name': sender_name,
+        'reason': reason,
+    }
+
+    prefix_map = {
+        'facebook': 'fb', 'instagram': 'ig', 'whatsapp': 'wa', 'telegram': 'tg',
+    }
+    prefix = prefix_map.get((platform or '').lower(), (platform or '').lower())
+    chat_id = f'{prefix}_{account_id}_{conversation_id}' if account_id and conversation_id else None
+    base_link = f'/messages/{chat_id}' if chat_id else '/messages'
+
+    assigned_user_id = None
+    try:
+        from social_integrations.views import get_assignment_for_conversation
+        assigned_user_id = get_assignment_for_conversation(
+            platform, conversation_id, account_id
+        )
+    except Exception:
+        pass
+
+    if assigned_user_id:
+        try:
+            user = User.objects.get(id=assigned_user_id, is_active=True)
+            create_notification(
+                user=user,
+                notification_type='ai_handoff_requested',
+                title=title,
+                message=msg,
+                ticket_id=None,
+                metadata=meta,
+                link_url=f'{base_link}?tab=assigned',
+            )
+            return
+        except User.DoesNotExist:
+            pass
+
+    for user in User.objects.filter(is_active=True)[:10]:
+        create_notification(
+            user=user,
+            notification_type='ai_handoff_requested',
+            title=title,
+            message=msg,
+            ticket_id=None,
+            metadata=meta,
+            link_url=base_link,
+        )

@@ -264,6 +264,13 @@ def widget_public_messages(request):
             conversation_id=session.session_id,
             account_id=str(conn.id),
         )
+        try:
+            from .services import ai_companion
+            ai_companion.schedule_ai_reply(
+                'widget', str(conn.id), session.session_id
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception('widget ai companion hook failed')
 
     return Response(response_data, status=status.HTTP_201_CREATED)
 

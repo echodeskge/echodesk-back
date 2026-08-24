@@ -1383,6 +1383,9 @@ class UnifiedConversationSerializer(serializers.Serializer):
     session_ended_at = serializers.DateTimeField(allow_null=True, required=False)
     is_archived = serializers.BooleanField(required=False, default=False)
     archived_at = serializers.DateTimeField(allow_null=True, required=False)
+    # AI companion mode: 'needs_human' | 'off' when escalated/paused,
+    # null when the AI is active or the feature is unused.
+    ai_state = serializers.CharField(allow_null=True, allow_blank=True, required=False)
 
 
 class PaginatedUnifiedConversationSerializer(serializers.Serializer):

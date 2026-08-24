@@ -2441,3 +2441,194 @@ class WidgetMessage(models.Model):
     def __str__(self):
         direction = 'visitor' if self.is_from_visitor else 'agent'
         return f"WidgetMessage({self.message_id}) from={direction}"
+
+
+# ============================================================================
+# AI COMPANION
+# ============================================================================
+
+class AICompanionSettings(models.Model):
+    """
+    Tenant-wide AI companion configuration (singleton, like AutoPostSettings).
+
+    Per-channel enablement lives in AICompanionChannel; this holds the
+    provider choice, key override, default guidance, and safety caps.
+    """
+    PROVIDER_CHOICES = [
+        ('anthropic', 'Anthropic (Claude)'),
+        ('openai', 'OpenAI'),
+    ]
+
+    is_enabled = models.BooleanField(
+        default=False, help_text='Master toggle for all AI companion behavior'
+    )
+    provider = models.CharField(max_length=20, choices=PROVIDER_CHOICES, default='anthropic')
+    model = models.CharField(
+        max_length=80, blank=True, default='',
+        help_text='Model id; empty = provider default',
+    )
+    api_key = EncryptedCharField(
+        blank=True, default='',
+        help_text='Tenant API key override; empty = platform default key',
+    )
+    guidance_prompt = models.TextField(
+        blank=True, default='',
+        help_text='Tenant instructions for how the AI should answer customers',
+    )
+    escalation_instructions = models.TextField(
+        blank=True, default='',
+        help_text='Extra instructions for when the AI should hand off to a human',
+    )
+    language = models.CharField(
+        max_length=10, default='ka',
+        help_text='Default reply language code (customer language still wins)',
+    )
+    max_replies_per_conversation_per_day = models.PositiveIntegerField(default=30)
+    max_replies_per_day = models.PositiveIntegerField(
+        default=500, help_text='Tenant-wide daily AI reply cap'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'AI Companion Settings'
+        verbose_name_plural = 'AI Companion Settings'
+
+    def __str__(self):
+        return f"AICompanionSettings(enabled={self.is_enabled}, provider={self.provider})"
+
+
+class AICompanionChannel(models.Model):
+    """
+    Enables the AI companion for one platform account.
+    account_id='' means "every account of this platform".
+    """
+    platform = models.CharField(max_length=20)
+    account_id = models.CharField(max_length=255, blank=True, default='')
+    enabled = models.BooleanField(default=False)
+    guidance_prompt = models.TextField(
+        blank=True, default='',
+        help_text='Channel-specific guidance; empty = inherit tenant default',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [['platform', 'account_id']]
+        verbose_name = 'AI Companion Channel'
+        verbose_name_plural = 'AI Companion Channels'
+
+    def __str__(self):
+        scope = self.account_id or 'all accounts'
+        return f"AICompanionChannel({self.platform}/{scope}, enabled={self.enabled})"
+
+
+class AIConversationState(models.Model):
+    """
+    Per-conversation AI mode. Absence of a row means mode 'ai'.
+
+    After a handoff (needs_human) or a manual pause (off) the AI never
+    resumes by itself — an agent must switch the mode back to 'ai'.
+    """
+    MODE_CHOICES = [
+        ('ai', 'AI Active'),
+        ('needs_human', 'Needs Human'),
+        ('off', 'Paused'),
+    ]
+
+    platform = models.CharField(max_length=20)
+    conversation_id = models.CharField(max_length=255)
+    account_id = models.CharField(max_length=255)
+    mode = models.CharField(max_length=20, choices=MODE_CHOICES, default='ai')
+    reason = models.TextField(
+        blank=True, default='',
+        help_text='Why the AI escalated (includes call requests)',
+    )
+    total_ai_replies = models.PositiveIntegerField(default=0)
+    daily_reply_count = models.PositiveIntegerField(default=0)
+    daily_count_date = models.DateField(null=True, blank=True)
+    last_ai_reply_at = models.DateTimeField(null=True, blank=True)
+    escalated_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [['platform', 'conversation_id', 'account_id']]
+        indexes = [
+            models.Index(fields=['platform', 'account_id', 'mode']),
+        ]
+        verbose_name = 'AI Conversation State'
+        verbose_name_plural = 'AI Conversation States'
+
+    def __str__(self):
+        return f"AIConversationState({self.platform}/{self.conversation_id}: {self.mode})"
+
+
+class ConversationSummary(models.Model):
+    """An AI-generated summary of one conversation, generated on demand."""
+    platform = models.CharField(max_length=20)
+    account_id = models.CharField(max_length=255)
+    conversation_id = models.CharField(max_length=255)
+    summary_text = models.TextField()
+    provider = models.CharField(max_length=20, blank=True, default='')
+    model = models.CharField(max_length=80, blank=True, default='')
+    prompt_tokens = models.PositiveIntegerField(null=True, blank=True)
+    completion_tokens = models.PositiveIntegerField(null=True, blank=True)
+    requested_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='conversation_summaries',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['platform', 'account_id', 'conversation_id', '-created_at']),
+        ]
+        verbose_name = 'Conversation Summary'
+        verbose_name_plural = 'Conversation Summaries'
+
+    def __str__(self):
+        return f"ConversationSummary({self.platform}/{self.conversation_id} @ {self.created_at:%Y-%m-%d %H:%M})"
+
+
+class AICompanionRun(models.Model):
+    """
+    Audit row for every AI provider invocation (reply decision, summary,
+    settings test) — success or failure. Doubles as the tenant daily-cap
+    counter and the future billing source.
+    """
+    KIND_CHOICES = [
+        ('reply', 'Reply Decision'),
+        ('summary', 'Summary'),
+        ('test', 'Settings Test'),
+    ]
+
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES)
+    platform = models.CharField(max_length=20, blank=True, default='')
+    account_id = models.CharField(max_length=255, blank=True, default='')
+    conversation_id = models.CharField(max_length=255, blank=True, default='')
+    provider = models.CharField(max_length=20, blank=True, default='')
+    model = models.CharField(max_length=80, blank=True, default='')
+    action = models.CharField(
+        max_length=30, blank=True, default='',
+        help_text='Decision outcome for reply runs: reply|handoff|ignore',
+    )
+    prompt_tokens = models.PositiveIntegerField(null=True, blank=True)
+    completion_tokens = models.PositiveIntegerField(null=True, blank=True)
+    started_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    success = models.BooleanField(default=False)
+    error_message = models.TextField(blank=True, default='')
+    raw_response = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-started_at']
+        indexes = [
+            models.Index(fields=['-started_at']),
+            models.Index(fields=['kind', 'started_at']),
+        ]
+        verbose_name = 'AI Companion Run'
+        verbose_name_plural = 'AI Companion Runs'
+
+    def __str__(self):
+        return f"AICompanionRun({self.kind}, success={self.success}, {self.started_at:%Y-%m-%d %H:%M})"

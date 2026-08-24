@@ -487,3 +487,44 @@ class WidgetMessageAdmin(TenantAwareAdminMixin, admin.ModelAdmin):
     list_filter = ('is_from_visitor', 'is_delivered', 'is_read_by_staff', 'is_deleted')
     search_fields = ('message_id', 'message_text')
     readonly_fields = ('created_at',)
+
+from .models import (  # noqa: E402
+    AICompanionChannel, AICompanionRun, AICompanionSettings,
+    AIConversationState, ConversationSummary,
+)
+
+
+@admin.register(AICompanionSettings)
+class AICompanionSettingsAdmin(TenantAwareAdminMixin, admin.ModelAdmin):
+    list_display = ('is_enabled', 'provider', 'model', 'language', 'updated_at')
+
+
+@admin.register(AICompanionChannel)
+class AICompanionChannelAdmin(TenantAwareAdminMixin, admin.ModelAdmin):
+    list_display = ('platform', 'account_id', 'enabled', 'updated_at')
+    list_filter = ('platform', 'enabled')
+
+
+@admin.register(AIConversationState)
+class AIConversationStateAdmin(TenantAwareAdminMixin, admin.ModelAdmin):
+    list_display = ('platform', 'conversation_id', 'account_id', 'mode',
+                    'total_ai_replies', 'last_ai_reply_at', 'escalated_at')
+    list_filter = ('platform', 'mode')
+    search_fields = ('conversation_id', 'account_id')
+
+
+@admin.register(ConversationSummary)
+class ConversationSummaryAdmin(TenantAwareAdminMixin, admin.ModelAdmin):
+    list_display = ('platform', 'conversation_id', 'provider', 'model',
+                    'requested_by', 'created_at')
+    list_filter = ('platform', 'provider')
+    search_fields = ('conversation_id', 'summary_text')
+    readonly_fields = ('created_at',)
+
+
+@admin.register(AICompanionRun)
+class AICompanionRunAdmin(TenantAwareAdminMixin, admin.ModelAdmin):
+    list_display = ('kind', 'platform', 'conversation_id', 'action', 'success',
+                    'prompt_tokens', 'completion_tokens', 'started_at')
+    list_filter = ('kind', 'success', 'platform')
+    readonly_fields = ('started_at',)

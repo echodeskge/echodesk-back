@@ -149,3 +149,35 @@ class IsStaffUser(permissions.BasePermission):
             return False
 
         return request.user.is_staff
+
+
+class CanUseAICompanion(permissions.BasePermission):
+    """
+    Permission to use AI companion features (summaries, per-conversation
+    AI state) — any user whose group grants the ai_companion feature.
+    """
+    message = "You do not have permission to use the AI companion."
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        return request.user.has_feature('ai_companion')
+
+
+class CanManageAICompanion(permissions.BasePermission):
+    """
+    Permission to manage AI companion settings.
+
+    - Read access (GET): Users with the ai_companion feature
+    - Write access: feature + admin role (mirrors CanManageSocialSettings)
+    """
+    message = "You do not have permission to manage AI companion settings."
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if not request.user.has_feature('ai_companion'):
+            return False
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        return request.user.role == 'admin'

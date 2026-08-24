@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from . import views, admin_views, telegram_views
+from . import views, admin_views, ai_views, telegram_views
 
 # Create a router and register our viewsets with it
 router = DefaultRouter()
@@ -165,6 +165,13 @@ urlpatterns = [
     # Admin OAuth endpoints
     path('admin/facebook/oauth/start/', admin_views.facebook_oauth_admin_start, name='admin_facebook_oauth_start'),
     path('admin/facebook/oauth/callback/', admin_views.facebook_oauth_admin_callback, name='admin_facebook_oauth_callback'),
+
+    # AI companion
+    path('ai/settings/', ai_views.ai_companion_settings, name='ai_companion_settings'),
+    path('ai/summarize/', ai_views.ai_summarize_conversation, name='ai_summarize_conversation'),
+    path('ai/summaries/', ai_views.ai_conversation_summaries, name='ai_conversation_summaries'),
+    path('ai/state/', ai_views.ai_conversation_state, name='ai_conversation_state'),
+    path('ai/test/', ai_views.ai_companion_test, name='ai_companion_test'),
 ]
 
 app_name = 'social_integrations'

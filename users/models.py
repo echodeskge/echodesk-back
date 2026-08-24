@@ -504,6 +504,8 @@ class Notification(models.Model):
         # Social messages
         ('message_received', 'New Message Received'),
         ('message_assigned', 'Message Assigned'),
+        # AI companion
+        ('ai_handoff_requested', 'AI Handoff Requested'),
         # Invoices
         ('invoice_created', 'Invoice Created'),
         ('invoice_paid', 'Invoice Paid'),

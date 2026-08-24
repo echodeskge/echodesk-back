@@ -260,6 +260,19 @@ class MessagesConsumer(AsyncWebsocketConsumer):
             'timestamp': event.get('timestamp'),
         }))
 
+    async def ai_state_update(self, event):
+        """Pushed when a conversation's AI companion mode changes
+        (handoff escalation, manual pause/resume)."""
+        await self.send(text_data=json.dumps({
+            'type': 'ai_state_update',
+            'platform': event.get('platform'),
+            'conversation_id': event.get('conversation_id'),
+            'account_id': event.get('account_id'),
+            'mode': event.get('mode'),
+            'reason': event.get('reason'),
+            'timestamp': event.get('timestamp'),
+        }))
+
 
 class WidgetVisitorConsumer(AsyncWebsocketConsumer):
     """
@@ -512,6 +525,9 @@ class WidgetVisitorConsumer(AsyncWebsocketConsumer):
         return
 
     async def reaction_update(self, event):
+        return
+
+    async def ai_state_update(self, event):
         return
 
 
@@ -886,5 +902,32 @@ async def send_reaction_update(
         'account_id': account_id,
         'message_id': message_id,
         'reaction_emoji': reaction_emoji,
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+    })
+
+
+async def send_ai_state_update(
+    tenant_schema,
+    *,
+    platform,
+    conversation_id,
+    account_id,
+    mode,
+    reason='',
+):
+    """Broadcast an AI companion mode change (handoff, pause, resume).
+
+    Beta clients badge the conversation row and show/hide the "needs
+    human" banner; legacy clients ignore the unknown type.
+    """
+    from datetime import datetime, timezone
+
+    await _safe_group_send(tenant_schema, {
+        'type': 'ai_state_update',
+        'platform': platform,
+        'conversation_id': conversation_id,
+        'account_id': account_id,
+        'mode': mode,
+        'reason': reason,
         'timestamp': datetime.now(timezone.utc).isoformat(),
     })

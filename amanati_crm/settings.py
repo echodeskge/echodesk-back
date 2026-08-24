@@ -509,6 +509,10 @@ BLOG_AUTO_PUBLISH = config('BLOG_AUTO_PUBLISH', default=False, cast=bool)
 # and BLOG_DAILY_POST_LIMIT but has its own auto-publish toggle.
 LANDING_AUTO_PUBLISH = config('LANDING_AUTO_PUBLISH', default=False, cast=bool)
 
+# AI Companion (auto-answers + conversation summaries). Global kill switch —
+# tenant-level enablement lives in social_integrations.AICompanionSettings.
+AI_COMPANION_ENABLED = config('AI_COMPANION_ENABLED', default=True, cast=bool)
+
 # TikTok Shop Partner Center Integration Settings
 TIKTOK_SHOP_APP_KEY = config('TIKTOK_SHOP_APP_KEY', default='')
 TIKTOK_SHOP_APP_SECRET = config('TIKTOK_SHOP_APP_SECRET', default='')
