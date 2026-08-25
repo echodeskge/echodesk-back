@@ -164,14 +164,28 @@ def execute_retry(retry_schedule):
     subscription = retry_schedule.subscription
     payment_order = retry_schedule.payment_order
 
+    # Guard: never retry a charge for a period that's already paid. Once any
+    # charge settles (via webhook OR the reconcile_pending_payments job),
+    # next_billing_date moves into the future — a pending retry must NOT fire
+    # a second charge. This is what double-charged artlighthouse in Aug 2026:
+    # the Aug 23 charge settled at BOG but the webhook never arrived, billing
+    # never advanced, and this retry path charged the card again on Aug 25.
+    if subscription.next_billing_date and subscription.next_billing_date > timezone.now():
+        retry_schedule.status = 'skipped'
+        retry_schedule.skip_reason = 'Subscription already paid for the current period (next_billing_date in the future)'
+        retry_schedule.save()
+        return {'success': False, 'error': retry_schedule.skip_reason}
+
     try:
         # Generate new external order ID for retry
         external_order_id = f"RETRY-{retry_schedule.id}-{payment_order.order_id}"
 
-        # Call BOG to charge saved card
+        # Call BOG to charge saved card. Callback MUST hit the backend API host
+        # (api.echodesk.ge) — app.echodesk.ge is the frontend and silently drops
+        # the webhook, leaving the charge stuck 'pending' (Aug 2026 incident).
         result = bog_service.charge_subscription(
             parent_order_id=subscription.parent_order_id,
-            callback_url=f"https://app.echodesk.ge/api/payments/webhook/",
+            callback_url=f"https://api.echodesk.ge/api/payments/webhook/",
             external_order_id=external_order_id
         )
 

@@ -652,6 +652,13 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'tenants.tasks.process_payment_retries',
         'schedule': crontab(minute=30),  # hourly; only acts on due retry rows
     },
+    # Poll BOG for stuck-pending recurring/retry charges (async offline
+    # charges whose webhook never arrived). Advances billing so the recurring
+    # + retry jobs stop re-charging — the fix for the Aug 2026 double-charge.
+    'reconcile-pending-payments': {
+        'task': 'tenants.tasks.reconcile_pending_payments',
+        'schedule': crontab(minute='*/20'),  # every 20 minutes
+    },
     'calculate-platform-metrics': {
         'task': 'tenants.tasks.calculate_platform_metrics',
         'schedule': crontab(minute=30, hour=0),

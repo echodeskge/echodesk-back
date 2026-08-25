@@ -45,6 +45,15 @@ def process_payment_retries():
 
 
 @shared_task
+def reconcile_pending_payments():
+    output = StringIO()
+    call_command('reconcile_pending_payments', stdout=output)
+    result = output.getvalue()
+    logger.info(f'reconcile_pending_payments completed: {result}')
+    return result
+
+
+@shared_task
 def calculate_platform_metrics():
     output = StringIO()
     call_command('calculate_platform_metrics', stdout=output)
