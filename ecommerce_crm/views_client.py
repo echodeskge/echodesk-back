@@ -1958,6 +1958,10 @@ def get_order_by_public_token(request):
                     'address': serializers.CharField(),
                     'city': serializers.CharField(),
                     'label': serializers.CharField(required=False, default='Delivery'),
+                    # Required for courier booking — book_quickshipper_courier
+                    # no-ops without the drop-off coordinates.
+                    'latitude': serializers.FloatField(required=False, allow_null=True),
+                    'longitude': serializers.FloatField(required=False, allow_null=True),
                 },
             ),
             'items': serializers.ListField(
@@ -1974,6 +1978,21 @@ def get_order_by_public_token(request):
             'shipping_method_id': serializers.IntegerField(required=False, allow_null=True),
             'promo_code': serializers.CharField(required=False, allow_blank=True),
             'notes': serializers.CharField(required=False, allow_blank=True),
+            # Pickup vs courier. Defaults to 'courier' for back-compat.
+            'delivery_method': serializers.ChoiceField(
+                choices=[('courier', 'Courier'), ('pickup', 'Pickup at store')],
+                required=False, default='courier',
+            ),
+            # Quickshipper courier selection, echoed back from the guest
+            # shipping-quote endpoint. Persisted to Order.payment_metadata
+            # so book_quickshipper_courier books the exact option paid for.
+            'quickshipper_provider_id': serializers.IntegerField(required=False, allow_null=True),
+            'quickshipper_provider_fee_id': serializers.CharField(required=False, allow_blank=True, allow_null=True),
+            'quickshipper_parcel_dimensions_id': serializers.IntegerField(required=False, allow_null=True),
+            'quickshipper_price': serializers.DecimalField(
+                max_digits=10, decimal_places=2, required=False, allow_null=True,
+            ),
+            'quickshipper_provider_name': serializers.CharField(required=False, allow_blank=True, allow_null=True),
         },
     ),
     responses={
@@ -2130,10 +2149,11 @@ def guest_checkout(request):
             )
 
     # --- Shipping method ---
+    # Pickup is always free — skip any shipping-method / courier pricing.
     shipping_method = None
     shipping_cost = Decimal('0')
     shipping_method_id = data.get('shipping_method_id')
-    if shipping_method_id:
+    if delivery_method != 'pickup' and shipping_method_id:
         try:
             shipping_method = ShippingMethod.objects.get(id=shipping_method_id, is_active=True)
             shipping_cost = shipping_method.get_effective_price(subtotal)
@@ -2151,7 +2171,10 @@ def guest_checkout(request):
     qs_provider_fee_id = data.get('quickshipper_provider_fee_id')
     qs_parcel_dimensions_id = data.get('quickshipper_parcel_dimensions_id')
     qs_provider_name = data.get('quickshipper_provider_name')
-    if qs_price_raw is not None and qs_provider_id is not None:
+    # Pickup is always free and never goes through a courier, so ignore any
+    # (possibly stale) quote the storefront still sent (mirrors the
+    # authenticated OrderCreateSerializer.create guard).
+    if delivery_method != 'pickup' and qs_price_raw is not None and qs_provider_id is not None:
         try:
             shipping_cost = Decimal(str(qs_price_raw))
             quickshipper_quote_meta = {
@@ -2331,7 +2354,18 @@ def guest_checkout(request):
         order.payment_url = payment_result['payment_url']
         order.payment_status = 'pending'
         order.payment_method = 'card'
-        order.payment_metadata = payment_result
+        # Preserve the courier selection + delivery method set at order
+        # creation — book_quickshipper_courier reads them after payment
+        # clears. Blindly assigning payment_result would wipe them and force
+        # the booking task to re-quote a different (cheapest) provider than
+        # the customer picked and paid for.
+        preserved_meta = order.payment_metadata or {}
+        merged_meta = dict(payment_result)
+        if preserved_meta.get('quickshipper_quote'):
+            merged_meta['quickshipper_quote'] = preserved_meta['quickshipper_quote']
+        if preserved_meta.get('delivery_method'):
+            merged_meta['delivery_method'] = preserved_meta['delivery_method']
+        order.payment_metadata = merged_meta
         order.save()
 
         output_serializer = OrderSerializer(order)
