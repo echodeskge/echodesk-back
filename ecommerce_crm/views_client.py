@@ -4,6 +4,7 @@ Client-facing ecommerce API endpoints
 These ViewSets are designed for ecommerce clients (customers) to access their own data.
 Uses EcommerceClientJWTAuthentication for client-specific access control.
 """
+import re
 import requests
 from rest_framework import viewsets, filters, status, serializers
 from rest_framework.decorators import action, api_view, permission_classes, authentication_classes
@@ -371,8 +372,22 @@ class ClientProductAutoSchema(AutoSchema):
                     logger.warning(f"Error querying attributes for tenant {tenant.schema_name}: {e}")
                     continue
 
-            # Generate parameters for all unique attributes
+            # Generate parameters for all unique attributes.
+            # Generated typed API clients turn each ?attr_<key> query param
+            # into a JS/TS identifier; a non-ASCII key (e.g. a Georgian
+            # attribute name) sanitizes down to a bare `attr`, so two such
+            # keys collide into duplicate identifiers and break the client
+            # build. Only document ASCII-slug keys (runtime filtering still
+            # accepts any attr_* via raw query string), and dedupe defensively.
+            seen_param_names = set()
             for attr_key, attr_data in all_attributes.items():
+                if not re.match(r'^[A-Za-z][A-Za-z0-9_]*$', attr_key or ''):
+                    continue
+                param_name = f'attr_{attr_key}'
+                if param_name in seen_param_names:
+                    continue
+                seen_param_names.add(param_name)
+
                 attr_label = attr_data['label']
                 attr_type = attr_data['type']
 
@@ -392,7 +407,7 @@ class ClientProductAutoSchema(AutoSchema):
 
                 parameters.append(
                     OpenApiParameter(
-                        name=f'attr_{attr_key}',
+                        name=param_name,
                         type=str,
                         location=OpenApiParameter.QUERY,
                         description=description,
