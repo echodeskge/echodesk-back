@@ -858,6 +858,13 @@ class Order(models.Model):
         default='card',
         help_text="Payment method (card, cash_on_delivery, etc.)"
     )
+    payment_provider = models.CharField(
+        max_length=20,
+        blank=True,
+        default='',
+        choices=[('bog', 'Bank of Georgia'), ('tbc', 'TBC Bank'), ('flitt', 'Flitt')],
+        help_text="Card gateway the order was charged through (empty for cash on delivery)"
+    )
     bog_order_id = models.CharField(
         max_length=100,
         blank=True,

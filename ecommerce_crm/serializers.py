@@ -751,8 +751,8 @@ class OrderListSerializer(serializers.ModelSerializer):
         model = Order
         fields = [
             'id', 'order_number', 'client', 'client_name', 'client_email',
-            'total_items', 'status', 'payment_status', 'total_amount',
-            'tracking_number', 'shipping_cost', 'tax_amount', 'subtotal',
+            'total_items', 'status', 'payment_status', 'payment_method', 'payment_provider',
+            'total_amount', 'tracking_number', 'shipping_cost', 'tax_amount', 'subtotal',
             'discount_amount', 'created_at'
         ]
         read_only_fields = ['id', 'order_number', 'created_at']
@@ -833,7 +833,7 @@ class OrderSerializer(serializers.ModelSerializer):
             # Tax and pricing
             'tax_amount', 'subtotal', 'discount_amount', 'promo_code',
             # Payment fields
-            'payment_status', 'payment_method', 'bog_order_id', 'payment_url',
+            'payment_status', 'payment_method', 'payment_provider', 'bog_order_id', 'payment_url',
             'payment_metadata',
             # Timestamps
             'created_at', 'updated_at', 'paid_at', 'confirmed_at', 'processing_at',
@@ -841,7 +841,7 @@ class OrderSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             'id', 'order_number', 'public_token', 'created_at', 'updated_at',
-            'paid_at', 'bog_order_id', 'payment_url', 'payment_metadata'
+            'paid_at', 'payment_provider', 'bog_order_id', 'payment_url', 'payment_metadata'
         ]
 
     def get_client_details(self, obj):
@@ -1068,6 +1068,21 @@ class OrderCreateSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True)
     promo_code = serializers.CharField(required=False, allow_blank=True)
     shipping_method_id = serializers.IntegerField(required=False, allow_null=True)
+
+    # Payment. Read by ClientOrderViewSet.create; declared here so they show
+    # up in the API schema.
+    payment_method = serializers.CharField(
+        required=False,
+        help_text='"card" (default) or "cash_on_delivery".',
+    )
+    payment_provider = serializers.ChoiceField(
+        choices=[('bog', 'Bank of Georgia'), ('tbc', 'TBC Bank'), ('flitt', 'Flitt')],
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text="Card gateway for card payments. Must be one of the shop's "
+                  "active providers; omitted means BOG. Saved cards are BOG-only.",
+    )
 
     # Quickshipper-selected courier (when the storefront is in live-quote
     # mode). All four are needed by `book_quickshipper_courier` to book

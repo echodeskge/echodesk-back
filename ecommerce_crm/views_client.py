@@ -943,21 +943,40 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
         summary='Create order from cart',
         description='''Submit cart and create order.
         - If card_id is provided: Charges the saved card directly
-        - If card_id is null/not provided: Returns a BOG payment URL for new payment
+        - If card_id is null/not provided: Returns a payment URL for new payment
+        - Optional payment_provider ("bog" | "tbc" | "flitt") picks the card gateway;
+          it must be one of the shop's active providers. Omitted means BOG.
+          Saved cards (card_id) are BOG-only.
         - If payment_method is "cash_on_delivery": Creates order without payment processing
         - Optional promo_code and shipping_method_id for discounts and shipping'''
     )
     def create(self, request, *args, **kwargs):
-        from tenants.bog_payment import bog_service
-        from django.conf import settings
         from django.db import connection
+        from .models import EcommerceSettings
+        from .payment_utils import resolve_card_provider, PaymentProviderError
 
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        order = serializer.save()
 
-        # Automatically generate payment URL
         payment_method = request.data.get('payment_method', 'card')
+
+        # Pick the card gateway before the order exists, so a bad choice
+        # doesn't leave an order holding stock.
+        card_provider = None
+        if payment_method != 'cash_on_delivery':
+            try:
+                card_provider = resolve_card_provider(
+                    request.data, EcommerceSettings.objects.filter(tenant=request.tenant).first()
+                )
+            except PaymentProviderError as e:
+                return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            if request.data.get('card_id') and card_provider != 'bog':
+                return Response(
+                    {'error': 'Saved cards can only be charged through BOG.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        order = serializer.save()
 
         # Send order confirmation email — only for COD orders, where the
         # order is final the moment it's placed. Card-payment orders go
@@ -997,10 +1016,10 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
         # the platform's when the tenant hasn't set any). If the tenant HAS
         # credentials configured but they can't be loaded, this raises rather
         # than silently charging the customer into the platform's BOG account.
-        from .models import EcommerceSettings
-        from .payment_utils import get_tenant_bog_service, BogCredentialError
+        from .payment_utils import get_tenant_bog_service, BogCredentialError, create_card_payment
         try:
-            bog_service_instance = get_tenant_bog_service(request.tenant)
+            if card_provider == 'bog':
+                bog_service_instance = get_tenant_bog_service(request.tenant)
         except BogCredentialError:
             import logging
             logging.getLogger(__name__).exception(
@@ -1033,6 +1052,7 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
                 order.bog_order_id = payment_result['order_id']
                 order.payment_status = 'processing'
                 order.payment_method = 'saved_card'
+                order.payment_provider = 'bog'
                 order.payment_metadata = payment_result
                 order.save()
 
@@ -1069,10 +1089,8 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
                     'details': str(e)
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-        # Create BOG payment (new payment or fallback from failed saved card charge)
+        # Create a hosted payment with the chosen provider
         try:
-            callback_url = f"https://{request.get_host()}/api/ecommerce/payment-webhook/"
-
             # Use return URLs from EcommerceSettings if configured, otherwise from request
             try:
                 ecommerce_settings = EcommerceSettings.objects.get(tenant=request.tenant)
@@ -1082,27 +1100,21 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
                 return_url_success = request.data.get('return_url_success', '')
                 return_url_fail = request.data.get('return_url_fail', '')
 
-            payment_result = bog_service_instance.create_payment(
-                amount=float(order.total_amount),
-                currency='GEL',
-                description=f"Order {order.order_number}",
+            payment = create_card_payment(
+                request, order, card_provider,
                 customer_email=order.client.email,
                 customer_name=order.client.full_name,
                 customer_phone=order.client.phone_number or '',
                 return_url_success=return_url_success,
                 return_url_fail=return_url_fail,
-                callback_url=callback_url,
-                external_order_id=order.order_number,
-                metadata={
-                    'order_id': order.id,
-                    'order_number': order.order_number,
-                    'tenant_id': request.tenant.id
-                }
             )
+            payment_result = payment['raw']
 
             # Update order with payment info
-            order.bog_order_id = payment_result['order_id']
-            order.payment_url = payment_result['payment_url']
+            if card_provider == 'bog':
+                order.bog_order_id = payment['provider_order_id']
+            order.payment_provider = card_provider
+            order.payment_url = payment['payment_url']
             order.payment_status = 'pending'
             order.payment_method = 'card'
             order.payment_metadata = payment_result
@@ -1111,10 +1123,12 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
             # Return order data with payment info
             output_serializer = OrderSerializer(order)
             response_data = output_serializer.data
-            response_data['payment_url'] = payment_result['payment_url']
-            response_data['bog_order_id'] = payment_result['order_id']
-            response_data['payment_amount'] = payment_result['amount']
-            response_data['payment_currency'] = payment_result['currency']
+            response_data['payment_url'] = payment['payment_url']
+            response_data['payment_provider'] = card_provider
+            if card_provider == 'bog':
+                response_data['bog_order_id'] = payment['provider_order_id']
+            response_data['payment_amount'] = payment_result.get('amount')
+            response_data['payment_currency'] = payment_result.get('currency')
             return Response(response_data, status=status.HTTP_201_CREATED)
 
         except Exception as e:
@@ -1124,7 +1138,7 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
             # inventory hostage.
             import logging
             logger = logging.getLogger(__name__)
-            logger.exception('BOG payment init failed for order %s: %s', order.order_number, e)
+            logger.exception('%s payment init failed for order %s: %s', card_provider, order.order_number, e)
             try:
                 order.cancel(reason='Payment initialization failed')
             except Exception:
@@ -1990,6 +2004,12 @@ def get_order_by_public_token(request):
                 )
             ),
             'payment_method': serializers.CharField(required=False, default='cash_on_delivery'),
+            # Card gateway for payment_method='card'. Must be one of the
+            # shop's active providers; omitted means BOG.
+            'payment_provider': serializers.ChoiceField(
+                choices=[('bog', 'Bank of Georgia'), ('tbc', 'TBC Bank'), ('flitt', 'Flitt')],
+                required=False,
+            ),
             'shipping_method_id': serializers.IntegerField(required=False, allow_null=True),
             'promo_code': serializers.CharField(required=False, allow_blank=True),
             'notes': serializers.CharField(required=False, allow_blank=True),
@@ -2163,6 +2183,17 @@ def guest_checkout(request):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+    # --- Card provider (BOG / TBC / Flitt) ---
+    # Resolved before the order exists so a bad choice doesn't leave an
+    # order holding stock.
+    card_provider = None
+    if data.get('payment_method', 'cash_on_delivery') != 'cash_on_delivery':
+        from .payment_utils import resolve_card_provider, PaymentProviderError
+        try:
+            card_provider = resolve_card_provider(data, ecommerce_settings)
+        except PaymentProviderError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
     # --- Shipping method ---
     # Pickup is always free — skip any shipping-method / courier pricing.
     shipping_method = None
@@ -2314,68 +2345,32 @@ def guest_checkout(request):
         response_data['message'] = 'Order will be paid on delivery'
         return Response(response_data, status=status.HTTP_201_CREATED)
 
-    # Card payment via BOG
+    # Card payment via the chosen provider
     try:
-        from django.conf import settings as django_settings
-        from tenants.bog_payment import BOGPaymentService
+        from .payment_utils import create_card_payment
 
-        try:
-            ec_settings = EcommerceSettings.objects.get(tenant=request.tenant)
-            if ec_settings.has_bog_credentials:
-                client_id = ec_settings.bog_client_id
-                client_secret = ec_settings.get_bog_secret()
-            else:
-                client_id = django_settings.BOG_CLIENT_ID
-                client_secret = django_settings.BOG_CLIENT_SECRET
-        except Exception:
-            client_id = django_settings.BOG_CLIENT_ID
-            client_secret = django_settings.BOG_CLIENT_SECRET
-
-        bog_service_instance = BOGPaymentService()
-        bog_service_instance.client_id = client_id
-        bog_service_instance.client_secret = client_secret
-        bog_service_instance.auth_url = django_settings.BOG_AUTH_URL
-        bog_service_instance.base_url = django_settings.BOG_API_BASE_URL
-
-        callback_url = f"https://{request.get_host()}/api/ecommerce/payment-webhook/"
-
-        try:
-            ec_settings = EcommerceSettings.objects.get(tenant=request.tenant)
-            return_url_success = ec_settings.bog_return_url_success or ''
-            return_url_fail = ec_settings.bog_return_url_fail or ''
-        except EcommerceSettings.DoesNotExist:
-            return_url_success = ''
-            return_url_fail = ''
-
-        payment_result = bog_service_instance.create_payment(
-            amount=float(order.total_amount),
-            currency='GEL',
-            description=f"Order {order.order_number}",
+        payment = create_card_payment(
+            request, order, card_provider,
             customer_email=client.email,
             customer_name=client.full_name,
             customer_phone=client.phone_number or '',
-            return_url_success=return_url_success,
-            return_url_fail=return_url_fail,
-            callback_url=callback_url,
-            external_order_id=order.order_number,
-            metadata={
-                'order_id': order.id,
-                'order_number': order.order_number,
-                'tenant_id': request.tenant.id,
-            },
+            return_url_success=(ecommerce_settings.bog_return_url_success or '') if ecommerce_settings else '',
+            return_url_fail=(ecommerce_settings.bog_return_url_fail or '') if ecommerce_settings else '',
         )
 
-        order.bog_order_id = payment_result['order_id']
-        order.payment_url = payment_result['payment_url']
+        if card_provider == 'bog':
+            order.bog_order_id = payment['provider_order_id']
+        order.payment_provider = card_provider
+        order.payment_url = payment['payment_url']
         order.payment_status = 'pending'
         order.payment_method = 'card'
         # Preserve the courier selection + delivery method set at order
         # creation — book_quickshipper_courier reads them after payment
-        # clears. Blindly assigning payment_result would wipe them and force
-        # the booking task to re-quote a different (cheapest) provider than
-        # the customer picked and paid for.
+        # clears. Blindly assigning the payment response would wipe them and
+        # force the booking task to re-quote a different (cheapest) provider
+        # than the customer picked and paid for.
         preserved_meta = order.payment_metadata or {}
-        merged_meta = dict(payment_result)
+        merged_meta = dict(payment['raw'])
         if preserved_meta.get('quickshipper_quote'):
             merged_meta['quickshipper_quote'] = preserved_meta['quickshipper_quote']
         if preserved_meta.get('delivery_method'):
@@ -2385,8 +2380,10 @@ def guest_checkout(request):
 
         output_serializer = OrderSerializer(order)
         response_data = output_serializer.data
-        response_data['payment_url'] = payment_result['payment_url']
-        response_data['bog_order_id'] = payment_result['order_id']
+        response_data['payment_url'] = payment['payment_url']
+        response_data['payment_provider'] = card_provider
+        if card_provider == 'bog':
+            response_data['bog_order_id'] = payment['provider_order_id']
         return Response(response_data, status=status.HTTP_201_CREATED)
 
     except Exception as e:

@@ -1594,7 +1594,7 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['order_number', 'client__first_name', 'client__last_name', 'client__email']
-    filterset_fields = ['client', 'status']
+    filterset_fields = ['client', 'status', 'payment_provider']
     ordering_fields = ['created_at', 'total_amount', 'status']
     ordering = ['-created_at']
 
@@ -2457,6 +2457,8 @@ def ecommerce_payment_webhook(request):
                 order.paid_at = timezone.now()
                 order.status = 'confirmed'
                 order.confirmed_at = timezone.now()
+                if not order.payment_provider:
+                    order.payment_provider = 'bog'
                 order.payment_metadata.update({
                     'bog_order_id': bog_order_id,
                     'transaction_id': transaction_id,
@@ -2612,6 +2614,8 @@ def tbc_payment_webhook(request):
                 order.paid_at = timezone.now()
                 order.status = 'confirmed'
                 order.confirmed_at = timezone.now()
+                if not order.payment_provider:
+                    order.payment_provider = 'tbc'
                 order.payment_metadata.update({
                     'tbc_pay_id': pay_id,
                     'tbc_status': tbc_status,
@@ -2623,14 +2627,18 @@ def tbc_payment_webhook(request):
                 _schema = connection.schema_name
                 _order_id = order.id
 
-                def _dispatch_courier():
-                    from .tasks import book_quickshipper_courier
+                def _dispatch_post_payment():
+                    from .tasks import send_order_email, book_quickshipper_courier
+                    try:
+                        send_order_email.delay(_schema, _order_id, 'confirmation')
+                    except Exception:
+                        logger.exception('Failed to queue confirmation email for order %s', _order_id)
                     try:
                         book_quickshipper_courier.delay(_schema, _order_id)
                     except Exception:
                         logger.exception('Failed to queue courier booking for order %s', _order_id)
 
-                transaction.on_commit(_dispatch_courier)
+                transaction.on_commit(_dispatch_post_payment)
 
             logger.info(f'TBC payment completed for order: {merchant_payment_id}')
             return Response({
@@ -2697,6 +2705,9 @@ def flitt_payment_webhook(request):
 
     logger = logging.getLogger(__name__)
 
+    # Capture the raw body BEFORE touching request.data: once DRF has parsed
+    # the stream, request.body raises and signature verification always fails.
+    raw_body = request.body
     data = request.data
     if not data:
         logger.warning('Flitt webhook received empty payload')
@@ -2722,8 +2733,7 @@ def flitt_payment_webhook(request):
     try:
         from tenants.payment_providers.flitt import FlittPaymentProvider
         provider = FlittPaymentProvider()
-        body_bytes = request.body if hasattr(request, 'body') else b''
-        signature_ok = bool(received_signature) and provider.verify_webhook({}, body_bytes)
+        signature_ok = bool(received_signature) and provider.verify_webhook({}, raw_body)
     except Exception as e:
         logger.warning(f'Flitt signature verification error: {e}')
         signature_ok = False
@@ -2775,20 +2785,26 @@ def flitt_payment_webhook(request):
                 if rectoken:
                     flitt_meta['flitt_rectoken'] = rectoken
 
+                if not order.payment_provider:
+                    order.payment_provider = 'flitt'
                 order.payment_metadata.update(flitt_meta)
                 order.save()
 
                 _schema = connection.schema_name
                 _order_id = order.id
 
-                def _dispatch_courier():
-                    from .tasks import book_quickshipper_courier
+                def _dispatch_post_payment():
+                    from .tasks import send_order_email, book_quickshipper_courier
+                    try:
+                        send_order_email.delay(_schema, _order_id, 'confirmation')
+                    except Exception:
+                        logger.exception('Failed to queue confirmation email for order %s', _order_id)
                     try:
                         book_quickshipper_courier.delay(_schema, _order_id)
                     except Exception:
                         logger.exception('Failed to queue courier booking for order %s', _order_id)
 
-                transaction.on_commit(_dispatch_courier)
+                transaction.on_commit(_dispatch_post_payment)
 
             logger.info(f'Flitt payment completed for order: {order_id}')
             return Response({
