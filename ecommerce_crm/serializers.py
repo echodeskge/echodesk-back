@@ -108,6 +108,21 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         read_only_fields = ['created_at', 'updated_at']
 
 
+class ProductVariantAdminSerializer(ProductVariantSerializer):
+    """Variant serializer for the admin API: also carries which product the
+    variant belongs to (required to create one; the nested read-only
+    serializer above has no need for it)."""
+    product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
+
+    class Meta(ProductVariantSerializer.Meta):
+        fields = ProductVariantSerializer.Meta.fields + ['product']
+
+    def update(self, instance, validated_data):
+        # A variant doesn't move between products.
+        validated_data.pop('product', None)
+        return super().update(instance, validated_data)
+
+
 def _first_image_url(raw):
     """Some legacy uploads concatenate multiple URLs into the single
     ``Product.image`` URLField separated by ``", "``. The field is

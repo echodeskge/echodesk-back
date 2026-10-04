@@ -510,3 +510,46 @@ class TestApprovalChainCRUD(LeaveTestCase):
         agent = self.create_user(email='lm-chain-agent@test.com', role='agent')
         resp = self.api_get(CHAIN_URL, user=agent)
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+
+# ============================================================================
+# Bug report #224 follow-ups: things that made the leave pages fail in use
+# ============================================================================
+
+class TestLeaveUsability(LeaveTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='lm-usable-admin@test.com')
+        self.agent = self.create_user(email='lm-usable-agent@test.com')
+
+    @_patch_feature
+    def test_first_request_allocates_the_yearly_balance(self):
+        from leave_management.models import LeaveBalance
+        from leave_management.utils import check_leave_balance
+        from datetime import date
+        leave_type = self.create_leave_type()
+        self.assertFalse(LeaveBalance.objects.filter(user=self.agent).exists())
+        ok, message = check_leave_balance(self.agent, leave_type, 1, date.today().year, self.tenant)
+        self.assertTrue(ok, message)
+        self.assertTrue(LeaveBalance.objects.filter(user=self.agent, leave_type=leave_type).exists())
+
+    @_patch_feature
+    def test_my_balance_shows_allowance_without_admin_setup(self):
+        self.create_leave_type()
+        resp = self.api_get('/api/leave/employee/my-balance/', user=self.agent)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(self.get_results(resp)), 1)
+
+    @_patch_feature
+    def test_deleting_a_leave_type_in_use_is_refused_cleanly(self):
+        leave_type = self.create_leave_type()
+        self.create_leave_request(self.agent, leave_type)
+        resp = self.api_delete(f'{LEAVE_TYPE_URL}{leave_type.pk}/', user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('error', resp.data)
+
+    @_patch_feature
+    def test_only_admins_can_list_everyones_requests(self):
+        self.assertEqual(self.api_get(REQUEST_URL, user=self.admin).status_code, status.HTTP_200_OK)
+        self.assertEqual(self.api_get(REQUEST_URL, user=self.agent).status_code, status.HTTP_403_FORBIDDEN)

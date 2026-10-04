@@ -46,6 +46,7 @@ from .serializers import (
     ProductCreateUpdateSerializer,
     ProductImageSerializer,
     ProductVariantSerializer,
+    ProductVariantAdminSerializer,
     EcommerceClientSerializer,
     EcommerceClientListSerializer,
     ClientRegistrationSerializer,
@@ -522,8 +523,10 @@ class ProductImageViewSet(NoCacheMixin, viewsets.ModelViewSet):
 
 class ProductVariantViewSet(NoCacheMixin, viewsets.ModelViewSet):
     """ViewSet for product variants (Admin only)"""
-    queryset = ProductVariant.objects.filter(is_active=True)
-    serializer_class = ProductVariantSerializer
+    # All variants, including inactive ones: admins switch a variant off and
+    # must still see it (and be able to switch it back on).
+    queryset = ProductVariant.objects.all()
+    serializer_class = ProductVariantAdminSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['product', 'is_active']

@@ -123,7 +123,7 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
         # Update balance
         if was_approved:
             # Return used days back
-            update_leave_balance(leave_request, action='cancel')
+            update_leave_balance(leave_request, action='cancel_approved')
         else:
             # Remove from pending
             update_leave_balance(leave_request, action='cancel')
@@ -222,6 +222,13 @@ class EmployeeLeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         """Get only the employee's own leave balances"""
+        # Make sure this year's balances exist, so a new employee (or the
+        # first visit in a new year) sees their allowance instead of nothing.
+        try:
+            from .utils import initialize_leave_balances_for_user
+            initialize_leave_balances_for_user(self.request.user, self.request.tenant)
+        except Exception:
+            pass
         return LeaveBalance.objects.filter(
             tenant=self.request.tenant,
             user=self.request.user

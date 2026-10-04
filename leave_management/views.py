@@ -120,7 +120,15 @@ class LeaveTypeViewSet(viewsets.ModelViewSet):
 
     @extend_schema(tags=['Leave Management - Admin'], summary='Delete leave type')
     def destroy(self, request, *args, **kwargs):
-        return super().destroy(request, *args, **kwargs)
+        from django.db.models import ProtectedError
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            # Requests already use this type; it can be deactivated instead.
+            return Response(
+                {'error': 'This leave type is used by existing leave requests and cannot be deleted. Deactivate it instead.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
 
 class AdminLeaveBalanceViewSet(viewsets.ModelViewSet):
@@ -251,7 +259,8 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
     """
     Admin ViewSet for managing all leave requests
     """
-    permission_classes = [IsAuthenticated, HasLeaveManagementFeature]
+    # Everyone's leave requests: administrators / HR only.
+    permission_classes = [IsAuthenticated, HasLeaveManagementFeature, CanManageLeaveBalances]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['employee', 'leave_type', 'status']
     search_fields = ['employee__email', 'employee__first_name', 'employee__last_name', 'reason']
@@ -293,8 +302,9 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
         return context
 
     def perform_create(self, serializer):
-        # Admin can create leave for any employee
-        serializer.save(tenant=self.request.tenant)
+        # The serializer sets tenant (and employee) itself; passing tenant
+        # again raised "got multiple values for keyword argument 'tenant'".
+        serializer.save()
 
     @extend_schema(
         tags=['Leave Management - Admin'],

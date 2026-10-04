@@ -460,3 +460,42 @@ class TestBulkProductUpdate(ProductViewTestMixin, EchoDeskTenantTestCase):
             'status': 'active',
         }, user=self.admin)
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class TestVariantAdminApi(EchoDeskTenantTestCase):
+    """Bug report #225: adding a variant to a product did not save."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='variant-admin@test.com')
+        from ecommerce_crm.models import Product
+        self.product = Product.objects.create(
+            sku='VAR-PARENT', name={'en': 'Parent'}, price='80.00', status='active',
+            quantity=5, created_by=self.admin,
+        )
+
+    def test_create_variant_for_a_product(self):
+        resp = self.api_post('/api/ecommerce/admin/variants/', {
+            'product': self.product.id, 'sku': 'VAR-PARENT-OMBRE',
+            'name': {'en': 'ombre', 'ka': 'ombre'}, 'price': '80', 'quantity': 1, 'is_active': True,
+        }, user=self.admin)
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(resp.data['product'], self.product.id)
+        self.assertEqual(self.product.variants.count(), 1)
+
+    def test_variant_without_price_uses_product_price_and_product_is_required(self):
+        ok = self.api_post('/api/ecommerce/admin/variants/', {
+            'product': self.product.id, 'sku': 'VAR-NOPRICE', 'name': {'en': 'x'}, 'price': None, 'quantity': 0,
+        }, user=self.admin)
+        self.assertEqual(ok.status_code, 201, ok.data)
+        missing = self.api_post('/api/ecommerce/admin/variants/', {'sku': 'VAR-ORPHAN', 'name': {'en': 'x'}}, user=self.admin)
+        self.assertEqual(missing.status_code, 400)
+        self.assertIn('product', missing.data)
+
+    def test_inactive_variant_stays_visible_and_can_be_reactivated(self):
+        from ecommerce_crm.models import ProductVariant
+        variant = ProductVariant.objects.create(product=self.product, sku='VAR-OFF', name={'en': 'off'}, is_active=False)
+        listed = self.api_get(f'/api/ecommerce/admin/variants/?product={self.product.id}', user=self.admin)
+        self.assertEqual([v['id'] for v in listed.data['results']], [variant.id])
+        back_on = self.api_patch(f'/api/ecommerce/admin/variants/{variant.id}/', {'is_active': True}, user=self.admin)
+        self.assertEqual(back_on.status_code, 200, back_on.data)

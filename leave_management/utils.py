@@ -76,15 +76,19 @@ def check_leave_balance(user, leave_type, days, year, tenant):
     """
     from .models import LeaveBalance, LeaveSettings
 
-    # Get or create balance for this year
-    try:
-        balance = LeaveBalance.objects.get(
-            tenant=tenant,
-            user=user,
-            leave_type=leave_type,
-            year=year
-        )
-    except LeaveBalance.DoesNotExist:
+    # Get or create balance for this year. Balances are allocated lazily: the
+    # first time an employee needs one, it is created from the leave type's
+    # yearly allowance (there is no screen where an admin would do it by hand).
+    balance = LeaveBalance.objects.filter(
+        tenant=tenant, user=user, leave_type=leave_type, year=year
+    ).first()
+    if balance is None:
+        initialize_leave_balances_for_user(user, tenant, year)
+        balance = LeaveBalance.objects.filter(
+            tenant=tenant, user=user, leave_type=leave_type, year=year
+        ).first()
+
+    if balance is None:
         # No balance record, check if negative balance is allowed
         try:
             settings = LeaveSettings.objects.get(tenant=tenant)
