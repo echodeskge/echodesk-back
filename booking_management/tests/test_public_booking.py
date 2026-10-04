@@ -199,7 +199,7 @@ class TestGuestBooking(PublicBookingTestCase):
         booking = Booking.objects.get(manage_token=resp.data['manage_token'])
         self.assertEqual(booking.payment_method, 'cash')
         self.assertEqual(booking.status, 'pending')
-        self.assertEqual(booking.client.phone, '+995 555 10 20 30')
+        self.assertEqual(booking.client.phone, '+995555102030')  # stored without spaces
         self.assertEqual(booking.end_time, time(11, 0))
 
     def test_existing_contact_matched_by_phone_is_not_modified(self):
@@ -810,3 +810,32 @@ class TestStaffNotifications(PublicBookingTestCase):
 
         self.api_post(f"{MANAGE_URL}{resp.data['manage_token']}/cancel/", {})
         self.assertTrue(Notification.objects.filter(user=owner, notification_type='booking_cancelled').exists())
+
+
+class TestPhoneMatching(PublicBookingTestCase):
+
+    def book(self, phone, start_time):
+        with patch('booking_management.tasks.send_booking_email_task.delay'):
+            return self.api_post(GUEST_URL, self.guest_payload(phone_number=phone, start_time=start_time, email=''))
+
+    def test_same_number_typed_differently_is_one_customer(self):
+        first = self.book('+995 555 10 20 30', '10:00')
+        second = self.book('555102030', '11:00')
+        third = self.book('00995-555-10-20-30', '12:00')
+        for resp in (first, second, third):
+            self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertEqual(Client.objects.filter(phone__contains='555102030').count(), 1)
+        self.assertEqual(Booking.objects.values('client').distinct().count(), 1)
+
+    def test_matches_a_contact_stored_with_spaces_or_without_country_code(self):
+        spaced = Client.objects.create(name='Spaced', phone='+995 555 77 88 99')
+        local = Client.objects.create(name='Local', phone='555 44 33 22')
+        a = self.book('555778899', '10:00')
+        b = self.book('+995555443322', '11:00')
+        self.assertEqual(Booking.objects.get(manage_token=a.data['manage_token']).client_id, spaced.id)
+        self.assertEqual(Booking.objects.get(manage_token=b.data['manage_token']).client_id, local.id)
+
+    def test_different_numbers_stay_different_customers(self):
+        self.book('+995555000001', '10:00')
+        self.book('+995555000002', '11:00')
+        self.assertEqual(Booking.objects.values('client').distinct().count(), 2)

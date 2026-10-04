@@ -12,7 +12,7 @@ from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.core.cache import cache
 from django.db import connection, transaction
-from django.db.models import Prefetch
+from django.db.models import CharField, F, Func, Prefetch, Value
 from django.utils import timezone
 from django.utils.crypto import constant_time_compare
 from django.views.decorators.csrf import csrf_exempt
@@ -41,7 +41,7 @@ from .throttles import (
     BookingAuthThrottle, BookingClientCreateThrottle, BookingGuestThrottle, BookingManageThrottle,
 )
 from .staff_notifications import notify_staff_of_booking
-from .utils_text import localized_text
+from .utils_text import localized_text, normalize_phone, phone_digits
 from .utils import (
     available_payment_options, can_cancel_booking, card_payment_enabled,
     check_booking_window, find_available_staff, generate_available_slots,
@@ -594,8 +594,19 @@ def _guest_client(first_name, last_name, phone, email):
     beyond being flagged as a booking client — a visitor typing someone's
     phone number must not be able to rename them or change their email.
     """
-    phone = phone.strip()
-    client = Client.objects.filter(phone=phone).order_by('id').first()
+    # The same number is one person however it was typed: compare digits
+    # ("+995 555 10 20 30" = "555102030"), against contacts stored in any format.
+    digits = phone_digits(phone)
+    variants = {digits}
+    if digits.startswith('995'):
+        variants.add(digits[3:])
+    client = Client.objects.annotate(
+        phone_only_digits=Func(
+            F('phone'), Value(r'[^0-9]'), Value(''), Value('g'),
+            function='regexp_replace', output_field=CharField(),
+        )
+    ).filter(phone_only_digits__in=variants).order_by('id').first() if digits else None
+    phone = normalize_phone(phone)
     if client is not None:
         if not client.is_booking_enabled:
             client.is_booking_enabled = True

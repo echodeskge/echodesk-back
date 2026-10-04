@@ -69,12 +69,13 @@ class BookingClientRegistrationSerializer(serializers.Serializer):
         client = Client.objects.filter(email__iexact=validated_data['email']).order_by('id').first()
 
         if client is None:
+            from .utils_text import normalize_phone
             client = Client(
                 name=f"{validated_data['first_name']} {validated_data['last_name']}".strip(),
                 email=validated_data['email'],
                 first_name=validated_data['first_name'],
                 last_name=validated_data['last_name'],
-                phone=phone_number,
+                phone=normalize_phone(phone_number) or phone_number,
             )
 
         client.is_booking_enabled = True

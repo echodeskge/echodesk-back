@@ -37,14 +37,17 @@ class EcommerceClientJWTAuthentication(BaseAuthentication):
 
             # Extract client_id from token
             client_id = token.get('client_id')
-            if token.get('kind') == 'booking':
-                # A booking-site customer token: its client_id refers to a
-                # different table, so it must never identify a shop customer.
-                return None
             if not client_id:
                 # No client_id means this is not an ecommerce client token
                 # Return None to let other authentication classes try
                 return None
+
+            # Only tokens this shop issued: a token from another tenant's
+            # shop or from a booking site carries a client_id that means a
+            # different person here.
+            from .tokens import is_shop_token_for_current_tenant
+            if not is_shop_token_for_current_tenant(token):
+                raise AuthenticationFailed('Token was not issued for this shop')
 
             # Get the client
             try:

@@ -2,6 +2,7 @@ from rest_framework import viewsets, filters, status, serializers
 from rest_framework.decorators import action, api_view, permission_classes, authentication_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
+from .tokens import is_shop_token_for_current_tenant, issue_shop_tokens
 from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiParameter, inline_serializer
 from django_filters.rest_framework import DjangoFilterBackend, FilterSet, CharFilter, NumberFilter, BooleanFilter
 from django.db.models import Q, F, Count, Avg
@@ -698,9 +699,7 @@ def login_client(request):
         client = serializer.validated_data['client']
 
         # Generate JWT tokens
-        refresh = RefreshToken()
-        refresh['client_id'] = client.id
-        refresh['email'] = client.email
+        refresh = issue_shop_tokens(client)
 
         response_serializer = EcommerceClientSerializer(client)
         return Response({
@@ -758,7 +757,7 @@ def refresh_client_token(request):
 
         # Check if it contains client_id (ecommerce client token)
         client_id = refresh.get('client_id')
-        if not client_id:
+        if not client_id or not is_shop_token_for_current_tenant(refresh):
             return Response({
                 'error': 'Invalid token type'
             }, status=status.HTTP_401_UNAUTHORIZED)
@@ -773,9 +772,7 @@ def refresh_client_token(request):
             }, status=status.HTTP_401_UNAUTHORIZED)
 
         # Generate new tokens
-        new_refresh = RefreshToken()
-        new_refresh['client_id'] = client.id
-        new_refresh['email'] = client.email
+        new_refresh = issue_shop_tokens(client)
 
         return Response({
             'access': str(new_refresh.access_token),
@@ -938,9 +935,7 @@ def verify_email(request):
             client.save()
 
             # Generate JWT tokens
-            refresh = RefreshToken()
-            refresh['client_id'] = client.id
-            refresh['email'] = client.email
+            refresh = issue_shop_tokens(client)
 
             response_serializer = EcommerceClientSerializer(client)
             return Response({
@@ -1188,7 +1183,7 @@ def get_current_client(request):
 
         # Extract client_id from token
         client_id = token.get('client_id')
-        if not client_id:
+        if not client_id or not is_shop_token_for_current_tenant(token):
             return Response(
                 {'error': 'Token does not contain client_id.'},
                 status=status.HTTP_401_UNAUTHORIZED
