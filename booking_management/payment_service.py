@@ -39,6 +39,9 @@ class BookingPaymentService:
         self.settings, created = BookingSettings.objects.get_or_create(tenant=tenant)
 
         self._bog_service = None
+        # What BOG said the last time process_webhook asked ('paid', 'failed',
+        # 'pending', 'processing', 'unknown', 'error', or None if not asked).
+        self.last_state = None
 
     @property
     def bog_service(self):
@@ -76,7 +79,8 @@ class BookingPaymentService:
         amount = booking.deposit_amount if booking.deposit_amount > 0 else booking.total_amount
 
         # Create payment description
-        service_name = booking.service.name if isinstance(booking.service.name, str) else booking.service.name.get('en', 'Service')
+        from .utils_text import localized_text
+        service_name = localized_text(booking.service.name, 'en') or 'Service'
         description = f"Booking {booking.booking_number} - {service_name}"
 
         # Create payment
@@ -147,6 +151,7 @@ class BookingPaymentService:
 
             status = self.bog_service.check_payment_status(booking.bog_order_id)
             state = status.get('status')
+            self.last_state = state
 
             if state == 'paid':
                 paid = Decimal(str(status.get('amount') or 0))
@@ -164,12 +169,26 @@ class BookingPaymentService:
                 booking.save(update_fields=['paid_amount', 'payment_status', 'payment_metadata', 'updated_at'])
 
                 if booking.status == 'cancelled':
-                    # Money arrived for a booking we already cancelled (e.g. the
-                    # unpaid sweeper ran first). Don't resurrect it; flag it.
-                    logger.error(
-                        "BOG CONFIRMED payment for CANCELLED booking %s — manual refund required",
-                        booking.booking_number,
-                    )
+                    # Money arrived for a booking that was already cancelled (the
+                    # customer cancelled, or the unpaid sweeper ran first). The
+                    # slot may be gone, so don't resurrect it: give the money back.
+                    metadata = dict(booking.payment_metadata or {})
+                    try:
+                        result = self.bog_service.refund_payment(order_id=booking.bog_order_id, amount=None)
+                        metadata['refund'] = {'status': 'requested', 'amount': str(paid), 'response': result,
+                                              'reason': 'paid after cancellation'}
+                        booking.payment_status = 'refunded'
+                        booking.paid_amount = Decimal('0')
+                        logger.warning("Refunded late payment for cancelled booking %s", booking.booking_number)
+                    except Exception as exc:
+                        metadata['refund'] = {'status': 'manual_required', 'amount': str(paid), 'error': str(exc),
+                                              'reason': 'paid after cancellation'}
+                        logger.error(
+                            "BOG CONFIRMED payment for CANCELLED booking %s — manual refund required: %s",
+                            booking.booking_number, exc,
+                        )
+                    booking.payment_metadata = metadata
+                    booking.save(update_fields=['payment_status', 'paid_amount', 'payment_metadata', 'updated_at'])
                 elif booking.status == 'pending':
                     if booking.payment_status == 'fully_paid' and self.settings.auto_confirm_on_full_payment:
                         booking.confirm()
@@ -182,6 +201,10 @@ class BookingPaymentService:
                 booking.payment_status = 'failed'
                 booking.save(update_fields=['payment_status', 'updated_at'])
                 logger.warning("Booking %s payment failed (%s)", booking.booking_number, status.get('bog_status'))
+                # The order can't be paid any more: free the slot right away
+                # so the customer (or anyone) can book the time again.
+                if booking.status == 'pending':
+                    booking.cancel(cancelled_by='admin', reason='Card payment was declined', notify=False)
 
             else:
                 # pending / processing / unknown / error: leave the booking alone;
@@ -200,6 +223,10 @@ class BookingPaymentService:
         the booking for staff to handle, and the cancellation stands.
         """
         if not booking.bog_order_id or not booking.paid_amount:
+            return {'status': 'no_refund', 'amount': Decimal('0')}
+
+        # Never refund the same booking twice.
+        if ((booking.payment_metadata or {}).get('refund') or {}).get('status') == 'requested':
             return {'status': 'no_refund', 'amount': Decimal('0')}
 
         # Calculate refund amount based on policy

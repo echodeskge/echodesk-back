@@ -32,6 +32,12 @@ class BookingTestCase(EchoDeskTenantTestCase):
     _category_counter = 0
     _service_counter = 0
 
+    def setUp(self):
+        super().setUp()
+        # Throttle counters live in the cache and would leak between tests.
+        from django.core.cache import cache
+        cache.clear()
+
     @staticmethod
     def get_results(resp):
         """Extract results from a paginated or non-paginated response."""

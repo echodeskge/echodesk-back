@@ -322,10 +322,22 @@ class TestAdminBookingViewSet(BookingViewTestMixin, BookingTestCase):
         booking.refresh_from_db()
         self.assertEqual(booking.status, 'confirmed')
 
-    def test_confirm_booking_without_payment_rejected(self):
-        booking = self.create_booking(self.service, client=self.bk_client, staff=self.staff)
+    def test_confirm_unpaid_card_booking_rejected(self):
+        booking = self.create_booking(
+            self.service, client=self.bk_client, staff=self.staff, payment_method='card',
+        )
         resp = self.api_post(f'{ADMIN_BOOKING_URL}{booking.id}/confirm/', {}, user=self.admin)
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_confirm_pay_at_venue_booking_needs_no_payment(self):
+        # What every guest booking from the public site looks like: unpaid, cash.
+        booking = self.create_booking(
+            self.service, client=self.bk_client, staff=self.staff, payment_method='cash',
+        )
+        resp = self.api_post(f'{ADMIN_BOOKING_URL}{booking.id}/confirm/', {}, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        booking.refresh_from_db()
+        self.assertEqual(booking.status, 'confirmed')
 
     def test_confirm_already_confirmed_rejected(self):
         booking = self.create_booking(
@@ -658,7 +670,7 @@ class TestClientRegistration(BookingViewTestMixin, BookingTestCase):
     def test_register_duplicate_email(self):
         existing = Client.objects.create(
             name='Existing', email='existing@test.com', phone='+995555111666',
-            is_booking_enabled=True,
+            is_booking_enabled=True, is_verified=True,
         )
         existing.set_password('SecurePass1')
         existing.save()

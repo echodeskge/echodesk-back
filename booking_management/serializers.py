@@ -8,6 +8,7 @@ from .models import (
 )
 from social_integrations.models import Client
 from users.models import User
+from .utils_text import localized_text
 
 
 # ============================================================================
@@ -38,12 +39,15 @@ class BookingClientRegistrationSerializer(serializers.Serializer):
     password_confirm = serializers.CharField(write_only=True)
 
     def validate_email(self, value):
-        # A registered (password-holding) booking account already uses this email
+        # A verified account already uses this email. (An unverified one may be
+        # re-registered: whoever proves the address with the emailed code gets
+        # the account, with the password from the latest registration — so
+        # squatting on someone's email with your own password gains nothing.)
         existing = Client.objects.filter(
-            email__iexact=value, is_booking_enabled=True
+            email__iexact=value, is_booking_enabled=True, is_verified=True
         ).exclude(password_hash__isnull=True).exclude(password_hash='').first()
         if existing:
-            raise serializers.ValidationError('A booking account with this email already exists')
+            raise serializers.ValidationError('A booking account with this email already exists', code='account_exists')
         return value
 
     def validate(self, attrs):
@@ -56,26 +60,23 @@ class BookingClientRegistrationSerializer(serializers.Serializer):
         password = validated_data.pop('password')
         phone_number = validated_data.pop('phone_number')
 
-        # A contact with this email may already exist (chat/social contact, or
-        # someone who booked as a guest). Attach the account to that record so
-        # their history stays together, but the account only becomes usable
-        # once the email is verified — is_verified is reset here, so knowing an
-        # address is not enough to claim it.
+        # A contact with this email may already exist (chat/social contact,
+        # someone who booked as a guest, or an unverified earlier registration).
+        # The account attaches to that record so their history stays together,
+        # but nothing about the stored contact is changed or revealed here:
+        # only the pending password is set, and the account stays unusable
+        # until the emailed code proves the address.
         client = Client.objects.filter(email__iexact=validated_data['email']).order_by('id').first()
 
         if client is None:
             client = Client(
                 name=f"{validated_data['first_name']} {validated_data['last_name']}".strip(),
                 email=validated_data['email'],
+                first_name=validated_data['first_name'],
+                last_name=validated_data['last_name'],
+                phone=phone_number,
             )
 
-        # Don't rewrite an existing contact's details before the email is proven.
-        if not client.first_name:
-            client.first_name = validated_data['first_name']
-        if not client.last_name:
-            client.last_name = validated_data['last_name']
-        if not client.phone:
-            client.phone = phone_number
         client.is_booking_enabled = True
         client.is_verified = False
         client.set_password(password)
@@ -98,10 +99,10 @@ class BookingClientLoginSerializer(serializers.Serializer):
             email__iexact=email, is_booking_enabled=True
         ).exclude(password_hash__isnull=True).exclude(password_hash='').order_by('id').first()
         if client is None:
-            raise serializers.ValidationError('Invalid email or password')
+            raise serializers.ValidationError({'code': 'invalid_credentials', 'detail': 'Invalid email or password'})
 
         if not client.check_password(password):
-            raise serializers.ValidationError('Invalid email or password')
+            raise serializers.ValidationError({'code': 'invalid_credentials', 'detail': 'Invalid email or password'})
 
         if not client.is_verified:
             raise serializers.ValidationError({'code': 'email_not_verified', 'detail': 'Email not verified. Please check your email.'})
@@ -118,13 +119,28 @@ class BookingClientLoginSerializer(serializers.Serializer):
         return attrs
 
 
+BOOKING_TOKEN_KIND = 'booking'
+
+
 def issue_client_tokens(client):
-    """JWT pair for a booking client (claims carry client_id, no user_id)."""
+    """JWT pair for a booking client (claims carry client_id, no user_id).
+
+    The token names the tenant it was issued for and what kind of client it
+    identifies: client ids are per-tenant row numbers, so without these a
+    token from another tenant's booking page (or a shop customer's token)
+    would be accepted as whichever client here happens to share the id.
+    """
+    from django.db import connection
     refresh = RefreshToken()
     refresh['client_id'] = client.id
-    refresh['booking_client_id'] = client.id  # Keep for backwards compatibility
-    refresh['email'] = client.email
+    refresh['kind'] = BOOKING_TOKEN_KIND
+    refresh['tenant'] = connection.schema_name
     return {'access': str(refresh.access_token), 'refresh': str(refresh)}
+
+
+def is_booking_token_for_current_tenant(token):
+    from django.db import connection
+    return token.get('kind') == BOOKING_TOKEN_KIND and token.get('tenant') == connection.schema_name
 
 
 # ============================================================================
@@ -145,14 +161,14 @@ class ServiceCategorySerializer(serializers.ModelSerializer):
         """Get name in requested language"""
         language = self.context.get('language', 'en')
         if isinstance(obj.name, dict):
-            return obj.name.get(language, obj.name.get('en', ''))
+            return localized_text(obj.name, language)
         return obj.name
 
     def get_description_display(self, obj):
         """Get description in requested language"""
         language = self.context.get('language', 'en')
         if isinstance(obj.description, dict):
-            return obj.description.get(language, obj.description.get('en', ''))
+            return localized_text(obj.description, language)
         return obj.description if obj.description else ''
 
 
@@ -188,7 +204,7 @@ class ServiceMinimalSerializer(serializers.ModelSerializer):
         """Get localized name"""
         if isinstance(obj.name, dict):
             language = self.context.get('language', 'en')
-            return obj.name.get(language, obj.name.get('en', str(obj.name)))
+            return localized_text(obj.name, language)
         return obj.name
 
 
@@ -328,13 +344,13 @@ class ServiceListSerializer(serializers.ModelSerializer):
     def get_name_display(self, obj):
         language = self.context.get('language', 'en')
         if isinstance(obj.name, dict):
-            return obj.name.get(language, obj.name.get('en', ''))
+            return localized_text(obj.name, language)
         return obj.name
 
     def get_description_display(self, obj):
         language = self.context.get('language', 'en')
         if isinstance(obj.description, dict):
-            return obj.description.get(language, obj.description.get('en', ''))
+            return localized_text(obj.description, language)
         return obj.description if obj.description else ''
 
     def get_deposit_amount(self, obj):
@@ -463,7 +479,7 @@ class BookingCreateSerializer(serializers.ModelSerializer):
         try:
             service = Service.objects.get(id=attrs.get('service_id'), status='active')
         except Service.DoesNotExist:
-            raise serializers.ValidationError({"service_id": "Service not found"})
+            raise serializers.ValidationError({"code": "service_unavailable", "error": "Service not found"})
 
         staff = None
         staff_id = attrs.get('staff_id')
@@ -471,37 +487,41 @@ class BookingCreateSerializer(serializers.ModelSerializer):
             try:
                 staff = BookingStaff.objects.get(id=staff_id)
             except BookingStaff.DoesNotExist:
-                raise serializers.ValidationError({"staff_id": "Staff not found"})
+                raise serializers.ValidationError({"code": "slot_unavailable", "error": "Staff not found"})
             if not staff_can_perform(service, staff):
-                raise serializers.ValidationError({"staff_id": "This staff member does not provide this service"})
+                raise serializers.ValidationError(
+                    {"code": "slot_unavailable", "error": "This staff member does not provide this service"}
+                )
 
         booking_settings = get_booking_settings()
 
         # Lead time / how far ahead, judged on the business's own clock
         ok, error_message = check_booking_window(date, start_time, booking_settings)
         if not ok:
-            raise serializers.ValidationError({"date": error_message})
+            raise serializers.ValidationError({"code": "outside_booking_window", "error": error_message})
 
-        # Validate availability
+        # Validate availability. Customers may only book times the slot list
+        # offers (enforce_grid) — not arbitrary minutes that fragment the day.
         is_available, error_message = validate_booking_availability(
-            service, staff, date, start_time, booking_settings=booking_settings
+            service, staff, date, start_time, booking_settings=booking_settings, enforce_grid=True
         )
         if not is_available:
-            raise serializers.ValidationError(error_message)
+            raise serializers.ValidationError({"code": "slot_unavailable", "error": error_message})
 
         # "Any staff": assign someone who is actually free, so the booking
         # occupies a real person's time (the view re-checks under a lock).
         attrs['auto_assign_staff'] = staff is None
         if staff is None:
-            staff = find_available_staff(service, date, start_time)
+            staff = find_available_staff(service, date, start_time, enforce_grid=True)
 
         # Payment choice must be one the business offers
         options = available_payment_options(booking_settings, service)
         payment_type = attrs.get('payment_type') or options[0]
         if payment_type not in options:
-            raise serializers.ValidationError(
-                {"payment_type": f"This payment option is not available. Choose one of: {', '.join(options)}."}
-            )
+            raise serializers.ValidationError({
+                "code": "payment_option_unavailable",
+                "payment_type": f"This payment option is not available. Choose one of: {', '.join(options)}.",
+            })
 
         attrs['payment_type'] = payment_type
         attrs['service'] = service
@@ -570,7 +590,11 @@ class GuestBookingCreateSerializer(BookingCreateSerializer):
 # ----------------------------------------------------------------------------
 
 class PublicStaffUserSerializer(serializers.ModelSerializer):
-    full_name = serializers.CharField(source='get_full_name', read_only=True)
+    full_name = serializers.SerializerMethodField()
+
+    def get_full_name(self, obj) -> str:
+        from .utils_text import public_user_name
+        return public_user_name(obj)
 
     class Meta:
         model = User
@@ -772,10 +796,12 @@ class BookingSettingsSerializer(serializers.ModelSerializer):
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
-        if bog_client_id is not None:
+        # The dashboard never receives the stored credentials back, so it posts
+        # these fields empty unless the user typed new ones. Empty = keep.
+        if bog_client_id:
             instance.bog_client_id = bog_client_id
 
-        if bog_client_secret is not None:
+        if bog_client_secret:
             instance.bog_client_secret = bog_client_secret
 
         instance.save()

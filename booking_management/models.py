@@ -352,6 +352,13 @@ class Booking(models.Model):
     cancelled_by = models.CharField(max_length=50, blank=True, choices=[('client', 'Client'), ('staff', 'Staff'), ('admin', 'Admin')])
     cancellation_reason = models.TextField(blank=True)
 
+    # Where this booking's notices go, and in which language. Kept on the
+    # booking because a guest may be attached to an existing contact whose
+    # stored email is different (or missing) — the notice must reach the
+    # person who actually made the booking.
+    contact_email = models.EmailField(blank=True, default='')
+    contact_language = models.CharField(max_length=5, blank=True, default='')
+
     # Secret link token so a guest (no account) can view/cancel their booking
     manage_token = models.CharField(max_length=64, blank=True, null=True, unique=True)
 
@@ -415,7 +422,7 @@ class Booking(models.Model):
         def _send():
             try:
                 from .tasks import send_booking_email_task
-                send_booking_email_task.delay(schema_name, booking_id, kind, None)
+                send_booking_email_task.delay(schema_name, booking_id, kind, None)  # language: booking.contact_language
             except Exception:
                 import logging
                 logging.getLogger(__name__).exception('Could not queue %s email for booking %s', kind, booking_id)

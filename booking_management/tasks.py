@@ -150,7 +150,8 @@ def _send_reminders_for_tenant(schema_name):
     """Send booking reminders within a single tenant schema context."""
     from booking_management.models import Booking
 
-    tomorrow = timezone.now().date() + timedelta(days=1)
+    from booking_management.utils import get_booking_settings, tenant_now
+    tomorrow = tenant_now(get_booking_settings()).date() + timedelta(days=1)
     bookings = Booking.objects.filter(
         date=tomorrow,
         status='confirmed',
@@ -160,7 +161,8 @@ def _send_reminders_for_tenant(schema_name):
     reminded = 0
     for booking in bookings:
         try:
-            # TODO: integrate actual email/SMS sending here
+            from booking_management.emails import send_booking_email
+            send_booking_email(booking, 'reminder', schema_name, booking.contact_language or None)
             logger.info(
                 'Reminder for booking %s: %s on %s at %s (tenant %s)',
                 booking.booking_number,
@@ -241,8 +243,13 @@ def _cancel_unpaid_for_tenant(schema_name):
                     if payment_service is None:
                         from booking_management.payment_service import get_booking_payment_service
                         payment_service = get_booking_payment_service()
+                    payment_service.last_state = None
                     payment_service.process_webhook({'body': {'external_order_id': booking.booking_number}})
                     booking.refresh_from_db()
+                    if payment_service.last_state not in ('pending', 'failed'):
+                        # paid (handled), still processing (customer mid-3DS), or
+                        # BOG couldn't be asked: don't give the slot away blind.
+                        continue
                 except Exception:
                     logger.exception(
                         'Could not verify payment for booking %s (tenant %s); leaving it',
@@ -250,7 +257,7 @@ def _cancel_unpaid_for_tenant(schema_name):
                     )
                     continue
                 if booking.status != 'pending' or booking.payment_status in ('deposit_paid', 'fully_paid'):
-                    continue
+                    continue  # paid meanwhile, or already cancelled (declined card)
 
             booking.cancel(
                 cancelled_by='admin',
@@ -273,8 +280,8 @@ def _cancel_unpaid_for_tenant(schema_name):
     return cancelled
 
 
-@shared_task(bind=True, max_retries=3, default_retry_delay=60)
-def send_booking_email_task(self, schema_name, booking_id, kind, language=None):
+@shared_task
+def send_booking_email_task(schema_name, booking_id, kind, language=None):
     """Email a booking notice ('created' | 'confirmed' | 'cancelled') to its client."""
     from tenant_schemas.utils import schema_context
 
@@ -284,9 +291,10 @@ def send_booking_email_task(self, schema_name, booking_id, kind, language=None):
             from booking_management.models import Booking
 
             booking = Booking.objects.select_related('client', 'service', 'staff', 'staff__user').filter(id=booking_id).first()
-            if booking is None or not booking.client.email:
+            if booking is None:
                 return False
 
+            language = language or booking.contact_language
             if not language:
                 try:
                     from tenants.models import Tenant
@@ -295,6 +303,8 @@ def send_booking_email_task(self, schema_name, booking_id, kind, language=None):
                     language = 'en'
 
             return send_booking_email(booking, kind, schema_name, language)
-    except Exception as exc:
+    except Exception:
+        # send_booking_email swallows mail errors itself; anything reaching
+        # here is a bug or a missing schema, which a retry would not fix.
         logger.exception('Booking email task failed (booking %s, %s)', booking_id, kind)
-        raise self.retry(exc=exc)
+        return False

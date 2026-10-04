@@ -19,7 +19,7 @@ from .serializers import (
     StaffExceptionSerializer, BookingSettingsSerializer
 )
 from .permissions import HasBookingManagementFeature
-from .utils import generate_available_slots, can_cancel_booking
+from .utils import generate_available_slots, can_cancel_booking, get_booking_settings, tenant_now
 from .payment_service import get_booking_payment_service
 import logging
 
@@ -50,7 +50,7 @@ def _optimized_booking_qs(qs=None):
 @permission_classes([permissions.IsAuthenticated, HasBookingManagementFeature])
 def dashboard_stats(request):
     """Get dashboard statistics"""
-    today = timezone.now().date()
+    today = tenant_now(get_booking_settings()).date()
 
     # Today's bookings
     today_bookings = Booking.objects.filter(date=today).exclude(status='cancelled')
@@ -122,7 +122,7 @@ def staff_schedule(request):
     staff_id = request.query_params.get('staff_id')
 
     if not date_str:
-        date_obj = timezone.now().date()
+        date_obj = tenant_now(get_booking_settings()).date()
     else:
         try:
             date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
@@ -322,7 +322,7 @@ class AdminBookingStaffViewSet(viewsets.ModelViewSet):
         # Get future exceptions
         exceptions = StaffException.objects.filter(
             staff=staff,
-            date__gte=timezone.now().date()
+            date__gte=tenant_now(get_booking_settings()).date()
         ).order_by('date')
         return Response(StaffExceptionSerializer(exceptions, many=True).data)
 
@@ -344,7 +344,7 @@ class AdminBookingStaffViewSet(viewsets.ModelViewSet):
                 pass
         else:
             # Default to upcoming bookings
-            queryset = queryset.filter(date__gte=timezone.now().date())
+            queryset = queryset.filter(date__gte=tenant_now(get_booking_settings()).date())
 
         queryset = queryset.order_by('date', 'start_time')
         return Response(BookingListSerializer(queryset, many=True).data)
@@ -397,7 +397,7 @@ class AdminStaffExceptionViewSet(viewsets.ModelViewSet):
         show_past = self.request.query_params.get('show_past', 'false').lower() == 'true'
 
         if not show_past:
-            queryset = queryset.filter(date__gte=timezone.now().date())
+            queryset = queryset.filter(date__gte=tenant_now(get_booking_settings()).date())
 
         return queryset.order_by('date')
 
@@ -467,8 +467,11 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
             )
 
         # Check payment unless admin forces confirmation
+        # Only bookings the customer chose to pay online must be paid first;
+        # pay-at-venue bookings (and ones staff created) are confirmed as-is.
         force = request.data.get('force', False)
-        if not force and booking.payment_status not in ['deposit_paid', 'fully_paid']:
+        awaiting_online_payment = booking.payment_method == 'card'
+        if not force and awaiting_online_payment and booking.payment_status not in ['deposit_paid', 'fully_paid']:
             return Response(
                 {'error': 'Cannot confirm booking without payment. Use force=true to override.'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -503,7 +506,16 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
             )
 
         cancellation_reason = request.data.get('reason', 'Cancelled by admin')
-        booking.cancel(cancelled_by='admin', reason=cancellation_reason)
+        from django.db import transaction
+        with transaction.atomic():
+            # Lock the row so two simultaneous cancels can't both refund.
+            booking = Booking.objects.select_for_update().get(pk=booking.pk)
+            if booking.status in ['completed', 'cancelled']:
+                return Response(
+                    {'error': f'Cannot cancel booking with status: {booking.status}'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            booking.cancel(cancelled_by='admin', reason=cancellation_reason)
 
         # Initiate refund if applicable
         if booking.paid_amount > 0:
@@ -598,7 +610,9 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
         booking.start_time = new_time
         end_dt = datetime.combine(new_date, new_time) + timedelta(minutes=booking.service.total_duration_minutes)
         booking.end_time = end_dt.time()
-        booking.save(update_fields=['date', 'start_time', 'end_time'])
+        booking.reminder_sent = False
+        booking.save(update_fields=['date', 'start_time', 'end_time', 'reminder_sent'])
+        booking._notify_client('rescheduled')
 
         # TODO: Send notification to client about reschedule
 
@@ -668,7 +682,7 @@ class AdminRecurringBookingViewSet(viewsets.ModelViewSet):
         """Cancel recurring booking"""
         recurring = self.get_object()
         recurring.status = 'cancelled'
-        recurring.end_date = timezone.now().date()
+        recurring.end_date = tenant_now(get_booking_settings()).date()
         recurring.save(update_fields=['status', 'end_date'])
         return Response(RecurringBookingSerializer(recurring).data)
 

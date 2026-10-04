@@ -303,6 +303,8 @@ REST_FRAMEWORK = {
         'auth': '10/min',
         'booking_auth': '20/min',
         'booking_guest': '30/hour',
+        'booking_manage': '30/hour',
+        'booking_client_create': '20/hour',
     },
 }
 

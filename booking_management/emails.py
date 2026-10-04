@@ -21,42 +21,52 @@ TEXTS = {
         'verify_intro': 'Use this code to verify your email for {business}:',
         'reset_subject': 'Reset your password — {business}',
         'reset_intro': 'Use this code to reset your password for {business}:',
-        'code_expiry': 'The code is valid for {minutes} minutes. If you did not request it, ignore this email.',
+        'code_expiry': 'The code is valid for {minutes} minutes. If you did not request it, you can ignore this email.',
         'created_subject': 'Booking request received — {business}',
-        'created_intro': 'We received your booking at {business}.',
+        'created_intro': "We received your booking request at {business}. We'll email you once it's confirmed.",
         'confirmed_subject': 'Booking confirmed — {business}',
         'confirmed_intro': 'Your booking at {business} is confirmed.',
         'cancelled_subject': 'Booking cancelled — {business}',
         'cancelled_intro': 'Your booking at {business} was cancelled.',
+        'rescheduled_subject': 'Booking time changed — {business}',
+        'rescheduled_intro': 'The time of your booking at {business} was changed. The new time is below.',
+        'reminder_subject': 'Reminder: your appointment tomorrow — {business}',
+        'reminder_intro': 'A reminder of your appointment at {business} tomorrow.',
         'service': 'Service',
         'staff': 'With',
-        'when': 'When',
+        'when': 'Date and time',
         'price': 'Price',
         'number': 'Booking number',
         'manage': 'View or cancel your booking',
-        'pay': 'Pay online',
+        'view': 'View your booking',
     },
     'ka': {
         'verify_subject': 'თქვენი დადასტურების კოდი — {business}',
         'verify_intro': 'გამოიყენეთ ეს კოდი ელ. ფოსტის დასადასტურებლად ({business}):',
         'reset_subject': 'პაროლის აღდგენა — {business}',
         'reset_intro': 'გამოიყენეთ ეს კოდი პაროლის აღსადგენად ({business}):',
-        'code_expiry': 'კოდი მოქმედებს {minutes} წუთის განმავლობაში. თუ თქვენ არ მოგითხოვიათ, უგულებელყავით ეს წერილი.',
+        'code_expiry': 'კოდი მოქმედებს {minutes} წუთის განმავლობაში. თუ კოდი თქვენ არ მოგითხოვიათ, ამ წერილს ყურადღება არ მიაქციოთ.',
         'created_subject': 'ჯავშნის მოთხოვნა მიღებულია — {business}',
-        'created_intro': 'თქვენი ჯავშანი მიღებულია: {business}.',
+        'created_intro': 'თქვენი ჯავშნის მოთხოვნა მიღებულია — {business}. დადასტურებისას შეგატყობინებთ.',
         'confirmed_subject': 'ჯავშანი დადასტურებულია — {business}',
-        'confirmed_intro': 'თქვენი ჯავშანი დადასტურებულია: {business}.',
+        'confirmed_intro': 'თქვენი ჯავშანი დადასტურებულია — {business}.',
         'cancelled_subject': 'ჯავშანი გაუქმებულია — {business}',
-        'cancelled_intro': 'თქვენი ჯავშანი გაუქმდა: {business}.',
+        'cancelled_intro': 'თქვენი ჯავშანი გაუქმდა — {business}.',
+        'rescheduled_subject': 'ჯავშნის დრო შეიცვალა — {business}',
+        'rescheduled_intro': 'თქვენი ჯავშნის დრო შეიცვალა — {business}. ახალი დრო მითითებულია ქვემოთ.',
+        'reminder_subject': 'შეხსენება: ხვალ ვიზიტი გაქვთ — {business}',
+        'reminder_intro': 'შეგახსენებთ, რომ ხვალ ვიზიტი გაქვთ — {business}.',
         'service': 'სერვისი',
         'staff': 'სპეციალისტი',
-        'when': 'დრო',
+        'when': 'თარიღი და დრო',
         'price': 'ფასი',
         'number': 'ჯავშნის ნომერი',
         'manage': 'ჯავშნის ნახვა ან გაუქმება',
-        'pay': 'ონლაინ გადახდა',
+        'view': 'ჯავშნის ნახვა',
     },
 }
+
+BOOKING_EMAIL_KINDS = ('created', 'confirmed', 'cancelled', 'rescheduled', 'reminder')
 
 
 def _texts(language):
@@ -125,30 +135,45 @@ def send_password_reset_code(client, code, language='en'):
     )
 
 
-def _localized(value, language):
-    if isinstance(value, dict):
-        return value.get(language) or value.get('en') or next(iter(value.values()), '')
-    return value or ''
+def _money(amount):
+    """50.00 → '50 ₾', 12.50 → '12.50 ₾' (same as the booking site shows)."""
+    text = f'{amount:.2f}'
+    if text.endswith('.00'):
+        text = text[:-3]
+    return f'{text} ₾'
+
+
+def booking_recipient(booking):
+    """Where a booking's notices go: the email given for THIS booking, else
+    the client's stored one. (A guest matched to an existing contact by phone
+    must get the mail at the address they typed, not the contact's old one.)"""
+    return booking.contact_email or (booking.client.email if booking.client_id else '') or ''
 
 
 def send_booking_email(booking, kind, schema_name, language='en'):
-    """kind: 'created' | 'confirmed' | 'cancelled'."""
-    if kind not in ('created', 'confirmed', 'cancelled'):
+    """kind: one of BOOKING_EMAIL_KINDS."""
+    from .utils_text import localized_text
+
+    if kind not in BOOKING_EMAIL_KINDS:
         return False
-    client = booking.client
-    if not client or not client.email:
+    recipient = booking_recipient(booking)
+    if not recipient:
         return False
 
+    language = language or booking.contact_language or 'en'
     t = _texts(language)
     business = _business_name()
     lines = [
         t[f'{kind}_intro'].format(business=business),
-        f"{t['service']}: {_localized(booking.service.name, language)}",
+        f"{t['service']}: {localized_text(booking.service.name, language)}",
     ]
     if booking.staff:
-        lines.append(f"{t['staff']}: {booking.staff}")
-    lines.append(f"{t['when']}: {booking.date.strftime('%d.%m.%Y')} {booking.start_time.strftime('%H:%M')}")
-    lines.append(f"{t['price']}: {booking.total_amount} ₾")
+        from .utils_text import public_staff_name
+        staff_name = public_staff_name(booking.staff)
+        if staff_name:
+            lines.append(f"{t['staff']}: {staff_name}")
+    lines.append(f"{t['when']}: {booking.date.strftime('%d.%m.%Y')}, {booking.start_time.strftime('%H:%M')}")
+    lines.append(f"{t['price']}: {_money(booking.total_amount)}")
     lines.append(f"{t['number']}: {booking.booking_number}")
 
     link = None
@@ -157,8 +182,8 @@ def send_booking_email(booking, kind, schema_name, language='en'):
 
     return _send(
         t[f'{kind}_subject'].format(business=business),
-        client.email,
+        recipient,
         lines,
         link=link,
-        link_label=t['manage'],
+        link_label=t['view'] if kind == 'cancelled' else t['manage'],
     )

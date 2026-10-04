@@ -568,3 +568,223 @@ class TestPayment(PublicBookingTestCase):
         refund.assert_called_once_with(order_id='bog-order-1', amount=None)  # full refund
         booking.refresh_from_db()
         self.assertEqual((booking.payment_status, booking.paid_amount), ('refunded', Decimal('0.00')))
+
+
+# ---------------------------------------------------------------------------
+# Audit fixes
+# ---------------------------------------------------------------------------
+
+class TestAuditFixes(PublicBookingTestCase):
+
+    def register(self, email='anna@test.com', password='SecurePass1'):
+        return self.api_post(REGISTER_URL, {
+            'email': email, 'phone_number': '+995555123123',
+            'first_name': 'Anna', 'last_name': 'Account',
+            'password': password, 'password_confirm': password,
+        })
+
+    def emailed_code(self):
+        return re.search(r'\b(\d{6})\b', mail.outbox[-1].body).group(1)
+
+    def guest(self, **overrides):
+        with patch('booking_management.tasks.send_booking_email_task.delay') as delay:
+            resp = self.api_post(GUEST_URL, self.guest_payload(**overrides))
+        return resp, delay
+
+    # -- privacy / accounts ---------------------------------------------------
+
+    def test_register_reveals_and_changes_nothing_about_an_existing_contact(self):
+        contact = Client.objects.create(name='Real Person', first_name='Real', last_name='Person',
+                                        phone='+995555999888', email='anna@test.com')
+        resp = self.register()
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertNotIn('client', resp.data)
+        self.assertNotIn('+995555999888', str(resp.data))
+        contact.refresh_from_db()
+        self.assertEqual((contact.first_name, contact.last_name, contact.phone), ('Real', 'Person', '+995555999888'))
+
+    def test_squatting_an_email_does_not_leave_the_squatters_password(self):
+        self.register(password='AttackerPw1')           # never verified
+        self.assertEqual(self.register(password='OwnerPass22').status_code, status.HTTP_201_CREATED)
+        verified = self.api_post(VERIFY_URL, {'email': 'anna@test.com', 'code': self.emailed_code()})
+        self.assertEqual(verified.status_code, status.HTTP_200_OK, verified.data)
+        attacker = self.api_post(LOGIN_URL, {'email': 'anna@test.com', 'password': 'AttackerPw1'})
+        owner = self.api_post(LOGIN_URL, {'email': 'anna@test.com', 'password': 'OwnerPass22'})
+        self.assertEqual(attacker.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(attacker.data['code'][0], 'invalid_credentials')
+        self.assertEqual(owner.status_code, status.HTTP_200_OK)
+
+    def test_code_is_discarded_after_five_wrong_guesses(self):
+        self.register()
+        right = self.emailed_code()
+        wrong = '000000' if right != '000000' else '111111'
+        for _ in range(5):
+            resp = self.api_post(VERIFY_URL, {'email': 'anna@test.com', 'code': wrong})
+            self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(resp.data['code'], 'invalid_code')
+        # even the right code no longer works; a new one must be requested
+        self.assertEqual(self.api_post(VERIFY_URL, {'email': 'anna@test.com', 'code': right}).status_code,
+                         status.HTTP_400_BAD_REQUEST)
+
+    def test_verify_answers_the_same_for_verified_and_unknown_accounts(self):
+        self.register()
+        self.api_post(VERIFY_URL, {'email': 'anna@test.com', 'code': self.emailed_code()})
+        again = self.api_post(VERIFY_URL, {'email': 'anna@test.com', 'code': '123456'})
+        unknown = self.api_post(VERIFY_URL, {'email': 'nobody@test.com', 'code': '123456'})
+        self.assertEqual((again.status_code, again.data), (unknown.status_code, unknown.data))
+
+    def test_tokens_from_another_tenant_or_the_shop_are_rejected(self):
+        from rest_framework_simplejwt.tokens import RefreshToken
+        client = Client.objects.create(name='V', email='v@test.com', is_booking_enabled=True, is_verified=True)
+        client.set_password('SecurePass1')
+        client.save()
+
+        def access(**claims):
+            token = RefreshToken()
+            token['client_id'] = client.id
+            for key, value in claims.items():
+                token[key] = value
+            return str(token.access_token), str(token)
+
+        for claims in ({}, {'kind': 'booking', 'tenant': 'othersalon'}, {'tenant': self.tenant.schema_name}):
+            token, refresh = access(**claims)
+            listed = self.client_api(token).get(BOOKINGS_URL, HTTP_HOST='tenant.test.com')
+            self.assertEqual(listed.status_code, status.HTTP_401_UNAUTHORIZED, claims)
+            self.assertEqual(self.api_post(REFRESH_URL, {'refresh': refresh}).status_code,
+                             status.HTTP_401_UNAUTHORIZED, claims)
+
+        good, _ = access(kind='booking', tenant=self.tenant.schema_name)
+        self.assertEqual(self.client_api(good).get(BOOKINGS_URL, HTTP_HOST='tenant.test.com').status_code,
+                         status.HTTP_200_OK)
+
+    def test_customer_recurring_bookings_are_not_exposed(self):
+        resp = self.api_get('/api/bookings/client/recurring-bookings/')
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    # -- rules ----------------------------------------------------------------
+
+    def test_only_offered_times_can_be_booked(self):
+        resp, _ = self.guest(start_time='10:07')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp.data['code'][0], 'slot_unavailable')
+        self.assertFalse(Booking.objects.exists())
+
+    def test_errors_carry_codes_for_translation(self):
+        noon = datetime.combine(self.day, time(12, 0))
+        with patch('booking_management.utils.tenant_now', return_value=noon):
+            soon, _ = self.guest(start_time='13:00')
+        self.assertEqual(soon.data['code'][0], 'outside_booking_window')
+        self.guest(staff_id=self.staff_a.id)
+        clash, _ = self.guest(staff_id=self.staff_a.id, phone_number='+995555000009')
+        self.assertEqual(clash.data['code'][0], 'slot_unavailable')
+
+    def test_duplicate_day_off_entries_do_not_break_slots(self):
+        for _ in range(2):
+            self.create_staff_exception(self.staff_a, exception_date=self.day)
+        resp = self.api_get(f'{SERVICES_URL}{self.service.id}/slots/?date={self.day}')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertTrue(all(len(s['available_staff']) == 1 for s in resp.data['slots']))
+
+    def test_one_customer_cannot_fill_the_calendar(self):
+        for hour in (9, 10, 11, 12, 13):
+            resp, _ = self.guest(start_time=f'{hour:02d}:00')
+            self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        sixth, _ = self.guest(start_time='14:00')
+        self.assertEqual(sixth.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(sixth.data['code'], 'booking_limit')
+
+    def test_names_fall_back_to_the_language_that_exists(self):
+        self.service.name = {'ka': 'თმის შეჭრა'}
+        self.service.save(update_fields=['name'])
+        english = self.api_get(f'{SERVICES_URL}?lang=en')
+        self.assertEqual(english.data[0]['name_display'], 'თმის შეჭრა')
+
+    def test_staff_without_a_name_never_shows_their_email(self):
+        user = self.staff_a.user
+        user.first_name = user.last_name = ''
+        user.save()
+        services = self.api_get(SERVICES_URL)
+        slots = self.api_get(f'{SERVICES_URL}{self.service.id}/slots/?date={self.day}&staff_id={self.staff_a.id}')
+        self.assertNotIn(user.email, str(services.data))
+        self.assertNotIn(user.email, str(slots.data))
+
+    # -- notices --------------------------------------------------------------
+
+    def test_guest_notice_goes_to_the_email_typed_on_the_booking(self):
+        Client.objects.create(name='Returning', phone='+995555999888', email='old@address.ge')
+        resp, delay = self.guest(phone_number='+995555999888', email='new@address.ge', lang='ka')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        booking = Booking.objects.get(manage_token=resp.data['manage_token'])
+        self.assertEqual((booking.contact_email, booking.contact_language), ('new@address.ge', 'ka'))
+        delay.assert_called_once()
+
+        from booking_management.emails import send_booking_email
+        self.assertTrue(send_booking_email(booking, 'created', self.tenant.schema_name, None))
+        self.assertEqual(mail.outbox[-1].to, ['new@address.ge'])
+        self.assertIn('მიღებულია', mail.outbox[-1].subject)
+
+    # -- payment --------------------------------------------------------------
+
+    def _card_booking(self, **kwargs):
+        defaults = dict(staff=self.staff_a, date=self.day, payment_method='card',
+                        bog_order_id='bog-order-9', deposit_amount=Decimal('50.00'))
+        defaults.update(kwargs)
+        return self.create_booking(self.service, **defaults)
+
+    def test_declined_card_frees_the_slot_immediately(self):
+        self.card_settings()
+        booking = self._card_booking()
+        with patch('tenants.bog_payment.BOGPaymentService.check_payment_status',
+                   return_value={'status': 'failed', 'bog_status': 'rejected'}):
+            self.api_post(WEBHOOK_URL, {'body': {'external_order_id': booking.booking_number}})
+        booking.refresh_from_db()
+        self.assertEqual((booking.status, booking.payment_status), ('cancelled', 'failed'))
+
+    def test_sweeper_does_not_cancel_when_the_bank_cannot_be_asked(self):
+        from booking_management.tasks import _cancel_unpaid_for_tenant
+        self.card_settings()
+        booking = self._card_booking()
+        Booking.objects.filter(id=booking.id).update(created_at=timezone.now() - timedelta(hours=3))
+        for state in ('error', 'unknown', 'processing'):
+            with patch('tenants.bog_payment.BOGPaymentService.check_payment_status',
+                       return_value={'status': state}):
+                self.assertEqual(_cancel_unpaid_for_tenant(self.tenant.schema_name), 0, state)
+        with patch('tenants.bog_payment.BOGPaymentService.check_payment_status',
+                   return_value={'status': 'pending'}):
+            self.assertEqual(_cancel_unpaid_for_tenant(self.tenant.schema_name), 1)
+
+    def test_payment_arriving_after_cancellation_is_refunded(self):
+        self.card_settings()
+        booking = self._card_booking(status='cancelled')
+        paid = {'status': 'paid', 'bog_status': 'completed', 'amount': '50.00'}
+        with patch('tenants.bog_payment.BOGPaymentService.check_payment_status', return_value=paid), \
+                patch('tenants.bog_payment.BOGPaymentService.refund_payment',
+                      return_value={'key': 'request_received'}) as refund:
+            self.api_post(WEBHOOK_URL, {'body': {'external_order_id': booking.booking_number}})
+        refund.assert_called_once_with(order_id='bog-order-9', amount=None)
+        booking.refresh_from_db()
+        self.assertEqual((booking.status, booking.payment_status, booking.paid_amount),
+                         ('cancelled', 'refunded', Decimal('0.00')))
+
+    def test_second_cancel_does_not_refund_again(self):
+        self.card_settings(refund_policy='partial_50')
+        booking = self._card_booking(paid_amount=Decimal('50.00'), payment_status='fully_paid',
+                                     status='confirmed', manage_token='tok-twice')
+        with patch('tenants.bog_payment.BOGPaymentService.refund_payment',
+                   return_value={'key': 'request_received'}) as refund:
+            first = self.api_post(f'{MANAGE_URL}tok-twice/cancel/', {})
+            second = self.api_post(f'{MANAGE_URL}tok-twice/cancel/', {})
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+        self.assertEqual(second.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(refund.call_count, 1)
+
+    def test_saving_settings_with_blank_credentials_keeps_the_stored_ones(self):
+        from booking_management.serializers import BookingSettingsSerializer
+        settings = self.card_settings()
+        serializer = BookingSettingsSerializer(settings, data={'bog_client_id': '', 'bog_client_secret': '',
+                                                               'public_address': 'New address'}, partial=True)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        saved = serializer.save()
+        saved.refresh_from_db()
+        self.assertEqual((saved.bog_client_id, saved.bog_client_secret), ('tenant-bog-id', 'tenant-bog-secret'))
+        self.assertEqual(saved.public_address, 'New address')

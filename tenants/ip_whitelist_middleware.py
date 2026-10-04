@@ -32,6 +32,11 @@ class IPWhitelistMiddleware:
         '/api/tenant/info/',  # Public tenant info
         '/api/security/current-ip/',  # Need this to show current IP even when blocked
         '/api/help/',  # Help center is public
+        # Public booking site: used by the tenant's customers from anywhere,
+        # and the payment gateway's callback.
+        '/api/bookings/client/',
+        '/api/bookings/clients/',
+        '/api/bookings/payment-webhook/',
         '/health/',  # Health check
         '/api/schema/',  # API schema
         '/admin/',  # Django admin

@@ -10,6 +10,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
+from django.core.cache import cache
 from django.db import connection, transaction
 from django.db.models import Prefetch
 from django.utils import timezone
@@ -28,18 +29,23 @@ from .serializers import (
     BookingCreateSerializer, GuestBookingCreateSerializer,
     PublicBookingSerializer, PublicBookingStaffSerializer, PublicServiceSerializer,
     RecurringBookingSerializer, RecurringBookingCreateSerializer,
-    issue_client_tokens,
+    is_booking_token_for_current_tenant, issue_client_tokens,
 )
 from .authentication import BookingClientJWTAuthentication
 from .emails import (
-    CODE_TTL_MINUTES, booking_manage_url, send_password_reset_code, send_verification_code,
+    CODE_TTL_MINUTES, booking_manage_url, booking_recipient, send_password_reset_code,
+    send_verification_code,
 )
 from .permissions import IsAuthenticatedBookingClient, PublicBookingEnabled
-from .throttles import BookingAuthThrottle, BookingGuestThrottle
+from .throttles import (
+    BookingAuthThrottle, BookingClientCreateThrottle, BookingGuestThrottle, BookingManageThrottle,
+)
+from .utils_text import localized_text
 from .utils import (
     available_payment_options, can_cancel_booking, card_payment_enabled,
     check_booking_window, find_available_staff, generate_available_slots,
     get_booking_settings, get_or_create_booking_settings, is_slot_booked, staff_can_perform,
+    tenant_now,
     validate_booking_availability,
 )
 from .payment_service import get_booking_payment_service
@@ -61,8 +67,45 @@ def _language(request):
     return lang if lang in ('en', 'ka') else 'en'
 
 
+# Every error the booking site may show carries a machine-readable `code`;
+# the site translates by code (the `error` text is English, for logs/API users).
+def _error(code, message, http_status=status.HTTP_400_BAD_REQUEST):
+    return Response({'code': code, 'error': message}, status=http_status)
+
+
 def _generate_code():
     return f"{secrets.randbelow(1000000):06d}"
+
+
+# A 6-digit code is only safe if guesses are limited per account, not just
+# per IP: after this many wrong tries the code is thrown away.
+MAX_CODE_ATTEMPTS = 5
+
+# One customer (account, or guest phone number) can hold at most this many
+# upcoming bookings — a cap on how much of a calendar one person can occupy.
+MAX_ACTIVE_BOOKINGS_PER_CLIENT = 5
+
+
+def _code_attempts_key(kind, client):
+    return f'booking:code-attempts:{connection.schema_name}:{kind}:{client.id}'
+
+
+def _register_code_failure(kind, client):
+    """Count a wrong code; returns True when the code must now be discarded."""
+    key = _code_attempts_key(kind, client)
+    try:
+        attempts = cache.incr(key)
+    except ValueError:
+        cache.set(key, 1, timeout=CODE_TTL_MINUTES * 60)
+        attempts = 1
+    if attempts >= MAX_CODE_ATTEMPTS:
+        cache.delete(key)
+        return True
+    return False
+
+
+def _clear_code_failures(kind, client):
+    cache.delete(_code_attempts_key(kind, client))
 
 
 def _find_account(email):
@@ -84,7 +127,7 @@ def _code_matches(stored, sent_at, code, ttl_minutes=CODE_TTL_MINUTES):
 
 def _queue_booking_email(booking, kind, language):
     """Send a booking notice in the background; never let mail break a request."""
-    if not booking.client.email:
+    if not booking_recipient(booking):
         return
     try:
         from .tasks import send_booking_email_task
@@ -105,12 +148,24 @@ def _booking_queryset():
     )
 
 
-def _create_booking(request, serializer, client):
+def _create_booking(request, serializer, client, contact_email=''):
     """Create a validated booking for `client`, start card payment if chosen.
 
     Returns (booking, error_response). Exactly one of them is None.
     """
     data = serializer.validated_data
+    language = _language(request)
+
+    upcoming = Booking.objects.filter(
+        client=client, status__in=['pending', 'confirmed'],
+        date__gte=tenant_now(get_booking_settings()).date(),
+    ).count()
+    if upcoming >= MAX_ACTIVE_BOOKINGS_PER_CLIENT:
+        return None, _error(
+            'booking_limit',
+            f'You already have {upcoming} upcoming bookings. Cancel one or contact the business to book more.',
+        )
+
     service = data['service']
     date = data['date']
     start_time = data['start_time']
@@ -128,12 +183,18 @@ def _create_booking(request, serializer, client):
         if staff is None or is_slot_booked(staff, date, start_time, service.total_duration_minutes):
             staff = find_available_staff(service, date, start_time) if auto_assign else None
             if staff is None:
-                raise ValidationError({'error': 'This time slot was just booked. Please select another time.'})
+                raise ValidationError({
+                    'code': 'slot_unavailable',
+                    'error': 'This time slot was just booked. Please select another time.',
+                })
             data['staff'] = staff
 
-        booking = serializer.save(client=client, manage_token=secrets.token_urlsafe(32))
-
-    language = _language(request)
+        booking = serializer.save(
+            client=client,
+            manage_token=secrets.token_urlsafe(32),
+            contact_email=contact_email or client.email or '',
+            contact_language=language,
+        )
 
     if booking.payment_method == 'card':
         manage_url = booking_manage_url(connection.schema_name, booking.manage_token)
@@ -148,9 +209,10 @@ def _create_booking(request, serializer, client):
             # No way to pay → don't leave a booking holding the slot.
             logger.exception('Payment init failed for booking %s', booking.booking_number)
             booking.cancel(cancelled_by='admin', reason='Payment initialization failed', notify=False)
-            return None, Response(
-                {'error': 'Online payment is unavailable right now. Please try again or choose another payment option.'},
-                status=status.HTTP_502_BAD_GATEWAY,
+            return None, _error(
+                'payment_unavailable',
+                'Online payment is unavailable right now. Please try again or choose another payment option.',
+                status.HTTP_502_BAD_GATEWAY,
             )
         booking.refresh_from_db()
     else:
@@ -172,14 +234,24 @@ def _booking_payload(booking, request, include_client=True):
 
 
 def _cancel_booking(booking, reason):
-    """Cancel on the customer's behalf and refund per policy."""
-    booking.cancel(cancelled_by='client', reason=reason or '')
+    """Cancel on the customer's behalf and refund per policy.
+
+    Returns the refreshed booking, or None if it was already cancelled or
+    completed (two simultaneous cancels must not both refund).
+    """
+    with transaction.atomic():
+        locked = Booking.objects.select_for_update().get(pk=booking.pk)
+        if locked.status in ('cancelled', 'completed'):
+            return None
+        locked.cancel(cancelled_by='client', reason=reason or '')
+    booking.refresh_from_db()
     if booking.paid_amount and booking.paid_amount > 0:
         try:
             get_booking_payment_service().initiate_refund(booking)
         except Exception:
             logger.exception('Refund failed for booking %s', booking.booking_number)
         booking.refresh_from_db()
+    return booking
 
 
 # ============================================================================
@@ -235,14 +307,10 @@ def client_register(request):
     """Register new booking client"""
     # Password strength validation
     password = request.data.get('password', '')
-    if len(password) < 8:
+    if not isinstance(password, str) or len(password) < 8 or not any(c.isdigit() for c in password):
         return Response(
-            {'password': ['Password must be at least 8 characters long.']},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-    if not any(c.isdigit() for c in password):
-        return Response(
-            {'password': ['Password must contain at least one number.']},
+            {'code': 'weak_password',
+             'password': ['Password must be at least 8 characters long and contain a number.']},
             status=status.HTTP_400_BAD_REQUEST
         )
 
@@ -255,14 +323,20 @@ def client_register(request):
         client.verification_token = code
         client.verification_sent_at = timezone.now()
         client.save(update_fields=['verification_token', 'verification_sent_at'])
+        _clear_code_failures('verify', client)
         send_verification_code(client, code, _language(request))
 
+        # Nothing about the client record is returned: it may be an existing
+        # contact's, and the caller hasn't proven the address yet.
         return Response({
             'message': 'Registration successful. Please check your email to verify your account.',
-            'client': BookingClientSerializer(client).data
         }, status=status.HTTP_201_CREATED)
 
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    errors = dict(serializer.errors)
+    email_errors = errors.get('email') or []
+    if any(getattr(e, 'code', '') == 'account_exists' for e in email_errors):
+        errors['code'] = 'account_exists'
+    return Response(errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 @extend_schema(tags=['Booking Client - Authentication'])
@@ -278,6 +352,7 @@ def client_resend_verification(request):
         client.verification_token = code
         client.verification_sent_at = timezone.now()
         client.save(update_fields=['verification_token', 'verification_sent_at'])
+        _clear_code_failures('verify', client)
         send_verification_code(client, code, _language(request))
     return Response({'message': 'If the account exists and is not verified, a code was sent.'})
 
@@ -316,8 +391,11 @@ def client_token_refresh(request):
     except TokenError:
         return Response({'error': 'Invalid or expired refresh token'}, status=status.HTTP_401_UNAUTHORIZED)
 
-    client_id = refresh.get('client_id') or refresh.get('booking_client_id')
-    client = Client.objects.filter(id=client_id, is_booking_enabled=True, is_verified=True).first()
+    client = None
+    if is_booking_token_for_current_tenant(refresh):
+        client = Client.objects.filter(
+            id=refresh.get('client_id'), is_booking_enabled=True, is_verified=True
+        ).first()
     if client is None:
         return Response({'error': 'Invalid or expired refresh token'}, status=status.HTTP_401_UNAUTHORIZED)
 
@@ -337,22 +415,27 @@ def client_verify_email(request):
 
     client = None
     if email and code:
+        # Same answer for "no such account", "already verified" and "wrong
+        # code", so this endpoint can't be used to find out who has an account.
         candidate = _find_account(email)
-        if candidate is not None and candidate.is_verified:
-            return Response({'message': 'Email already verified'})
-        if candidate is not None and _code_matches(candidate.verification_token, candidate.verification_sent_at, code):
-            client = candidate
+        if candidate is not None and not candidate.is_verified and candidate.verification_token:
+            if _code_matches(candidate.verification_token, candidate.verification_sent_at, code):
+                client = candidate
+            elif _register_code_failure('verify', candidate):
+                candidate.verification_token = None
+                candidate.save(update_fields=['verification_token'])
     elif token and len(str(token)) >= 20:
         # Long link-style tokens issued before codes were introduced
-        client = Client.objects.filter(verification_token=token, is_booking_enabled=True).first()
-        if client is not None and client.is_verified:
-            return Response({'message': 'Email already verified'})
+        client = Client.objects.filter(
+            verification_token=token, is_booking_enabled=True, is_verified=False
+        ).first()
     else:
-        return Response({'error': 'Email and code required'}, status=status.HTTP_400_BAD_REQUEST)
+        return _error('invalid_code', 'Email and code required')
 
     if client is None:
-        return Response({'error': 'Invalid or expired verification code'}, status=status.HTTP_400_BAD_REQUEST)
+        return _error('invalid_code', 'Invalid or expired verification code')
 
+    _clear_code_failures('verify', client)
     client.is_verified = True
     client.verification_token = None
     client.last_login = timezone.now()
@@ -385,6 +468,7 @@ def client_password_reset_request(request):
         client.reset_token = code
         client.reset_token_expires = timezone.now() + timedelta(minutes=CODE_TTL_MINUTES)
         client.save(update_fields=['reset_token', 'reset_token_expires'])
+        _clear_code_failures('reset', client)
         send_password_reset_code(client, code, _language(request))
 
     return Response({'message': 'If the account exists, a reset code was sent to its email.'})
@@ -404,15 +488,28 @@ def client_password_reset_confirm(request):
     if not email or not code or not new_password:
         return Response({'error': 'Email, code and new password required'}, status=status.HTTP_400_BAD_REQUEST)
 
-    if len(new_password) < 8 or not any(c.isdigit() for c in new_password):
+    if not isinstance(new_password, str) or len(new_password) < 8 or not any(c.isdigit() for c in new_password):
         return Response(
-            {'new_password': ['Password must be at least 8 characters long and contain a number.']},
+            {'code': 'weak_password',
+             'new_password': ['Password must be at least 8 characters long and contain a number.']},
             status=status.HTTP_400_BAD_REQUEST
         )
 
     client = _find_account(email)
-    if client is None or not client.verify_reset_token(str(code).strip()):
-        return Response({'error': 'Invalid or expired code'}, status=status.HTTP_400_BAD_REQUEST)
+    valid = False
+    if client is not None and client.reset_token and client.reset_token_expires:
+        if timezone.now() <= client.reset_token_expires and constant_time_compare(
+            str(client.reset_token), str(code).strip()
+        ):
+            valid = True
+        elif _register_code_failure('reset', client):
+            client.reset_token = None
+            client.reset_token_expires = None
+            client.save(update_fields=['reset_token', 'reset_token_expires'])
+    if not valid:
+        return _error('invalid_code', 'Invalid or expired code')
+
+    _clear_code_failures('reset', client)
 
     client.set_password(new_password)
     client.reset_token = None
@@ -450,7 +547,7 @@ def payment_webhook(request):
             metadata['created_email_sent'] = True
             booking.payment_metadata = metadata
             booking.save(update_fields=['payment_metadata'])
-            _queue_booking_email(booking, 'created', getattr(request.tenant, 'preferred_language', 'en'))
+            _queue_booking_email(booking, 'created', booking.contact_language or None)
 
     return Response({'status': 'ok'})
 
@@ -532,7 +629,7 @@ def guest_booking_create(request):
 
     client, matched = _guest_client(first_name, last_name, phone, email)
 
-    booking, error = _create_booking(request, serializer, client)
+    booking, error = _create_booking(request, serializer, client, contact_email=email)
     if error is not None:
         return error
 
@@ -556,10 +653,16 @@ def manage_booking(request, token):
     """View a booking through its private link."""
     booking = _booking_queryset().filter(manage_token=token).first() if token else None
     if booking is None:
-        return Response({'error': 'Booking not found'}, status=status.HTTP_404_NOT_FOUND)
+        return _error('not_found', 'Booking not found', status.HTTP_404_NOT_FOUND)
 
     # Returning from the bank: don't wait for the callback to learn the result.
-    if booking.payment_method == 'card' and booking.payment_status == 'pending' and booking.bog_order_id:
+    # At most one check per booking every 10 seconds — the page polls, and each
+    # check is a call to the bank made while the booking row is locked.
+    if (
+        booking.payment_method == 'card' and booking.payment_status == 'pending'
+        and booking.status == 'pending' and booking.bog_order_id
+        and cache.add(f'booking:paycheck:{connection.schema_name}:{booking.pk}', 1, timeout=10)
+    ):
         try:
             get_booking_payment_service().process_webhook({'body': {'external_order_id': booking.booking_number}})
             booking = _booking_queryset().get(pk=booking.pk)
@@ -575,17 +678,17 @@ def manage_booking(request, token):
 @api_view(['POST'])
 @authentication_classes([])
 @permission_classes([PublicBookingEnabled])
-@throttle_classes([BookingGuestThrottle])
+@throttle_classes([BookingManageThrottle])
 def manage_booking_cancel(request, token):
     """Cancel a booking through its private link."""
     booking = _booking_queryset().filter(manage_token=token).first() if token else None
     if booking is None:
-        return Response({'error': 'Booking not found'}, status=status.HTTP_404_NOT_FOUND)
+        return _error('not_found', 'Booking not found', status.HTTP_404_NOT_FOUND)
 
     booking_settings = get_or_create_booking_settings()
     can_cancel, reason = can_cancel_booking(booking, booking_settings)
     if not can_cancel:
-        return Response({'error': reason}, status=status.HTTP_400_BAD_REQUEST)
+        return _error('cannot_cancel', reason)
 
     _cancel_booking(booking, request.data.get('reason', ''))
 
@@ -672,7 +775,7 @@ class ClientServiceViewSet(viewsets.ReadOnlyModelViewSet):
 
         return Response({
             'date': date_str,
-            'service': service.name if isinstance(service.name, str) else service.name.get(language, service.name.get('en', '')),
+            'service': localized_text(service.name, language),
             'slots': slots
         })
 
@@ -713,6 +816,7 @@ class ClientBookingViewSet(
     serializer_class = PublicBookingSerializer
     authentication_classes = [BookingClientJWTAuthentication]
     permission_classes = [PublicBookingEnabled, IsAuthenticatedBookingClient]
+    throttle_classes = [BookingClientCreateThrottle]
     feature_required = 'booking_management'
 
     def get_queryset(self):
@@ -755,7 +859,7 @@ class ClientBookingViewSet(
         # Check if can cancel
         can_cancel, reason = can_cancel_booking(booking, booking_settings)
         if not can_cancel:
-            return Response({'error': reason}, status=status.HTTP_400_BAD_REQUEST)
+            return _error('cannot_cancel', reason)
 
         _cancel_booking(booking, request.data.get('reason', ''))
 
@@ -767,25 +871,16 @@ class ClientBookingViewSet(
         booking = self.get_object()
 
         if booking.status not in ['pending', 'confirmed']:
-            return Response({'error': 'Cannot reschedule this booking'}, status=status.HTTP_400_BAD_REQUEST)
+            return _error('cannot_change', 'Cannot reschedule this booking')
 
         new_date_str = request.data.get('date')
         new_time_str = request.data.get('start_time')
 
-        if not new_date_str or not new_time_str:
-            return Response(
-                {'error': 'date and start_time are required'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
         try:
-            new_date = datetime.strptime(new_date_str, '%Y-%m-%d').date()
-            new_time = datetime.strptime(new_time_str[:5], '%H:%M').time()
+            new_date = datetime.strptime(str(new_date_str), '%Y-%m-%d').date()
+            new_time = datetime.strptime(str(new_time_str)[:5], '%H:%M').time()
         except ValueError:
-            return Response(
-                {'error': 'Invalid date or time format. Use YYYY-MM-DD and HH:MM'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return _error('slot_unavailable', 'Invalid date or time format. Use YYYY-MM-DD and HH:MM')
 
         booking_settings = get_or_create_booking_settings()
 
@@ -793,15 +888,19 @@ class ClientBookingViewSet(
         # and the new time by the same lead time as a new booking.
         can_change, reason = can_cancel_booking(booking, booking_settings)
         if not can_change:
-            return Response({'error': reason.replace('cancelled', 'changed')}, status=status.HTTP_400_BAD_REQUEST)
+            return _error('cannot_change', reason.replace('cancelled', 'changed'))
 
         ok, error_msg = check_booking_window(new_date, new_time, booking_settings)
         if not ok:
-            return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
+            return _error('outside_booking_window', error_msg)
 
         with transaction.atomic():
-            if booking.staff_id:
-                BookingStaff.objects.select_for_update().filter(pk=booking.staff_id).first()
+            # Serialize against other bookings for the same staff
+            list(
+                BookingStaff.objects.select_for_update()
+                .filter(pk__in=booking.service.staff_members.values('pk'))
+                .order_by('pk')
+            )
 
             # Validate availability (ignoring this booking's own current slot)
             is_available, error_msg = validate_booking_availability(
@@ -811,19 +910,25 @@ class ClientBookingViewSet(
                 new_time,
                 exclude_booking_id=booking.pk,
                 booking_settings=booking_settings,
+                enforce_grid=True,
             )
 
             if not is_available:
-                return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
+                return _error('slot_unavailable', error_msg)
 
             # Update booking
             if booking.staff is None:
-                booking.staff = find_available_staff(booking.service, new_date, new_time, exclude_booking_id=booking.pk)
+                booking.staff = find_available_staff(
+                    booking.service, new_date, new_time, exclude_booking_id=booking.pk, enforce_grid=True
+                )
             booking.date = new_date
             booking.start_time = new_time
             end_dt = datetime.combine(new_date, new_time) + timedelta(minutes=booking.service.total_duration_minutes)
             booking.end_time = end_dt.time()
-            booking.save(update_fields=['staff', 'date', 'start_time', 'end_time', 'updated_at'])
+            booking.reminder_sent = False
+            booking.save(update_fields=['staff', 'date', 'start_time', 'end_time', 'reminder_sent', 'updated_at'])
+
+        _queue_booking_email(booking, 'rescheduled', _language(request))
 
         return Response(_booking_payload(booking, request))
 
@@ -833,10 +938,10 @@ class ClientBookingViewSet(
         booking = self.get_object()
 
         if booking.status != 'completed':
-            return Response({'error': 'Can only rate completed bookings'}, status=status.HTTP_400_BAD_REQUEST)
+            return _error('cannot_rate', 'Can only rate completed bookings')
 
         if booking.rating is not None:
-            return Response({'error': 'This booking has already been rated'}, status=status.HTTP_400_BAD_REQUEST)
+            return _error('cannot_rate', 'This booking has already been rated')
 
         rating = request.data.get('rating')
         review_text = request.data.get('review', '')

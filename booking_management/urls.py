@@ -48,7 +48,8 @@ client_router.register(r'categories', ClientServiceCategoryViewSet, basename='cl
 client_router.register(r'services', ClientServiceViewSet, basename='client-service')
 client_router.register(r'staff', ClientBookingStaffViewSet, basename='client-staff')
 client_router.register(r'bookings', ClientBookingViewSet, basename='client-booking')
-client_router.register(r'recurring-bookings', ClientRecurringBookingViewSet, basename='client-recurring-booking')
+# Customer-managed recurring bookings are not exposed: they are created with
+# no availability / lead-time / payment checks. Staff manage them in the admin API.
 
 
 # ============================================================================

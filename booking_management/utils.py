@@ -173,7 +173,7 @@ def generate_available_slots(service, date, staff=None, language='en', booking_s
             })
             slot['available_staff'].append({
                 'staff_id': staff_member.id,
-                'staff_name': str(staff_member),
+                'staff_name': public_staff_name(staff_member),
             })
 
     grouped_slots = []
@@ -199,31 +199,41 @@ def get_staff_availability(staff, date):
     """
     day_of_week = date.weekday()
 
-    # Check for exceptions first
-    try:
-        exception = StaffException.objects.get(staff=staff, date=date)
+    weekly = StaffAvailability.objects.filter(
+        staff=staff, day_of_week=day_of_week, is_available=True
+    ).order_by('-id').first()
+
+    # Exceptions for the date win. (.filter().first(), not .get(): nothing
+    # stops the same day being entered twice, and that must not 500 the page.)
+    exception = StaffException.objects.filter(staff=staff, date=date).order_by('-id').first()
+    if exception is not None:
         if not exception.is_available:
             return None
-        return {
-            'start_time': exception.start_time or time(9, 0),
-            'end_time': exception.end_time or time(17, 0),
-            'break_start': None,
-            'break_end': None
-        }
-    except StaffException.DoesNotExist:
-        pass
+        if exception.start_time and exception.end_time:
+            return {
+                'start_time': exception.start_time,
+                'end_time': exception.end_time,
+                'break_start': None,
+                'break_end': None
+            }
+        if weekly is None:
+            # Working on a normally-off day with no hours given
+            return {
+                'start_time': exception.start_time or time(9, 0),
+                'end_time': exception.end_time or time(17, 0),
+                'break_start': None,
+                'break_end': None
+            }
+        # "Available" exception without hours: the normal day applies
 
-    # Get regular availability
-    try:
-        availability = StaffAvailability.objects.get(staff=staff, day_of_week=day_of_week, is_available=True)
-        return {
-            'start_time': availability.start_time,
-            'end_time': availability.end_time,
-            'break_start': availability.break_start,
-            'break_end': availability.break_end
-        }
-    except StaffAvailability.DoesNotExist:
+    if weekly is None:
         return None
+    return {
+        'start_time': weekly.start_time,
+        'end_time': weekly.end_time,
+        'break_start': weekly.break_start,
+        'break_end': weekly.break_end
+    }
 
 
 def is_slot_booked(staff, date, start_time, duration_minutes, exclude_booking_id=None):
@@ -247,14 +257,22 @@ def is_slot_booked(staff, date, start_time, duration_minutes, exclude_booking_id
     return overlapping.exists()
 
 
-def check_staff_slot(service, staff, date, start_time, exclude_booking_id=None):
+def check_staff_slot(service, staff, date, start_time, exclude_booking_id=None, enforce_grid=False):
     """Can this staff member take this service at this time?
+
+    enforce_grid: also require the start to be one of the times the slot list
+    offers (customers may only book offered times; staff may book any time).
 
     Returns: (is_available: bool, error_message: str)
     """
     staff_availability = get_staff_availability(staff, date)
     if not staff_availability:
         return False, f"Staff {staff} is not available on this date"
+
+    if enforce_grid:
+        offered = {(t.hour, t.minute) for t in _candidate_start_times(service, staff_availability)}
+        if (start_time.hour, start_time.minute) not in offered or start_time.second:
+            return False, "This time is not available"
 
     # Check if time is within working hours
     if not is_time_in_range(start_time, staff_availability['start_time'], staff_availability['end_time']):
@@ -276,16 +294,20 @@ def check_staff_slot(service, staff, date, start_time, exclude_booking_id=None):
     return True, ""
 
 
-def find_available_staff(service, date, start_time, exclude_booking_id=None):
+def find_available_staff(service, date, start_time, exclude_booking_id=None, enforce_grid=False):
     """First active staff member of the service who is free at this time, or None."""
     for staff_member in service.staff_members.filter(is_active_for_bookings=True).order_by('id'):
-        ok, _ = check_staff_slot(service, staff_member, date, start_time, exclude_booking_id=exclude_booking_id)
+        ok, _ = check_staff_slot(
+            service, staff_member, date, start_time,
+            exclude_booking_id=exclude_booking_id, enforce_grid=enforce_grid,
+        )
         if ok:
             return staff_member
     return None
 
 
-def validate_booking_availability(service, staff, date, start_time, exclude_booking_id=None, booking_settings=None):
+def validate_booking_availability(service, staff, date, start_time, exclude_booking_id=None,
+                                  booking_settings=None, enforce_grid=False):
     """
     Validate if booking can be made
 
@@ -305,13 +327,21 @@ def validate_booking_availability(service, staff, date, start_time, exclude_book
         return False, "Cannot book a time that has already passed"
 
     if staff:
-        return check_staff_slot(service, staff, date, start_time, exclude_booking_id=exclude_booking_id)
+        return check_staff_slot(
+            service, staff, date, start_time,
+            exclude_booking_id=exclude_booking_id, enforce_grid=enforce_grid,
+        )
 
     if not service.staff_members.filter(is_active_for_bookings=True).exists():
         return False, "No staff available for this service"
-    if find_available_staff(service, date, start_time, exclude_booking_id=exclude_booking_id) is None:
-        return False, "This time slot is already booked"
+    if find_available_staff(
+        service, date, start_time, exclude_booking_id=exclude_booking_id, enforce_grid=enforce_grid
+    ) is None:
+        return False, "This time is not available"
     return True, ""
+
+
+from .utils_text import localized_text, public_staff_name  # noqa: E402,F401  (re-exported)
 
 
 def is_time_in_range(check_time, start_time, end_time):

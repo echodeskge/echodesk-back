@@ -17,8 +17,16 @@ class BookingClientJWTAuthentication(JWTAuthentication):
         Attempts to find and return a Client using the given validated token.
         """
         try:
-            # Try new claim first, fall back to legacy claim
-            client_id = validated_token.get('client_id') or validated_token.get('booking_client_id')
+            # Only tokens issued by THIS tenant's booking site are accepted.
+            # Client ids are per-tenant row numbers and every token is signed
+            # with the same key, so a token from another tenant's booking
+            # page — or a shop customer's token — must not pass as the client
+            # here who happens to share the id.
+            from .serializers import is_booking_token_for_current_tenant
+            if not is_booking_token_for_current_tenant(validated_token):
+                raise exceptions.AuthenticationFailed('Token was not issued for this booking site')
+
+            client_id = validated_token.get('client_id')
 
             if not client_id:
                 raise exceptions.AuthenticationFailed('Token does not contain client_id')
@@ -41,6 +49,8 @@ class BookingClientJWTAuthentication(JWTAuthentication):
         except KeyError:
             logger.error('client_id not found in token payload')
             raise exceptions.AuthenticationFailed('Invalid token payload')
+        except exceptions.AuthenticationFailed:
+            raise
         except Exception as e:
             logger.error(f'Error in BookingClientJWTAuthentication: {str(e)}')
             raise exceptions.AuthenticationFailed('Authentication failed')
