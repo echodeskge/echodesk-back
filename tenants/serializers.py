@@ -64,7 +64,7 @@ class TenantCreateSerializer(serializers.ModelSerializer):
             )
         
         # Reserved subdomains
-        reserved = ['www', 'api', 'admin', 'mail', 'ftp', 'public', 'app']
+        reserved = ['www', 'api', 'admin', 'mail', 'ftp', 'public', 'app', 'book']
         if value.lower() in reserved:
             raise serializers.ValidationError(
                 f"'{value}' is a reserved subdomain."
@@ -159,7 +159,7 @@ class TenantRegistrationSerializer(serializers.Serializer):
             )
         
         # Reserved subdomains
-        reserved = ['www', 'api', 'admin', 'mail', 'ftp', 'public', 'app', 'support', 'help']
+        reserved = ['www', 'api', 'admin', 'mail', 'ftp', 'public', 'app', 'support', 'help', 'book']
         if value.lower() in reserved:
             raise serializers.ValidationError(
                 f"'{value}' is a reserved subdomain."

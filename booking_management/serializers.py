@@ -596,6 +596,10 @@ class PublicBookingSerializer(serializers.ModelSerializer):
     service = PublicServiceSerializer(read_only=True)
     staff = PublicBookingStaffSerializer(read_only=True)
     remaining_amount = serializers.ReadOnlyField()
+    # Whether the customer may still cancel / move it online, per the
+    # business's notice period — so every page can show or hide the buttons.
+    can_cancel = serializers.SerializerMethodField()
+    cancel_blocked_reason = serializers.SerializerMethodField()
 
     class Meta:
         model = Booking
@@ -606,8 +610,22 @@ class PublicBookingSerializer(serializers.ModelSerializer):
             'rating', 'review',
             'cancelled_at', 'cancelled_by', 'cancellation_reason',
             'created_at', 'confirmed_at', 'completed_at',
+            'can_cancel', 'cancel_blocked_reason',
         ]
         read_only_fields = fields
+
+    def _cancel_state(self, obj):
+        from .utils import can_cancel_booking, get_or_create_booking_settings
+        if '_booking_settings' not in self.context:
+            self.context['_booking_settings'] = get_or_create_booking_settings()
+        return can_cancel_booking(obj, self.context['_booking_settings'])
+
+    def get_can_cancel(self, obj) -> bool:
+        return self._cancel_state(obj)[0]
+
+    def get_cancel_blocked_reason(self, obj) -> str:
+        can_cancel, reason = self._cancel_state(obj)
+        return '' if can_cancel else reason
 
 
 class BookingUpdateSerializer(serializers.ModelSerializer):

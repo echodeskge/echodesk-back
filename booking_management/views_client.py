@@ -168,9 +168,6 @@ def _booking_payload(booking, request, include_client=True):
         # A guest booking may be attached to an existing contact matched by
         # phone number; never echo that person's stored details back.
         data.pop('client', None)
-    can_cancel, reason = can_cancel_booking(booking, get_or_create_booking_settings())
-    data['can_cancel'] = can_cancel
-    data['cancel_blocked_reason'] = '' if can_cancel else reason
     return data
 
 
@@ -200,11 +197,7 @@ def public_info(request):
     card_ok = card_payment_enabled(booking_settings)
 
     bank_transfer = None
-    if (
-        booking_settings is not None
-        and booking_settings.payment_method == 'manual_transfer'
-        and booking_settings.bank_iban
-    ):
+    if booking_settings is not None and booking_settings.bank_iban:
         bank_transfer = {
             'bank_name': booking_settings.bank_name,
             'iban': booking_settings.bank_iban,

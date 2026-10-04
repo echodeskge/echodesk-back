@@ -388,11 +388,11 @@ def can_cancel_booking(booking, settings):
 # ---------------------------------------------------------------------------
 
 def card_payment_enabled(booking_settings):
-    """Online card payment is on only when the tenant chose the BOG gateway,
-    allows card payment and has saved its BOG credentials."""
+    """Online card payment is on only when the tenant allows card payment and
+    has saved its BOG credentials. (The dashboard exposes exactly these two
+    things; the legacy `payment_method` field is not editable there.)"""
     return bool(
         booking_settings
-        and booking_settings.payment_method == 'bog_gateway'
         and booking_settings.allow_card_payment
         and booking_settings.bog_client_id
         and booking_settings.bog_client_secret

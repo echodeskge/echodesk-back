@@ -72,7 +72,7 @@ class PublicBookingTestCase(BookingViewTestMixin, BookingTestCase):
         return payload
 
     def card_settings(self, **kwargs):
-        settings = self.create_settings(payment_method='bog_gateway', **kwargs)
+        settings = self.create_settings(**kwargs)
         settings.bog_client_id = 'tenant-bog-id'
         settings.bog_client_secret = 'tenant-bog-secret'
         settings.save()
@@ -343,6 +343,8 @@ class TestAccounts(PublicBookingTestCase):
         listed = api.get(BOOKINGS_URL, HTTP_HOST='tenant.test.com')
         self.assertEqual(listed.status_code, status.HTTP_200_OK)
         self.assertEqual(len(self.get_results(listed)), 1)
+        # the list says whether each booking can still be changed online
+        self.assertTrue(self.get_results(listed)[0]['can_cancel'])
 
         # Public endpoints must not choke on a customer token
         self.assertEqual(api.get(SERVICES_URL, HTTP_HOST='tenant.test.com').status_code, status.HTTP_200_OK)
