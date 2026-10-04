@@ -602,7 +602,11 @@ class TestBookingSettings(BookingViewTestMixin, BookingTestCase):
 # CLIENT — Registration & Login
 # ============================================================================
 
-class TestClientRegistration(BookingTestCase):
+class TestClientRegistration(BookingViewTestMixin, BookingTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self._ensure_booking_feature()
 
     def test_register_success(self):
         resp = self.api_post(CLIENT_REGISTER_URL, {
@@ -652,10 +656,12 @@ class TestClientRegistration(BookingTestCase):
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_register_duplicate_email(self):
-        Client.objects.create(
+        existing = Client.objects.create(
             name='Existing', email='existing@test.com', phone='+995555111666',
             is_booking_enabled=True,
         )
+        existing.set_password('SecurePass1')
+        existing.save()
         resp = self.api_post(CLIENT_REGISTER_URL, {
             'email': 'existing@test.com',
             'phone_number': '+995555111777',
@@ -667,10 +673,11 @@ class TestClientRegistration(BookingTestCase):
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
 
-class TestClientLogin(BookingTestCase):
+class TestClientLogin(BookingViewTestMixin, BookingTestCase):
 
     def setUp(self):
         super().setUp()
+        self._ensure_booking_feature()
         self.client_obj = Client.objects.create(
             name='Login Test',
             email='logintest@test.com',
@@ -708,21 +715,25 @@ class TestClientLogin(BookingTestCase):
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
 
-class TestClientVerifyEmail(BookingTestCase):
+class TestClientVerifyEmail(BookingViewTestMixin, BookingTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self._ensure_booking_feature()
 
     def test_verify_email_success(self):
         client_obj = self.create_client()
         client_obj.is_booking_enabled = True
         client_obj.is_verified = False
-        client_obj.verification_token = 'test-token-123'
+        client_obj.verification_token = 'legacy-link-token-0123456789abcdef'
         client_obj.save()
-        resp = self.api_post(CLIENT_VERIFY_EMAIL_URL, {'token': 'test-token-123'})
+        resp = self.api_post(CLIENT_VERIFY_EMAIL_URL, {'token': 'legacy-link-token-0123456789abcdef'})
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         client_obj.refresh_from_db()
         self.assertTrue(client_obj.is_verified)
 
     def test_verify_email_invalid_token(self):
-        resp = self.api_post(CLIENT_VERIFY_EMAIL_URL, {'token': 'bad-token'})
+        resp = self.api_post(CLIENT_VERIFY_EMAIL_URL, {'token': 'bad-token-that-is-long-enough-000'})
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_verify_email_missing_token(self):
@@ -734,7 +745,11 @@ class TestClientVerifyEmail(BookingTestCase):
 # CLIENT — Service Browsing (public endpoints)
 # ============================================================================
 
-class TestClientServiceViewSet(BookingTestCase):
+class TestClientServiceViewSet(BookingViewTestMixin, BookingTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self._ensure_booking_feature()
 
     def test_list_services_public(self):
         self.create_service(status='active')
@@ -907,16 +922,19 @@ class TestClientBookingRating(BookingViewTestMixin, BookingTestCase):
 
 class TestPaymentWebhook(BookingTestCase):
 
-    @patch('booking_management.payment_service.get_booking_payment_service')
+    @patch('booking_management.views_client.get_booking_payment_service')
     def test_webhook_success(self, mock_payment):
         mock_svc = MagicMock()
-        mock_svc.process_webhook.return_value = MagicMock()
+        mock_svc.process_webhook.return_value = None
         mock_payment.return_value = mock_svc
         resp = self.api_post(PAYMENT_WEBHOOK_URL, {'order_id': 'test123'})
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
-    @patch('booking_management.payment_service.get_booking_payment_service')
+    @patch('booking_management.views_client.get_booking_payment_service')
     def test_webhook_error(self, mock_payment):
+        # Couldn't confirm the payment state → 5xx so BOG retries, and no
+        # internal error text leaks to the caller.
         mock_payment.return_value.process_webhook.side_effect = Exception('Bad data')
         resp = self.api_post(PAYMENT_WEBHOOK_URL, {'order_id': 'bad'})
-        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn('Bad data', str(resp.data))

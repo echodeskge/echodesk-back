@@ -301,6 +301,8 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_THROTTLE_RATES': {
         'auth': '10/min',
+        'booking_auth': '20/min',
+        'booking_guest': '30/hour',
     },
 }
 
@@ -481,6 +483,8 @@ LOGGING = {
 
 # Frontend Configuration
 FRONTEND_BASE_URL = config('FRONTEND_BASE_URL', default='echodesk.ge')
+# Public booking site customers use (book.echodesk.ge/<tenant schema>)
+BOOKING_SITE_URL = config('BOOKING_SITE_URL', default=f'https://book.{MAIN_DOMAIN}')
 REVALIDATION_SECRET = config('REVALIDATION_SECRET', default='')
 
 # Optional: For advanced deployments
@@ -686,7 +690,8 @@ CELERY_BEAT_SCHEDULE = {
     },
     'cancel-unpaid-bookings': {
         'task': 'booking_management.tasks.cancel_unpaid_bookings',
-        'schedule': crontab(minute=0, hour='*/6'),  # Every 6 hours
+        # Releases slots held by abandoned online card payments (30 min grace)
+        'schedule': crontab(minute='*/10'),
     },
     # Ecommerce low stock check
     'check-low-stock': {

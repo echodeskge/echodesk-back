@@ -9,6 +9,12 @@ from .views_client import (
     client_password_reset_request,
     client_password_reset_confirm,
     client_profile,
+    client_resend_verification,
+    client_token_refresh,
+    public_info,
+    guest_booking_create,
+    manage_booking,
+    manage_booking_cancel,
     payment_webhook,
     ClientServiceCategoryViewSet,
     ClientServiceViewSet,
@@ -77,6 +83,8 @@ urlpatterns = [
     path('clients/password-reset/request/', client_password_reset_request, name='client-password-reset-request'),
     path('clients/password-reset/confirm/', client_password_reset_confirm, name='client-password-reset-confirm'),
     path('clients/profile/', client_profile, name='client-profile'),
+    path('clients/resend-verification/', client_resend_verification, name='client-resend-verification'),
+    path('clients/token/refresh/', client_token_refresh, name='client-token-refresh'),
 
     # ========================================================================
     # PAYMENT WEBHOOK (public, called by BOG gateway)
@@ -86,6 +94,10 @@ urlpatterns = [
     # ========================================================================
     # CLIENT-FACING ENDPOINTS (requires BookingClient JWT)
     # ========================================================================
+    path('client/info/', public_info, name='client-info'),
+    path('client/guest-bookings/', guest_booking_create, name='client-guest-booking'),
+    path('client/manage/<str:token>/', manage_booking, name='client-manage-booking'),
+    path('client/manage/<str:token>/cancel/', manage_booking_cancel, name='client-manage-booking-cancel'),
     path('client/', include(client_router.urls)),
 
     # ========================================================================

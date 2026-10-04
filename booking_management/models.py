@@ -329,6 +329,11 @@ class Booking(models.Model):
     # Payment integration (BOG)
     bog_order_id = models.CharField(max_length=255, blank=True, null=True, help_text="BOG payment order ID")
     payment_url = models.URLField(max_length=500, blank=True, null=True, help_text="BOG payment URL")
+    payment_method = models.CharField(
+        max_length=10, blank=True, default='',
+        choices=[('cash', 'Pay at the venue'), ('card', 'Card (online)')],
+        help_text="How the customer chose to pay (empty for bookings made before this field existed)"
+    )
     payment_metadata = models.JSONField(blank=True, null=True, help_text="Full payment response from BOG")
 
     # Notes
@@ -346,6 +351,9 @@ class Booking(models.Model):
     cancelled_at = models.DateTimeField(blank=True, null=True)
     cancelled_by = models.CharField(max_length=50, blank=True, choices=[('client', 'Client'), ('staff', 'Staff'), ('admin', 'Admin')])
     cancellation_reason = models.TextField(blank=True)
+
+    # Secret link token so a guest (no account) can view/cancel their booking
+    manage_token = models.CharField(max_length=64, blank=True, null=True, unique=True)
 
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
@@ -373,11 +381,13 @@ class Booking(models.Model):
             self.booking_number = generate_booking_number()
         super().save(*args, **kwargs)
 
-    def confirm(self):
+    def confirm(self, notify=True):
         """Confirm booking"""
         self.status = 'confirmed'
         self.confirmed_at = timezone.now()
         self.save(update_fields=['status', 'confirmed_at', 'updated_at'])
+        if notify:
+            self._notify_client('confirmed')
 
     def complete(self):
         """Mark booking as completed"""
@@ -385,13 +395,32 @@ class Booking(models.Model):
         self.completed_at = timezone.now()
         self.save(update_fields=['status', 'completed_at', 'updated_at'])
 
-    def cancel(self, cancelled_by, reason=''):
+    def cancel(self, cancelled_by, reason='', notify=True):
         """Cancel booking"""
         self.status = 'cancelled'
         self.cancelled_at = timezone.now()
         self.cancelled_by = cancelled_by
         self.cancellation_reason = reason
         self.save(update_fields=['status', 'cancelled_at', 'cancelled_by', 'cancellation_reason', 'updated_at'])
+        if notify:
+            self._notify_client('cancelled')
+
+    def _notify_client(self, kind):
+        """Email the client about a status change, once the change is committed."""
+        from django.db import connection, transaction
+
+        schema_name = connection.schema_name
+        booking_id = self.id
+
+        def _send():
+            try:
+                from .tasks import send_booking_email_task
+                send_booking_email_task.delay(schema_name, booking_id, kind, None)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception('Could not queue %s email for booking %s', kind, booking_id)
+
+        transaction.on_commit(_send)
 
     @property
     def is_paid(self):
@@ -495,6 +524,15 @@ class RecurringBooking(models.Model):
         return self.next_booking_date
 
 
+def _credentials_fernet():
+    """Fernet for the stored BOG credentials, keyed from SECRET_KEY (same
+    scheme as EcommerceSettings). settings.ENCRYPTION_KEY was never defined, so
+    the previous code could not store credentials at all."""
+    import base64
+    key = settings.SECRET_KEY[:32].encode().ljust(32, b'0')
+    return Fernet(base64.urlsafe_b64encode(key))
+
+
 class BookingSettings(models.Model):
     """
     Tenant-specific booking settings
@@ -543,6 +581,15 @@ class BookingSettings(models.Model):
     min_hours_before_booking = models.IntegerField(default=2, help_text="Minimum hours in advance to book")
     max_days_advance_booking = models.IntegerField(default=60, help_text="Maximum days in advance to book")
 
+    # Business clock. Booking dates/times are stored in this zone's wall time.
+    timezone = models.CharField(max_length=64, default='Asia/Tbilisi', help_text="IANA timezone of the business")
+
+    # Public booking page (book.echodesk.ge/<schema>)
+    public_page_enabled = models.BooleanField(default=True, help_text="Let customers book online")
+    public_description = models.JSONField(default=dict, blank=True, help_text='Localized description: {"en": "...", "ka": "..."}')
+    public_address = models.CharField(max_length=255, blank=True)
+    public_phone = models.CharField(max_length=50, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -559,8 +606,8 @@ class BookingSettings(models.Model):
         if not self._bog_client_id_encrypted:
             return ''
         try:
-            fernet = Fernet(settings.ENCRYPTION_KEY.encode())
-            return fernet.decrypt(self._bog_client_id_encrypted).decode()
+            fernet = _credentials_fernet()
+            return fernet.decrypt(bytes(self._bog_client_id_encrypted)).decode()
         except Exception:
             return ''
 
@@ -568,7 +615,7 @@ class BookingSettings(models.Model):
     def bog_client_id(self, value):
         """Encrypt and store BOG client ID"""
         if value:
-            fernet = Fernet(settings.ENCRYPTION_KEY.encode())
+            fernet = _credentials_fernet()
             self._bog_client_id_encrypted = fernet.encrypt(value.encode())
         else:
             self._bog_client_id_encrypted = None
@@ -579,8 +626,8 @@ class BookingSettings(models.Model):
         if not self._bog_client_secret_encrypted:
             return ''
         try:
-            fernet = Fernet(settings.ENCRYPTION_KEY.encode())
-            return fernet.decrypt(self._bog_client_secret_encrypted).decode()
+            fernet = _credentials_fernet()
+            return fernet.decrypt(bytes(self._bog_client_secret_encrypted)).decode()
         except Exception:
             return ''
 
@@ -588,7 +635,7 @@ class BookingSettings(models.Model):
     def bog_client_secret(self, value):
         """Encrypt and store BOG client secret"""
         if value:
-            fernet = Fernet(settings.ENCRYPTION_KEY.encode())
+            fernet = _credentials_fernet()
             self._bog_client_secret_encrypted = fernet.encrypt(value.encode())
         else:
             self._bog_client_secret_encrypted = None

@@ -1,10 +1,17 @@
-from tenants.bog_payment import BOGPaymentService
-from .models import Booking, BookingSettings
-from django.db import connection
-from tenants.models import Tenant
+from decimal import Decimal
 import logging
 
+from django.db import connection, transaction
+
+from tenants.bog_payment import BOGPaymentService
+from tenants.models import Tenant
+from .models import Booking, BookingSettings
+
 logger = logging.getLogger(__name__)
+
+
+class BookingPaymentNotConfigured(RuntimeError):
+    """Card payment was requested but the tenant has no usable BOG credentials."""
 
 
 class BookingPaymentService:
@@ -31,45 +38,42 @@ class BookingPaymentService:
         # Get or create booking settings
         self.settings, created = BookingSettings.objects.get_or_create(tenant=tenant)
 
-        # Initialize BOG service
-        self.bog_service = self._init_bog_service()
+        self._bog_service = None
 
-    def _init_bog_service(self):
-        """Initialize BOG payment service with booking settings"""
-        # Check if tenant has configured BOG credentials
-        if self.settings.bog_client_id and self.settings.bog_client_secret:
-            # Use tenant's credentials
+    @property
+    def bog_service(self):
+        """BOG client using the tenant's own merchant credentials.
+
+        Built lazily, and never with fallback credentials: charging a salon's
+        customer into some other merchant account would be worse than failing.
+        """
+        if self._bog_service is None:
             client_id = self.settings.bog_client_id
             client_secret = self.settings.bog_client_secret
-            use_production = self.settings.bog_use_production
-        else:
-            # Fall back to test credentials (for development/testing)
-            from django.conf import settings
-            client_id = getattr(settings, 'BOG_TEST_CLIENT_ID', '')
-            client_secret = getattr(settings, 'BOG_TEST_CLIENT_SECRET', '')
-            use_production = False
+            if not client_id or not client_secret:
+                raise BookingPaymentNotConfigured(
+                    f"Tenant {self.tenant.schema_name} has no BOG credentials for bookings"
+                )
+            service = BOGPaymentService()
+            service.client_id = client_id
+            service.client_secret = client_secret
+            self._bog_service = service
+        return self._bog_service
 
-            logger.warning(f"Tenant {self.tenant.schema_name} has no BOG credentials configured. Using test credentials.")
-
-        return BOGPaymentService(
-            client_id=client_id,
-            client_secret=client_secret,
-            use_production=use_production
-        )
-
-    def create_booking_payment(self, booking, callback_url):
+    def create_booking_payment(self, booking, callback_url, return_url_success='', return_url_fail=''):
         """
         Create BOG payment for a booking
 
         Args:
             booking: Booking instance
             callback_url: Webhook URL for payment notifications
+            return_url_success / return_url_fail: where BOG sends the customer afterwards
 
         Returns:
             dict: Payment result with order_id and payment_url
         """
         # Determine amount to charge (deposit or full)
-        amount = float(booking.deposit_amount) if booking.deposit_amount > 0 else float(booking.total_amount)
+        amount = booking.deposit_amount if booking.deposit_amount > 0 else booking.total_amount
 
         # Create payment description
         service_name = booking.service.name if isinstance(booking.service.name, str) else booking.service.name.get('en', 'Service')
@@ -78,11 +82,14 @@ class BookingPaymentService:
         # Create payment
         try:
             result = self.bog_service.create_payment(
-                amount=amount,
+                amount=float(amount),
                 currency='GEL',
                 description=description,
-                customer_email=booking.client.email,
+                customer_email=booking.client.email or '',
                 customer_name=booking.client.full_name,
+                customer_phone=booking.client.phone or '',
+                return_url_success=return_url_success,
+                return_url_fail=return_url_fail,
                 callback_url=callback_url,
                 external_order_id=booking.booking_number
             )
@@ -101,118 +108,132 @@ class BookingPaymentService:
 
     def process_webhook(self, webhook_data):
         """
-        Process BOG webhook notification
+        Process BOG webhook notification.
 
-        Args:
-            webhook_data: Webhook payload from BOG
+        The callback body is not trusted: it only tells us which booking to
+        look at. Whether money actually moved is decided by asking BOG for the
+        order's status with the tenant's own credentials.
 
         Returns:
-            Booking: Updated booking instance
+            Booking: Updated booking instance, or None when the callback doesn't
+            match a booking / can't be confirmed yet.
         """
-        try:
-            # Extract payment info
-            body = webhook_data.get('body', {})
-            order_status = body.get('order_status', {})
-            status_key = order_status.get('key', '')
-            response_code = body.get('response_code', '')
-            external_order_id = body.get('external_order_id', '')
-            amount = body.get('amount', 0)
+        body = webhook_data.get('body') or {}
+        external_order_id = body.get('external_order_id') or ''
+        callback_order_id = body.get('order_id') or body.get('id') or ''
 
-            # Find booking
-            try:
-                booking = Booking.objects.get(booking_number=external_order_id)
-            except Booking.DoesNotExist:
-                logger.error(f"Booking not found for webhook: {external_order_id}")
-                raise ValueError(f"Booking not found: {external_order_id}")
+        if not external_order_id and not callback_order_id:
+            logger.warning("Booking payment webhook without order identifiers")
+            return None
 
-            # Update payment metadata
-            booking.payment_metadata = webhook_data
+        with transaction.atomic():
+            lookup = Booking.objects.select_for_update()
+            booking = None
+            if external_order_id:
+                booking = lookup.filter(booking_number=external_order_id).first()
+            if booking is None and callback_order_id:
+                booking = lookup.filter(bog_order_id=callback_order_id).first()
+            if booking is None:
+                logger.error("Booking not found for webhook: %s / %s", external_order_id, callback_order_id)
+                return None
 
-            # Process payment status
-            if status_key == 'completed' and response_code == '100':
-                # Payment successful
-                booking.paid_amount += float(amount) / 100  # BOG sends amount in cents
+            if not booking.bog_order_id:
+                logger.warning("Webhook for booking %s which has no BOG order", booking.booking_number)
+                return None
 
-                # Update payment status
-                if booking.paid_amount >= booking.total_amount:
-                    booking.payment_status = 'fully_paid'
-                elif booking.paid_amount >= booking.deposit_amount:
-                    booking.payment_status = 'deposit_paid'
+            # Idempotent: a paid booking stays as it is on repeated callbacks.
+            if booking.payment_status in ('deposit_paid', 'fully_paid', 'refunded'):
+                return booking
 
-                # Auto-confirm booking based on settings
-                if booking.status == 'pending':
-                    should_confirm = False
+            status = self.bog_service.check_payment_status(booking.bog_order_id)
+            state = status.get('status')
 
+            if state == 'paid':
+                paid = Decimal(str(status.get('amount') or 0))
+                if paid <= 0:
+                    # Receipt didn't carry an amount; we charged exactly this.
+                    paid = booking.deposit_amount if booking.deposit_amount > 0 else booking.total_amount
+
+                booking.paid_amount = paid
+                booking.payment_status = 'fully_paid' if paid >= booking.total_amount else 'deposit_paid'
+                booking.payment_metadata = {
+                    'bog_status': status.get('bog_status'),
+                    'transaction_id': status.get('transaction_id'),
+                    'response_code': status.get('response_code'),
+                }
+                booking.save(update_fields=['paid_amount', 'payment_status', 'payment_metadata', 'updated_at'])
+
+                if booking.status == 'cancelled':
+                    # Money arrived for a booking we already cancelled (e.g. the
+                    # unpaid sweeper ran first). Don't resurrect it; flag it.
+                    logger.error(
+                        "BOG CONFIRMED payment for CANCELLED booking %s — manual refund required",
+                        booking.booking_number,
+                    )
+                elif booking.status == 'pending':
                     if booking.payment_status == 'fully_paid' and self.settings.auto_confirm_on_full_payment:
-                        should_confirm = True
-                    elif booking.payment_status == 'deposit_paid' and self.settings.auto_confirm_on_deposit:
-                        should_confirm = True
-
-                    if should_confirm:
                         booking.confirm()
-                    else:
-                        booking.save(update_fields=['paid_amount', 'payment_status', 'payment_metadata'])
-                else:
-                    booking.save(update_fields=['paid_amount', 'payment_status', 'payment_metadata'])
+                    elif booking.payment_status == 'deposit_paid' and self.settings.auto_confirm_on_deposit:
+                        booking.confirm()
 
-                logger.info(f"Booking {booking.booking_number} payment successful. Status: {booking.payment_status}")
+                logger.info("Booking %s payment successful. Status: %s", booking.booking_number, booking.payment_status)
 
-            elif status_key in ['canceled', 'expired']:
-                # Payment failed/cancelled
+            elif state == 'failed':
                 booking.payment_status = 'failed'
-                booking.save(update_fields=['payment_status', 'payment_metadata'])
-                logger.warning(f"Booking {booking.booking_number} payment failed: {status_key}")
+                booking.save(update_fields=['payment_status', 'updated_at'])
+                logger.warning("Booking %s payment failed (%s)", booking.booking_number, status.get('bog_status'))
+
+            else:
+                # pending / processing / unknown / error: leave the booking alone;
+                # BOG calls back again when the order settles.
+                logger.info("Booking %s payment not final yet: %s", booking.booking_number, state)
 
             return booking
 
-        except Exception as e:
-            logger.error(f"Error processing booking webhook: {str(e)}")
-            raise
-
     def initiate_refund(self, booking):
         """
-        Initiate refund for a booking
-
-        Args:
-            booking: Booking instance
+        Refund a cancelled booking according to the tenant's refund policy.
 
         Returns:
-            dict: Refund result
+            dict: {'status': 'no_refund' | 'refunded' | 'manual_required', 'amount': Decimal}
+        Never raises: a refund that can't be made automatically is recorded on
+        the booking for staff to handle, and the cancellation stands.
         """
-        if not booking.bog_order_id or booking.paid_amount == 0:
-            raise ValueError("No payment to refund")
+        if not booking.bog_order_id or not booking.paid_amount:
+            return {'status': 'no_refund', 'amount': Decimal('0')}
 
         # Calculate refund amount based on policy
         from .utils import calculate_refund_amount
         refund_amount = calculate_refund_amount(booking, self.settings)
 
-        if refund_amount == 0:
+        if refund_amount <= 0:
             logger.info(f"No refund for booking {booking.booking_number} due to policy")
-            return {'status': 'no_refund', 'amount': 0}
+            return {'status': 'no_refund', 'amount': Decimal('0')}
 
+        metadata = dict(booking.payment_metadata or {})
         try:
-            # Initiate refund via BOG
-            # Note: BOG refund API may vary - adjust as needed
+            full = refund_amount >= booking.paid_amount
             result = self.bog_service.refund_payment(
                 order_id=booking.bog_order_id,
-                amount=float(refund_amount)
+                amount=None if full else refund_amount,
             )
-
-            # Update booking
+            metadata['refund'] = {'status': 'requested', 'amount': str(refund_amount), 'response': result}
             booking.payment_status = 'refunded'
-            booking.paid_amount -= refund_amount
-            if booking.paid_amount < 0:
-                booking.paid_amount = 0
-
-            booking.save(update_fields=['payment_status', 'paid_amount'])
-
+            booking.paid_amount = max(Decimal('0'), booking.paid_amount - refund_amount)
+            booking.payment_metadata = metadata
+            booking.save(update_fields=['payment_status', 'paid_amount', 'payment_metadata', 'updated_at'])
             logger.info(f"Refund initiated for booking {booking.booking_number}: {refund_amount} GEL")
-
-            return result
+            return {'status': 'refunded', 'amount': refund_amount}
 
         except Exception as e:
-            logger.error(f"Failed to initiate refund for {booking.booking_number}: {str(e)}")
-            raise
+            logger.error(
+                "Refund for booking %s (%s GEL) needs manual handling: %s",
+                booking.booking_number, refund_amount, e,
+            )
+            metadata['refund'] = {'status': 'manual_required', 'amount': str(refund_amount), 'error': str(e)}
+            booking.payment_metadata = metadata
+            booking.save(update_fields=['payment_metadata', 'updated_at'])
+            return {'status': 'manual_required', 'amount': refund_amount}
 
     def check_payment_status(self, booking):
         """

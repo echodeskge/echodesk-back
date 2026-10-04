@@ -290,6 +290,59 @@ class BOGPaymentService:
                 'error': str(e)
             }
 
+    def refund_payment(self, order_id: str, amount=None) -> Dict:
+        """
+        Refund a completed payment.
+
+        Args:
+            order_id: BOG order ID
+            amount: amount to refund for a partial refund; None refunds in full
+
+        Returns:
+            Dict with BOG's response (key, message, action_id)
+
+        Raises:
+            ValueError: BOG rejected the refund or could not be reached
+        """
+        if not self.is_configured():
+            raise ValueError('BOG payment gateway is not configured')
+
+        payload = {}
+        if amount is not None:
+            payload['amount'] = f'{float(amount):.2f}'
+
+        try:
+            headers = {
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {self._get_access_token()}',
+            }
+            response = requests.post(
+                f'{self.base_url}/payment/refund/{order_id}',
+                json=payload,
+                headers=headers,
+                timeout=30
+            )
+        except requests.RequestException as e:
+            logger.error(f'Error refunding BOG payment {order_id}: {e}')
+            raise ValueError(f'Refund error: {str(e)}')
+
+        if response.status_code in [200, 201, 202]:
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            logger.info(f'BOG refund requested: order_id={order_id}, amount={amount or "full"}')
+            return {
+                'order_id': order_id,
+                'key': data.get('key'),
+                'message': data.get('message'),
+                'action_id': data.get('action_id'),
+            }
+
+        error_msg = f'BOG refund failed: {response.status_code} - {response.text}'
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+
     def verify_webhook_signature(self, payload: str, signature: str, public_key: str = None) -> bool:
         """
         Verify webhook signature from BOG callback

@@ -183,13 +183,19 @@ def _send_reminders_for_tenant(schema_name):
     return reminded
 
 
+# How long a customer has to complete an online card payment before the
+# booking is released and the slot becomes bookable again.
+UNPAID_CARD_GRACE_MINUTES = 30
+
+
 @shared_task
 def cancel_unpaid_bookings():
     """
-    Auto-cancel bookings that haven't been paid within the grace period.
+    Release bookings whose online card payment was never completed.
 
-    Finds pending bookings with payment_status='pending' that were created
-    more than 24 hours ago and cancels them, freeing up the time slot.
+    Only bookings the customer chose to pay by card are touched. Bookings to
+    be paid at the venue (and ones created by staff) wait for the business to
+    confirm them, however long that takes.
     """
     from tenant_schemas.utils import schema_context
     from tenants.models import Tenant
@@ -213,22 +219,43 @@ def cancel_unpaid_bookings():
 
 
 def _cancel_unpaid_for_tenant(schema_name):
-    """Cancel unpaid bookings within a single tenant schema context."""
+    """Cancel unpaid card bookings within a single tenant schema context."""
     from booking_management.models import Booking
 
-    grace_cutoff = timezone.now() - timedelta(hours=24)
+    grace_cutoff = timezone.now() - timedelta(minutes=UNPAID_CARD_GRACE_MINUTES)
     bookings = Booking.objects.filter(
         status='pending',
-        payment_status='pending',
+        payment_method='card',
+        payment_status__in=['pending', 'failed'],
         created_at__lt=grace_cutoff,
     ).select_related('client', 'service')
 
     cancelled = 0
+    payment_service = None
     for booking in bookings:
         try:
+            # The payment may have gone through with the callback lost — ask
+            # BOG before giving the slot away.
+            if booking.bog_order_id and booking.payment_status == 'pending':
+                try:
+                    if payment_service is None:
+                        from booking_management.payment_service import get_booking_payment_service
+                        payment_service = get_booking_payment_service()
+                    payment_service.process_webhook({'body': {'external_order_id': booking.booking_number}})
+                    booking.refresh_from_db()
+                except Exception:
+                    logger.exception(
+                        'Could not verify payment for booking %s (tenant %s); leaving it',
+                        booking.booking_number, schema_name,
+                    )
+                    continue
+                if booking.status != 'pending' or booking.payment_status in ('deposit_paid', 'fully_paid'):
+                    continue
+
             booking.cancel(
                 cancelled_by='admin',
-                reason='Auto-cancelled: unpaid after 24-hour grace period',
+                reason='Auto-cancelled: online payment was not completed',
+                notify=False,
             )
             cancelled += 1
             logger.info(
@@ -244,3 +271,30 @@ def _cancel_unpaid_for_tenant(schema_name):
             )
 
     return cancelled
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def send_booking_email_task(self, schema_name, booking_id, kind, language=None):
+    """Email a booking notice ('created' | 'confirmed' | 'cancelled') to its client."""
+    from tenant_schemas.utils import schema_context
+
+    try:
+        with schema_context(schema_name):
+            from booking_management.emails import send_booking_email
+            from booking_management.models import Booking
+
+            booking = Booking.objects.select_related('client', 'service', 'staff', 'staff__user').filter(id=booking_id).first()
+            if booking is None or not booking.client.email:
+                return False
+
+            if not language:
+                try:
+                    from tenants.models import Tenant
+                    language = Tenant.objects.get(schema_name=schema_name).preferred_language
+                except Exception:
+                    language = 'en'
+
+            return send_booking_email(booking, kind, schema_name, language)
+    except Exception as exc:
+        logger.exception('Booking email task failed (booking %s, %s)', booking_id, kind)
+        raise self.retry(exc=exc)

@@ -586,7 +586,8 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
             booking.service,
             booking.staff,
             new_date,
-            new_time
+            new_time,
+            exclude_booking_id=booking.pk,
         )
 
         if not is_available:

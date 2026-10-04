@@ -1,9 +1,129 @@
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, timezone as dt_timezone
+from decimal import Decimal
+
 from django.utils import timezone
-from .models import Booking, StaffAvailability, StaffException
+
+from .models import Booking, BookingSettings, StaffAvailability, StaffException
+
+DEFAULT_TIMEZONE = 'Asia/Tbilisi'
+DEFAULT_MIN_HOURS_BEFORE = 2
+DEFAULT_MAX_DAYS_ADVANCE = 60
+
+# Bookings in these states occupy their staff member's time.
+ACTIVE_BOOKING_STATUSES = ['pending', 'confirmed', 'in_progress']
 
 
-def generate_available_slots(service, date, staff=None, language='en'):
+# ---------------------------------------------------------------------------
+# Tenant settings / clock
+# ---------------------------------------------------------------------------
+
+def get_booking_settings():
+    """Return the current tenant's BookingSettings row, or None."""
+    try:
+        from django.db import connection
+        from tenants.models import Tenant
+        tenant = Tenant.objects.get(schema_name=connection.schema_name)
+        return BookingSettings.objects.filter(tenant=tenant).first()
+    except Exception:
+        return None
+
+
+def get_or_create_booking_settings():
+    """The current tenant's BookingSettings row, created with defaults if missing."""
+    from django.db import connection
+    from tenants.models import Tenant
+    tenant = Tenant.objects.get(schema_name=connection.schema_name)
+    booking_settings, _ = BookingSettings.objects.get_or_create(tenant=tenant)
+    return booking_settings
+
+
+def _tzinfo(booking_settings=None):
+    name = getattr(booking_settings, 'timezone', None) or DEFAULT_TIMEZONE
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:
+        # No tz database on the host (or a bad name): Georgia has no DST, so a
+        # fixed +04:00 is the right fallback for the default zone.
+        return dt_timezone(timedelta(hours=4))
+
+
+def tenant_now(booking_settings=None):
+    """Current wall-clock time at the business, as a naive datetime.
+
+    Booking dates and times are stored naive, in the business's local time, so
+    "is this in the past / too soon" must be judged against local time too —
+    not UTC, which is four hours behind Tbilisi.
+    """
+    return timezone.now().astimezone(_tzinfo(booking_settings)).replace(tzinfo=None)
+
+
+def check_booking_window(date, start_time, booking_settings=None):
+    """Lead-time and advance-booking limits for customer-made bookings.
+
+    Returns: (ok: bool, error_message: str)
+    """
+    min_hours = getattr(booking_settings, 'min_hours_before_booking', DEFAULT_MIN_HOURS_BEFORE)
+    max_days = getattr(booking_settings, 'max_days_advance_booking', DEFAULT_MAX_DAYS_ADVANCE)
+    now = tenant_now(booking_settings)
+
+    if datetime.combine(date, start_time) < now + timedelta(hours=min_hours):
+        return False, f"Bookings must be made at least {min_hours} hours in advance."
+    if date > now.date() + timedelta(days=max_days):
+        return False, f"Bookings cannot be made more than {max_days} days in advance."
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Slots
+# ---------------------------------------------------------------------------
+
+def _candidate_start_times(service, availability):
+    """Start times a service could begin at within one staff member's day."""
+    if service.booking_type == 'fixed_slots':
+        slots = service.available_time_slots if isinstance(service.available_time_slots, list) else []
+        times = []
+        for slot_str in slots:
+            try:
+                times.append(datetime.strptime(slot_str, '%H:%M').time())
+            except (ValueError, TypeError):
+                continue
+        return times
+
+    if service.booking_type == 'duration_based':
+        # A slot every 30 minutes (or the service duration, whichever is smaller)
+        step = max(1, min(30, service.duration_minutes))
+        start = time_to_minutes(availability['start_time'])
+        end = time_to_minutes(availability['end_time'])
+        return [minutes_to_time(m) for m in range(start, end, step)]
+
+    return []
+
+
+def _fits_working_hours(availability, start_time, total_minutes):
+    """Whole appointment (service + buffer) inside working hours and clear of the break."""
+    start = time_to_minutes(start_time)
+    end = start + total_minutes
+
+    if start < time_to_minutes(availability['start_time']):
+        return False
+    if end > time_to_minutes(availability['end_time']):
+        return False
+
+    break_start = availability.get('break_start')
+    break_end = availability.get('break_end')
+    if break_start and break_end:
+        if start < time_to_minutes(break_end) and end > time_to_minutes(break_start):
+            return False
+    return True
+
+
+def staff_can_perform(service, staff):
+    """Staff member is bookable and assigned to this service."""
+    return bool(staff.is_active_for_bookings) and service.staff_members.filter(pk=staff.pk).exists()
+
+
+def generate_available_slots(service, date, staff=None, language='en', booking_settings=None):
     """
     Generate list of available time slots for a service on a given date
 
@@ -12,148 +132,60 @@ def generate_available_slots(service, date, staff=None, language='en'):
         date: Date to check availability
         staff: Optional BookingStaff instance
         language: Language for error messages
+        booking_settings: BookingSettings for the tenant (looked up if omitted)
 
     Returns:
-        list: List of available time slot dictionaries with start_time, end_time, staff_id
+        list: One dict per start time — start_time, end_time, staff_id,
+        staff_name and available_staff (everyone free at that time).
     """
-    available_slots = []
+    if booking_settings is None:
+        booking_settings = get_booking_settings()
 
-    # Get day of week (0=Monday, 6=Sunday)
-    day_of_week = date.weekday()
+    if staff is not None:
+        if not staff_can_perform(service, staff):
+            return []
+        staff_members = [staff]
+    else:
+        staff_members = list(service.staff_members.filter(is_active_for_bookings=True))
 
-    # Handle fixed slots booking type
-    if service.booking_type == 'fixed_slots' and service.available_time_slots:
-        # Get predefined time slots
-        time_slots = service.available_time_slots if isinstance(service.available_time_slots, list) else []
+    total_minutes = service.total_duration_minutes
+    slots_by_time = {}
 
-        # If specific staff requested
-        if staff:
-            staff_availability = get_staff_availability(staff, date)
-            if not staff_availability:
-                return []
+    for staff_member in staff_members:
+        availability = get_staff_availability(staff_member, date)
+        if not availability:
+            continue
 
-            for slot_str in time_slots:
-                try:
-                    slot_time = datetime.strptime(slot_str, '%H:%M').time()
-                    if is_time_in_range(slot_time, staff_availability['start_time'], staff_availability['end_time']):
-                        # Check if not in break time
-                        if not (staff_availability.get('break_start') and staff_availability.get('break_end') and
-                                is_time_in_range(slot_time, staff_availability['break_start'], staff_availability['break_end'])):
-                            # Check if slot is not already booked
-                            if not is_slot_booked(staff, date, slot_time, service.total_duration_minutes):
-                                end_time = add_minutes_to_time(slot_time, service.duration_minutes)
-                                available_slots.append({
-                                    'start_time': slot_time.strftime('%H:%M'),
-                                    'end_time': end_time.strftime('%H:%M'),
-                                    'staff_id': staff.id,
-                                    'staff_name': str(staff)
-                                })
-                except ValueError:
-                    continue
+        for start_time in _candidate_start_times(service, availability):
+            if not _fits_working_hours(availability, start_time, total_minutes):
+                continue
+            ok, _ = check_booking_window(date, start_time, booking_settings)
+            if not ok:
+                continue
+            if is_slot_booked(staff_member, date, start_time, total_minutes):
+                continue
 
-        # No specific staff - check all staff members
-        else:
-            for staff_member in service.staff_members.filter(is_active_for_bookings=True):
-                staff_availability = get_staff_availability(staff_member, date)
-                if not staff_availability:
-                    continue
-
-                for slot_str in time_slots:
-                    try:
-                        slot_time = datetime.strptime(slot_str, '%H:%M').time()
-                        if is_time_in_range(slot_time, staff_availability['start_time'], staff_availability['end_time']):
-                            if not (staff_availability.get('break_start') and staff_availability.get('break_end') and
-                                    is_time_in_range(slot_time, staff_availability['break_start'], staff_availability['break_end'])):
-                                if not is_slot_booked(staff_member, date, slot_time, service.total_duration_minutes):
-                                    end_time = add_minutes_to_time(slot_time, service.duration_minutes)
-                                    available_slots.append({
-                                        'start_time': slot_time.strftime('%H:%M'),
-                                        'end_time': end_time.strftime('%H:%M'),
-                                        'staff_id': staff_member.id,
-                                        'staff_name': str(staff_member)
-                                    })
-                    except ValueError:
-                        continue
-
-    # Handle duration-based booking type
-    elif service.booking_type == 'duration_based':
-        # Generate slots every 30 minutes (or service duration, whichever is smaller)
-        slot_interval = min(30, service.duration_minutes)
-
-        # If specific staff requested
-        if staff:
-            staff_availability = get_staff_availability(staff, date)
-            if not staff_availability:
-                return []
-
-            current_time = staff_availability['start_time']
-            end_time = staff_availability['end_time']
-
-            while current_time < end_time:
-                # Check if slot can fit before end time
-                slot_end = add_minutes_to_time(current_time, service.total_duration_minutes)
-                if time_to_minutes(slot_end) <= time_to_minutes(end_time):
-                    # Check if not in break time
-                    if not (staff_availability.get('break_start') and staff_availability.get('break_end') and
-                            is_time_in_range(current_time, staff_availability['break_start'], staff_availability['break_end'])):
-                        # Check if slot is not already booked
-                        if not is_slot_booked(staff, date, current_time, service.total_duration_minutes):
-                            slot_end_display = add_minutes_to_time(current_time, service.duration_minutes)
-                            available_slots.append({
-                                'start_time': current_time.strftime('%H:%M'),
-                                'end_time': slot_end_display.strftime('%H:%M'),
-                                'staff_id': staff.id,
-                                'staff_name': str(staff)
-                            })
-
-                # Move to next slot
-                current_time = add_minutes_to_time(current_time, slot_interval)
-
-        # No specific staff - check all staff members
-        else:
-            for staff_member in service.staff_members.filter(is_active_for_bookings=True):
-                staff_availability = get_staff_availability(staff_member, date)
-                if not staff_availability:
-                    continue
-
-                current_time = staff_availability['start_time']
-                end_time = staff_availability['end_time']
-
-                while current_time < end_time:
-                    slot_end = add_minutes_to_time(current_time, service.total_duration_minutes)
-                    if time_to_minutes(slot_end) <= time_to_minutes(end_time):
-                        if not (staff_availability.get('break_start') and staff_availability.get('break_end') and
-                                is_time_in_range(current_time, staff_availability['break_start'], staff_availability['break_end'])):
-                            if not is_slot_booked(staff_member, date, current_time, service.total_duration_minutes):
-                                slot_end_display = add_minutes_to_time(current_time, service.duration_minutes)
-                                available_slots.append({
-                                    'start_time': current_time.strftime('%H:%M'),
-                                    'end_time': slot_end_display.strftime('%H:%M'),
-                                    'staff_id': staff_member.id,
-                                    'staff_name': str(staff_member)
-                                })
-
-                    current_time = add_minutes_to_time(current_time, slot_interval)
-
-    # Group slots by time — include all available staff for each time
-    from collections import defaultdict
-    time_groups = defaultdict(list)
-    for slot in available_slots:
-        time_key = slot['start_time']
-        time_groups[time_key].append({
-            'staff_id': slot['staff_id'],
-            'staff_name': slot['staff_name'],
-        })
+            key = start_time.strftime('%H:%M')
+            slot = slots_by_time.setdefault(key, {
+                'start_time': key,
+                'end_time': add_minutes_to_time(start_time, service.duration_minutes).strftime('%H:%M'),
+                'available_staff': [],
+            })
+            slot['available_staff'].append({
+                'staff_id': staff_member.id,
+                'staff_name': str(staff_member),
+            })
 
     grouped_slots = []
-    for time_key in sorted(time_groups.keys()):
-        staff_list = time_groups[time_key]
+    for key in sorted(slots_by_time.keys()):
+        slot = slots_by_time[key]
+        primary = slot['available_staff'][0]
         grouped_slots.append({
-            'start_time': time_key,
-            'end_time': available_slots[0]['end_time'] if available_slots else '',
-            'staff_id': staff_list[0]['staff_id'],  # Primary staff
-            'staff_name': staff_list[0]['staff_name'],
-            'available_staff': staff_list,  # All available staff at this time
+            'start_time': slot['start_time'],
+            'end_time': slot['end_time'],
+            'staff_id': primary['staff_id'],  # Primary staff
+            'staff_name': primary['staff_name'],
+            'available_staff': slot['available_staff'],  # All available staff at this time
         })
 
     return grouped_slots
@@ -194,7 +226,7 @@ def get_staff_availability(staff, date):
         return None
 
 
-def is_slot_booked(staff, date, start_time, duration_minutes):
+def is_slot_booked(staff, date, start_time, duration_minutes, exclude_booking_id=None):
     """
     Check if a time slot is already booked for staff
     """
@@ -204,39 +236,22 @@ def is_slot_booked(staff, date, start_time, duration_minutes):
     overlapping = Booking.objects.filter(
         staff=staff,
         date=date,
-        status__in=['pending', 'confirmed', 'in_progress']
+        status__in=ACTIVE_BOOKING_STATUSES
     ).filter(
         start_time__lt=end_time,
         end_time__gt=start_time
     )
+    if exclude_booking_id is not None:
+        overlapping = overlapping.exclude(pk=exclude_booking_id)
 
     return overlapping.exists()
 
 
-def validate_booking_availability(service, staff, date, start_time):
-    """
-    Validate if booking can be made
+def check_staff_slot(service, staff, date, start_time, exclude_booking_id=None):
+    """Can this staff member take this service at this time?
 
     Returns: (is_available: bool, error_message: str)
     """
-    # Check if date is in the past
-    if date < timezone.now().date():
-        return False, "Cannot book in the past"
-
-    # Check if date is today and time has passed
-    if date == timezone.now().date():
-        current_time = timezone.now().time()
-        if start_time <= current_time:
-            return False, "Cannot book a time that has already passed"
-
-    # Get staff (or first available if not specified)
-    if not staff:
-        staff_members = service.staff_members.filter(is_active_for_bookings=True)
-        if not staff_members.exists():
-            return False, "No staff available for this service"
-        staff = staff_members.first()
-
-    # Check staff availability
     staff_availability = get_staff_availability(staff, date)
     if not staff_availability:
         return False, f"Staff {staff} is not available on this date"
@@ -245,20 +260,57 @@ def validate_booking_availability(service, staff, date, start_time):
     if not is_time_in_range(start_time, staff_availability['start_time'], staff_availability['end_time']):
         return False, f"Time is outside staff working hours ({staff_availability['start_time']} - {staff_availability['end_time']})"
 
-    # Check if not in break time
-    if staff_availability.get('break_start') and staff_availability.get('break_end'):
-        if is_time_in_range(start_time, staff_availability['break_start'], staff_availability['break_end']):
-            return False, f"Time conflicts with staff break time"
-
     # Check if end time is within working hours
-    end_time = add_minutes_to_time(start_time, service.total_duration_minutes)
-    if time_to_minutes(end_time) > time_to_minutes(staff_availability['end_time']):
+    total_minutes = service.total_duration_minutes
+    if time_to_minutes(start_time) + total_minutes > time_to_minutes(staff_availability['end_time']):
         return False, "Booking would extend beyond staff working hours"
 
+    # Check the whole appointment against the break, not just its start
+    if not _fits_working_hours(staff_availability, start_time, total_minutes):
+        return False, "Time conflicts with staff break time"
+
     # Check if slot is already booked
-    if is_slot_booked(staff, date, start_time, service.total_duration_minutes):
+    if is_slot_booked(staff, date, start_time, total_minutes, exclude_booking_id=exclude_booking_id):
         return False, "This time slot is already booked"
 
+    return True, ""
+
+
+def find_available_staff(service, date, start_time, exclude_booking_id=None):
+    """First active staff member of the service who is free at this time, or None."""
+    for staff_member in service.staff_members.filter(is_active_for_bookings=True).order_by('id'):
+        ok, _ = check_staff_slot(service, staff_member, date, start_time, exclude_booking_id=exclude_booking_id)
+        if ok:
+            return staff_member
+    return None
+
+
+def validate_booking_availability(service, staff, date, start_time, exclude_booking_id=None, booking_settings=None):
+    """
+    Validate if booking can be made
+
+    With no staff given, the booking is possible when any active staff member
+    of the service is free at that time.
+
+    Returns: (is_available: bool, error_message: str)
+    """
+    now = tenant_now(booking_settings if booking_settings is not None else get_booking_settings())
+
+    # Check if date is in the past
+    if date < now.date():
+        return False, "Cannot book in the past"
+
+    # Check if date is today and time has passed
+    if date == now.date() and start_time <= now.time():
+        return False, "Cannot book a time that has already passed"
+
+    if staff:
+        return check_staff_slot(service, staff, date, start_time, exclude_booking_id=exclude_booking_id)
+
+    if not service.staff_members.filter(is_active_for_bookings=True).exists():
+        return False, "No staff available for this service"
+    if find_available_staff(service, date, start_time, exclude_booking_id=exclude_booking_id) is None:
+        return False, "This time slot is already booked"
     return True, ""
 
 
@@ -270,6 +322,11 @@ def is_time_in_range(check_time, start_time, end_time):
 def time_to_minutes(t):
     """Convert time to minutes since midnight"""
     return t.hour * 60 + t.minute
+
+
+def minutes_to_time(minutes):
+    """Convert minutes since midnight to a time object"""
+    return time(minutes // 60, minutes % 60)
 
 
 def add_minutes_to_time(t, minutes):
@@ -290,18 +347,19 @@ def calculate_refund_amount(booking, settings):
     Returns:
         Decimal: Refund amount
     """
-    if booking.paid_amount == 0:
-        return 0
+    paid = Decimal(str(booking.paid_amount or 0))
+    if paid == 0:
+        return Decimal('0')
 
     # Check cancellation policy
     if settings.refund_policy == 'full':
-        return booking.paid_amount
+        return paid
     elif settings.refund_policy == 'partial_50':
-        return booking.paid_amount * 0.5
+        return (paid * Decimal('0.5')).quantize(Decimal('0.01'))
     elif settings.refund_policy == 'partial_25':
-        return booking.paid_amount * 0.25
+        return (paid * Decimal('0.25')).quantize(Decimal('0.01'))
     else:  # no_refund
-        return 0
+        return Decimal('0')
 
 
 def can_cancel_booking(booking, settings):
@@ -315,8 +373,7 @@ def can_cancel_booking(booking, settings):
 
     # Calculate time until booking
     booking_datetime = datetime.combine(booking.date, booking.start_time)
-    now = timezone.now()
-    time_until_booking = booking_datetime - now.replace(tzinfo=None)
+    time_until_booking = booking_datetime - tenant_now(settings)
 
     # Check minimum cancellation time
     min_hours = timedelta(hours=settings.cancellation_hours_before)
@@ -324,3 +381,46 @@ def can_cancel_booking(booking, settings):
         return False, f"Bookings must be cancelled at least {settings.cancellation_hours_before} hours in advance"
 
     return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Payment options
+# ---------------------------------------------------------------------------
+
+def card_payment_enabled(booking_settings):
+    """Online card payment is on only when the tenant chose the BOG gateway,
+    allows card payment and has saved its BOG credentials."""
+    return bool(
+        booking_settings
+        and booking_settings.payment_method == 'bog_gateway'
+        and booking_settings.allow_card_payment
+        and booking_settings.bog_client_id
+        and booking_settings.bog_client_secret
+    )
+
+
+def available_payment_options(booking_settings, service=None):
+    """Payment choices a customer may pick for a booking.
+
+    'cash'    — pay at the venue (no online payment)
+    'deposit' — pay the service's deposit online now, the rest at the venue
+    'full'    — pay the full price online now
+    """
+    if service is not None and not service.base_price:
+        return ['cash']  # free service: nothing to charge
+
+    card_ok = card_payment_enabled(booking_settings)
+    cash_ok = booking_settings is None or booking_settings.allow_cash_payment
+    if booking_settings is not None and booking_settings.require_deposit and card_ok:
+        cash_ok = False
+
+    options = []
+    if cash_ok:
+        options.append('cash')
+    if card_ok:
+        if service is None or 0 < service.deposit_percentage < 100:
+            options.append('deposit')
+        options.append('full')
+
+    # Never leave a business unbookable because of a settings combination.
+    return options or ['cash']
