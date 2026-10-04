@@ -123,7 +123,9 @@ def send_push_notification(
         # VAPID-key mismatch), NOT a code bug — log it at warning level so
         # Sentry doesn't get flooded by every dead subscription. 5xx is the
         # push service misbehaving, so keep that at error.
-        status_code = getattr(e.response, 'status_code', None) if e.response else None
+        # NB: compare against None — a requests.Response with a 4xx/5xx status
+        # is falsy, so `if e.response` skipped exactly the cases handled here.
+        status_code = getattr(e.response, 'status_code', None) if e.response is not None else None
         if status_code and 400 <= status_code < 500:
             logger.warning(
                 f"WebPush {status_code} for subscription {subscription.id}: {str(e)}"

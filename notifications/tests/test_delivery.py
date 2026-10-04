@@ -139,6 +139,29 @@ class TestSendPushNotification(EchoDeskTenantTestCase):
 
     @patch('notifications.utils.get_vapid_keys', return_value=MOCK_VAPID)
     @patch('notifications.utils.webpush')
+    def test_410_with_real_response_marks_subscription_inactive(self, mock_wp, mock_keys):
+        # A real requests.Response with a 4xx status is falsy (unlike the
+        # MagicMock above), which is what pywebpush actually attaches.
+        import requests
+        from pywebpush import WebPushException
+
+        response = requests.Response()
+        response.status_code = 410
+        self.assertFalse(bool(response))
+        mock_wp.side_effect = WebPushException('Push failed: 410 Gone', response=response)
+
+        result = send_push_notification(
+            subscription=self.sub,
+            title='Gone',
+            body='Subscription expired',
+        )
+
+        self.assertFalse(result)
+        self.sub.refresh_from_db()
+        self.assertFalse(self.sub.is_active)
+
+    @patch('notifications.utils.get_vapid_keys', return_value=MOCK_VAPID)
+    @patch('notifications.utils.webpush')
     def test_generic_failure_logs_error(self, mock_wp, mock_keys):
         mock_wp.side_effect = Exception('Connection refused')
 
