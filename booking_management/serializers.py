@@ -444,7 +444,7 @@ class BookingDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'booking_number', 'client', 'service', 'staff', 'date', 'start_time', 'end_time',
             'status', 'payment_status', 'payment_method', 'total_amount', 'deposit_amount', 'paid_amount', 'remaining_amount',
-            'bog_order_id', 'payment_url', 'client_notes', 'staff_notes',
+            'bog_order_id', 'payment_url', 'client_notes', 'staff_notes', 'contact_email',
             'rating', 'review',
             'cancelled_at', 'cancelled_by', 'cancellation_reason',
             'created_at', 'updated_at', 'confirmed_at', 'completed_at'

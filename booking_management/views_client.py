@@ -40,6 +40,7 @@ from .permissions import IsAuthenticatedBookingClient, PublicBookingEnabled
 from .throttles import (
     BookingAuthThrottle, BookingClientCreateThrottle, BookingGuestThrottle, BookingManageThrottle,
 )
+from .staff_notifications import notify_staff_of_booking
 from .utils_text import localized_text
 from .utils import (
     available_payment_options, can_cancel_booking, card_payment_enabled,
@@ -148,7 +149,7 @@ def _booking_queryset():
     )
 
 
-def _create_booking(request, serializer, client, contact_email=''):
+def _create_booking(request, serializer, client, contact_email='', client_label=''):
     """Create a validated booking for `client`, start card payment if chosen.
 
     Returns (booking, error_response). Exactly one of them is None.
@@ -219,6 +220,7 @@ def _create_booking(request, serializer, client, contact_email=''):
         # Card bookings get their notice once the payment clears.
         _queue_booking_email(booking, 'created', language)
 
+    notify_staff_of_booking(booking, 'created', client_label=client_label)
     return booking, None
 
 
@@ -251,6 +253,7 @@ def _cancel_booking(booking, reason):
         except Exception:
             logger.exception('Refund failed for booking %s', booking.booking_number)
         booking.refresh_from_db()
+    notify_staff_of_booking(booking, 'cancelled')
     return booking
 
 
@@ -629,7 +632,10 @@ def guest_booking_create(request):
 
     client, matched = _guest_client(first_name, last_name, phone, email)
 
-    booking, error = _create_booking(request, serializer, client, contact_email=email)
+    booking, error = _create_booking(
+        request, serializer, client, contact_email=email,
+        client_label=f"{first_name} {last_name}".strip(),
+    )
     if error is not None:
         return error
 
@@ -929,6 +935,7 @@ class ClientBookingViewSet(
             booking.save(update_fields=['staff', 'date', 'start_time', 'end_time', 'reminder_sent', 'updated_at'])
 
         _queue_booking_email(booking, 'rescheduled', _language(request))
+        notify_staff_of_booking(booking, 'rescheduled')
 
         return Response(_booking_payload(booking, request))
 

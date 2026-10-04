@@ -510,6 +510,9 @@ class Notification(models.Model):
         ('invoice_created', 'Invoice Created'),
         ('invoice_paid', 'Invoice Paid'),
         ('invoice_overdue', 'Invoice Overdue'),
+        # Online bookings (made by customers on the public booking site)
+        ('booking_created', 'New Online Booking'),
+        ('booking_rescheduled', 'Online Booking Rescheduled'),
         # Leave
         ('leave_request_submitted', 'Leave Request Submitted'),
         ('leave_request_approved', 'Leave Request Approved'),

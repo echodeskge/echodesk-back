@@ -788,3 +788,25 @@ class TestAuditFixes(PublicBookingTestCase):
         saved.refresh_from_db()
         self.assertEqual((saved.bog_client_id, saved.bog_client_secret), ('tenant-bog-id', 'tenant-bog-secret'))
         self.assertEqual(saved.public_address, 'New address')
+
+
+class TestStaffNotifications(PublicBookingTestCase):
+
+    def test_staff_are_told_about_online_bookings_and_cancellations(self):
+        from users.models import Notification
+        owner = self.create_admin(email='salon-owner@test.com')
+        with patch('booking_management.tasks.send_booking_email_task.delay'):
+            resp = self.api_post(GUEST_URL, self.guest_payload(staff_id=self.staff_a.id))
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+
+        created = Notification.objects.filter(notification_type='booking_created')
+        notified = set(created.values_list('user_id', flat=True))
+        self.assertIn(owner.id, notified)
+        self.assertIn(self.staff_a.user_id, notified)
+        self.assertNotIn(self.staff_b.user_id, notified)
+        note = created.get(user=owner)
+        self.assertIn('Nino Guest', note.message)
+        self.assertTrue(note.link_url.startswith('/bookings/bookings/'))
+
+        self.api_post(f"{MANAGE_URL}{resp.data['manage_token']}/cancel/", {})
+        self.assertTrue(Notification.objects.filter(user=owner, notification_type='booking_cancelled').exists())
