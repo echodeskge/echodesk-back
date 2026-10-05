@@ -346,6 +346,7 @@ class Booking(models.Model):
 
     # Reminders
     reminder_sent = models.BooleanField(default=False, help_text="Whether reminder was sent")
+    second_reminder_sent = models.BooleanField(default=False, help_text="Whether the second (closer) reminder was sent")
 
     # Cancellation
     cancelled_at = models.DateTimeField(blank=True, null=True)
@@ -597,6 +598,23 @@ class BookingSettings(models.Model):
     public_address = models.CharField(max_length=255, blank=True)
     public_phone = models.CharField(max_length=50, blank=True)
 
+    # Reminders (email and SMS): hours before the visit, on the business clock
+    reminder_hours_before = models.IntegerField(default=24, help_text="Send the reminder this many hours before the visit")
+    second_reminder_hours_before = models.IntegerField(blank=True, null=True, help_text="Optional second reminder, closer to the visit")
+
+    # SMS notices to customers (sender.ge)
+    sms_enabled = models.BooleanField(default=False)
+    _sms_api_key_encrypted = models.BinaryField(blank=True, null=True)
+    sms_on_created = models.BooleanField(default=False, help_text="SMS when an online booking request arrives")
+    sms_on_confirmed = models.BooleanField(default=True)
+    sms_on_rescheduled = models.BooleanField(default=True)
+    sms_on_cancelled = models.BooleanField(default=True)
+    sms_on_reminder = models.BooleanField(default=True)
+    sms_templates = models.JSONField(default=dict, blank=True, help_text='Custom texts: {"reminder": {"ka": "...", "en": "..."}}; missing = built-in default')
+    # Cap on SMS segments per calendar month sent through the shared EchoDesk
+    # account (not the salon's own key). Null = platform default. Staff-only.
+    sms_platform_monthly_limit = models.IntegerField(blank=True, null=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -647,6 +665,23 @@ class BookingSettings(models.Model):
         else:
             self._bog_client_secret_encrypted = None
 
+    @property
+    def sms_api_key(self):
+        """The salon's own sender.ge API key (decrypted), or ''."""
+        if not self._sms_api_key_encrypted:
+            return ''
+        try:
+            return _credentials_fernet().decrypt(bytes(self._sms_api_key_encrypted)).decode()
+        except Exception:
+            return ''
+
+    @sms_api_key.setter
+    def sms_api_key(self, value):
+        if value:
+            self._sms_api_key_encrypted = _credentials_fernet().encrypt(value.encode())
+        else:
+            self._sms_api_key_encrypted = None
+
     def save(self, *args, **kwargs):
         # Ensure encrypted values are set if assigned via deferred attributes
         if hasattr(self, '_client_secret_to_encrypt'):
@@ -656,3 +691,29 @@ class BookingSettings(models.Model):
             self.bog_client_id = self._client_id_to_encrypt
             delattr(self, '_client_id_to_encrypt')
         super().save(*args, **kwargs)
+
+
+class BookingSmsLog(models.Model):
+    """Every SMS the booking module tried to send: usage, caps, troubleshooting."""
+    ACCOUNT_CHOICES = [('own', "Salon's own key"), ('platform', 'Shared EchoDesk account'), ('', 'None')]
+    STATUS_CHOICES = [('sent', 'Sent'), ('failed', 'Failed'), ('skipped', 'Skipped')]
+
+    booking = models.ForeignKey(Booking, on_delete=models.SET_NULL, null=True, blank=True, related_name='sms_logs')
+    phone = models.CharField(max_length=50)
+    kind = models.CharField(max_length=20)
+    language = models.CharField(max_length=5, blank=True)
+    text = models.TextField()
+    segments = models.IntegerField(default=1)
+    account = models.CharField(max_length=10, choices=ACCOUNT_CHOICES, blank=True)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES)
+    provider_message_id = models.CharField(max_length=100, blank=True)
+    error = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = 'booking_sms_log'
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['account', 'status', 'created_at'])]
+
+    def __str__(self):
+        return f"{self.kind} → {self.phone} ({self.status})"

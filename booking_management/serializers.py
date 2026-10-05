@@ -761,6 +761,15 @@ class BookingSettingsSerializer(serializers.ModelSerializer):
     bog_client_secret = serializers.CharField(write_only=True, required=False, allow_blank=True)
     has_bog_client_id = serializers.SerializerMethodField()
     has_bog_client_secret = serializers.SerializerMethodField()
+    # SMS: the key is write-only; "" keeps the stored one, sms_api_key_clear removes it
+    sms_api_key = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    sms_api_key_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+    has_sms_api_key = serializers.SerializerMethodField()
+    sms_platform_available = serializers.SerializerMethodField()
+    sms_platform_limit = serializers.SerializerMethodField()
+    sms_platform_sent_this_month = serializers.SerializerMethodField()
+    sms_sent_this_month = serializers.SerializerMethodField()
+    sms_default_templates = serializers.SerializerMethodField()
 
     class Meta:
         model = BookingSettings
@@ -773,8 +782,71 @@ class BookingSettingsSerializer(serializers.ModelSerializer):
             'auto_confirm_on_deposit', 'auto_confirm_on_full_payment',
             'min_hours_before_booking', 'max_days_advance_booking',
             'timezone', 'public_page_enabled', 'public_description', 'public_address', 'public_phone',
+            'reminder_hours_before', 'second_reminder_hours_before',
+            'sms_enabled', 'sms_api_key', 'sms_api_key_clear', 'has_sms_api_key',
+            'sms_on_created', 'sms_on_confirmed', 'sms_on_rescheduled', 'sms_on_cancelled', 'sms_on_reminder',
+            'sms_templates', 'sms_default_templates',
+            'sms_platform_available', 'sms_platform_limit', 'sms_platform_sent_this_month', 'sms_sent_this_month',
         ]
         read_only_fields = ['id']
+
+    def get_has_sms_api_key(self, obj) -> bool:
+        return bool(obj.sms_api_key)
+
+    def get_sms_platform_available(self, obj) -> bool:
+        from .sms import platform_api_key
+        return bool(platform_api_key())
+
+    def get_sms_platform_limit(self, obj) -> int:
+        from .sms import platform_monthly_limit
+        return platform_monthly_limit(obj)
+
+    def get_sms_platform_sent_this_month(self, obj) -> int:
+        from .sms import sent_this_month
+        return sent_this_month('platform')
+
+    def get_sms_sent_this_month(self, obj) -> int:
+        from .sms import sent_this_month
+        return sent_this_month()
+
+    def get_sms_default_templates(self, obj) -> dict:
+        from .sms import DEFAULT_TEMPLATES
+        return DEFAULT_TEMPLATES
+
+    def validate_reminder_hours_before(self, value):
+        if not 1 <= value <= 168:
+            raise serializers.ValidationError('Choose between 1 and 168 hours')
+        return value
+
+    def validate_second_reminder_hours_before(self, value):
+        if value is not None and not 1 <= value <= 168:
+            raise serializers.ValidationError('Choose between 1 and 168 hours')
+        return value
+
+    def validate_sms_templates(self, value):
+        from .sms import MAX_TEMPLATE_LENGTH, SMS_KINDS
+        if not isinstance(value, dict):
+            raise serializers.ValidationError('Invalid templates')
+        cleaned = {}
+        for kind, texts in value.items():
+            if kind not in SMS_KINDS or not isinstance(texts, dict):
+                continue
+            for language, text in texts.items():
+                if language not in ('ka', 'en') or not isinstance(text, str) or not text.strip():
+                    continue  # empty = use the default
+                if len(text) > MAX_TEMPLATE_LENGTH:
+                    raise serializers.ValidationError(f'A message can be at most {MAX_TEMPLATE_LENGTH} characters')
+                cleaned.setdefault(kind, {})[language] = text.strip()
+        return cleaned
+
+    def validate(self, attrs):
+        first = attrs.get('reminder_hours_before', getattr(self.instance, 'reminder_hours_before', 24))
+        second = attrs.get('second_reminder_hours_before', getattr(self.instance, 'second_reminder_hours_before', None))
+        if second is not None and second >= first:
+            raise serializers.ValidationError(
+                {'second_reminder_hours_before': 'The second reminder must be closer to the visit than the first'}
+            )
+        return attrs
 
     def validate_timezone(self, value):
         try:
@@ -793,9 +865,16 @@ class BookingSettingsSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         bog_client_id = validated_data.pop('bog_client_id', None)
         bog_client_secret = validated_data.pop('bog_client_secret', None)
+        sms_api_key = validated_data.pop('sms_api_key', None)
+        sms_api_key_clear = validated_data.pop('sms_api_key_clear', False)
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
+
+        if sms_api_key_clear:
+            instance.sms_api_key = ''
+        elif sms_api_key:
+            instance.sms_api_key = sms_api_key.strip()
 
         # The dashboard never receives the stored credentials back, so it posts
         # these fields empty unless the user typed new ones. Empty = keep.
@@ -807,6 +886,21 @@ class BookingSettingsSerializer(serializers.ModelSerializer):
 
         instance.save()
         return instance
+
+
+class BookingTestSmsSerializer(serializers.Serializer):
+    phone = serializers.CharField(max_length=50)
+    kind = serializers.ChoiceField(choices=['created', 'confirmed', 'rescheduled', 'cancelled', 'reminder'], default='reminder')
+    language = serializers.ChoiceField(choices=['ka', 'en'], default='ka')
+    # Unsaved text to try; empty = the saved (or default) template
+    text = serializers.CharField(max_length=600, required=False, allow_blank=True)
+
+
+class BookingTestSmsResultSerializer(serializers.Serializer):
+    status = serializers.CharField()
+    text = serializers.CharField()
+    segments = serializers.IntegerField()
+    account = serializers.CharField()
 
 
 # ----------------------------------------------------------------------------

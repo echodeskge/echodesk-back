@@ -119,11 +119,10 @@ def _create_recurring_bookings_for_tenant(schema_name):
 @shared_task
 def send_booking_reminders():
     """
-    Send reminders for bookings happening in the next 24 hours.
+    Send the reminders that are due right now, in every tenant.
 
-    Finds all confirmed bookings with date = tomorrow that haven't been
-    reminded yet, and marks them as reminded.  Actual email/SMS delivery
-    can be plugged in later.
+    Runs every few minutes; each salon chooses how many hours before the
+    visit its customers are reminded (see due_reminder).
     """
     from tenant_schemas.utils import schema_context
     from tenants.models import Tenant
@@ -146,35 +145,111 @@ def send_booking_reminders():
     return total_reminded
 
 
-def _send_reminders_for_tenant(schema_name):
-    """Send booking reminders within a single tenant schema context."""
-    from booking_management.models import Booking
+# Reminders go out only in these hours on the business's clock; one that
+# falls due at night is sent in the morning if the visit is still ahead.
+REMINDER_SEND_FROM_HOUR = 9
+REMINDER_SEND_UNTIL_HOUR = 21
+DEFAULT_REMINDER_HOURS = 24
+# A reminder that keeps failing (provider down) is retried on later runs,
+# but not forever.
+REMINDER_MAX_ATTEMPTS = 3
 
+
+def due_reminder(booking, now, booking_settings=None):
+    """Which reminder a confirmed booking is due right now: 'first', 'second' or None.
+
+    `now` is the business's wall-clock time (naive), as booking times are.
+    """
+    from datetime import datetime
+    from booking_management.utils import _tzinfo
+
+    if booking.status != 'confirmed':
+        return None
+    if not (REMINDER_SEND_FROM_HOUR <= now.hour < REMINDER_SEND_UNTIL_HOUR):
+        return None
+    start = datetime.combine(booking.date, booking.start_time)
+    if start <= now:
+        return None
+
+    first_hours = getattr(booking_settings, 'reminder_hours_before', None) or DEFAULT_REMINDER_HOURS
+    second_hours = getattr(booking_settings, 'second_reminder_hours_before', None)
+    # When the booking was made, on the same clock
+    created = booking.created_at.astimezone(_tzinfo(booking_settings)).replace(tzinfo=None) if booking.created_at else None
+
+    def due(hours):
+        if now < start - timedelta(hours=hours):
+            return False
+        # Booked inside the window: the confirmation they just got is enough
+        return created is None or created <= start - timedelta(hours=hours)
+
+    if second_hours and not booking.second_reminder_sent and due(second_hours):
+        return 'second'
+    if not booking.reminder_sent and due(first_hours):
+        # ...unless the closer reminder already covers it
+        if second_hours and now >= start - timedelta(hours=second_hours):
+            return None
+        return 'first'
+    return None
+
+
+def _send_reminders_for_tenant(schema_name):
+    """Send due booking reminders (email and SMS) within one tenant schema."""
+    from django.core.cache import cache
+    from booking_management.emails import booking_recipient, send_booking_email
+    from booking_management.models import Booking
+    from booking_management.sms import send_booking_sms
     from booking_management.utils import get_booking_settings, tenant_now
-    tomorrow = tenant_now(get_booking_settings()).date() + timedelta(days=1)
+
+    booking_settings = get_booking_settings()
+    now = tenant_now(booking_settings)
+    if not (REMINDER_SEND_FROM_HOUR <= now.hour < REMINDER_SEND_UNTIL_HOUR):
+        return 0
+
+    first_hours = getattr(booking_settings, 'reminder_hours_before', None) or DEFAULT_REMINDER_HOURS
+    horizon = (now + timedelta(hours=first_hours)).date()
     bookings = Booking.objects.filter(
-        date=tomorrow,
+        date__gte=now.date(),
+        date__lte=horizon,
         status='confirmed',
-        reminder_sent=False,
-    ).select_related('client', 'service', 'staff')
+    ).exclude(
+        reminder_sent=True, second_reminder_sent=True,
+    ).select_related('client', 'service', 'staff', 'staff__user')
 
     reminded = 0
     for booking in bookings:
         try:
-            from booking_management.emails import send_booking_email
-            send_booking_email(booking, 'reminder', schema_name, booking.contact_language or None)
-            logger.info(
-                'Reminder for booking %s: %s on %s at %s (tenant %s)',
-                booking.booking_number,
-                booking.client.full_name,
-                booking.date,
-                booking.start_time,
-                schema_name,
-            )
+            which = due_reminder(booking, now, booking_settings)
+            if which is None:
+                continue
+            flag = 'reminder_sent' if which == 'first' else 'second_reminder_sent'
 
-            booking.reminder_sent = True
-            booking.save(update_fields=['reminder_sent', 'updated_at'])
-            reminded += 1
+            language = booking.contact_language or None
+            has_email = bool(booking_recipient(booking))
+            emailed = send_booking_email(booking, 'reminder', schema_name, language) if has_email else False
+            sms = send_booking_sms(booking, 'reminder', language, schema_name)
+            delivered = emailed or sms == 'sent'
+
+            # Something we could have sent failed: try again on a later run
+            failed = (has_email and not emailed) or sms == 'failed'
+            if not delivered and failed:
+                attempts_key = f'booking_reminder_attempts:{schema_name}:{booking.id}:{which}'
+                attempts = (cache.get(attempts_key) or 0) + 1
+                cache.set(attempts_key, attempts, 60 * 60 * 48)
+                if attempts < REMINDER_MAX_ATTEMPTS:
+                    continue
+
+            setattr(booking, flag, True)
+            fields = [flag, 'updated_at']
+            if which == 'second' and not booking.reminder_sent:
+                booking.reminder_sent = True  # the earlier one is moot now
+                fields.append('reminder_sent')
+            booking.save(update_fields=fields)
+            if delivered:
+                reminded += 1
+                logger.info(
+                    'Reminder (%s) for booking %s on %s at %s (tenant %s): email=%s sms=%s',
+                    which, booking.booking_number, booking.date, booking.start_time, schema_name, emailed, sms,
+                )
         except Exception:
             logger.exception(
                 'Error sending reminder for booking %s (tenant %s)',
@@ -282,7 +357,11 @@ def _cancel_unpaid_for_tenant(schema_name):
 
 @shared_task
 def send_booking_email_task(schema_name, booking_id, kind, language=None):
-    """Email a booking notice ('created' | 'confirmed' | 'cancelled') to its client."""
+    """Send a booking notice to its client: email, and SMS if the salon uses it.
+
+    kind: 'created' | 'confirmed' | 'cancelled' | 'rescheduled'. (The name is
+    historical; tasks may be queued under it.)
+    """
     from tenant_schemas.utils import schema_context
 
     try:
@@ -302,7 +381,11 @@ def send_booking_email_task(schema_name, booking_id, kind, language=None):
                 except Exception:
                     language = 'en'
 
-            return send_booking_email(booking, kind, schema_name, language)
+            emailed = send_booking_email(booking, kind, schema_name, language)
+            # SMS goes out on its own switch, whether or not there was an email
+            from booking_management.sms import send_booking_sms
+            texted = send_booking_sms(booking, kind, language, schema_name) == 'sent'
+            return emailed or texted
     except Exception:
         # send_booking_email swallows mail errors itself; anything reaching
         # here is a bug or a missing schema, which a retry would not fix.

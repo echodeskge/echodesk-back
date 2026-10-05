@@ -906,7 +906,8 @@ class ClientBookingViewSet(
             end_dt = datetime.combine(new_date, new_time) + timedelta(minutes=booking.service.total_duration_minutes)
             booking.end_time = end_dt.time()
             booking.reminder_sent = False
-            booking.save(update_fields=['staff', 'date', 'start_time', 'end_time', 'reminder_sent', 'updated_at'])
+            booking.second_reminder_sent = False
+            booking.save(update_fields=['staff', 'date', 'start_time', 'end_time', 'reminder_sent', 'second_reminder_sent', 'updated_at'])
 
         _queue_booking_email(booking, 'rescheduled', _language(request))
         notify_staff_of_booking(booking, 'rescheduled')

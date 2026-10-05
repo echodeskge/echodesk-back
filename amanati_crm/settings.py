@@ -487,6 +487,11 @@ LOGGING = {
 FRONTEND_BASE_URL = config('FRONTEND_BASE_URL', default='echodesk.ge')
 # Public booking site customers use (book.echodesk.ge/<tenant schema>)
 BOOKING_SITE_URL = config('BOOKING_SITE_URL', default=f'https://book.{MAIN_DOMAIN}')
+
+# Booking SMS: the shared sender.ge account used by salons that have not
+# entered their own key, and how many SMS a month each may send through it.
+SENDER_GE_API_KEY = config('SENDER_GE_API_KEY', default='')
+BOOKING_SMS_PLATFORM_MONTHLY_LIMIT = config('BOOKING_SMS_PLATFORM_MONTHLY_LIMIT', default=200, cast=int)
 REVALIDATION_SECRET = config('REVALIDATION_SECRET', default='')
 
 # Optional: For advanced deployments
@@ -688,7 +693,8 @@ CELERY_BEAT_SCHEDULE = {
     },
     'send-booking-reminders': {
         'task': 'booking_management.tasks.send_booking_reminders',
-        'schedule': crontab(hour=9, minute=0),  # Daily at 9 AM
+        # Each salon sets how many hours before the visit to remind
+        'schedule': crontab(minute='*/10'),
     },
     'cancel-unpaid-bookings': {
         'task': 'booking_management.tasks.cancel_unpaid_bookings',

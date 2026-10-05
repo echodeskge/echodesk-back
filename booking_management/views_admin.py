@@ -13,7 +13,7 @@ from .models import (
 )
 from social_integrations.models import Client
 from .serializers import (
-    AdminBookingCreateSerializer,
+    AdminBookingCreateSerializer, BookingTestSmsSerializer, BookingTestSmsResultSerializer,
     BookingClientSerializer, ServiceListSerializer, ServiceDetailSerializer,
     ServiceCategorySerializer, BookingStaffSerializer, BookingStaffCreateSerializer,
     BookingListSerializer, BookingDetailSerializer,
@@ -640,7 +640,8 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
         end_dt = datetime.combine(new_date, new_time) + timedelta(minutes=booking.service.total_duration_minutes)
         booking.end_time = end_dt.time()
         booking.reminder_sent = False
-        booking.save(update_fields=['date', 'start_time', 'end_time', 'reminder_sent'])
+        booking.second_reminder_sent = False
+        booking.save(update_fields=['date', 'start_time', 'end_time', 'reminder_sent', 'second_reminder_sent'])
         booking._notify_client('rescheduled')
 
         # TODO: Send notification to client about reschedule
@@ -812,3 +813,45 @@ def booking_settings(request):
             return Response(serializer.data)
 
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+TEST_SMS_PER_HOUR = 10
+
+
+@extend_schema(
+    tags=['Booking Admin - Settings'],
+    request=BookingTestSmsSerializer,
+    responses={200: BookingTestSmsResultSerializer},
+)
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated, HasBookingManagementFeature])
+def booking_settings_test_sms(request):
+    """Send one of the SMS texts, filled with sample data, to a phone number.
+
+    Goes through the same account as real notices (own key, else the shared
+    account and its monthly limit), so it shows what a customer would get.
+    """
+    from django.core.cache import cache
+    from django.db import connection
+    from .sms import render_template, sample_values, send_text, template_for
+    from .utils import get_or_create_booking_settings
+
+    serializer = BookingTestSmsSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    data = serializer.validated_data
+
+    counter_key = f'booking_test_sms:{connection.schema_name}'
+    sent = cache.get(counter_key) or 0
+    if sent >= TEST_SMS_PER_HOUR:
+        return Response({'error': 'Too many test messages. Try again in an hour.'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+    settings = get_or_create_booking_settings()
+    # Preview the text being edited, even before it is saved
+    template = (data.get('text') or '').strip() or template_for(settings, data['kind'], data['language'])
+    text = render_template(template, sample_values(data['language']))
+    log = send_text(settings, data['phone'], text, f"test_{data['kind']}"[:20], data['language'])
+    if log.status != 'sent':
+        return Response({'error': log.error or 'The SMS could not be sent', 'text': text}, status=status.HTTP_400_BAD_REQUEST)
+
+    cache.set(counter_key, sent + 1, 60 * 60)
+    return Response({'status': 'sent', 'text': text, 'segments': log.segments, 'account': log.account})
