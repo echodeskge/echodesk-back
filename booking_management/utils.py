@@ -3,7 +3,10 @@ from decimal import Decimal
 
 from django.utils import timezone
 
+from django.db.models import CharField, F, Func, Value
 from .models import Booking, BookingSettings, StaffAvailability, StaffException
+from social_integrations.models import Client
+from .utils_text import normalize_phone, phone_digits
 
 DEFAULT_TIMEZONE = 'Asia/Tbilisi'
 DEFAULT_MIN_HOURS_BEFORE = 2
@@ -339,6 +342,44 @@ def validate_booking_availability(service, staff, date, start_time, exclude_book
     ) is None:
         return False, "This time is not available"
     return True, ""
+
+
+def find_or_create_client(first_name, last_name, phone, email):
+    """Contact record for a guest: reuse the one with this phone, else create.
+
+    Returns (client, matched_existing). An existing record is never modified
+    beyond being flagged as a booking client — a visitor typing someone's
+    phone number must not be able to rename them or change their email.
+    """
+    # The same number is one person however it was typed: compare digits
+    # ("+995 555 10 20 30" = "555102030"), against contacts stored in any format.
+    digits = phone_digits(phone)
+    variants = {digits}
+    if digits.startswith('995'):
+        variants.add(digits[3:])
+    client = Client.objects.annotate(
+        phone_only_digits=Func(
+            F('phone'), Value(r'[^0-9]'), Value(''), Value('g'),
+            function='regexp_replace', output_field=CharField(),
+        )
+    ).filter(phone_only_digits__in=variants).order_by('id').first() if digits else None
+    phone = normalize_phone(phone)
+    if client is not None:
+        if not client.is_booking_enabled:
+            client.is_booking_enabled = True
+            client.save(update_fields=['is_booking_enabled'])
+        return client, True
+
+    full_name = f"{first_name} {last_name}".strip()
+    client = Client.objects.create(
+        name=full_name,
+        first_name=first_name,
+        last_name=last_name,
+        phone=phone,
+        email=(email or None),
+        is_booking_enabled=True,
+    )
+    return client, False
 
 
 from .utils_text import localized_text, public_staff_name  # noqa: E402,F401  (re-exported)

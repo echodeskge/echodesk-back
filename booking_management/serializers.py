@@ -807,3 +807,110 @@ class BookingSettingsSerializer(serializers.ModelSerializer):
 
         instance.save()
         return instance
+
+
+# ----------------------------------------------------------------------------
+# Admin: bookings taken by staff (phone, walk-in, from the calendar)
+# ----------------------------------------------------------------------------
+
+class AdminBookingCreateSerializer(serializers.Serializer):
+    """A booking entered by the business itself.
+
+    The customer is either an existing contact (`client_id`) or a new one
+    given by name and phone. Unlike customer bookings there is no lead-time
+    window and no slot grid: staff may book any minute of the working day,
+    as long as the specialist is working and not already busy.
+    """
+    service_id = serializers.IntegerField()
+    staff_id = serializers.IntegerField()
+    date = serializers.DateField()
+    start_time = serializers.TimeField()
+    client_id = serializers.IntegerField(required=False, allow_null=True)
+    first_name = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
+    last_name = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
+    phone_number = serializers.CharField(max_length=50, required=False, allow_blank=True, default='')
+    email = serializers.EmailField(required=False, allow_blank=True, allow_null=True)
+    total_amount = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True, min_value=0)
+    status = serializers.ChoiceField(choices=['pending', 'confirmed'], default='confirmed')
+    staff_notes = serializers.CharField(required=False, allow_blank=True, default='')
+    client_notes = serializers.CharField(required=False, allow_blank=True, default='')
+    # Tell the customer by email (when they have one) that the booking is in.
+    notify_client = serializers.BooleanField(default=True)
+
+    def validate(self, attrs):
+        from .utils import check_staff_slot, staff_can_perform
+
+        try:
+            service = Service.objects.get(id=attrs['service_id'], status='active')
+        except Service.DoesNotExist:
+            raise serializers.ValidationError({'service_id': 'Service not found'})
+        try:
+            staff = BookingStaff.objects.select_related('user').get(id=attrs['staff_id'])
+        except BookingStaff.DoesNotExist:
+            raise serializers.ValidationError({'staff_id': 'Staff not found'})
+        if not staff_can_perform(service, staff):
+            raise serializers.ValidationError({'staff_id': 'This staff member does not provide this service'})
+
+        if attrs.get('client_id'):
+            try:
+                attrs['client'] = Client.objects.get(id=attrs['client_id'])
+            except Client.DoesNotExist:
+                raise serializers.ValidationError({'client_id': 'Client not found'})
+        else:
+            if not attrs.get('first_name', '').strip():
+                raise serializers.ValidationError({'first_name': 'Enter the customer\'s name'})
+            digits = [c for c in attrs.get('phone_number', '') if c.isdigit()]
+            if len(digits) < 6:
+                raise serializers.ValidationError({'phone_number': 'Enter a valid phone number'})
+
+        ok, error_message = check_staff_slot(service, staff, attrs['date'], attrs['start_time'])
+        if not ok:
+            raise serializers.ValidationError({'start_time': error_message})
+
+        attrs['service'] = service
+        attrs['staff'] = staff
+        return attrs
+
+    def create(self, validated_data):
+        from datetime import datetime, timedelta
+        from .utils import find_or_create_client
+
+        service = validated_data['service']
+        client = validated_data.get('client')
+        if client is None:
+            client, _ = find_or_create_client(
+                validated_data['first_name'].strip(), validated_data.get('last_name', '').strip(),
+                validated_data['phone_number'], validated_data.get('email') or None,
+            )
+        start = datetime.combine(validated_data['date'], validated_data['start_time'])
+        end_time = (start + timedelta(minutes=service.total_duration_minutes)).time()
+        total = validated_data.get('total_amount')
+        booking = Booking.objects.create(
+            client=client,
+            service=service,
+            staff=validated_data['staff'],
+            date=validated_data['date'],
+            start_time=validated_data['start_time'],
+            end_time=end_time,
+            status=validated_data['status'],
+            confirmed_at=timezone.now() if validated_data['status'] == 'confirmed' else None,
+            total_amount=service.base_price if total is None else total,
+            deposit_amount=0,
+            payment_method='cash',
+            staff_notes=validated_data.get('staff_notes', ''),
+            client_notes=validated_data.get('client_notes', ''),
+            contact_email=client.email or '',
+            contact_language=_business_language(),
+        )
+        return booking
+
+
+def _business_language():
+    """Language for notices to customers the business booked itself."""
+    try:
+        from django.db import connection
+        from tenants.models import Tenant
+        language = Tenant.objects.get(schema_name=connection.schema_name).preferred_language
+    except Exception:
+        language = 'en'
+    return language if language in ('en', 'ka') else 'en'

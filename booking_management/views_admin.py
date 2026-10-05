@@ -4,7 +4,8 @@ from rest_framework.response import Response
 from django.utils import timezone
 from django.db.models import Q, Count, Sum, Avg, Prefetch
 from datetime import datetime, timedelta, date
-from drf_spectacular.utils import extend_schema, extend_schema_view
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
 from .models import (
     Service, ServiceCategory, BookingStaff,
     Booking, RecurringBooking, StaffAvailability, StaffException,
@@ -12,6 +13,7 @@ from .models import (
 )
 from social_integrations.models import Client
 from .serializers import (
+    AdminBookingCreateSerializer,
     BookingClientSerializer, ServiceListSerializer, ServiceDetailSerializer,
     ServiceCategorySerializer, BookingStaffSerializer, BookingStaffCreateSerializer,
     BookingListSerializer, BookingDetailSerializer,
@@ -113,7 +115,13 @@ def dashboard_stats(request):
     })
 
 
-@extend_schema(tags=['Booking Admin - Dashboard'])
+@extend_schema(
+    tags=['Booking Admin - Dashboard'],
+    parameters=[
+        OpenApiParameter('date', OpenApiTypes.DATE, description='Day to show (YYYY-MM-DD); default today'),
+        OpenApiParameter('staff_id', OpenApiTypes.INT, description='Only this staff member'),
+    ],
+)
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated, HasBookingManagementFeature])
 def staff_schedule(request):
@@ -453,7 +461,28 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         if self.action == 'retrieve':
             return BookingDetailSerializer
+        if self.action == 'create':
+            return AdminBookingCreateSerializer
         return BookingListSerializer
+
+    def create(self, request, *args, **kwargs):
+        """Book for a customer by hand (phone call, walk-in, calendar click)."""
+        from django.db import transaction
+        from .utils import is_slot_booked
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        with transaction.atomic():
+            # Same lock as customer bookings so two front desks (or a customer
+            # online) can't take the same minute of the same specialist.
+            BookingStaff.objects.select_for_update().filter(pk=data['staff'].pk).exists()
+            if is_slot_booked(data['staff'], data['date'], data['start_time'], data['service'].total_duration_minutes):
+                return Response({'start_time': 'This time slot was just booked'}, status=status.HTTP_400_BAD_REQUEST)
+            booking = serializer.save()
+        if data.get('notify_client') and booking.status == 'confirmed':
+            booking._notify_client('confirmed')
+        return Response(BookingDetailSerializer(booking).data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'])
     def confirm(self, request, pk=None):

@@ -12,7 +12,7 @@ from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.core.cache import cache
 from django.db import connection, transaction
-from django.db.models import CharField, F, Func, Prefetch, Value
+from django.db.models import Prefetch
 from django.utils import timezone
 from django.utils.crypto import constant_time_compare
 from django.views.decorators.csrf import csrf_exempt
@@ -43,6 +43,7 @@ from .throttles import (
 from .staff_notifications import notify_staff_of_booking
 from .utils_text import localized_text, normalize_phone, phone_digits
 from .utils import (
+    find_or_create_client,
     available_payment_options, can_cancel_booking, card_payment_enabled,
     check_booking_window, find_available_staff, generate_available_slots,
     get_booking_settings, get_or_create_booking_settings, is_slot_booked, staff_can_perform,
@@ -587,44 +588,6 @@ def client_profile(request):
 # GUEST BOOKING (no account)
 # ============================================================================
 
-def _guest_client(first_name, last_name, phone, email):
-    """Contact record for a guest: reuse the one with this phone, else create.
-
-    Returns (client, matched_existing). An existing record is never modified
-    beyond being flagged as a booking client — a visitor typing someone's
-    phone number must not be able to rename them or change their email.
-    """
-    # The same number is one person however it was typed: compare digits
-    # ("+995 555 10 20 30" = "555102030"), against contacts stored in any format.
-    digits = phone_digits(phone)
-    variants = {digits}
-    if digits.startswith('995'):
-        variants.add(digits[3:])
-    client = Client.objects.annotate(
-        phone_only_digits=Func(
-            F('phone'), Value(r'[^0-9]'), Value(''), Value('g'),
-            function='regexp_replace', output_field=CharField(),
-        )
-    ).filter(phone_only_digits__in=variants).order_by('id').first() if digits else None
-    phone = normalize_phone(phone)
-    if client is not None:
-        if not client.is_booking_enabled:
-            client.is_booking_enabled = True
-            client.save(update_fields=['is_booking_enabled'])
-        return client, True
-
-    full_name = f"{first_name} {last_name}".strip()
-    client = Client.objects.create(
-        name=full_name,
-        first_name=first_name,
-        last_name=last_name,
-        phone=phone,
-        email=(email or None),
-        is_booking_enabled=True,
-    )
-    return client, False
-
-
 @extend_schema(tags=['Booking Client - Bookings'], request=GuestBookingCreateSerializer)
 @api_view(['POST'])
 @authentication_classes([])
@@ -641,7 +604,7 @@ def guest_booking_create(request):
     phone = data['phone_number']
     email = (data.get('email') or '').strip()
 
-    client, matched = _guest_client(first_name, last_name, phone, email)
+    client, matched = find_or_create_client(first_name, last_name, phone, email)
 
     booking, error = _create_booking(
         request, serializer, client, contact_email=email,
