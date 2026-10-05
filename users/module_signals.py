@@ -203,7 +203,7 @@ try:
                         'date': str(instance.date),
                         'start_time': str(instance.start_time),
                     },
-                    link_url=f'/bookings/{instance.id}',
+                    link_url=f'/bookings/bookings/{instance.id}',
                 )
 
         # Booking cancelled
@@ -219,7 +219,7 @@ try:
                         'booking_number': instance.booking_number,
                         'cancelled_by': instance.cancelled_by or '',
                     },
-                    link_url=f'/bookings/{instance.id}',
+                    link_url=f'/bookings/bookings/{instance.id}',
                 )
 
 except ImportError:
