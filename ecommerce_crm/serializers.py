@@ -96,16 +96,49 @@ class ProductVariantAttributeValueSerializer(serializers.ModelSerializer):
 class ProductVariantSerializer(serializers.ModelSerializer):
     """Serializer for product variants"""
     attribute_values = ProductVariantAttributeValueSerializer(many=True, read_only=True)
+    # Write side of attribute_values: [{"attribute_id": 1, "value_json": "brown"}, ...].
+    # Sending the list replaces the variant's attributes; omitting it keeps them.
+    attributes = ProductVariantAttributeValueSerializer(many=True, write_only=True, required=False)
     effective_price = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
 
     class Meta:
         model = ProductVariant
         fields = [
-            'id', 'sku', 'name', 'price', 'effective_price', 'quantity',
-            'image', 'is_active', 'sort_order', 'attribute_values',
+            'id', 'sku', 'name', 'price', 'compare_at_price', 'effective_price', 'quantity',
+            'image', 'is_active', 'sort_order', 'attribute_values', 'attributes',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at']
+
+    def validate_attributes(self, value):
+        seen = set()
+        for item in value:
+            attribute = item['attribute']
+            if attribute.pk in seen:
+                raise serializers.ValidationError('The same attribute is listed twice')
+            seen.add(attribute.pk)
+        return value
+
+    def _set_attributes(self, variant, attributes):
+        variant.attribute_values.all().delete()
+        ProductVariantAttributeValue.objects.bulk_create([
+            ProductVariantAttributeValue(variant=variant, attribute=item['attribute'], value_json=item['value_json'])
+            for item in attributes
+        ])
+
+    def create(self, validated_data):
+        attributes = validated_data.pop('attributes', None)
+        variant = super().create(validated_data)
+        if attributes:
+            self._set_attributes(variant, attributes)
+        return variant
+
+    def update(self, instance, validated_data):
+        attributes = validated_data.pop('attributes', None)
+        variant = super().update(instance, validated_data)
+        if attributes is not None:
+            self._set_attributes(variant, attributes)
+        return variant
 
 
 class ProductVariantAdminSerializer(ProductVariantSerializer):

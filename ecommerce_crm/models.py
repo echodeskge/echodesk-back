@@ -399,6 +399,14 @@ class ProductVariant(models.Model):
         validators=[MinValueValidator(Decimal('0.00'))],
         help_text="Variant price (if different from base product)"
     )
+    compare_at_price = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal('0.00'))],
+        help_text="Crossed-out price for this variant only (so one colour can be on sale)"
+    )
 
     # Inventory
     quantity = models.IntegerField(default=0)

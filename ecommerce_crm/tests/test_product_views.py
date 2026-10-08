@@ -330,6 +330,45 @@ class TestProductVariants(ProductViewTestMixin, EchoDeskTenantTestCase):
         self.assertEqual(v.price, Decimal('35.00'))
         self.assertEqual(v.quantity, 15)
 
+    def test_create_variant_with_attributes_image_and_sale_price(self):
+        colour = AttributeDefinition.objects.create(
+            name={'en': 'Colour', 'ka': 'ფერი'}, key='colour', attribute_type='select',
+            options=[{'value': 'brown', 'label': {'en': 'Brown', 'ka': 'ყავისფერი'}}],
+        )
+        resp = self.api_post(VARIANT_URL, {
+            'product': self.product.pk, 'sku': 'VAR-ATTR-001',
+            'name': {'en': 'Brown', 'ka': 'ყავისფერი'},
+            'price': '40.00', 'compare_at_price': '55.00',
+            'image': 'https://cdn.example.com/brown.jpg',
+            'attributes': [{'attribute_id': colour.pk, 'value_json': 'brown'}],
+        }, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertEqual(resp.data['compare_at_price'], '55.00')
+        self.assertEqual(resp.data['image'], 'https://cdn.example.com/brown.jpg')
+        self.assertEqual(len(resp.data['attribute_values']), 1)
+        self.assertEqual(resp.data['attribute_values'][0]['attribute']['key'], 'colour')
+        self.assertEqual(resp.data['attribute_values'][0]['value_json'], 'brown')
+        self.assertNotIn('attributes', resp.data)
+
+        v = ProductVariant.objects.get(sku='VAR-ATTR-001')
+        # Omitting `attributes` keeps them; sending a list replaces them
+        resp = self.api_patch(f'{VARIANT_URL}{v.pk}/', {'quantity': 3}, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(v.attribute_values.count(), 1)
+        size = AttributeDefinition.objects.create(name={'en': 'Size'}, key='size', attribute_type='select', options=[])
+        resp = self.api_patch(f'{VARIANT_URL}{v.pk}/', {
+            'attributes': [{'attribute_id': size.pk, 'value_json': 'M'}],
+        }, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual([a.attribute.key for a in v.attribute_values.all()], ['size'])
+        resp = self.api_patch(f'{VARIANT_URL}{v.pk}/', {'attributes': []}, user=self.admin)
+        self.assertEqual(v.attribute_values.count(), 0)
+        # The same attribute twice is rejected
+        resp = self.api_patch(f'{VARIANT_URL}{v.pk}/', {
+            'attributes': [{'attribute_id': size.pk, 'value_json': 'M'}, {'attribute_id': size.pk, 'value_json': 'L'}],
+        }, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
     def test_delete_variant(self):
         v = ProductVariant.objects.create(
             product=self.product, sku='VAR-DEL-001',
