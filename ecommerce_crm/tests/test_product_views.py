@@ -205,6 +205,51 @@ class TestUpdateProduct(ProductViewTestMixin, EchoDeskTenantTestCase):
 # Delete product
 # ============================================================================
 
+class TestProductGallerySync(ProductViewTestMixin, EchoDeskTenantTestCase):
+    """The edit form posts its whole photo list as `image`; saving must make the
+    stored photos match it, including removals (bug #227)."""
+
+    A = 'https://cdn.example.com/a.jpg'
+    B = 'https://cdn.example.com/b.jpg'
+    C = 'https://cdn.example.com/c.jpg'
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='gallery-admin@test.com')
+        self.product = self._make_product('GAL-001')
+        self.product.image = self.A
+        self.product.save()
+        ProductImage.objects.create(product=self.product, image=self.B, sort_order=1)
+        ProductImage.objects.create(product=self.product, image=self.C, sort_order=2)
+
+    def _save(self, image):
+        resp = self.api_patch(f'{PROD_URL}{self.product.pk}/', {'image': image}, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.product.refresh_from_db()
+        return [i.image for i in self.product.images.order_by('sort_order')]
+
+    def test_removing_a_gallery_photo_deletes_it(self):
+        self.assertEqual(self._save(f'{self.A}, {self.C}'), [self.C])
+        self.assertEqual(self.product.image, self.A)
+
+    def test_removing_the_main_photo_promotes_the_next(self):
+        self.assertEqual(self._save(f'{self.B}, {self.C}'), [self.C])
+        self.assertEqual(self.product.image, self.B)
+
+    def test_removing_all_photos(self):
+        self.assertEqual(self._save(''), [])
+        self.assertIn(self.product.image, ('', None))
+
+    def test_reorder_and_add(self):
+        new = 'https://cdn.example.com/d.jpg'
+        self.assertEqual(self._save(f'{self.A}, {new}, {self.C}, {self.B}'), [new, self.C, self.B])
+
+    def test_saving_without_image_keeps_photos(self):
+        resp = self.api_patch(f'{PROD_URL}{self.product.pk}/', {'quantity': 3}, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.product.images.count(), 2)
+
+
 class TestDeleteProduct(ProductViewTestMixin, EchoDeskTenantTestCase):
 
     def setUp(self):

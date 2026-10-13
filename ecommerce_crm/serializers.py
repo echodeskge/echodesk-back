@@ -420,6 +420,22 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
                 sort_order=idx + 1,  # primary occupies sort_order 0 implicitly
             )
 
+    def _sync_gallery(self, product, urls):
+        """Gallery rows = exactly `urls` (the photos after the primary), in order."""
+        wanted = [u for u in dict.fromkeys(urls) if u and u != product.image]
+        rows = list(product.images.all())
+        for row in rows:
+            if row.image not in wanted:
+                row.delete()
+        by_url = {row.image: row for row in rows if row.image in wanted}
+        for idx, url in enumerate(wanted, start=1):
+            row = by_url.get(url)
+            if row is None:
+                ProductImage.objects.create(product=product, image=url, sort_order=idx)
+            elif row.sort_order != idx:
+                row.sort_order = idx
+                row.save(update_fields=['sort_order'])
+
     def create(self, validated_data):
         # Extract nested data
         attributes_data = validated_data.pop('attributes', [])
@@ -502,11 +518,21 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
         if request and hasattr(request, 'user'):
             validated_data['updated_by'] = request.user
 
+        # The edit form sends its whole photo list as `image` ("a, b, c").
+        # Note that before saving, since `image` is then reduced to the first URL.
+        sync_gallery = 'image' in validated_data and images_data is None
+
         # Update product
         product = super().update(instance, validated_data)
 
-        # Persist any new extra URLs as proper ProductImage rows.
-        self._create_extra_images(product, extra_image_urls)
+        if sync_gallery:
+            # Make the gallery match the list exactly: photos removed in the
+            # editor go, new ones are added, the order follows the list.
+            # (Only adding used to bring removed photos back on the next edit.)
+            self._sync_gallery(product, extra_image_urls)
+        else:
+            # Persist any new extra URLs as proper ProductImage rows.
+            self._create_extra_images(product, extra_image_urls)
 
         # Update attributes if provided
         if attributes_data is not None:
