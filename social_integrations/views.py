@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 import logging
 from datetime import datetime, timedelta
@@ -7209,6 +7210,30 @@ def mark_conversation_unread(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+def widget_session_ids(conversation_id):
+    """Session ids of the website-chat conversation the dashboard means.
+
+    The dashboard identifies a widget chat in three ways depending on the
+    screen: the session id, the composite list id "widget_<conn>_<session>",
+    or the visitor id (a UUID). Messages and archive rows are keyed by the
+    session id, so resolve all three to it. (Using the raw value matched
+    nothing: deleting "succeeded" with 0 messages and the chat stayed.)
+    """
+    from .models import WidgetSession
+
+    raw = str(conversation_id or '').strip()
+    match = re.match(r'^widget_\d+_(.+)$', raw)
+    if match:
+        raw = match.group(1)
+    if not raw:
+        return []
+    ids = list(
+        WidgetSession.objects.filter(Q(session_id=raw) | Q(visitor_id=raw))
+        .values_list('session_id', flat=True)
+    )
+    return ids or [raw]
+
+
 @api_view(['DELETE'])
 @permission_classes([IsAuthenticated, IsStaffUser])
 def delete_conversation(request):
@@ -7307,7 +7332,7 @@ def delete_conversation(request):
 
         elif platform == 'widget':
             deleted_count = WidgetMessage.objects.filter(
-                session__session_id=conversation_id,
+                session__session_id__in=widget_session_ids(conversation_id),
                 is_deleted=False,
             ).update(is_deleted=True)
 
@@ -11962,6 +11987,17 @@ def archive_conversation(request):
                 })
                 continue
 
+            if platform == 'widget':
+                # Archive rows must use the session id the list checks against
+                session_ids = widget_session_ids(conversation_id)
+                account_id = re.sub(r'^widget_', '', str(account_id))
+                for extra_id in session_ids[1:]:
+                    ConversationArchive.objects.get_or_create(
+                        platform=platform, conversation_id=extra_id, account_id=account_id,
+                        defaults={'archived_by': request.user},
+                    )
+                conversation_id = session_ids[0]
+
             # Create or update the archive record
             archive, created = ConversationArchive.objects.get_or_create(
                 platform=platform,
@@ -12006,7 +12042,7 @@ def archive_conversation(request):
                 ).update(is_read_by_staff=True, read_by_staff_at=now)
             elif platform == 'widget':
                 WidgetMessage.objects.filter(
-                    session__session_id=conversation_id,
+                    session__session_id__in=widget_session_ids(conversation_id),
                     is_from_visitor=True,
                     is_read_by_staff=False,
                 ).update(is_read_by_staff=True, read_by_staff_at=now)
@@ -12130,10 +12166,14 @@ def unarchive_conversation(request):
                 })
                 continue
 
-            # Delete the archive record
+            # Delete the archive record (a widget chat may be named by visitor
+            # or composite id; its archive rows are keyed by session id)
+            conversation_ids = widget_session_ids(conversation_id) if platform == 'widget' else [conversation_id]
+            if platform == 'widget':
+                account_id = re.sub(r'^widget_', '', str(account_id))
             deleted_count, _ = ConversationArchive.objects.filter(
                 platform=platform,
-                conversation_id=conversation_id,
+                conversation_id__in=conversation_ids,
                 account_id=account_id
             ).delete()
 
@@ -12298,6 +12338,24 @@ def archive_all_conversations(request):
                             'account_id': str(tg_account.telegram_user_id)
                         })
 
+        if include_all or 'widget' in platforms:
+            # Website chats: one conversation per session, keyed like the list
+            # (account = widget connection id). Was missing, so "archive all"
+            # left every website chat in the inbox.
+            widget_sessions = (
+                WidgetSession.objects.filter(messages__is_deleted=False)
+                .values_list('session_id', 'connection_id')
+                .distinct()
+            )
+            for session_id, connection_id in widget_sessions:
+                key = ('widget', str(session_id), str(connection_id))
+                if key not in existing_archives and key not in active_assignments:
+                    conversations_to_archive.append({
+                        'platform': 'widget',
+                        'conversation_id': str(session_id),
+                        'account_id': str(connection_id),
+                    })
+
         # Bulk create archive records
         archive_objects = [
             ConversationArchive(
@@ -12344,6 +12402,12 @@ def archive_all_conversations(request):
                 is_read_by_staff=False
             ).update(is_read_by_staff=True, read_by_staff_at=now)
             messages_marked_read += count
+
+        if include_all or 'widget' in platforms:
+            messages_marked_read += WidgetMessage.objects.filter(
+                is_from_visitor=True,
+                is_read_by_staff=False,
+            ).update(is_read_by_staff=True, read_by_staff_at=now)
 
         logger.info(f"Archived {archived_count} conversations, marked {messages_marked_read} messages as read (platform: {platform_param})")
 
