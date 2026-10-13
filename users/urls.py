@@ -1,5 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
+from .password_reset import password_reset_confirm, password_reset_request
 from .views import (
     UserViewSet, GroupViewSet, PermissionViewSet, DepartmentViewSet,
     TenantGroupViewSet, NotificationViewSet, tenant_homepage,
@@ -22,6 +23,9 @@ router.register(r'team-chat/messages', TeamChatMessageViewSet, basename='team-ch
 
 urlpatterns = [
     path('', tenant_homepage, name='tenant_homepage'),
+    # Before the router: otherwise users/<pk>/ swallows "password-reset"
+    path('api/users/password-reset/', password_reset_request, name='password-reset-request'),
+    path('api/users/password-reset/confirm/', password_reset_confirm, name='password-reset-confirm'),
     path('api/', include(router.urls)),
 
     # Notification Preferences endpoints
