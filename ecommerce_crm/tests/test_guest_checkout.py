@@ -164,3 +164,80 @@ class TestGuestBackwardCompat(GuestCheckoutTestMixin, EchoDeskTenantTestCase):
         )
         resp = self.api_post(GUEST_URL, payload)
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class TestGuestContactDetails(GuestCheckoutTestMixin, EchoDeskTenantTestCase):
+    """A guest order under an email someone used before keeps the contact
+    details typed at checkout instead of showing the earlier customer's."""
+
+    def setUp(self):
+        super().setUp()
+        self._settings(allow_pickup=True)
+        self.earlier = EcommerceClient.objects.create(
+            email='shared@test.com', first_name='Ana', last_name='First',
+            phone_number='+995512343434', password='', is_verified=True,
+        )
+
+    def _place(self):
+        payload = self._payload(
+            email='Shared@test.com', first_name='Nini', last_name='Second',
+            phone='+995571575151', payment_method='cash_on_delivery',
+            delivery_method='pickup',
+        )
+        with patch('ecommerce_crm.tasks.send_order_email.delay'):
+            resp = self.api_post(GUEST_URL, payload)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        return Order.objects.get(order_number=resp.data['order_number'])
+
+    def test_order_keeps_typed_contact(self):
+        order = self._place()
+        self.assertEqual(order.client_id, self.earlier.id)
+        self.assertEqual(order.contact_name, 'Nini Second')
+        self.assertEqual(order.contact_email, 'shared@test.com')
+        self.assertEqual(order.contact_phone, '+995571575151')
+
+    def test_admin_list_and_detail_show_typed_contact(self):
+        order = self._place()
+        resp = self.api_get('/api/ecommerce/admin/orders/', user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        rows = resp.data['results'] if isinstance(resp.data, dict) else resp.data
+        row = next(r for r in rows if r['id'] == order.id)
+        self.assertEqual(row['client_name'], 'Nini Second')
+
+        resp = self.api_get(f'/api/ecommerce/admin/orders/{order.id}/', user=self.admin)
+        self.assertEqual(resp.data['client_details']['full_name'], 'Nini Second')
+        self.assertEqual(resp.data['client_details']['phone_number'], '+995571575151')
+
+    def test_older_orders_fall_back_to_client(self):
+        order = self._place()
+        Order.objects.filter(id=order.id).update(
+            customer_first_name='', customer_last_name='', customer_email='', customer_phone='',
+        )
+        order.refresh_from_db()
+        self.assertEqual(order.contact_name, 'Ana First')
+        self.assertEqual(order.contact_phone, '+995512343434')
+
+    def test_courier_gets_typed_contact(self):
+        from ecommerce_crm.tasks import book_quickshipper_courier
+
+        EcommerceSettings.objects.filter(tenant=self.tenant).update(quickshipper_enabled=True)
+        payload = self._payload(
+            email='shared@test.com', first_name='Nini', last_name='Second',
+            phone='+995571575151', payment_method='card',
+            **self._quickshipper_fields(),
+        )
+        with _mock_bog():
+            resp = self.api_post(GUEST_URL, payload)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        order = Order.objects.get(order_number=resp.data['order_number'])
+
+        courier = MagicMock()
+        courier.create_order.return_value = {'orderId': 555}
+        with patch('ecommerce_crm.services.quickshipper.client_from_settings', return_value=courier):
+            book_quickshipper_courier.run(self.tenant.schema_name, order.id)
+
+        drop_off = courier.create_order.call_args[0][0]['dropOffInfo']
+        self.assertEqual(drop_off['name'], 'Nini Second')
+        self.assertEqual(drop_off['phone'], '+995571575151')
+        order.refresh_from_db()
+        self.assertEqual(order.tracking_number, '555')

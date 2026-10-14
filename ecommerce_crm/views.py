@@ -1591,7 +1591,8 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
     queryset = Order.objects.all()
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ['order_number', 'client__first_name', 'client__last_name', 'client__email']
+    search_fields = ['order_number', 'client__first_name', 'client__last_name', 'client__email',
+                     'customer_first_name', 'customer_last_name', 'customer_email', 'customer_phone']
     filterset_fields = ['client', 'status', 'payment_provider']
     ordering_fields = ['created_at', 'total_amount', 'status']
     ordering = ['-created_at']
@@ -1692,9 +1693,9 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
                 amount=float(order.total_amount),
                 currency='GEL',
                 description=f"Order {order.order_number}",
-                customer_email=order.client.email,
-                customer_name=order.client.full_name,
-                customer_phone=order.client.phone_number or '',
+                customer_email=order.contact_email,
+                customer_name=order.contact_name,
+                customer_phone=order.contact_phone,
                 return_url_success=return_url_success,
                 return_url_fail=return_url_fail,
                 callback_url=callback_url,
@@ -2148,9 +2149,9 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
             writer.writerow([
                 order.order_number,
                 order.created_at.strftime('%Y-%m-%d %H:%M:%S') if order.created_at else '',
-                order.client.full_name if order.client else '',
-                order.client.email if order.client else '',
-                order.client.phone_number if order.client else '',
+                order.contact_name,
+                order.contact_email,
+                order.contact_phone,
                 order.total_amount,
                 order.subtotal,
                 order.shipping_cost,
@@ -2237,9 +2238,9 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
                 amount=float(order.total_amount),
                 currency='GEL',
                 description=f"Order {order.order_number}",
-                customer_email=order.client.email,
-                customer_name=order.client.full_name,
-                customer_phone=order.client.phone_number or '',
+                customer_email=order.contact_email,
+                customer_name=order.contact_name,
+                customer_phone=order.contact_phone,
                 return_url_success=return_url_success,
                 return_url_fail=return_url_fail,
                 callback_url=callback_url,
@@ -3737,7 +3738,7 @@ def _build_drop_off_payload(address, fallback_phone: str = "") -> dict:
         "latitude": float(address.latitude) if address.latitude is not None else 0,
         "longitude": float(address.longitude) if address.longitude is not None else 0,
         "name": address.client.full_name if address.client_id else "",
-        "phone": (address.client.phone if address.client_id and address.client.phone else fallback_phone) or "",
+        "phone": (address.client.phone_number if address.client_id and address.client.phone_number else fallback_phone) or "",
         "phonePrefix": "",
     }
 

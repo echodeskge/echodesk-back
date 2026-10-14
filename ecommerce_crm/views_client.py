@@ -1102,9 +1102,9 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
 
             payment = create_card_payment(
                 request, order, card_provider,
-                customer_email=order.client.email,
-                customer_name=order.client.full_name,
-                customer_phone=order.client.phone_number or '',
+                customer_email=order.contact_email,
+                customer_name=order.contact_name,
+                customer_phone=order.contact_phone,
                 return_url_success=return_url_success,
                 return_url_fail=return_url_fail,
             )
@@ -2270,6 +2270,10 @@ def guest_checkout(request):
             order = Order.objects.create(
                 order_number=Order.generate_order_number(),
                 client=client,
+                customer_first_name=str(data['first_name']).strip()[:100],
+                customer_last_name=str(data['last_name']).strip()[:100],
+                customer_email=email,
+                customer_phone=str(data['phone']).strip()[:30],
                 delivery_address=delivery_address,
                 subtotal=subtotal,
                 discount_amount=discount_amount,
@@ -2351,9 +2355,9 @@ def guest_checkout(request):
 
         payment = create_card_payment(
             request, order, card_provider,
-            customer_email=client.email,
-            customer_name=client.full_name,
-            customer_phone=client.phone_number or '',
+            customer_email=order.contact_email,
+            customer_name=order.contact_name,
+            customer_phone=order.contact_phone,
             return_url_success=(ecommerce_settings.bog_return_url_success or '') if ecommerce_settings else '',
             return_url_fail=(ecommerce_settings.bog_return_url_fail or '') if ecommerce_settings else '',
         )

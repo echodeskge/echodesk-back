@@ -66,8 +66,8 @@ def send_order_email(self, schema_name, order_id, email_type):
                 'frontend_url': storefront_url,
                 'public_order_url': public_order_url,
                 'public_token': order.public_token,
-                'client_name': client.first_name or 'Valued Customer',
-                'client_email': client.email,
+                'client_name': order.contact_first_name or 'Valued Customer',
+                'client_email': order.contact_email,
                 'items': [
                     {
                         'product_name': _get_product_name(item.product_name),
@@ -426,8 +426,8 @@ def book_quickshipper_courier(self, schema_name, order_id):
                     'country': address.country or '',
                     'latitude': float(address.latitude) if address.latitude is not None else 0,
                     'longitude': float(address.longitude) if address.longitude is not None else 0,
-                    'name': address.client.full_name if address.client_id else '',
-                    'phone': (address.client.phone or '') if address.client_id else '',
+                    'name': order.contact_name,
+                    'phone': order.contact_phone,
                     'phonePrefix': '',
                 },
                 'provider': {

@@ -835,6 +835,14 @@ class Order(models.Model):
         related_name='orders',
         help_text="Client who placed the order"
     )
+    # Contact details as typed at checkout. Guest checkout files the order
+    # under whichever client owns the email, so the client's saved name and
+    # phone may belong to someone else's earlier order. Blank on orders
+    # placed before these fields existed; use the contact_* properties.
+    customer_first_name = models.CharField(max_length=100, blank=True, default='')
+    customer_last_name = models.CharField(max_length=100, blank=True, default='')
+    customer_email = models.EmailField(blank=True, default='')
+    customer_phone = models.CharField(max_length=30, blank=True, default='')
     delivery_address = models.ForeignKey(
         ClientAddress,
         on_delete=models.PROTECT,
@@ -949,7 +957,28 @@ class Order(models.Model):
         ]
 
     def __str__(self):
-        return f"Order {self.order_number} - {self.client.full_name}"
+        return f"Order {self.order_number} - {self.contact_name}"
+
+    @property
+    def contact_first_name(self):
+        if self.customer_first_name or self.customer_last_name:
+            return self.customer_first_name
+        return self.client.first_name if self.client_id else ''
+
+    @property
+    def contact_name(self):
+        name = f"{self.customer_first_name} {self.customer_last_name}".strip()
+        if name:
+            return name
+        return self.client.full_name if self.client_id else ''
+
+    @property
+    def contact_email(self):
+        return self.customer_email or (self.client.email if self.client_id else '')
+
+    @property
+    def contact_phone(self):
+        return self.customer_phone or ((self.client.phone_number or '') if self.client_id else '')
 
     @property
     def total_items(self):

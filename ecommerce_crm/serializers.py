@@ -817,8 +817,8 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
 class OrderListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for order lists - excludes nested items for faster list views"""
-    client_name = serializers.CharField(source='client.full_name', read_only=True)
-    client_email = serializers.CharField(source='client.email', read_only=True)
+    client_name = serializers.CharField(source='contact_name', read_only=True)
+    client_email = serializers.CharField(source='contact_email', read_only=True)
     total_items = serializers.SerializerMethodField()
 
     class Meta:
@@ -922,9 +922,9 @@ class OrderSerializer(serializers.ModelSerializer):
         """Return client basic info"""
         return {
             'id': obj.client.id,
-            'full_name': obj.client.full_name,
-            'email': obj.client.email,
-            'phone_number': obj.client.phone_number
+            'full_name': obj.contact_name,
+            'email': obj.contact_email,
+            'phone_number': obj.contact_phone,
         }
 
 
@@ -1328,6 +1328,10 @@ class OrderCreateSerializer(serializers.Serializer):
             order = Order.objects.create(
                 order_number=order_number,
                 client=cart.client,
+                customer_first_name=cart.client.first_name or '',
+                customer_last_name=cart.client.last_name or '',
+                customer_email=cart.client.email or '',
+                customer_phone=cart.client.phone_number or '',
                 delivery_address=delivery_address,
                 subtotal=subtotal,
                 discount_amount=discount_amount,
