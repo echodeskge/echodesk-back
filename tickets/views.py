@@ -512,6 +512,11 @@ class TicketViewSet(viewsets.ModelViewSet):
                 user=self.request.user
             )
 
+    def perform_update(self, serializer):
+        """Tag the instance with the acting user so history + broadcasts can attribute it."""
+        serializer.instance._current_user = self.request.user
+        serializer.save()
+
     def destroy(self, request, *args, **kwargs):
         """Delete a ticket with permission check based on tenant settings."""
         ticket = self.get_object()
@@ -533,7 +538,11 @@ class TicketViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_403_FORBIDDEN
                 )
 
-        return super().destroy(request, *args, **kwargs)
+        # Delete the instance we already fetched (super().destroy would re-fetch
+        # and lose the _current_user tag the post_delete broadcast reads).
+        ticket._current_user = request.user
+        self.perform_destroy(ticket)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['post'])
     def add_comment(self, request, pk=None):

@@ -516,6 +516,20 @@ class TicketBoardConsumer(AsyncWebsocketConsumer):
             'deleted_by_name': event.get('deleted_by_name')
         }))
 
+    async def ticket_commented(self, event):
+        """Broadcast a new comment (and the fresh comment count) to all users on the board"""
+        if event.get('exclude_channel') == self.channel_name:
+            return
+
+        await self.send(text_data=json.dumps({
+            'type': 'ticket_commented',
+            'ticket_id': event['ticket_id'],
+            'comment': event.get('comment'),
+            'comments_count': event.get('comments_count'),
+            'user_id': event.get('user_id'),
+            'user_name': event.get('user_name')
+        }))
+
     async def ticket_being_moved(self, event):
         """Notify users that someone is dragging a ticket"""
         if event.get('exclude_channel') == self.channel_name:
@@ -756,6 +770,37 @@ async def broadcast_ticket_deleted(tenant_schema, board_id, ticket_id, deleted_b
             'ticket_id': ticket_id,
             'deleted_by_id': deleted_by.id if deleted_by else None,
             'deleted_by_name': deleted_by.get_full_name() or deleted_by.email if deleted_by else 'System',
+            'exclude_channel': exclude_channel
+        }
+    )
+
+
+async def broadcast_ticket_commented(tenant_schema, board_id, ticket_id, comment, comments_count, user, exclude_channel=None):
+    """
+    Broadcast a new ticket comment to all users viewing the board.
+
+    Args:
+        tenant_schema: The tenant schema name
+        board_id: The board ID
+        ticket_id: The ticket that was commented on
+        comment: JSON-safe dict describing the comment (id, comment, created_at, user)
+        comments_count: Total comments on the ticket after this one
+        user: User who wrote the comment
+        exclude_channel: Optional channel name to exclude from broadcast
+    """
+    from channels.layers import get_channel_layer
+
+    channel_layer = get_channel_layer()
+
+    await channel_layer.group_send(
+        f'board_{tenant_schema}_{board_id}',
+        {
+            'type': 'ticket_commented',
+            'ticket_id': ticket_id,
+            'comment': comment,
+            'comments_count': comments_count,
+            'user_id': user.id if user else None,
+            'user_name': user.get_full_name() or user.email if user else 'System',
             'exclude_channel': exclude_channel
         }
     )

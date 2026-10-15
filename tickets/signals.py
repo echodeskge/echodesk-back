@@ -2,9 +2,10 @@
 Signals for automatic notification creation on ticket events.
 """
 from django.db.models import Q
-from django.db.models.signals import post_save, pre_save, m2m_changed
+from django.db.models.signals import post_save, post_delete, pre_save, m2m_changed
 from django.dispatch import receiver
 from django.contrib.auth import get_user_model
+from django.core.serializers.json import DjangoJSONEncoder
 from .models import (
     Ticket,
     TicketComment,
@@ -12,12 +13,48 @@ from .models import (
     TicketAttachment,
     TicketHistory,
 )
+import json
 import re
 from asgiref.sync import async_to_sync
 from django.db import connection
 from tenant_schemas.utils import schema_context
 
 User = get_user_model()
+
+
+def _tenant_schema():
+    """Schema name of the tenant the signal is firing in (board groups are per tenant)."""
+    return getattr(connection, 'schema_name', 'public')
+
+
+def _json_safe(data):
+    """
+    Round-trip through JSON so the payload only holds plain dicts/lists/str/
+    numbers: DRF's ReturnDict, Decimal and datetime objects are not channel-
+    layer (msgpack) safe.
+    """
+    return json.loads(json.dumps(data, cls=DjangoJSONEncoder))
+
+
+def _ticket_card_payload(ticket):
+    """Compact card for board broadcasts — same shape as kanban_board?lite=1."""
+    from .serializers import TicketCardSerializer
+    return _json_safe(TicketCardSerializer(ticket).data)
+
+
+def _comment_payload(comment):
+    """Minimal comment dict for the ticket_commented broadcast."""
+    user = comment.user
+    return _json_safe({
+        'id': comment.id,
+        'comment': comment.comment,
+        'created_at': comment.created_at,
+        'user': {
+            'id': user.id,
+            'name': user.get_full_name(),
+            'email': user.email,
+        } if user else None,
+    })
 
 
 def create_notification(user, notification_type, title, message, ticket_id=None, metadata=None, link_url=''):
@@ -257,6 +294,24 @@ def notify_on_ticket_comment(sender, instance, created, **kwargs):
             }
         )
 
+    # Broadcast the comment to everyone viewing the board so cards can bump
+    # their comment count / open threads can append it live
+    if ticket.column_id and ticket.column.board_id:
+        try:
+            from users.consumers import broadcast_ticket_commented
+
+            async_to_sync(broadcast_ticket_commented)(
+                tenant_schema=_tenant_schema(),
+                board_id=ticket.column.board_id,
+                ticket_id=ticket.id,
+                comment=_comment_payload(instance),
+                # Fresh DB count: the view's ticket may carry a stale `comments` prefetch
+                comments_count=TicketComment.objects.filter(ticket_id=ticket.id).count(),
+                user=commenter,
+            )
+        except Exception as e:
+            print(f"[Signals] Error broadcasting ticket comment: {str(e)}")
+
 
 @receiver(pre_save, sender=Ticket)
 def capture_ticket_prev_state(sender, instance, **kwargs):
@@ -478,6 +533,20 @@ def notify_on_ticket_status_change(sender, instance, created, **kwargs):
     """
     if created:
         _send_new_ticket_telegram_notification(instance)
+
+        # Broadcast the new card to everyone viewing the board
+        if instance.column_id and instance.column.board_id:
+            try:
+                from users.consumers import broadcast_ticket_created
+
+                async_to_sync(broadcast_ticket_created)(
+                    tenant_schema=_tenant_schema(),
+                    board_id=instance.column.board_id,
+                    ticket_data=_ticket_card_payload(instance),
+                    created_by=instance.created_by,
+                )
+            except Exception as e:
+                print(f"[Signals] Error broadcasting ticket creation: {str(e)}")
         return
 
     # Check if column was changed (set in pre_save)
@@ -536,7 +605,7 @@ def notify_on_ticket_status_change(sender, instance, created, **kwargs):
                     from_column_id=old_column_id,
                     to_column_id=instance.column_id,
                     position=instance.position_in_column,
-                    updated_by=None  # Could get from request context if available
+                    updated_by=getattr(instance, '_current_user', None),  # set by the view
                 )
                 print(f"[Signals] Broadcasted ticket {instance.id} movement to board {instance.column.board_id}")
             except Exception as e:
@@ -588,10 +657,35 @@ def notify_on_ticket_status_change(sender, instance, created, **kwargs):
                 board_id=instance.column.board_id,
                 ticket_id=instance.id,
                 changes=field_changes,
-                updated_by=None
+                updated_by=getattr(instance, '_current_user', None),  # set by the view
             )
             print(f"[Signals] Broadcasted ticket {instance.id} field updates to board {instance.column.board_id}")
         except Exception as e:
             print(f"[Signals] Error broadcasting ticket updates: {str(e)}")
+
+
+@receiver(post_delete, sender=Ticket)
+def broadcast_on_ticket_delete(sender, instance, **kwargs):
+    """
+    Tell everyone viewing the board that a ticket is gone. Uses column_id
+    (still set on the deleted instance) and never raises: a board/column
+    cascade delete also fires this and the parent rows may be mid-removal.
+    """
+    if not instance.column_id:
+        return
+    try:
+        from users.consumers import broadcast_ticket_deleted
+
+        board_id = instance.column.board_id
+        if not board_id:
+            return
+        async_to_sync(broadcast_ticket_deleted)(
+            tenant_schema=_tenant_schema(),
+            board_id=board_id,
+            ticket_id=instance.id,
+            deleted_by=getattr(instance, '_current_user', None),  # set by the view
+        )
+    except Exception as e:
+        print(f"[Signals] Error broadcasting ticket deletion: {str(e)}")
 
 
