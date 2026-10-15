@@ -8,7 +8,7 @@ import django.db.models.deletion
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('users', '0020_booking_notification_types'),
+        ('users', '0021_authdevicetoken'),
     ]
 
     operations = [
