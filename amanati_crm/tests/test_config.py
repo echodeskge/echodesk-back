@@ -169,8 +169,12 @@ class TestRestFrameworkConfig(SimpleTestCase):
         self.assertIn('rest_framework.filters.OrderingFilter', backends)
 
     def test_schema_class_is_spectacular(self):
+        from django.utils.module_loading import import_string
+        from drf_spectacular.openapi import AutoSchema
+
         schema = settings.REST_FRAMEWORK.get('DEFAULT_SCHEMA_CLASS', '')
-        self.assertEqual(schema, 'drf_spectacular.openapi.AutoSchema')
+        self.assertEqual(schema, 'amanati_crm.schema.EchoDeskAutoSchema')
+        self.assertTrue(issubclass(import_string(schema), AutoSchema))
 
     def test_pagination_configured(self):
         pagination = settings.REST_FRAMEWORK.get('DEFAULT_PAGINATION_CLASS', '')

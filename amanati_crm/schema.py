@@ -3,6 +3,7 @@ Custom OpenAPI schema preprocessing for feature-based endpoint filtering
 """
 from drf_spectacular.generators import SchemaGenerator
 from drf_spectacular.openapi import AutoSchema
+from drf_spectacular.plumbing import build_basic_type
 from django.urls import resolve
 
 
@@ -128,7 +129,34 @@ def feature_based_preprocessing_hook(endpoints):
     return filtered_endpoints
 
 
-class FeatureAwareAutoSchema(AutoSchema):
+class EchoDeskAutoSchema(AutoSchema):
+    """
+    The project's default AutoSchema (REST_FRAMEWORK['DEFAULT_SCHEMA_CLASS']).
+
+    Behaves exactly like drf-spectacular's AutoSchema apart from the opt-in
+    path-parameter typing below.
+    """
+
+    def _resolve_path_parameters(self, variables):
+        """
+        Honour a view's ``schema_path_param_types`` mapping.
+
+        Views whose ``get_queryset`` used to be opaque to schema generation had
+        their ``{id}`` path parameters documented as strings, and the dashboard's
+        generated client was built against that. A view that later exposes its
+        model (e.g. to document its filterset) can pin the old type with::
+
+            schema_path_param_types = {'id': OpenApiTypes.STR}
+        """
+        parameters = super()._resolve_path_parameters(variables)
+        pinned = getattr(self.view, 'schema_path_param_types', None) or {}
+        for parameter in parameters:
+            if parameter['name'] in pinned:
+                parameter['schema'] = build_basic_type(pinned[parameter['name']])
+        return parameters
+
+
+class FeatureAwareAutoSchema(EchoDeskAutoSchema):
     """
     Custom AutoSchema that respects feature requirements
 

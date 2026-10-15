@@ -31,6 +31,19 @@ class TestTicketOpenApiContract(TicketTestCase):
         self.assertEqual(content['$ref'], '#/components/schemas/Board')
         self.assertIn('lite', [p['name'] for p in op['parameters']])
 
+    def test_id_path_parameters_stay_strings(self):
+        """The web client calls e.g. ticketsRetrieve(id: string); keep that type."""
+        paths = self.schema()['paths']
+        for path in (
+            '/api/tickets/{id}/',
+            '/api/tickets/{id}/move_to_column/',
+            '/api/boards/{id}/',
+            '/api/boards/{id}/kanban_board/',
+        ):
+            for method, op in paths[path].items():
+                id_param = next(p for p in op['parameters'] if p['in'] == 'path' and p['name'] == 'id')
+                self.assertEqual(id_param['schema']['type'], 'string', f'{method.upper()} {path}')
+
     def test_ticket_list_exposes_board_filter(self):
         op = self.schema()['paths']['/api/tickets/']['get']
         names = {p['name'] for p in op['parameters']}

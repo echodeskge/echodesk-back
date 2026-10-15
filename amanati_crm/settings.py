@@ -294,7 +294,7 @@ REST_FRAMEWORK = {
         'rest_framework.filters.SearchFilter',
         'rest_framework.filters.OrderingFilter',
     ],
-    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+    'DEFAULT_SCHEMA_CLASS': 'amanati_crm.schema.EchoDeskAutoSchema',
     'DEFAULT_PAGINATION_CLASS': 'ecommerce_crm.pagination.DynamicPageSizePagination',
     'DEFAULT_THROTTLE_CLASSES': [
         'rest_framework.throttling.ScopedRateThrottle',

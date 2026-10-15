@@ -409,6 +409,9 @@ class TicketViewSet(viewsets.ModelViewSet):
     search_fields = ['title', 'description']
     ordering_fields = ['created_at', 'updated_at', 'priority']
     ordering = ['-created_at']
+    # The dashboard's generated client passes `{id}` as a string; keep the
+    # documented type now that get_queryset is visible to schema generation.
+    schema_path_param_types = {'id': OpenApiTypes.STR}
 
     def get_serializer_class(self):
         """Use list serializer for list action."""
@@ -1235,7 +1238,9 @@ class BoardViewSet(viewsets.ModelViewSet):
     """ViewSet for managing kanban boards."""
     serializer_class = BoardSerializer
     permission_classes = [BoardPermission]
-    
+    # Same as TicketViewSet: the generated web client sends `{id}` as a string.
+    schema_path_param_types = {'id': OpenApiTypes.STR}
+
     def get_queryset(self):
         """Return boards the user can access based on direct attachment or group membership."""
         if getattr(self, 'swagger_fake_view', False):
