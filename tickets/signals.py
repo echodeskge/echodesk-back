@@ -40,14 +40,22 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
     )
 
 
+# "@john.doe@example.com" (full e-mail, tried first so the inner "@" is not
+# treated as a second mention) or "@john" / "@john.doe" (name-ish token).
+MENTION_RE = re.compile(r'@([\w.+-]+@[\w-]+(?:\.[\w-]+)+|[\w.-]+)')
+
+
 def extract_mentions(text):
     """
     Extract @mentions from text.
-    Returns list of usernames mentioned.
+    Returns the list of mentioned e-mails / name tokens, in order of appearance.
+    A trailing '.' (end of sentence) is not part of the mention.
     """
-    # Match @username patterns (alphanumeric, dots, underscores, hyphens)
-    pattern = r'@([\w\.\-]+)'
-    mentions = re.findall(pattern, text)
+    mentions = []
+    for mention in MENTION_RE.findall(text or ''):
+        mention = mention.rstrip('.')
+        if mention:
+            mentions.append(mention)
     return mentions
 
 

@@ -197,3 +197,60 @@ class TestRecordTicketHistory(TicketTestCase):
 
         histories = TicketHistory.objects.filter(ticket=ticket)
         self.assertEqual(histories.count(), 0)
+
+
+class TestMentions(TicketTestCase):
+    """extract_mentions / get_users_from_mentions — e-mail and name mentions."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='mention-admin@test.com')
+        self.board, self.col_todo, _, _ = self.setup_board_with_columns(admin=self.admin)
+        self.john = self.create_user(email='john.doe@example.com', first_name='John', last_name='Doe')
+        self.anna = self.create_user(email='anna-k@sub.example.co.uk', first_name='Anna', last_name='K')
+
+    def test_extract_email_mention(self):
+        from tickets.signals import extract_mentions
+        self.assertEqual(extract_mentions('hey @john.doe@example.com look'), ['john.doe@example.com'])
+
+    def test_extract_email_mention_strips_trailing_dot(self):
+        from tickets.signals import extract_mentions
+        self.assertEqual(extract_mentions('cc @john.doe@example.com.'), ['john.doe@example.com'])
+        self.assertEqual(extract_mentions('thanks @john.'), ['john'])
+
+    def test_extract_name_mention_still_works(self):
+        from tickets.signals import extract_mentions
+        self.assertEqual(extract_mentions('ping @John and @anna-k'), ['John', 'anna-k'])
+
+    def test_extract_two_emails(self):
+        from tickets.signals import extract_mentions
+        text = '@john.doe@example.com, @anna-k@sub.example.co.uk please review'
+        self.assertEqual(extract_mentions(text), ['john.doe@example.com', 'anna-k@sub.example.co.uk'])
+
+    def test_email_mention_resolves_user_by_email(self):
+        from tickets.signals import extract_mentions, get_users_from_mentions
+        users = get_users_from_mentions(extract_mentions('see @JOHN.DOE@example.com'))
+        self.assertEqual([u.id for u in users], [self.john.id])
+
+    def test_name_mention_resolves_user(self):
+        from tickets.signals import extract_mentions, get_users_from_mentions
+        users = get_users_from_mentions(extract_mentions('see @Doe'))
+        self.assertEqual([u.id for u in users], [self.john.id])
+
+    def test_two_email_mentions_resolve_both_users(self):
+        from tickets.signals import extract_mentions, get_users_from_mentions
+        users = get_users_from_mentions(
+            extract_mentions('@john.doe@example.com and @anna-k@sub.example.co.uk')
+        )
+        self.assertEqual({u.id for u in users}, {self.john.id, self.anna.id})
+
+    @_ws_patch
+    @_notif_patch
+    @_incr_patch
+    def test_comment_with_email_mention_notifies_user(self, *mocks):
+        from users.models import Notification
+        ticket = self.create_ticket(title='M', column=self.col_todo, created_by=self.admin)
+        self.create_comment(ticket, self.admin, 'FYI @john.doe@example.com.')
+        self.assertTrue(
+            Notification.objects.filter(user=self.john, notification_type='ticket_mentioned').exists()
+        )
