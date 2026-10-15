@@ -1,3 +1,5 @@
+import secrets
+
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin, Group, Permission
 from django.db import models
 from django.utils import timezone
@@ -779,3 +781,60 @@ class HiddenTeamChatConversation(models.Model):
 
     def __str__(self):
         return f"{self.user.email} hid conversation {self.conversation.id}"
+
+
+class AuthDeviceToken(models.Model):
+    """
+    Per-device API token for the mobile apps.
+
+    The web dashboard keeps using DRF's single shared ``Token`` per user; the
+    mobile apps get one of these per installed device instead, so logging out
+    of (or losing) a phone invalidates only that phone.  The key is sent in the
+    same ``Authorization: Token <key>`` header — ``users.authentication.
+    MultiTokenAuthentication`` tries the shared token first, then this table.
+    """
+    PLATFORM_CHOICES = [
+        ('web', 'Web'),
+        ('ios', 'iOS'),
+        ('android', 'Android'),
+    ]
+
+    key = models.CharField(max_length=40, primary_key=True)
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='device_tokens',
+    )
+    platform = models.CharField(max_length=10, choices=PLATFORM_CHOICES)
+    device_id = models.CharField(
+        max_length=255, blank=True, db_index=True,
+        help_text="Client-generated installation id; re-logging in from the same device replaces its token"
+    )
+    device_name = models.CharField(max_length=150, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = 'Device Auth Token'
+        verbose_name_plural = 'Device Auth Tokens'
+
+    def __str__(self):
+        return f"{self.user.email} / {self.platform} {self.device_name or self.device_id}".rstrip()
+
+    @property
+    def is_expired(self):
+        return self.expires_at is not None and self.expires_at <= timezone.now()
+
+    @classmethod
+    def issue(cls, user, platform, device_id='', device_name=''):
+        """Create a fresh token for this user+device, revoking the previous one for the same device."""
+        if device_id:
+            cls.objects.filter(user=user, device_id=device_id).delete()
+        return cls.objects.create(
+            key=secrets.token_hex(20),
+            user=user,
+            platform=platform,
+            device_id=device_id,
+            device_name=device_name,
+        )

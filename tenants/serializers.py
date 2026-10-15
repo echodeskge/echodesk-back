@@ -190,8 +190,15 @@ class TenantLoginSerializer(serializers.Serializer):
     """
     Serializer for tenant-specific login
     """
+    PLATFORM_CHOICES = ['web', 'ios', 'android']
+
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True)
+    # Optional device info — mobile apps send platform=ios|android (plus a
+    # stable device_id) to get a per-device token instead of the shared one.
+    platform = serializers.ChoiceField(choices=PLATFORM_CHOICES, required=False, default='web')
+    device_id = serializers.CharField(max_length=255, required=False, allow_blank=True, default='')
+    device_name = serializers.CharField(max_length=150, required=False, allow_blank=True, default='')
     
     def validate(self, attrs):
         email = attrs.get('email')

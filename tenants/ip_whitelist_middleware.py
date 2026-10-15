@@ -6,6 +6,7 @@ import logging
 from django.http import JsonResponse
 from tenant_schemas.utils import get_public_schema_name
 from rest_framework.authtoken.models import Token
+from users.models import AuthDeviceToken
 from .security_service import SecurityService
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,16 @@ class IPWhitelistMiddleware:
             token = Token.objects.select_related('user').get(key=token_key)
             return token.user.is_superuser
         except Token.DoesNotExist:
+            pass
+        except Exception as e:
+            logger.error(f"Error checking token for superuser: {e}")
+            return False
+
+        # Same header may carry a per-device mobile token
+        try:
+            device_token = AuthDeviceToken.objects.select_related('user').get(key=token_key)
+            return device_token.user.is_superuser and not device_token.is_expired
+        except AuthDeviceToken.DoesNotExist:
             return False
         except Exception as e:
             logger.error(f"Error checking token for superuser: {e}")

@@ -153,8 +153,9 @@ class TestRestFrameworkConfig(SimpleTestCase):
 
     def test_token_authentication_configured(self):
         auth_classes = settings.REST_FRAMEWORK.get('DEFAULT_AUTHENTICATION_CLASSES', [])
+        # Subclass of DRF's TokenAuthentication that also accepts per-device tokens.
         self.assertIn(
-            'rest_framework.authentication.TokenAuthentication',
+            'users.authentication.MultiTokenAuthentication',
             auth_classes,
         )
 
