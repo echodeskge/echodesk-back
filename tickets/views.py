@@ -2,6 +2,7 @@ from rest_framework import viewsets, permissions, filters, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
+import django_filters
 from django.db.models import Q, F, Count, Prefetch, Exists, OuterRef, Subquery, IntegerField
 from django.db import transaction
 from django.utils import timezone
@@ -382,6 +383,20 @@ class TicketPermission(permissions.BasePermission):
         return False
 
 
+class TicketFilter(django_filters.FilterSet):
+    """
+    Query-param filters for the ticket list. ``board`` filters through the
+    column so a client can list every ticket on one board without first
+    resolving its column ids; the remaining fields are the pre-existing
+    exact-match filters.
+    """
+    board = django_filters.NumberFilter(field_name='column__board_id')
+
+    class Meta:
+        model = Ticket
+        fields = ['priority', 'assigned_to', 'created_by', 'tags', 'column', 'assigned_groups']
+
+
 class TicketViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing tickets with filtering and permissions.
@@ -389,7 +404,7 @@ class TicketViewSet(viewsets.ModelViewSet):
     serializer_class = TicketSerializer
     permission_classes = [TicketPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['priority', 'assigned_to', 'created_by', 'tags', 'column', 'assigned_groups']
+    filterset_class = TicketFilter
     search_fields = ['title', 'description']
     ordering_fields = ['created_at', 'updated_at', 'priority']
     ordering = ['-created_at']

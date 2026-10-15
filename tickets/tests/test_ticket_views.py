@@ -252,6 +252,35 @@ class TestTicketQueryset(TicketTestCase):
         resp = self.api_get('/api/tickets/', user=user)
         self.assertGreaterEqual(len(self.get_results(resp)), 1)
 
+    def test_filter_by_board(self):
+        admin = self.create_admin()
+        board_a, col_a, col_a2, _ = self.setup_board_with_columns(admin=admin)
+        board_b = self.create_board(name='Other Board', created_by=admin)
+        col_b = self.create_column(board_b, name='Inbox', position=0, created_by=admin)
+        t_a1 = self.create_ticket(title='A1', column=col_a, created_by=admin)
+        t_a2 = self.create_ticket(title='A2', column=col_a2, created_by=admin)
+        t_b = self.create_ticket(title='B', column=col_b, created_by=admin)
+
+        resp = self.api_get(f'/api/tickets/?board={board_a.id}', user=admin)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual({t['id'] for t in self.get_results(resp)}, {t_a1.id, t_a2.id})
+
+        resp = self.api_get(f'/api/tickets/?board={board_b.id}', user=admin)
+        self.assertEqual([t['id'] for t in self.get_results(resp)], [t_b.id])
+
+    def test_existing_column_and_priority_filters_still_work(self):
+        admin = self.create_admin()
+        board, col1, col2, _ = self.setup_board_with_columns(admin=admin)
+        t_high = self.create_ticket(title='High', column=col1, created_by=admin, priority='high')
+        self.create_ticket(title='Low', column=col1, created_by=admin, priority='low')
+        t_col2 = self.create_ticket(title='Col2', column=col2, created_by=admin, priority='high')
+
+        resp = self.api_get(f'/api/tickets/?column={col1.id}&priority=high', user=admin)
+        self.assertEqual([t['id'] for t in self.get_results(resp)], [t_high.id])
+
+        resp = self.api_get(f'/api/tickets/?board={board.id}&priority=high', user=admin)
+        self.assertEqual({t['id'] for t in self.get_results(resp)}, {t_high.id, t_col2.id})
+
 
 class TestTicketActions(TicketTestCase):
 
