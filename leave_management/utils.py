@@ -8,6 +8,86 @@ from django.utils import timezone
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# TEAM SCOPING
+# ============================================================================
+# Who counts as "my team" for the manager endpoints, in one place so the
+# permissions, the querysets and the approval check cannot drift apart:
+#   - staff / superusers see everyone;
+#   - a user sees their direct reports (``User.manager``);
+#   - a user with role 'manager' and a department also sees that department;
+#   - nobody manages themselves.
+
+def _is_elevated(user):
+    """Staff and superusers bypass team scoping entirely."""
+    return bool(user.is_staff or user.is_superuser)
+
+
+def _manages_department(user):
+    """True when the user's role entitles them to their whole department."""
+    return user.role == 'manager' and user.department_id is not None
+
+
+def is_leave_manager(user):
+    """
+    Can this user open the manager side of leave management at all?
+
+    True for staff/superusers, the 'manager' role, anyone with at least one
+    active direct report, and the legacy ``view_team_leaves`` permission.
+    """
+    if not user or not user.is_authenticated:
+        return False
+    if _is_elevated(user) or user.role == 'manager':
+        return True
+    if user.managed_employees.filter(is_active=True).exists():
+        return True
+    return user.has_perm('leave_management.view_team_leaves')
+
+
+def team_q(user, prefix='employee'):
+    """
+    Q object restricting a queryset to the user's team.
+
+    ``prefix`` names the FK to the employee on the model being filtered:
+    ``employee`` for LeaveRequest, ``user`` for LeaveBalance.
+    """
+    if _is_elevated(user):
+        return Q()
+
+    q = Q(**{f'{prefix}__manager': user})
+    if _manages_department(user):
+        q |= Q(**{f'{prefix}__department_id': user.department_id})
+    return q & ~Q(**{prefix: user})
+
+
+def manages_employee(user, employee):
+    """Object-level counterpart of team_q: does ``user`` manage ``employee``?"""
+    if _is_elevated(user):
+        return True
+    if employee is None or employee.pk == user.pk:
+        return False
+    if employee.manager_id == user.pk:
+        return True
+    if _manages_department(user) and employee.department_id == user.department_id:
+        return True
+    return False
+
+
+def filter_by_status_in(queryset, raw):
+    """
+    Apply a ``?status__in=pending,approved`` query parameter.
+
+    ``raw`` is the parameter's string value (or None); blank entries are
+    ignored, and an empty list leaves the queryset untouched.
+    """
+    if not raw:
+        return queryset
+    statuses = [s.strip() for s in raw.split(',') if s.strip()]
+    if not statuses:
+        return queryset
+    return queryset.filter(status__in=statuses)
+
+
 def calculate_working_days(start_date, end_date, tenant, exclude_public_holidays=True):
     """
     Calculate working days between start_date and end_date (inclusive)
@@ -418,16 +498,12 @@ def can_user_approve(user, leave_request):
     if not next_role:
         return False, "Leave request is already fully approved or does not require further approval"
 
-    # Check if user has the required role
-    # This would need to be implemented based on your user role system
-    # For now, we'll check basic permissions
-
     if next_role == 'manager':
-        # Check if user is employee's manager
-        if hasattr(leave_request.employee, 'manager') and leave_request.employee.manager == user:
+        # The employee's direct manager (or department manager, or staff)
+        if manages_employee(user, leave_request.employee):
             return True, ""
-        # Or has manager permissions
-        if user.is_staff or user.has_perm('leave_management.approve_leave'):
+        # Or has an explicit approval permission
+        if user.has_perm('leave_management.approve_leave'):
             return True, ""
         return False, "You are not the employee's manager"
 

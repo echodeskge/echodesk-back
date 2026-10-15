@@ -39,41 +39,25 @@ class IsLeaveEmployee(permissions.BasePermission):
 
 class IsLeaveManager(permissions.BasePermission):
     """
-    Permission check: User is a manager (has direct reports)
+    Permission check: User is a manager (staff, 'manager' role, has direct
+    reports, or the view_team_leaves permission)
     Object-level: Can access team members' leave requests
     """
     message = "You do not have manager permissions."
 
     def has_permission(self, request, view):
+        from .utils import is_leave_manager
+
         if not request.user or not request.user.is_authenticated:
             return False
 
-        # Admins and staff always have access
-        if request.user.is_staff or request.user.is_superuser:
-            return True
-
-        # Check if user has managed employees
-        # This assumes User model has a 'managed_employees' related field
-        # Adjust based on your actual user-manager relationship
-        if hasattr(request.user, 'managed_employees'):
-            return request.user.managed_employees.exists()
-
-        # Check if user has manager permission
-        if request.user.has_perm('leave_management.view_team_leaves'):
-            return True
-
-        return False
+        return is_leave_manager(request.user)
 
     def has_object_permission(self, request, view, obj):
-        # Admins and staff have full access
-        if request.user.is_staff or request.user.is_superuser:
-            return True
+        from .utils import manages_employee
 
-        # Check if the employee reports to this manager
-        if hasattr(obj.employee, 'manager'):
-            return obj.employee.manager == request.user
-
-        return False
+        # Staff pass through; otherwise the employee must be on the user's team
+        return manages_employee(request.user, obj.employee)
 
 
 class CanApproveLeave(permissions.BasePermission):
@@ -154,19 +138,14 @@ class CanViewTeamBalance(permissions.BasePermission):
     message = "You can only view your team members' balances."
 
     def has_object_permission(self, request, view, obj):
-        # Admins and staff have full access
-        if request.user.is_staff or request.user.is_superuser:
-            return True
+        from .utils import manages_employee
 
         # Employees can view their own balance
         if obj.user == request.user:
             return True
 
-        # Managers can view their team's balances
-        if hasattr(obj.user, 'manager'):
-            return obj.user.manager == request.user
-
-        return False
+        # Staff and managers can view their team's balances
+        return manages_employee(request.user, obj.user)
 
 
 class CanManagePublicHolidays(permissions.BasePermission):
@@ -190,6 +169,8 @@ class CanCancelLeave(permissions.BasePermission):
     message = "You cannot cancel this leave request."
 
     def has_object_permission(self, request, view, obj):
+        from .utils import manages_employee
+
         # Admins can cancel any leave
         if request.user.is_staff or request.user.is_superuser:
             return True
@@ -199,9 +180,8 @@ class CanCancelLeave(permissions.BasePermission):
             return True
 
         # Managers can cancel their team's pending leaves
-        if hasattr(obj.employee, 'manager') and obj.employee.manager == request.user:
-            if obj.status in ['pending', 'manager_approved']:
-                return True
+        if obj.status in ['pending', 'manager_approved']:
+            return manages_employee(request.user, obj.employee)
 
         return False
 
@@ -213,16 +193,11 @@ class IsLeaveOwnerOrManager(permissions.BasePermission):
     message = "You can only access your own leaves or your team members' leaves."
 
     def has_object_permission(self, request, view, obj):
-        # Admins and staff have full access
-        if request.user.is_staff or request.user.is_superuser:
-            return True
+        from .utils import manages_employee
 
         # Owner has access
         if obj.employee == request.user:
             return True
 
-        # Manager has access to team member's leave
-        if hasattr(obj.employee, 'manager'):
-            return obj.employee.manager == request.user
-
-        return False
+        # Staff and the employee's manager have access
+        return manages_employee(request.user, obj.employee)

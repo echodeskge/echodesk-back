@@ -125,7 +125,7 @@ class UserViewSet(viewsets.ModelViewSet):
         return UserSerializer
     
     def get_queryset(self):
-        queryset = User.objects.select_related('department', 'booking_staff').prefetch_related('tenant_groups', 'tenant_groups__features').all()
+        queryset = User.objects.select_related('department', 'manager', 'booking_staff').prefetch_related('tenant_groups', 'tenant_groups__features').all()
 
         # Filter by role if specified
         role = self.request.query_params.get('role', None)

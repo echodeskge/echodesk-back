@@ -109,12 +109,17 @@ try:
         from users.notification_utils import create_notification
 
         if created:
-            # Notify managers / HR — use users with is_staff as a proxy
-            managers = User.objects.filter(is_active=True, is_staff=True)[:10]
+            # Notify the employee's direct manager when one is assigned and
+            # active; otherwise fall back to staff users as a proxy for HR.
+            manager = instance.employee.manager
+            if manager and manager.is_active and manager.id != instance.employee_id:
+                managers = [manager]
+            else:
+                managers = User.objects.filter(
+                    is_active=True, is_staff=True
+                ).exclude(id=instance.employee_id)[:10]
             employee_name = instance.employee.get_full_name() or instance.employee.email
             for manager in managers:
-                if manager.id == instance.employee_id:
-                    continue  # Don't notify the requester
                 create_notification(
                     user=manager,
                     notification_type='leave_request_submitted',
@@ -127,7 +132,7 @@ try:
                         'start_date': str(instance.start_date),
                         'end_date': str(instance.end_date),
                     },
-                    link_url=f'/leave/requests/{instance.id}',
+                    link_url=f'/leave/team-requests?id={instance.id}',
                 )
             return
 
@@ -144,7 +149,7 @@ try:
                     'leave_request_id': instance.id,
                     'status': instance.status,
                 },
-                link_url=f'/leave/requests/{instance.id}',
+                link_url=f'/leave/my-requests?id={instance.id}',
             )
 
         # Rejected
@@ -158,7 +163,7 @@ try:
                     'leave_request_id': instance.id,
                     'rejection_reason': instance.rejection_reason or '',
                 },
-                link_url=f'/leave/requests/{instance.id}',
+                link_url=f'/leave/my-requests?id={instance.id}',
             )
 
 except ImportError:

@@ -240,6 +240,10 @@ def tenant_dashboard(request):
                     'last_name': {'type': 'string'},
                     'is_staff': {'type': 'boolean'},
                     'is_superuser': {'type': 'boolean'},
+                    'is_leave_manager': {
+                        'type': 'boolean',
+                        'description': 'True when the user can open the leave management manager views (staff, manager role, or has direct reports)'
+                    },
                     'date_joined': {'type': 'string', 'format': 'date-time'},
                     'last_login': {'type': 'string', 'format': 'date-time'},
                     'is_active': {'type': 'boolean'},
@@ -349,6 +353,9 @@ def tenant_profile(request):
     except Exception:
         pass
 
+    # Whether to show the leave "team" views (mobile reads this on login)
+    from leave_management.utils import is_leave_manager
+
     return Response({
         'id': user.id,
         'email': user.email,
@@ -356,6 +363,7 @@ def tenant_profile(request):
         'last_name': user.last_name,
         'is_staff': user.is_staff,
         'is_superuser': user.is_superuser,
+        'is_leave_manager': is_leave_manager(user),
         'date_joined': user.date_joined,
         'last_login': user.last_login,
         'is_active': user.is_active,

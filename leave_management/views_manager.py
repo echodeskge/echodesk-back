@@ -4,7 +4,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import extend_schema, OpenApiParameter
 
 from .models import LeaveRequest, LeaveBalance
 from .serializers import (
@@ -16,7 +16,27 @@ from .permissions import (
     HasLeaveManagementFeature, IsLeaveManager, CanApproveLeave,
     CanViewTeamBalance
 )
-from .utils import update_leave_balance, get_next_approver_role
+from .utils import (
+    update_leave_balance, get_next_approver_role,
+    team_q, filter_by_status_in
+)
+
+
+STATUS_IN_PARAM = OpenApiParameter(
+    name='status__in', type=str, location=OpenApiParameter.QUERY,
+    description='Comma-separated list of statuses to include, e.g. '
+                '`pending,manager_approved`. Use `status` for a single value.'
+)
+START_DATE_PARAM = OpenApiParameter(
+    name='start_date', type=str, location=OpenApiParameter.QUERY,
+    description='Window start (YYYY-MM-DD). Returns requests that overlap the '
+                'window, i.e. whose end_date is on or after this day.'
+)
+END_DATE_PARAM = OpenApiParameter(
+    name='end_date', type=str, location=OpenApiParameter.QUERY,
+    description='Window end (YYYY-MM-DD). Returns requests that overlap the '
+                'window, i.e. whose start_date is on or before this day.'
+)
 
 
 # ============================================================================
@@ -41,29 +61,30 @@ class ManagerLeaveRequestViewSet(viewsets.ReadOnlyModelViewSet):
         """Get leave requests for team members"""
         user = self.request.user
 
-        # If staff/superuser, show all
-        if user.is_staff or user.is_superuser:
-            queryset = LeaveRequest.objects.filter(tenant=self.request.tenant)
-        else:
-            # Show only requests from direct reports
-            # This assumes employee.manager field exists
-            queryset = LeaveRequest.objects.filter(
-                tenant=self.request.tenant,
-                employee__manager=user
-            )
+        # Staff see everyone; others see their direct reports / department
+        queryset = LeaveRequest.objects.filter(
+            tenant=self.request.tenant
+        ).filter(team_q(user))
 
         queryset = queryset.select_related(
             'employee', 'leave_type', 'manager_approver', 'hr_approver', 'rejected_by'
         )
 
-        # Filter by date range
+        # Filter by date window: a request is included when it overlaps the
+        # window, so a leave straddling the window's edge still shows up
+        # (the team calendar asks month by month).
         start_date = self.request.query_params.get('start_date')
         end_date = self.request.query_params.get('end_date')
 
         if start_date:
-            queryset = queryset.filter(start_date__gte=start_date)
+            queryset = queryset.filter(end_date__gte=start_date)
         if end_date:
-            queryset = queryset.filter(end_date__lte=end_date)
+            queryset = queryset.filter(start_date__lte=end_date)
+
+        # Multi-status filter (?status__in=pending,manager_approved)
+        queryset = filter_by_status_in(
+            queryset, self.request.query_params.get('status__in')
+        )
 
         # By default, show pending requests first
         if not self.request.query_params.get('ordering'):
@@ -178,7 +199,11 @@ class ManagerLeaveRequestViewSet(viewsets.ReadOnlyModelViewSet):
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
-    @extend_schema(tags=['Leave Management - Manager'], summary='List team leave requests')
+    @extend_schema(
+        tags=['Leave Management - Manager'],
+        summary='List team leave requests',
+        parameters=[STATUS_IN_PARAM, START_DATE_PARAM, END_DATE_PARAM],
+    )
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
 
@@ -201,15 +226,11 @@ class ManagerTeamBalanceViewSet(viewsets.ReadOnlyModelViewSet):
         """Get leave balances for team members"""
         user = self.request.user
 
-        # If staff/superuser, show all
-        if user.is_staff or user.is_superuser:
-            queryset = LeaveBalance.objects.filter(tenant=self.request.tenant)
-        else:
-            # Show only balances for direct reports
-            queryset = LeaveBalance.objects.filter(
-                tenant=self.request.tenant,
-                user__manager=user
-            )
+        # Staff see everyone; others see their direct reports / department.
+        # LeaveBalance points at the employee through ``user``.
+        queryset = LeaveBalance.objects.filter(
+            tenant=self.request.tenant
+        ).filter(team_q(user, prefix='user'))
 
         return queryset.select_related('user', 'leave_type')
 

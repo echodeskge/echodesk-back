@@ -151,6 +151,96 @@ class TestLeaveSignals(EchoDeskTenantTestCase):
             user=self.admin,
         )
         self.assertTrue(notifs.exists())
+        self.assertEqual(notifs.first().link_url, f'/leave/team-requests?id={lr.id}')
+
+    def _make_leave_type(self, code):
+        from leave_management.models import LeaveType
+        return LeaveType.objects.create(
+            tenant=self.tenant,
+            code=code,
+            name={'en': 'Vacation'},
+            is_paid=True,
+            requires_approval=True,
+            calculation_method='annual',
+            default_days_per_year=Decimal('20'),
+            accrual_rate_per_month=Decimal('0'),
+            color='#3B82F6',
+            is_active=True,
+            sort_order=0,
+            created_by=self.admin,
+            updated_by=self.admin,
+        )
+
+    @_ws_patch
+    @_push_patch
+    def test_leave_request_created_notifies_only_direct_manager(self, mock_incr, mock_async):
+        from leave_management.models import LeaveRequest
+
+        manager = self.create_user(email='leave-sig-mgr@test.com', role='agent')
+        self.employee.manager = manager
+        self.employee.save()
+        lt = self._make_leave_type('VSIG4')
+
+        lr = LeaveRequest.objects.create(
+            tenant=self.tenant,
+            employee=self.employee,
+            leave_type=lt,
+            start_date=date.today() + timedelta(days=7),
+            end_date=date.today() + timedelta(days=9),
+            total_days=Decimal('3'),
+            status='pending',
+        )
+
+        notifs = Notification.objects.filter(notification_type='leave_request_submitted')
+        self.assertEqual(list(notifs.values_list('user_id', flat=True)), [manager.id])
+        self.assertEqual(notifs.first().link_url, f'/leave/team-requests?id={lr.id}')
+
+    @_ws_patch
+    @_push_patch
+    def test_leave_request_created_inactive_manager_falls_back_to_staff(self, mock_incr, mock_async):
+        from leave_management.models import LeaveRequest
+
+        manager = self.create_user(
+            email='leave-sig-mgr-gone@test.com', role='agent', is_active=False
+        )
+        self.employee.manager = manager
+        self.employee.save()
+        lt = self._make_leave_type('VSIG5')
+
+        LeaveRequest.objects.create(
+            tenant=self.tenant,
+            employee=self.employee,
+            leave_type=lt,
+            start_date=date.today() + timedelta(days=7),
+            end_date=date.today() + timedelta(days=9),
+            total_days=Decimal('3'),
+            status='pending',
+        )
+
+        notifs = Notification.objects.filter(notification_type='leave_request_submitted')
+        recipients = set(notifs.values_list('user_id', flat=True))
+        self.assertIn(self.admin.id, recipients)
+        self.assertNotIn(manager.id, recipients)
+
+    @_ws_patch
+    @_push_patch
+    def test_staff_requester_is_not_notified_about_own_request(self, mock_incr, mock_async):
+        from leave_management.models import LeaveRequest
+
+        lt = self._make_leave_type('VSIG6')
+        LeaveRequest.objects.create(
+            tenant=self.tenant,
+            employee=self.admin,
+            leave_type=lt,
+            start_date=date.today() + timedelta(days=7),
+            end_date=date.today() + timedelta(days=9),
+            total_days=Decimal('3'),
+            status='pending',
+        )
+        notifs = Notification.objects.filter(
+            notification_type='leave_request_submitted', user=self.admin
+        )
+        self.assertFalse(notifs.exists())
 
     @_ws_patch
     @_push_patch
@@ -192,6 +282,7 @@ class TestLeaveSignals(EchoDeskTenantTestCase):
             user=self.employee,
         )
         self.assertTrue(notifs.exists())
+        self.assertEqual(notifs.first().link_url, f'/leave/my-requests?id={lr.id}')
 
     @_ws_patch
     @_push_patch
@@ -234,6 +325,7 @@ class TestLeaveSignals(EchoDeskTenantTestCase):
             user=self.employee,
         )
         self.assertTrue(notifs.exists())
+        self.assertEqual(notifs.first().link_url, f'/leave/my-requests?id={lr.id}')
 
 
 class TestBookingSignals(EchoDeskTenantTestCase):
