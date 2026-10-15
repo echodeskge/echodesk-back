@@ -1,9 +1,12 @@
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from .models import PushSubscription, NotificationLog
+from .models import DevicePushToken, PushSubscription, NotificationLog
 from .serializers import (
+    DevicePushTokenSerializer,
+    DeviceTokenDeleteSerializer,
     PushSubscriptionSerializer,
     SubscribeSerializer,
     UnsubscribeSerializer,
@@ -114,6 +117,102 @@ class NotificationViewSet(viewsets.ViewSet):
         )
         serializer = PushSubscriptionSerializer(subscriptions, many=True)
         return Response(serializer.data)
+
+    @extend_schema(
+        methods=['GET'],
+        summary='List my registered mobile devices',
+        description='Active Expo push tokens registered by the calling user.',
+        responses={200: DevicePushTokenSerializer(many=True)},
+    )
+    @extend_schema(
+        methods=['POST'],
+        summary='Register a mobile device for push',
+        description=(
+            'Register (or refresh) an Expo push token for the calling user. '
+            'A token already known to the server is re-pointed to the caller '
+            'and re-activated. Returns 201 when a new row was created, 200 '
+            'when an existing one was updated.'
+        ),
+        request=DevicePushTokenSerializer,
+        responses={
+            200: DevicePushTokenSerializer,
+            201: DevicePushTokenSerializer,
+            400: OpenApiResponse(description='Invalid token format or platform'),
+        },
+    )
+    @extend_schema(
+        methods=['DELETE'],
+        summary='Unregister a mobile device',
+        description=(
+            'Deactivate one of the caller\'s Expo push tokens. Pass the token '
+            'in the JSON body or as the `token` query parameter. Only the '
+            'caller\'s own tokens can be removed; anything else is 404.'
+        ),
+        request=DeviceTokenDeleteSerializer,
+        parameters=[
+            OpenApiParameter(
+                'token', str, OpenApiParameter.QUERY, required=False,
+                description='Expo push token (alternative to the body field)',
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(description='Device unregistered'),
+            404: OpenApiResponse(description='Token not registered for this user'),
+        },
+    )
+    @action(detail=False, methods=['get', 'post', 'delete'], url_path='devices')
+    def devices(self, request):
+        """Register / list / unregister Expo push tokens (native mobile app)."""
+        if request.method == 'GET':
+            devices = DevicePushToken.objects.filter(
+                user=request.user,
+                is_active=True
+            )
+            return Response(DevicePushTokenSerializer(devices, many=True).data)
+
+        if request.method == 'POST':
+            serializer = DevicePushTokenSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            fields = serializer.validated_data
+            token = fields.pop('token')
+
+            # update_or_create keyed on the token: a phone that logs in as a
+            # different user moves the token to the new owner.
+            device, created = DevicePushToken.objects.update_or_create(
+                token=token,
+                defaults={
+                    'user': request.user,
+                    'platform': fields['platform'],
+                    'device_id': fields.get('device_id', ''),
+                    'device_name': fields.get('device_name', ''),
+                    'app_version': fields.get('app_version', ''),
+                    'is_active': True,
+                },
+            )
+            return Response(
+                DevicePushTokenSerializer(device).data,
+                status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+            )
+
+        # DELETE — token from body (preferred) or query string
+        token = None
+        if isinstance(request.data, dict):
+            token = request.data.get('token')
+        token = token or request.query_params.get('token')
+        serializer = DeviceTokenDeleteSerializer(data={'token': token})
+        serializer.is_valid(raise_exception=True)
+
+        updated = DevicePushToken.objects.filter(
+            user=request.user,
+            token=serializer.validated_data['token'],
+        ).update(is_active=False)
+        if not updated:
+            return Response({
+                'error': 'Device not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        return Response({
+            'message': 'Device unregistered successfully'
+        })
 
     @action(detail=False, methods=['get'])
     def logs(self, request):

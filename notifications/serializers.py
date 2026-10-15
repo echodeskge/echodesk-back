@@ -1,5 +1,6 @@
 from rest_framework import serializers
-from .models import PushSubscription, NotificationLog
+from .expo import is_valid_expo_token
+from .models import DevicePushToken, PushSubscription, NotificationLog
 
 
 class PushSubscriptionSerializer(serializers.ModelSerializer):
@@ -36,6 +37,39 @@ class SubscribeSerializer(serializers.Serializer):
 class UnsubscribeSerializer(serializers.Serializer):
     """Serializer for unsubscribe request."""
     endpoint = serializers.CharField()
+
+
+class DevicePushTokenSerializer(serializers.ModelSerializer):
+    """Expo device token row — used for register (POST) and list (GET)."""
+
+    class Meta:
+        model = DevicePushToken
+        fields = [
+            'id', 'token', 'platform', 'device_id', 'device_name',
+            'app_version', 'is_active', 'created_at', 'last_seen_at',
+        ]
+        read_only_fields = ['id', 'is_active', 'created_at', 'last_seen_at']
+        # The token is unique across users on purpose: re-registering an
+        # existing token re-points it to the caller (handled in the view), so
+        # the default UniqueValidator must not reject it here.
+        extra_kwargs = {
+            'token': {'validators': []},
+            'device_id': {'required': False},
+            'device_name': {'required': False},
+            'app_version': {'required': False},
+        }
+
+    def validate_token(self, value):
+        if not is_valid_expo_token(value):
+            raise serializers.ValidationError(
+                "Token must look like ExponentPushToken[...]"
+            )
+        return value
+
+
+class DeviceTokenDeleteSerializer(serializers.Serializer):
+    """Serializer for unregistering a device token."""
+    token = serializers.CharField()
 
 
 class NotificationLogSerializer(serializers.ModelSerializer):

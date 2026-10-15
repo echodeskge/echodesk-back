@@ -6,6 +6,7 @@ any module can import it without circular-import issues.  Also provides Redis-
 backed caching helpers for unread counts (Phase 2).
 """
 
+from django.conf import settings
 from django.core.cache import cache
 from django.db import connection
 from django.utils import timezone
@@ -167,30 +168,70 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
     except Exception as e:
         print(f"[notification_utils] Error broadcasting via WebSocket: {e}")
 
-    # --- Web Push (only if user has push enabled) ---
+    # --- Push (Web Push + Expo, only if user has push enabled) ---
     if should_push:
+        nav_url = link_url or (f'/tickets/{ticket_id}' if ticket_id else '/')
+        _dispatch_push(
+            user=user,
+            tenant_schema=tenant_schema,
+            title=title,
+            body=message,
+            data={
+                'notification_id': notification.id,
+                'notification_type': notification_type,
+                'link_url': notification.link_url,
+                'url': nav_url,
+                'ticket_id': ticket_id,
+                'leave_request_id': notification.metadata.get('leave_request_id'),
+            },
+            url=nav_url,
+            tag=f'echodesk-{ticket_id or notification.id}',
+            badge=unread_count,
+        )
+
+
+def _dispatch_push(user, tenant_schema, title, body, data, url, tag, badge):
+    """
+    Hand push delivery (Web Push + Expo) to the Celery task.
+
+    Skips the enqueue entirely when the user has nothing to deliver to, so
+    the broker is not hit for every notification of users without a browser
+    subscription or a registered phone. If the broker is unreachable the task
+    is executed inline so a Redis blip never loses a push.
+    """
+    from notifications.models import DevicePushToken, PushSubscription
+    from notifications.tasks import deliver_push_notification_task
+
+    has_web = PushSubscription.objects.filter(user=user, is_active=True).exists()
+    has_device = DevicePushToken.objects.filter(user=user, is_active=True).exists()
+    if not has_web and not has_device:
+        return
+
+    kwargs = dict(
+        tenant_schema=tenant_schema,
+        user_id=user.id,
+        title=title,
+        body=body,
+        data=data,
+        url=url,
+        tag=tag,
+        badge=badge,
+    )
+
+    try:
+        deliver_push_notification_task.delay(**kwargs)
+    except Exception as e:
+        if getattr(settings, 'CELERY_TASK_ALWAYS_EAGER', False):
+            # Eager mode already ran the task inline; the exception is the
+            # task's own failure (propagates=True), not a broker problem.
+            print(f"[notification_utils] Push delivery failed: {e}")
+            return
+        # Broker down — deliver now rather than silently dropping the push.
+        print(f"[notification_utils] Push enqueue failed ({e}); delivering inline")
         try:
-            from notifications.utils import send_notification_to_user as send_push
-
-            nav_url = link_url or (f'/tickets/{ticket_id}' if ticket_id else '/')
-
-            send_push(
-                user=user,
-                title=title,
-                body=message,
-                data={
-                    'ticket_id': ticket_id,
-                    'notification_type': notification_type,
-                    'notification_id': notification.id,
-                    'url': nav_url,
-                },
-                icon='/favicon.ico',
-                url=nav_url,
-                tag=f'echodesk-{ticket_id or notification.id}',
-            )
-            print(f"[notification_utils] Web Push sent for notification {notification.id}")
-        except Exception as e:
-            print(f"[notification_utils] Error sending Web Push: {e}")
+            deliver_push_notification_task.apply(kwargs=kwargs)
+        except Exception as inline_err:
+            print(f"[notification_utils] Inline push delivery failed: {inline_err}")
 
 
 # ---------------------------------------------------------------------------
