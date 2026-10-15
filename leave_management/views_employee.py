@@ -22,7 +22,8 @@ from .permissions import (
 )
 from .utils import (
     update_leave_balance, filter_by_status_in,
-    calculate_working_days, check_overlapping_leaves, check_leave_balance
+    calculate_working_days, check_overlapping_leaves, check_leave_balance,
+    initialize_leave_balances_for_user
 )
 
 
@@ -175,12 +176,17 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
         user = request.user
 
         def respond(total_days, allowed, message):
-            # Balance for the start year; check_leave_balance allocates it
-            # lazily, so after that call this reflects the real allowance.
-            balance = LeaveBalance.objects.filter(
+            # Balance for the start year. Balances are allocated lazily (see
+            # check_leave_balance), so initialise here too: the form then
+            # shows the same allowance whichever check refused the request.
+            balance_qs = LeaveBalance.objects.filter(
                 tenant=tenant, user=user, leave_type=leave_type,
                 year=start_date.year
-            ).first()
+            )
+            balance = balance_qs.first()
+            if balance is None:
+                initialize_leave_balances_for_user(user, tenant, start_date.year)
+                balance = balance_qs.first()
             data = {
                 'total_days': total_days,
                 'available_days': balance.available_days if balance else None,

@@ -229,6 +229,25 @@ class TestTeamBalances(LeaveTestCase):
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
     @_patch_feature
+    def test_balance_inside_team_is_visible(self):
+        # Object permission runs against a LeaveBalance (``user``, not
+        # ``employee``) -- this used to raise AttributeError for non-staff.
+        resp = self.api_get(f'{TEAM_BALANCES_URL}{self.report_bal.id}/', user=self.lead)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['id'], self.report_bal.id)
+
+    @_patch_feature
+    def test_own_balance_is_not_a_team_balance(self):
+        resp = self.api_get(f'{TEAM_BALANCES_URL}{self.own_bal.id}/', user=self.lead)
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    @_patch_feature
+    def test_staff_retrieves_any_balance(self):
+        staff = self.create_user(email='tb-staff@test.com', is_staff=True)
+        resp = self.api_get(f'{TEAM_BALANCES_URL}{self.other_bal.id}/', user=staff)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    @_patch_feature
     def test_summary_counts_only_the_team(self):
         resp = self.api_get(f'{TEAM_BALANCES_URL}summary/', user=self.lead)
         self.assertEqual(resp.status_code, status.HTTP_200_OK)

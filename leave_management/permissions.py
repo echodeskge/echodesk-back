@@ -56,8 +56,11 @@ class IsLeaveManager(permissions.BasePermission):
     def has_object_permission(self, request, view, obj):
         from .utils import manages_employee
 
-        # Staff pass through; otherwise the employee must be on the user's team
-        return manages_employee(request.user, obj.employee)
+        # Staff pass through; otherwise the employee must be on the user's
+        # team. LeaveRequest points at the employee via ``employee``,
+        # LeaveBalance via ``user``.
+        employee = getattr(obj, 'employee', None) or getattr(obj, 'user', None)
+        return manages_employee(request.user, employee)
 
 
 class CanApproveLeave(permissions.BasePermission):

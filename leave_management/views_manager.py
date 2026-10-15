@@ -13,8 +13,7 @@ from .serializers import (
     LeaveBalanceListSerializer, LeaveBalanceDetailSerializer
 )
 from .permissions import (
-    HasLeaveManagementFeature, IsLeaveManager, CanApproveLeave,
-    CanViewTeamBalance
+    HasLeaveManagementFeature, IsLeaveManager, CanApproveLeave
 )
 from .utils import (
     update_leave_balance, get_next_approver_role,

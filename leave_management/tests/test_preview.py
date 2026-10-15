@@ -78,6 +78,7 @@ class TestLeavePreview(LeaveTestCase):
         self.assertFalse(resp.data['allowed'])
         self.assertIn('overlapping', resp.data['message'])
         self.assertEqual(Decimal(resp.data['total_days']), Decimal('3'))
+        self.assertIsNotNone(resp.data['available_days'])
 
     @_patch_feature
     def test_insufficient_balance_is_refused(self):
@@ -101,6 +102,8 @@ class TestLeavePreview(LeaveTestCase):
         self.assertFalse(resp.data['allowed'])
         self.assertEqual(Decimal(resp.data['total_days']), Decimal('0'))
         self.assertIn('End date', resp.data['message'])
+        # The balance is reported even when an earlier check refuses the request
+        self.assertEqual(Decimal(resp.data['available_days']), Decimal('20'))
 
     @_patch_feature
     def test_weekend_only_range_has_no_working_days(self):
@@ -112,6 +115,7 @@ class TestLeavePreview(LeaveTestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertFalse(resp.data['allowed'])
         self.assertIn('no working days', resp.data['message'])
+        self.assertEqual(Decimal(resp.data['available_days']), Decimal('20'))
 
     @_patch_feature
     def test_inactive_leave_type_is_rejected(self):

@@ -4,6 +4,7 @@ from django.contrib.auth.models import Group, Permission
 from django.contrib.auth.password_validation import validate_password
 from django.contrib.contenttypes.models import ContentType
 from django.utils import timezone
+from drf_spectacular.utils import extend_schema_field
 from .models import Department, TenantGroup, Notification, NotificationPreference, UserOnlineStatus, TeamChatConversation, TeamChatMessage
 from tenants.feature_models import Feature
 
@@ -219,6 +220,7 @@ class UserSerializer(serializers.ModelSerializer):
             'manager', 'manager_name',
         ]
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_manager_name(self, obj):
         """Display name of the user's direct manager (None when unassigned)"""
         if obj.manager_id and obj.manager:
