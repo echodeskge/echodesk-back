@@ -518,6 +518,66 @@ class TicketListSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class TicketCardAssigneeSerializer(serializers.ModelSerializer):
+    """Who a ticket card is assigned to — just enough to render an avatar/name."""
+    name = serializers.CharField(source='get_full_name', read_only=True)
+
+    class Meta:
+        model = User
+        fields = ['id', 'name', 'email']
+        read_only_fields = fields
+
+
+class TicketCardTagSerializer(serializers.ModelSerializer):
+    """Tag chip for a ticket card (no created_by, so no per-tag user lookup)."""
+
+    class Meta:
+        model = Tag
+        fields = ['id', 'name', 'color']
+        read_only_fields = fields
+
+
+class TicketCardSerializer(serializers.ModelSerializer):
+    """
+    Kanban card payload for ``kanban_board?lite=1`` and board broadcasts.
+
+    Flat and cheap on purpose: no description, no nested column/creator,
+    no comment or checklist bodies. ``comments_count`` / ``attachments_count``
+    come from queryset annotations (default to 0 when serialising a bare
+    instance, e.g. right after creation). ``assignees`` merges the legacy
+    ``assigned_to`` with ``assigned_users``, deduplicated.
+    """
+    column_id = serializers.IntegerField(read_only=True)
+    is_closed = serializers.ReadOnlyField()  # Dynamic closed status from column
+    tags = TicketCardTagSerializer(many=True, read_only=True)
+    assignees = serializers.SerializerMethodField()
+    comments_count = serializers.IntegerField(read_only=True, default=0)
+    attachments_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = Ticket
+        fields = [
+            'id', 'title', 'priority', 'column_id', 'position_in_column',
+            'is_order', 'is_closed', 'tags', 'assignees',
+            'comments_count', 'attachments_count',
+            'price', 'currency', 'is_paid', 'payment_due_date',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = fields
+
+    def get_assignees(self, obj):
+        users = []
+        seen = set()
+        if obj.assigned_to_id and obj.assigned_to:
+            users.append(obj.assigned_to)
+            seen.add(obj.assigned_to_id)
+        for user in obj.assigned_users.all():
+            if user.id not in seen:
+                users.append(user)
+                seen.add(user.id)
+        return TicketCardAssigneeSerializer(users, many=True, context=self.context).data
+
+
 class KanbanBoardSerializer(serializers.Serializer):
     """Serializer for Kanban board data with columns and tickets."""
     columns = TicketColumnSerializer(many=True, read_only=True)

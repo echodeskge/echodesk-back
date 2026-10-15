@@ -170,3 +170,80 @@ class TestBoardQueryset(TicketTestCase):
         board_ids = [b['id'] for b in self.get_results(resp)]
         self.assertIn(open_board.id, board_ids)
         self.assertNotIn(restricted.id, board_ids)
+
+
+class TestKanbanBoardLite(TicketTestCase):
+    """kanban_board?lite=1 returns compact ticket cards with the same top-level keys."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='lite-admin@test.com')
+        self.board, self.col1, self.col2, self.col3 = self.setup_board_with_columns(admin=self.admin)
+        self.helper = self.create_user(email='lite-helper@test.com', first_name='Helen', last_name='Per')
+        self.tag = self.create_tag(name='Urgent', color='#FF0000', created_by=self.admin)
+        self.ticket = self.create_ticket(
+            title='Card', column=self.col1, created_by=self.admin,
+            description='<p>long body</p>', assigned_to=self.admin,
+        )
+        self.ticket.assigned_users.add(self.helper)
+        self.ticket.tags.add(self.tag)
+        self.create_comment(self.ticket, self.admin, 'c1')
+        self.create_comment(self.ticket, self.helper, 'c2')
+        # A plain path keeps the FileField off the (S3) storage backend
+        self.create_attachment(self.ticket, uploaded_by=self.admin, file='attachments/test.txt')
+
+    def test_lite_cards_have_no_description_and_carry_counts(self):
+        resp = self.api_get(f'/api/boards/{self.board.id}/kanban_board/?lite=1', user=self.admin)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(set(resp.data.keys()), {'board', 'columns', 'tickets_by_column'})
+        cards = resp.data['tickets_by_column'][self.col1.id]
+        self.assertEqual(len(cards), 1)
+        card = cards[0]
+        self.assertNotIn('description', card)
+        self.assertNotIn('created_by', card)
+        self.assertEqual(card['id'], self.ticket.id)
+        self.assertEqual(card['column_id'], self.col1.id)
+        self.assertEqual(card['comments_count'], 2)
+        self.assertEqual(card['attachments_count'], 1)
+        self.assertEqual(card['is_closed'], False)
+        self.assertEqual([t['name'] for t in card['tags']], ['Urgent'])
+        assignee_ids = [a['id'] for a in card['assignees']]
+        self.assertEqual(assignee_ids, [self.admin.id, self.helper.id])
+        self.assertEqual(card['assignees'][1]['name'], 'Helen Per')
+        self.assertEqual(card['assignees'][1]['email'], 'lite-helper@test.com')
+        for key in ('position_in_column', 'priority', 'is_order', 'price', 'currency',
+                    'is_paid', 'payment_due_date', 'created_at', 'updated_at'):
+            self.assertIn(key, card)
+
+    def test_lite_accepts_true(self):
+        resp = self.api_get(f'/api/boards/{self.board.id}/kanban_board/?lite=true', user=self.admin)
+        self.assertNotIn('description', resp.data['tickets_by_column'][self.col1.id][0])
+
+    def test_default_shape_unchanged(self):
+        resp = self.api_get(f'/api/boards/{self.board.id}/kanban_board/', user=self.admin)
+        self.assertEqual(resp.status_code, 200)
+        ticket = resp.data['tickets_by_column'][self.col1.id][0]
+        self.assertIn('description', ticket)
+        self.assertIn('column', ticket)
+        self.assertIn('created_by', ticket)
+        self.assertEqual(ticket['comments_count'], 2)
+        self.assertNotIn('attachments_count', ticket)
+
+    def test_lite_query_count_is_bounded(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        # More tickets, tags and assignees: query count must not grow with them
+        for i in range(6):
+            t = self.create_ticket(title=f'T{i}', column=self.col2, created_by=self.admin)
+            t.assigned_users.add(self.helper)
+            t.tags.add(self.tag)
+            self.create_comment(t, self.helper, 'x')
+        with CaptureQueriesContext(connection) as ctx:
+            resp = self.api_get(f'/api/boards/{self.board.id}/kanban_board/?lite=1', user=self.admin)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data['tickets_by_column'][self.col2.id]), 6)
+        # tenant + board (+3 access prefetches) + columns + tickets + 2 prefetches
+        # + the column tickets_count aggregate; django-tenant-schemas pairs each
+        # with a SET search_path, which is noise here.
+        real = [q['sql'] for q in ctx.captured_queries if not q['sql'].startswith('SET search_path')]
+        self.assertLessEqual(len(real), 12, [sql[:80] for sql in real])

@@ -24,7 +24,7 @@ from .serializers import (
     ItemListSerializer, ItemListMinimalSerializer, ListItemSerializer, ListItemMinimalSerializer,
     TicketFormSerializer, TicketFormMinimalSerializer, TicketFormSubmissionSerializer,
     TicketAttachmentSerializer, TicketHistorySerializer,
-    BoardTelegramConnectionSerializer
+    BoardTelegramConnectionSerializer, TicketCardSerializer
 )
 
 
@@ -1265,33 +1265,74 @@ class BoardViewSet(viewsets.ModelViewSet):
         """Set the created_by field when creating a board."""
         serializer.save(created_by=self.request.user)
     
+    @extend_schema(
+        operation_id='board_kanban_board',
+        summary='Kanban Board',
+        description=(
+            'Columns and tickets for one board, with tickets grouped by column in '
+            'display order. Pass `lite=1` to get compact ticket cards (no description, '
+            'no nested column/creator, no comment bodies) with `comments_count` and '
+            '`attachments_count` — the same response keys, much smaller payload, '
+            'suited to the mobile board.'
+        ),
+        parameters=[
+            OpenApiParameter(
+                name='lite',
+                type=OpenApiTypes.BOOL,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description='1|true: return compact ticket cards (TicketCard) instead of full ticket objects.',
+            ),
+        ],
+        responses={200: OpenApiResponse(description='board, columns, tickets_by_column')},
+        tags=['Kanban Board'],
+    )
     @action(detail=True, methods=['get'])
     def kanban_board(self, request, pk=None):
         """Get kanban board data for a specific board."""
         board = self.get_object()
+        lite = str(request.query_params.get('lite', '')).lower() in ('1', 'true', 'yes')
 
         # Build optimized ticket queryset with all relations prefetched
         from django.contrib.auth import get_user_model
         User = get_user_model()
-        ticket_qs = (
-            Ticket.objects
-            .order_by('position_in_column', '-created_at')
-            .select_related(
-                'created_by', 'assigned_to', 'assigned_department',
-                'column', 'column__board', 'column__created_by',
-            )
-            .prefetch_related(
-                Prefetch('assigned_users', queryset=User.objects.only('id', 'first_name', 'last_name', 'email')),
-                'assigned_groups',
-                'tags',
-                'attachments',
-                Prefetch(
-                    'ticketassignment_set',
-                    queryset=TicketAssignment.objects.select_related('user', 'assigned_by'),
-                ),
-            )
-            .annotate(comments_count=Count('comments'))
+        assignee_prefetch = Prefetch(
+            'assigned_users', queryset=User.objects.only('id', 'first_name', 'last_name', 'email'),
         )
+        if lite:
+            # Card payload only needs assignees, tags and two counts
+            ticket_serializer_class = TicketCardSerializer
+            ticket_qs = (
+                Ticket.objects
+                .order_by('position_in_column', '-created_at')
+                .select_related('assigned_to', 'column')
+                .prefetch_related(assignee_prefetch, 'tags')
+                .annotate(
+                    comments_count=Count('comments', distinct=True),
+                    attachments_count=Count('attachments', distinct=True),
+                )
+            )
+        else:
+            ticket_serializer_class = TicketListSerializer
+            ticket_qs = (
+                Ticket.objects
+                .order_by('position_in_column', '-created_at')
+                .select_related(
+                    'created_by', 'assigned_to', 'assigned_department',
+                    'column', 'column__board', 'column__created_by',
+                )
+                .prefetch_related(
+                    assignee_prefetch,
+                    'assigned_groups',
+                    'tags',
+                    'attachments',
+                    Prefetch(
+                        'ticketassignment_set',
+                        queryset=TicketAssignment.objects.select_related('user', 'assigned_by'),
+                    ),
+                )
+                .annotate(comments_count=Count('comments'))
+            )
 
         # Get columns with prefetched tickets in a single query
         columns = (
@@ -1312,7 +1353,9 @@ class BoardViewSet(viewsets.ModelViewSet):
             columns_data.append(column_serializer.data)
 
             # Use prefetched tickets instead of a separate query per column
-            tickets_serializer = TicketListSerializer(column.tickets.all(), many=True, context={'request': request})
+            tickets_serializer = ticket_serializer_class(
+                column.tickets.all(), many=True, context={'request': request}
+            )
             tickets_by_column[column.id] = tickets_serializer.data
 
         return Response({
