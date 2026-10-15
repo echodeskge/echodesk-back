@@ -2,7 +2,7 @@ from rest_framework import viewsets, permissions, filters, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import Q, F, Max, Count, Prefetch, Exists, OuterRef, Subquery, IntegerField
+from django.db.models import Q, F, Count, Prefetch, Exists, OuterRef, Subquery, IntegerField
 from django.db import transaction
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse
@@ -37,6 +37,52 @@ def get_current_tenant(request):
     cached = Tenant.objects.get(schema_name=connection.schema_name)
     request._current_tenant = cached
     return cached
+
+
+def _renumber_column(column_id, ordered_ids, skip_id=None):
+    """
+    Rewrite position_in_column for one column so it is exactly 0..n-1 in the
+    order given. ``skip_id`` is left to its own ``save()`` (the ticket being
+    moved) so that its pre_save history/broadcast hooks still see the change.
+    Single UPDATE via bulk_update; no signals fire for the renumbered rows.
+    """
+    rows = [
+        Ticket(pk=ticket_id, position_in_column=index)
+        for index, ticket_id in enumerate(ordered_ids)
+        if ticket_id != skip_id
+    ]
+    if rows:
+        Ticket.objects.bulk_update(rows, ['position_in_column'])
+
+
+def _locked_column_order(column_ids):
+    """
+    Lock every ticket in the given columns and return their ids grouped by
+    column, in board display order. Must be called inside transaction.atomic().
+    """
+    by_column = {column_id: [] for column_id in column_ids}
+    rows = (
+        Ticket.objects.select_for_update()
+        .filter(column_id__in=column_ids)
+        .order_by('position_in_column', '-created_at')
+        .values_list('id', 'column_id')
+    )
+    for ticket_id, column_id in rows:
+        by_column[column_id].append(ticket_id)
+    return by_column
+
+
+def _parse_position(raw):
+    """
+    Parse an optional 0-based position from the request body.
+    Returns (position_or_None, error_message_or_None).
+    """
+    if raw is None or raw == '':
+        return None, None
+    try:
+        return int(raw), None
+    except (TypeError, ValueError):
+        return None, 'position_in_column must be a number'
 
 
 class BoardPermission(permissions.BasePermission):
@@ -557,33 +603,44 @@ class TicketViewSet(viewsets.ModelViewSet):
     @extend_schema(
         operation_id='move_ticket_to_column',
         summary='Move Ticket to Column',
-        description='Move a ticket to a different column in the Kanban board and optionally set its position.',
+        description=(
+            'Move a ticket to a different column in the Kanban board. '
+            '`position_in_column` is the 0-based index the ticket should occupy in the '
+            'target column (0 = top); values past the end are clamped to the end. '
+            'Omit it (or send null) to append at the bottom. Both the source and the '
+            'target column are renumbered so positions are always exactly 0..n-1.'
+        ),
         request={
             'type': 'object',
             'properties': {
                 'column_id': {'type': 'integer'},
-                'position_in_column': {'type': 'integer', 'nullable': True}
+                'position_in_column': {
+                    'type': 'integer', 'nullable': True, 'minimum': 0,
+                    'description': '0-based index in the target column; omitted = append',
+                },
             },
             'required': ['column_id']
         },
         responses={
             200: TicketSerializer,
-            400: OpenApiResponse(description='Invalid column or missing column_id'),
+            400: OpenApiResponse(description='Invalid column, missing column_id or non-integer position'),
         },
         tags=['Kanban Board']
     )
     @action(detail=True, methods=['patch'], permission_classes=[permissions.IsAuthenticated])
     def move_to_column(self, request, pk=None):
-        """Move a ticket to a different column."""
+        """Move a ticket to a different column, inserting at a 0-based index."""
         ticket = self.get_object()
         column_id = request.data.get('column_id')
-        new_position = request.data.get('position_in_column')
+        new_position, position_error = _parse_position(request.data.get('position_in_column'))
 
         if not column_id:
             return Response(
                 {'error': 'column_id is required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        if position_error:
+            return Response({'error': position_error}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             new_column = TicketColumn.objects.get(id=column_id)
@@ -612,31 +669,29 @@ class TicketViewSet(viewsets.ModelViewSet):
                     active_time_log.exited_at = timezone.now()
                     active_time_log.calculate_duration()
 
-            # Lock affected tickets in old column to prevent concurrent reorder issues
+            # Lock both columns' tickets, then rebuild their orders in memory:
+            # pull the ticket out of the source, drop it into the target at the
+            # requested (clamped) index, and renumber both 0..n-1.
+            column_ids = {new_column.id}
             if old_column:
-                Ticket.objects.select_for_update().filter(
-                    column=old_column,
-                    position_in_column__gt=ticket.position_in_column
-                ).update(position_in_column=F('position_in_column') - 1)
+                column_ids.add(old_column.id)
+            orders = _locked_column_order(column_ids)
 
-            # Lock affected tickets in new column and insert at position
-            if new_position is not None:
-                # Insert at specific position
-                Ticket.objects.select_for_update().filter(
-                    column=new_column,
-                    position_in_column__gte=new_position
-                ).update(position_in_column=F('position_in_column') + 1)
-                ticket.position_in_column = new_position
+            target_ids = [tid for tid in orders[new_column.id] if tid != ticket.id]
+            if new_position is None:
+                index = len(target_ids)
             else:
-                # Add to end of column
-                max_position = Ticket.objects.select_for_update().filter(
-                    column=new_column
-                ).aggregate(
-                    max_pos=Max('position_in_column')
-                )['max_pos'] or 0
-                ticket.position_in_column = max_position + 1
+                index = max(0, min(new_position, len(target_ids)))
+            target_ids.insert(index, ticket.id)
+
+            if old_column and old_column.id != new_column.id:
+                source_ids = [tid for tid in orders[old_column.id] if tid != ticket.id]
+                _renumber_column(old_column.id, source_ids)
+            _renumber_column(new_column.id, target_ids, skip_id=ticket.id)
 
             ticket.column = new_column
+            ticket.position_in_column = index
+            ticket._current_user = request.user  # for TicketHistory + broadcast attribution
             ticket.save()
 
             # Handle time tracking for new column (if enabled)
@@ -651,53 +706,62 @@ class TicketViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(ticket)
         return Response(serializer.data)
 
+    @extend_schema(
+        operation_id='reorder_ticket_in_column',
+        summary='Reorder Ticket in Column',
+        description=(
+            'Move a ticket to a 0-based index within its current column (0 = top); '
+            'values past the end are clamped to the end. The column is renumbered so '
+            'positions are always exactly 0..n-1.'
+        ),
+        request={
+            'type': 'object',
+            'properties': {
+                'position_in_column': {'type': 'integer', 'minimum': 0},
+            },
+            'required': ['position_in_column']
+        },
+        responses={
+            200: TicketSerializer,
+            400: OpenApiResponse(description='Missing/invalid position or ticket has no column'),
+        },
+        tags=['Kanban Board']
+    )
     @action(detail=True, methods=['patch'], permission_classes=[permissions.IsAuthenticated])
     def reorder_in_column(self, request, pk=None):
-        """Reorder a ticket within its current column."""
+        """Reorder a ticket within its current column (0-based index)."""
         ticket = self.get_object()
-        new_position = request.data.get('position_in_column')
-        
+        new_position, position_error = _parse_position(request.data.get('position_in_column'))
+
+        if position_error:
+            return Response({'error': position_error}, status=status.HTTP_400_BAD_REQUEST)
         if new_position is None:
             return Response(
-                {'error': 'position_in_column is required'}, 
+                {'error': 'position_in_column is required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        try:
-            new_position = int(new_position)
-        except ValueError:
+
+        if not ticket.column_id:
             return Response(
-                {'error': 'position_in_column must be a number'}, 
+                {'error': 'Ticket is not assigned to any column'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        if not ticket.column:
-            return Response(
-                {'error': 'Ticket is not assigned to any column'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
+
         with transaction.atomic():
-            # Update positions of other tickets in the same column
-            if new_position > ticket.position_in_column:
-                # Moving down - decrease position of tickets in between
-                Ticket.objects.filter(
-                    column=ticket.column,
-                    position_in_column__gt=ticket.position_in_column,
-                    position_in_column__lte=new_position
-                ).update(position_in_column=F('position_in_column') - 1)
-            else:
-                # Moving up - increase position of tickets in between
-                Ticket.objects.filter(
-                    column=ticket.column,
-                    position_in_column__gte=new_position,
-                    position_in_column__lt=ticket.position_in_column
-                ).update(position_in_column=F('position_in_column') + 1)
-            
-            # Update the ticket's position
-            ticket.position_in_column = new_position
+            # Re-fetch with a row lock, then rebuild the column order in memory
+            ticket = Ticket.objects.select_for_update().get(pk=ticket.pk)
+            ordered_ids = [
+                tid for tid in _locked_column_order({ticket.column_id})[ticket.column_id]
+                if tid != ticket.id
+            ]
+            index = max(0, min(new_position, len(ordered_ids)))
+            ordered_ids.insert(index, ticket.id)
+            _renumber_column(ticket.column_id, ordered_ids, skip_id=ticket.id)
+
+            ticket.position_in_column = index
+            ticket._current_user = request.user
             ticket.save()
-        
+
         serializer = self.get_serializer(ticket)
         return Response(serializer.data)
 
@@ -1196,7 +1260,7 @@ class BoardViewSet(viewsets.ModelViewSet):
         User = get_user_model()
         ticket_qs = (
             Ticket.objects
-            .order_by('position_in_column')
+            .order_by('position_in_column', '-created_at')
             .select_related(
                 'created_by', 'assigned_to', 'assigned_department',
                 'column', 'column__board', 'column__created_by',

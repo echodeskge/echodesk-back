@@ -331,15 +331,18 @@ class Ticket(models.Model):
             if default_column:
                 self.column = default_column
 
-        # Auto-assign position in column if not set
-        if self.column and not self.position_in_column:
+        # Auto-assign position in column on create if not set. Positions are a
+        # 0-based index, so a new ticket lands after the current last one
+        # (n tickets -> index n). Only on create: an update that legitimately
+        # moves a ticket to index 0 must not be bounced back to the end.
+        if self._state.adding and self.column and not self.position_in_column:
             with transaction.atomic():
                 max_position = Ticket.objects.filter(
                     column=self.column
                 ).select_for_update().aggregate(
                     models.Max('position_in_column')
-                )['position_in_column__max'] or 0
-                self.position_in_column = max_position + 1
+                )['position_in_column__max']
+                self.position_in_column = 0 if max_position is None else max_position + 1
 
         # Auto-update payment status
         if self.price and self.amount_paid >= self.price:
