@@ -22,6 +22,7 @@ from .services import SingleFrontendDeploymentService, TenantConfigAPI
 from .bog_payment import bog_service
 from .permissions import get_subscription_info
 from .security_service import SecurityService
+from users.models import AuthDeviceToken
 from django.contrib.auth.hashers import make_password
 import logging
 import uuid
@@ -32,6 +33,31 @@ User = get_user_model()
 
 class AuthRateThrottle(ScopedRateThrottle):
     scope = 'auth'
+
+
+MOBILE_PLATFORMS = ('ios', 'android')
+
+
+def _issue_login_token(user, data):
+    """
+    Return ``(key, token_type)`` for a freshly authenticated user.
+
+    Mobile clients (``platform`` ios/android) get a per-device
+    ``AuthDeviceToken`` so each phone can be logged out on its own; everything
+    else keeps the single shared DRF ``Token`` the web dashboard relies on.
+    """
+    platform = data.get('platform') or 'web'
+    if platform in MOBILE_PLATFORMS:
+        device = AuthDeviceToken.issue(
+            user,
+            platform=platform,
+            device_id=(data.get('device_id') or '')[:255],
+            device_name=(data.get('device_name') or '')[:150],
+        )
+        return device.key, 'device'
+
+    token, _created = Token.objects.get_or_create(user=user)
+    return token.key, 'shared'
 
 
 @extend_schema(
@@ -47,6 +73,7 @@ class AuthRateThrottle(ScopedRateThrottle):
                 'properties': {
                     'message': {'type': 'string'},
                     'token': {'type': 'string'},
+                    'token_type': {'type': 'string', 'enum': ['shared', 'device']},
                     'dashboard_data': {'type': 'object'}
                 }
             }
@@ -111,8 +138,8 @@ def tenant_login(request):
                 'email': user.email
             }, status=status.HTTP_403_FORBIDDEN)
 
-        # Get or create token for the user
-        token, created = Token.objects.get_or_create(user=user)
+        # Shared web token, or a per-device token for mobile clients
+        token_key, token_type = _issue_login_token(user, serializer.validated_data)
 
         # Update last_login
         user.last_login = timezone.now()
@@ -130,7 +157,8 @@ def tenant_login(request):
 
         return Response({
             'message': 'Login successful',
-            'token': token.key,
+            'token': token_key,
+            'token_type': token_type,
             'dashboard_data': dashboard_serializer.data
         }, status=status.HTTP_200_OK)
 
@@ -185,8 +213,12 @@ def tenant_logout(request):
             user=request.user
         )
 
-        # Delete the user's token
-        request.user.auth_token.delete()
+        # A device token logs out just that device; the shared web token
+        # logs out every web session.
+        if isinstance(request.auth, AuthDeviceToken):
+            request.auth.delete()
+        else:
+            request.user.auth_token.delete()
         return Response({
             'message': 'Successfully logged out'
         }, status=status.HTTP_200_OK)
@@ -687,8 +719,9 @@ def change_tenant_password(request):
     user.set_password(new_password)
     user.save()
     
-    # Delete all existing tokens to force re-login
+    # Delete all existing tokens (web + every device) to force re-login
     Token.objects.filter(user=user).delete()
+    AuthDeviceToken.objects.filter(user=user).delete()
     
     return Response({
         'message': 'Password changed successfully. Please login again.'
@@ -1594,14 +1627,15 @@ def forced_password_change(request):
         user.temporary_password = None
         user.save()
 
-        # Generate token for immediate login
-        token, created = Token.objects.get_or_create(user=user)
+        # Generate token for immediate login (per-device for mobile clients)
+        token_key, token_type = _issue_login_token(user, request.data)
 
         logger.info(f'Password changed successfully for user: {email}')
 
         return Response({
             'message': 'Password changed successfully',
-            'token': token.key
+            'token': token_key,
+            'token_type': token_type
         }, status=status.HTTP_200_OK)
 
     except User.DoesNotExist:

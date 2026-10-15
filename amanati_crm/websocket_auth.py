@@ -10,6 +10,8 @@ from django.contrib.auth.models import AnonymousUser
 from urllib.parse import parse_qs
 from tenant_schemas.utils import schema_context
 
+from users.models import AuthDeviceToken
+
 # Try to import Django Token authentication
 try:
     from rest_framework.authtoken.models import Token as DjangoToken
@@ -52,6 +54,18 @@ def get_user_from_token(token_string, tenant_schema=None):
                 return user
             except (DjangoToken.DoesNotExist, Exception) as e:
                 print(f"[WebSocket Auth] Django Token validation failed: {e}")
+
+        # Mobile apps authenticate with per-device tokens (same per-schema scoping).
+        try:
+            device_token = AuthDeviceToken.objects.select_related('user').get(key=token_string)
+            if device_token.user.is_active and not device_token.is_expired:
+                print(f"[WebSocket Auth] Device token authentication successful for user: {device_token.user.email}")
+                return device_token.user
+            print(f"[WebSocket Auth] Device token rejected (inactive user or expired)")
+        except AuthDeviceToken.DoesNotExist:
+            pass
+        except Exception as e:
+            print(f"[WebSocket Auth] Device token validation failed: {e}")
 
         print(f"[WebSocket Auth] No valid authentication found for token")
         return AnonymousUser()
