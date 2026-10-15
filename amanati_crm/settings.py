@@ -620,6 +620,13 @@ VAPID_PRIVATE_KEY = config('VAPID_PRIVATE_KEY', default='')
 VAPID_PUBLIC_KEY = config('VAPID_PUBLIC_KEY', default='')
 VAPID_ADMIN_EMAIL = config('VAPID_ADMIN_EMAIL', default='mailto:info@echodesk.ge')
 
+# Expo push (native mobile app). The access token is optional — Expo only
+# requires it when "Enhanced Security for Push Notifications" is enabled on
+# the project. Timeout is per HTTP request (one batch of ≤100 tokens).
+EXPO_PUSH_URL = config('EXPO_PUSH_URL', default='https://exp.host/--/api/v2/push/send')
+EXPO_ACCESS_TOKEN = config('EXPO_ACCESS_TOKEN', default='')
+EXPO_PUSH_TIMEOUT = config('EXPO_PUSH_TIMEOUT', default=10, cast=int)
+
 # Celery Configuration (Redis DB 2)
 if redis_password:
     celery_redis_url = f'rediss://:{redis_password}@{redis_host}:{redis_port}/2?ssl_cert_reqs=none'
@@ -636,6 +643,10 @@ CELERY_TASK_ACKS_LATE = True
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_TASK_SOFT_TIME_LIMIT = 300
 CELERY_TASK_TIME_LIMIT = 600
+# Eager mode runs `.delay()` inline in the calling process — used by the test
+# suite (CI + local) so tasks execute without a worker. Never set in prod.
+CELERY_TASK_ALWAYS_EAGER = config('CELERY_TASK_ALWAYS_EAGER', default=False, cast=bool)
+CELERY_TASK_EAGER_PROPAGATES = config('CELERY_TASK_EAGER_PROPAGATES', default=False, cast=bool)
 
 from celery.schedules import crontab
 

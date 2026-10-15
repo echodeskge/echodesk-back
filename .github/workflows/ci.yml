@@ -52,6 +52,7 @@ jobs:
       MAIN_DOMAIN: echodesk.ge
       API_DOMAIN: api.echodesk.ge
       SENDGRID_API_KEY: fake
+      CELERY_TASK_ALWAYS_EAGER: "1"
       DJANGO_SETTINGS_MODULE: amanati_crm.settings
     steps:
       - uses: actions/checkout@v4
@@ -108,6 +109,7 @@ jobs:
       MAIN_DOMAIN: echodesk.ge
       API_DOMAIN: api.echodesk.ge
       SENDGRID_API_KEY: fake
+      CELERY_TASK_ALWAYS_EAGER: "1"
       DJANGO_SETTINGS_MODULE: amanati_crm.settings
     steps:
       - uses: actions/checkout@v4
@@ -165,6 +167,7 @@ jobs:
       MAIN_DOMAIN: echodesk.ge
       API_DOMAIN: api.echodesk.ge
       SENDGRID_API_KEY: fake
+      CELERY_TASK_ALWAYS_EAGER: "1"
       DJANGO_SETTINGS_MODULE: amanati_crm.settings
     steps:
       - uses: actions/checkout@v4
