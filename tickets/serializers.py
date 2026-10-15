@@ -388,7 +388,11 @@ class TicketSerializer(serializers.ModelSerializer):
             # Set column if provided (regular tickets)
             validated_data['column'] = TicketColumn.objects.get(id=column_id)
 
-        ticket = Ticket.objects.create(**validated_data)
+        # The post_save broadcast would fire before the tags / assignees below
+        # are written, so defer it and send the complete card at the end.
+        ticket = Ticket(**validated_data)
+        ticket._defer_created_broadcast = True
+        ticket.save()
 
         # Set tags
         if tag_ids:
@@ -408,6 +412,10 @@ class TicketSerializer(serializers.ModelSerializer):
                     role=role,
                     assigned_by=current_user
                 )
+
+        # Board broadcast with tags + assignees in place (see note above)
+        from .signals import broadcast_new_ticket_card
+        broadcast_new_ticket_card(ticket)
 
         return ticket
 

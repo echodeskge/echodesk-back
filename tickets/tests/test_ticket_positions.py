@@ -237,3 +237,20 @@ class TestKanbanOrder(PositionTestCase):
         self.assertEqual(resp.status_code, 200)
         ids = [t['id'] for t in resp.data['tickets_by_column'][self.col_a.id]]
         self.assertEqual(ids, [a[2].id, a[0].id, a[1].id])
+
+
+class TestReorderResponse(PositionTestCase):
+
+    def test_reorder_response_keeps_count_annotations(self):
+        # The row is re-fetched under FOR UPDATE (no aggregates allowed), so
+        # the response must be re-loaded through get_queryset() afterwards
+        a = self.make_tickets(self.col_a, 2)
+        self.create_comment(a[0], self.admin, 'c1')
+        self.create_checklist_item(a[0], text='done', created_by=self.admin, is_checked=True)
+        self.create_checklist_item(a[0], text='todo', created_by=self.admin)
+        resp = self.reorder(a[0], 1)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['position_in_column'], 1)
+        self.assertEqual(resp.data['comments_count'], 1)
+        self.assertEqual(resp.data['checklist_items_count'], 2)
+        self.assertEqual(resp.data['completed_checklist_items_count'], 1)

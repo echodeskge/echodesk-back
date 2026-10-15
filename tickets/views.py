@@ -6,7 +6,8 @@ import django_filters
 from django.db.models import Q, F, Count, Prefetch, Exists, OuterRef, Subquery, IntegerField
 from django.db import transaction
 from django.utils import timezone
-from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse, inline_serializer
+from rest_framework import serializers as drf_serializers
 from drf_spectacular.openapi import OpenApiTypes
 from .models import (
     Ticket, Tag, TicketComment, TicketColumn, ChecklistItem,
@@ -420,6 +421,11 @@ class TicketViewSet(viewsets.ModelViewSet):
         Filter queryset based on user permissions and query parameters.
         Annotate with counts to avoid N+1 queries.
         """
+        if getattr(self, 'swagger_fake_view', False):
+            # Schema generation runs with AnonymousUser; return an empty queryset
+            # so drf-spectacular can still introspect the filterset parameters
+            return Ticket.objects.none()
+
         queryset = Ticket.objects.annotate(
             comments_count=Count('comments', distinct=True),
             checklist_items_count=Count('checklist_items', distinct=True),
@@ -634,17 +640,16 @@ class TicketViewSet(viewsets.ModelViewSet):
             'Omit it (or send null) to append at the bottom. Both the source and the '
             'target column are renumbered so positions are always exactly 0..n-1.'
         ),
-        request={
-            'type': 'object',
-            'properties': {
-                'column_id': {'type': 'integer'},
-                'position_in_column': {
-                    'type': 'integer', 'nullable': True, 'minimum': 0,
-                    'description': '0-based index in the target column; omitted = append',
-                },
+        request=inline_serializer(
+            name='MoveTicketToColumnRequest',
+            fields={
+                'column_id': drf_serializers.IntegerField(),
+                'position_in_column': drf_serializers.IntegerField(
+                    required=False, allow_null=True, min_value=0,
+                    help_text='0-based index in the target column; omitted = append',
+                ),
             },
-            'required': ['column_id']
-        },
+        ),
         responses={
             200: TicketSerializer,
             400: OpenApiResponse(description='Invalid column, missing column_id or non-integer position'),
@@ -675,8 +680,20 @@ class TicketViewSet(viewsets.ModelViewSet):
             )
 
         with transaction.atomic():
-            # Re-fetch ticket with row lock to prevent race conditions
+            # Lock both columns' tickets first (one query, deterministic order)
+            # and only then the moving row. Taking the single-row lock first
+            # lets two opposite-direction moves (A->B and B->A) deadlock.
+            column_ids = {new_column.id}
+            if ticket.column_id:
+                column_ids.add(ticket.column_id)
+            orders = _locked_column_order(column_ids)
+
+            # Re-fetch the moving row (already locked above unless it was moved
+            # to a third column concurrently -- then lock that column too).
             ticket = Ticket.objects.select_for_update().get(pk=ticket.pk)
+            if ticket.column_id and ticket.column_id not in column_ids:
+                column_ids.add(ticket.column_id)
+                orders = _locked_column_order(column_ids)
             old_column = ticket.column
 
             # Handle time tracking for old column (if enabled and ticket is leaving a column)
@@ -693,14 +710,9 @@ class TicketViewSet(viewsets.ModelViewSet):
                     active_time_log.exited_at = timezone.now()
                     active_time_log.calculate_duration()
 
-            # Lock both columns' tickets, then rebuild their orders in memory:
-            # pull the ticket out of the source, drop it into the target at the
-            # requested (clamped) index, and renumber both 0..n-1.
-            column_ids = {new_column.id}
-            if old_column:
-                column_ids.add(old_column.id)
-            orders = _locked_column_order(column_ids)
-
+            # Rebuild both orders in memory: pull the ticket out of the source,
+            # drop it into the target at the requested (clamped) index, and
+            # renumber both 0..n-1.
             target_ids = [tid for tid in orders[new_column.id] if tid != ticket.id]
             if new_position is None:
                 index = len(target_ids)
@@ -738,13 +750,14 @@ class TicketViewSet(viewsets.ModelViewSet):
             'values past the end are clamped to the end. The column is renumbered so '
             'positions are always exactly 0..n-1.'
         ),
-        request={
-            'type': 'object',
-            'properties': {
-                'position_in_column': {'type': 'integer', 'minimum': 0},
+        request=inline_serializer(
+            name='ReorderTicketInColumnRequest',
+            fields={
+                'position_in_column': drf_serializers.IntegerField(
+                    min_value=0, help_text='0-based index in the current column',
+                ),
             },
-            'required': ['position_in_column']
-        },
+        ),
         responses={
             200: TicketSerializer,
             400: OpenApiResponse(description='Missing/invalid position or ticket has no column'),
@@ -772,20 +785,34 @@ class TicketViewSet(viewsets.ModelViewSet):
             )
 
         with transaction.atomic():
-            # Re-fetch with a row lock, then rebuild the column order in memory
+            # Lock the whole column first (see move_to_column), then re-fetch
+            # the row; if it was moved to another column meanwhile, reorder it
+            # there instead.
+            column_id = ticket.column_id
+            orders = _locked_column_order({column_id})
             ticket = Ticket.objects.select_for_update().get(pk=ticket.pk)
-            ordered_ids = [
-                tid for tid in _locked_column_order({ticket.column_id})[ticket.column_id]
-                if tid != ticket.id
-            ]
+            if not ticket.column_id:
+                return Response(
+                    {'error': 'Ticket is not assigned to any column'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if ticket.column_id != column_id:
+                column_id = ticket.column_id
+                orders = _locked_column_order({column_id})
+
+            ordered_ids = [tid for tid in orders[column_id] if tid != ticket.id]
             index = max(0, min(new_position, len(ordered_ids)))
             ordered_ids.insert(index, ticket.id)
-            _renumber_column(ticket.column_id, ordered_ids, skip_id=ticket.id)
+            _renumber_column(column_id, ordered_ids, skip_id=ticket.id)
 
             ticket.position_in_column = index
             ticket._current_user = request.user
             ticket.save()
 
+        # Re-load through get_queryset() so the response carries the count
+        # annotations (comments_count, checklist_items_count, ...); FOR UPDATE
+        # and those aggregates cannot be combined, so this runs after the lock.
+        ticket = self.get_queryset().get(pk=ticket.pk)
         serializer = self.get_serializer(ticket)
         return Response(serializer.data)
 
@@ -1211,6 +1238,9 @@ class BoardViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         """Return boards the user can access based on direct attachment or group membership."""
+        if getattr(self, 'swagger_fake_view', False):
+            return Board.objects.none()  # schema generation runs as AnonymousUser
+
         user = self.request.user
 
         # Scalar subquery so columns_count doesn't fan out the main row set
@@ -1275,7 +1305,8 @@ class BoardViewSet(viewsets.ModelViewSet):
         serializer.save(created_by=self.request.user)
     
     @extend_schema(
-        operation_id='board_kanban_board',
+        # No operation_id / responses override: the generated clients depend on
+        # `boards_kanban_board_retrieve` returning the viewset's Board schema.
         summary='Kanban Board',
         description=(
             'Columns and tickets for one board, with tickets grouped by column in '
@@ -1293,7 +1324,6 @@ class BoardViewSet(viewsets.ModelViewSet):
                 description='1|true: return compact ticket cards (TicketCard) instead of full ticket objects.',
             ),
         ],
-        responses={200: OpenApiResponse(description='board, columns, tickets_by_column')},
         tags=['Kanban Board'],
     )
     @action(detail=True, methods=['get'])

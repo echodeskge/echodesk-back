@@ -42,6 +42,30 @@ def _ticket_card_payload(ticket):
     return _json_safe(TicketCardSerializer(ticket).data)
 
 
+def broadcast_new_ticket_card(ticket):
+    """
+    Broadcast a freshly created ticket's card to everyone viewing its board.
+
+    Called from the post_save hook for plain ``Ticket.objects.create`` paths,
+    and from ``TicketSerializer.create`` once tags / assignees are applied
+    (post_save fires before those M2M writes, so the card would be missing
+    them). Never raises.
+    """
+    if not (ticket.column_id and ticket.column.board_id):
+        return
+    try:
+        from users.consumers import broadcast_ticket_created
+
+        async_to_sync(broadcast_ticket_created)(
+            tenant_schema=_tenant_schema(),
+            board_id=ticket.column.board_id,
+            ticket_data=_ticket_card_payload(ticket),
+            created_by=ticket.created_by,
+        )
+    except Exception as e:
+        print(f"[Signals] Error broadcasting ticket creation: {str(e)}")
+
+
 def _comment_payload(comment):
     """Minimal comment dict for the ticket_commented broadcast."""
     user = comment.user
@@ -534,19 +558,11 @@ def notify_on_ticket_status_change(sender, instance, created, **kwargs):
     if created:
         _send_new_ticket_telegram_notification(instance)
 
-        # Broadcast the new card to everyone viewing the board
-        if instance.column_id and instance.column.board_id:
-            try:
-                from users.consumers import broadcast_ticket_created
-
-                async_to_sync(broadcast_ticket_created)(
-                    tenant_schema=_tenant_schema(),
-                    board_id=instance.column.board_id,
-                    ticket_data=_ticket_card_payload(instance),
-                    created_by=instance.created_by,
-                )
-            except Exception as e:
-                print(f"[Signals] Error broadcasting ticket creation: {str(e)}")
+        # Broadcast the new card to everyone viewing the board, unless the
+        # creator (TicketSerializer.create) will do it itself once the card's
+        # tags / assignees are written
+        if not getattr(instance, '_defer_created_broadcast', False):
+            broadcast_new_ticket_card(instance)
         return
 
     # Check if column was changed (set in pre_save)
@@ -668,10 +684,18 @@ def notify_on_ticket_status_change(sender, instance, created, **kwargs):
 def broadcast_on_ticket_delete(sender, instance, **kwargs):
     """
     Tell everyone viewing the board that a ticket is gone. Uses column_id
-    (still set on the deleted instance) and never raises: a board/column
-    cascade delete also fires this and the parent rows may be mid-removal.
+    (still set on the deleted instance) and never raises.
+
+    Skipped when the delete cascades from another model (e.g. removing a
+    user cascades to every ticket they created): that would cost one column
+    query plus one group_send per ticket. Column / board deletes SET_NULL
+    the tickets instead, so they never reach this hook.
     """
     if not instance.column_id:
+        return
+    origin = kwargs.get('origin')
+    origin_model = getattr(origin, 'model', None) or type(origin)
+    if origin is not None and origin_model is not Ticket:
         return
     try:
         from users.consumers import broadcast_ticket_deleted
