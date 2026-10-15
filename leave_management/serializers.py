@@ -350,6 +350,37 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
         return leave_request
 
 
+class LeaveRequestPreviewSerializer(serializers.Serializer):
+    """Input for the dry-run check the mobile form runs before submitting"""
+    leave_type = serializers.PrimaryKeyRelatedField(queryset=LeaveType.objects.none())
+    start_date = serializers.DateField()
+    end_date = serializers.DateField()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Only this tenant's active leave types are selectable
+        request = self.context.get('request')
+        tenant = getattr(request, 'tenant', None)
+        if tenant is not None:
+            self.fields['leave_type'].queryset = LeaveType.objects.filter(
+                tenant=tenant, is_active=True
+            )
+
+
+class LeaveRequestPreviewResponseSerializer(serializers.Serializer):
+    """Outcome of the dry-run check (response shape only)"""
+    total_days = serializers.DecimalField(max_digits=5, decimal_places=1)
+    available_days = serializers.DecimalField(
+        max_digits=5, decimal_places=1, allow_null=True,
+        help_text='Days left on the balance for the start year, null when no balance applies'
+    )
+    allowed = serializers.BooleanField()
+    message = serializers.CharField(
+        allow_blank=True,
+        help_text='Why the request would be refused; empty when allowed'
+    )
+
+
 class LeaveRequestUpdateSerializer(serializers.ModelSerializer):
     """Serializer for updating leave requests (limited fields)"""
 

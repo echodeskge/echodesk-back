@@ -118,6 +118,27 @@ class TestUserCreate(EchoDeskTenantTestCase):
         user = User.objects.get(email='pcrequired@test.com')
         self.assertTrue(user.password_change_required)
 
+    @patch('users.views.send_user_invitation_email_task')
+    def test_create_user_with_manager(self, mock_email):
+        resp = self.api_post(USERS_URL, {
+            'email': 'managed@test.com',
+            'role': 'agent',
+            'manager_id': self.agent.id,
+        }, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        user = User.objects.get(email='managed@test.com')
+        self.assertEqual(user.manager, self.agent)
+
+    @patch('users.views.send_user_invitation_email_task')
+    def test_create_user_with_unknown_manager_rejected(self, mock_email):
+        resp = self.api_post(USERS_URL, {
+            'email': 'orphan@test.com',
+            'role': 'agent',
+            'manager_id': 999999,
+        }, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('manager_id', resp.data)
+
 
 class TestUserUpdate(EchoDeskTenantTestCase):
     """Tests for updating users."""
@@ -155,6 +176,76 @@ class TestUserUpdate(EchoDeskTenantTestCase):
             user=self.agent,
         )
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_sets_manager_id(self):
+        resp = self.api_patch(
+            detail_url(self.agent.id),
+            {'manager_id': self.other_agent.id},
+            user=self.admin,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.agent.refresh_from_db()
+        self.assertEqual(self.agent.manager, self.other_agent)
+
+    def test_manager_id_self_rejected(self):
+        resp = self.api_patch(
+            detail_url(self.agent.id),
+            {'manager_id': self.agent.id},
+            user=self.admin,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('manager_id', resp.data)
+        self.agent.refresh_from_db()
+        self.assertIsNone(self.agent.manager)
+
+    def test_manager_id_unknown_rejected(self):
+        resp = self.api_patch(
+            detail_url(self.agent.id),
+            {'manager_id': 999999},
+            user=self.admin,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('manager_id', resp.data)
+
+    def test_manager_id_null_clears_manager(self):
+        self.agent.manager = self.other_agent
+        self.agent.save()
+        resp = self.api_patch(
+            detail_url(self.agent.id),
+            {'manager_id': None},
+            user=self.admin,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.agent.refresh_from_db()
+        self.assertIsNone(self.agent.manager)
+
+    def test_self_update_cannot_set_manager(self):
+        """manager_id is not a safe self-service field."""
+        resp = self.api_patch(
+            detail_url(self.agent.id),
+            {'manager_id': self.other_agent.id},
+            user=self.agent,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.agent.refresh_from_db()
+        self.assertIsNone(self.agent.manager)
+
+    def test_get_returns_manager(self):
+        self.other_agent.first_name = 'Nino'
+        self.other_agent.last_name = 'K'
+        self.other_agent.save()
+        self.agent.manager = self.other_agent
+        self.agent.save()
+        resp = self.api_get(detail_url(self.agent.id), user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['manager'], self.other_agent.id)
+        self.assertEqual(resp.data['manager_name'], 'Nino K')
+
+    def test_get_returns_null_manager_when_unassigned(self):
+        resp = self.api_get(detail_url(self.agent.id), user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIsNone(resp.data['manager'])
+        self.assertIsNone(resp.data['manager_name'])
 
     def test_self_update_cannot_escalate_role(self):
         """BUG 2 regression: non-privileged users cannot change their own role."""

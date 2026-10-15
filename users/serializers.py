@@ -4,6 +4,7 @@ from django.contrib.auth.models import Group, Permission
 from django.contrib.auth.password_validation import validate_password
 from django.contrib.contenttypes.models import ContentType
 from django.utils import timezone
+from drf_spectacular.utils import extend_schema_field
 from .models import Department, TenantGroup, Notification, NotificationPreference, UserOnlineStatus, TeamChatConversation, TeamChatMessage
 from tenants.feature_models import Feature
 
@@ -180,6 +181,11 @@ class UserSerializer(serializers.ModelSerializer):
     tenant_groups = TenantGroupSerializer(many=True, read_only=True)
     department = DepartmentSerializer(read_only=True)
     department_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
+    # The manager is written through manager_id on the create/update
+    # serializers; here it is read-only so the user list/detail show who
+    # the user reports to without another round trip.
+    manager = serializers.PrimaryKeyRelatedField(read_only=True)
+    manager_name = serializers.SerializerMethodField()
     group_ids = serializers.ListField(
         child=serializers.IntegerField(),
         write_only=True,
@@ -204,11 +210,22 @@ class UserSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'email', 'first_name', 'last_name', 'full_name',
             'role', 'status', 'phone_number', 'job_title', 'department', 'department_id',
+            'manager', 'manager_name',
             'is_active', 'is_staff', 'is_booking_staff', 'date_joined', 'last_login',
             'permissions', 'group_permissions', 'all_permissions', 'feature_keys',
             'groups', 'group_ids', 'tenant_groups', 'tenant_group_ids', 'user_permission_ids'
         ]
-        read_only_fields = ['id', 'date_joined', 'last_login', 'feature_keys', 'is_booking_staff']
+        read_only_fields = [
+            'id', 'date_joined', 'last_login', 'feature_keys', 'is_booking_staff',
+            'manager', 'manager_name',
+        ]
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_manager_name(self, obj):
+        """Display name of the user's direct manager (None when unassigned)"""
+        if obj.manager_id and obj.manager:
+            return obj.manager.get_full_name() or obj.manager.email
+        return None
 
     def get_permissions(self, obj):
         """Get user's direct permissions"""
@@ -287,9 +304,42 @@ class EmailUniquenessMixin:
         return value
 
 
-class UserCreateSerializer(EmailUniquenessMixin, serializers.ModelSerializer):
+class ManagerIdMixin:
+    """Accept ``manager_id`` and resolve it to ``manager`` for the model.
+
+    The manager must be a user in this tenant (the schema scopes the lookup)
+    and cannot be the user being edited. ``null`` clears the assignment.
+    """
+
+    def validate_manager_id(self, value):
+        if value is None:
+            return None
+        if self.instance is not None and value == self.instance.pk:
+            raise serializers.ValidationError(
+                "A user cannot be their own manager."
+            )
+        if not User.objects.filter(pk=value).exists():
+            raise serializers.ValidationError("Manager not found.")
+        return value
+
+    @staticmethod
+    def pop_manager(validated_data):
+        """Return (present, manager_or_None) and drop manager_id from the data."""
+        if 'manager_id' not in validated_data:
+            return False, None
+        manager_id = validated_data.pop('manager_id')
+        if manager_id is None:
+            return True, None
+        return True, User.objects.get(pk=manager_id)
+
+
+class UserCreateSerializer(ManagerIdMixin, EmailUniquenessMixin, serializers.ModelSerializer):
     """Serializer for creating users - password is auto-generated and sent via email"""
     department_id = serializers.IntegerField(required=False, allow_null=True)
+    manager_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text="ID of the user's direct manager (approves their leave requests)"
+    )
     group_ids = serializers.ListField(
         child=serializers.IntegerField(),
         required=False,
@@ -310,7 +360,7 @@ class UserCreateSerializer(EmailUniquenessMixin, serializers.ModelSerializer):
         model = User
         fields = [
             'email', 'first_name', 'last_name',
-            'role', 'status', 'phone_number', 'department_id',
+            'role', 'status', 'phone_number', 'department_id', 'manager_id',
             'group_ids', 'tenant_group_ids', 'user_permission_ids'
         ]
         extra_kwargs = {
@@ -321,6 +371,9 @@ class UserCreateSerializer(EmailUniquenessMixin, serializers.ModelSerializer):
         group_ids = validated_data.pop('group_ids', [])
         tenant_group_ids = validated_data.pop('tenant_group_ids', [])
         user_permission_ids = validated_data.pop('user_permission_ids', [])
+        has_manager, manager = self.pop_manager(validated_data)
+        if has_manager:
+            validated_data['manager'] = manager
 
         # Note: Password will be set in the view's perform_create method
         # User is created without a password initially
@@ -334,8 +387,12 @@ class UserCreateSerializer(EmailUniquenessMixin, serializers.ModelSerializer):
         return user
 
 
-class UserUpdateSerializer(EmailUniquenessMixin, serializers.ModelSerializer):
+class UserUpdateSerializer(ManagerIdMixin, EmailUniquenessMixin, serializers.ModelSerializer):
     """Serializer for updating users"""
+    manager_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text="ID of the user's direct manager (null clears it)"
+    )
     group_ids = serializers.ListField(
         child=serializers.IntegerField(),
         required=False,
@@ -356,7 +413,7 @@ class UserUpdateSerializer(EmailUniquenessMixin, serializers.ModelSerializer):
         model = User
         fields = [
             'email', 'first_name', 'last_name', 'role', 'status',
-            'phone_number', 'job_title', 'is_active',
+            'phone_number', 'job_title', 'is_active', 'manager_id',
             'group_ids', 'tenant_group_ids', 'user_permission_ids'
         ]
         extra_kwargs = {
@@ -364,14 +421,17 @@ class UserUpdateSerializer(EmailUniquenessMixin, serializers.ModelSerializer):
             # so other-field updates don't have to resend it.
             'email': {'required': False},
         }
-    
+
     def update(self, instance, validated_data):
         group_ids = validated_data.pop('group_ids', None)
         tenant_group_ids = validated_data.pop('tenant_group_ids', None)
         user_permission_ids = validated_data.pop('user_permission_ids', None)
-        
+        has_manager, manager = self.pop_manager(validated_data)
+
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
+        if has_manager:
+            instance.manager = manager
         instance.save()
         
         if group_ids is not None:

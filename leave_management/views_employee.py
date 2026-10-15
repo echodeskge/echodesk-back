@@ -5,12 +5,13 @@ from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
 from datetime import date
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import extend_schema, OpenApiParameter
 
 from .models import LeaveRequest, LeaveBalance, PublicHoliday, LeaveType
 from .serializers import (
     LeaveRequestListSerializer, LeaveRequestDetailSerializer,
     LeaveRequestCreateSerializer, LeaveRequestUpdateSerializer,
+    LeaveRequestPreviewSerializer, LeaveRequestPreviewResponseSerializer,
     LeaveCancellationSerializer,
     LeaveBalanceListSerializer, LeaveBalanceDetailSerializer,
     PublicHolidayListSerializer,
@@ -19,7 +20,18 @@ from .serializers import (
 from .permissions import (
     HasLeaveManagementFeature, IsLeaveEmployee, CanCancelLeave
 )
-from .utils import update_leave_balance
+from .utils import (
+    update_leave_balance, filter_by_status_in,
+    calculate_working_days, check_overlapping_leaves, check_leave_balance,
+    initialize_leave_balances_for_user
+)
+
+
+STATUS_IN_PARAM = OpenApiParameter(
+    name='status__in', type=str, location=OpenApiParameter.QUERY,
+    description='Comma-separated list of statuses to include, e.g. '
+                '`pending,approved`. Use `status` for a single value.'
+)
 
 
 # ============================================================================
@@ -44,11 +56,16 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Get only the employee's own leave requests"""
-        return LeaveRequest.objects.filter(
+        queryset = LeaveRequest.objects.filter(
             tenant=self.request.tenant,
             employee=self.request.user
         ).select_related(
             'leave_type', 'manager_approver', 'hr_approver', 'final_approver', 'rejected_by'
+        )
+
+        # Multi-status filter (?status__in=pending,approved)
+        return filter_by_status_in(
+            queryset, self.request.query_params.get('status__in')
         )
 
     def get_serializer_class(self):
@@ -56,6 +73,8 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
             return LeaveRequestListSerializer
         elif self.action == 'create':
             return LeaveRequestCreateSerializer
+        elif self.action == 'preview':
+            return LeaveRequestPreviewSerializer
         elif self.action in ['update', 'partial_update']:
             return LeaveRequestUpdateSerializer
         elif self.action == 'cancel':
@@ -135,6 +154,73 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         tags=['Leave Management - Employee'],
+        summary='Preview a leave request before submitting',
+        description='Runs the same checks as submitting (working days, overlap, '
+                    'balance) without creating anything, so the form can show '
+                    'the day count and any blocker as the dates change.',
+        request=LeaveRequestPreviewSerializer,
+        responses={200: LeaveRequestPreviewResponseSerializer},
+    )
+    @action(detail=False, methods=['post'])
+    def preview(self, request):
+        """Dry-run the create validation and report the outcome"""
+        serializer = LeaveRequestPreviewSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+
+        leave_type = serializer.validated_data['leave_type']
+        start_date = serializer.validated_data['start_date']
+        end_date = serializer.validated_data['end_date']
+        tenant = request.tenant
+        user = request.user
+
+        def respond(total_days, allowed, message):
+            # Balance for the start year. Balances are allocated lazily (see
+            # check_leave_balance), so initialise here too: the form then
+            # shows the same allowance whichever check refused the request.
+            balance_qs = LeaveBalance.objects.filter(
+                tenant=tenant, user=user, leave_type=leave_type,
+                year=start_date.year
+            )
+            balance = balance_qs.first()
+            if balance is None:
+                initialize_leave_balances_for_user(user, tenant, start_date.year)
+                balance = balance_qs.first()
+            data = {
+                'total_days': total_days,
+                'available_days': balance.available_days if balance else None,
+                'allowed': allowed,
+                'message': message,
+            }
+            return Response(LeaveRequestPreviewResponseSerializer(data).data)
+
+        # Same order as LeaveRequestCreateSerializer.validate
+        if end_date < start_date:
+            return respond(0, False, 'End date must be on or after start date')
+
+        total_days = calculate_working_days(start_date, end_date, tenant)
+        if total_days == 0:
+            return respond(
+                total_days, False, 'The selected date range contains no working days'
+            )
+
+        has_overlap, overlap_msg = check_overlapping_leaves(
+            user, start_date, end_date, tenant
+        )
+        if has_overlap:
+            return respond(total_days, False, overlap_msg)
+
+        has_balance, balance_msg = check_leave_balance(
+            user, leave_type, total_days, start_date.year, tenant
+        )
+        if not has_balance:
+            return respond(total_days, False, balance_msg)
+
+        return respond(total_days, True, '')
+
+    @extend_schema(
+        tags=['Leave Management - Employee'],
         summary='Get pending leave requests'
     )
     @action(detail=False, methods=['get'])
@@ -189,7 +275,11 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
-    @extend_schema(tags=['Leave Management - Employee'], summary='List my leave requests')
+    @extend_schema(
+        tags=['Leave Management - Employee'],
+        summary='List my leave requests',
+        parameters=[STATUS_IN_PARAM],
+    )
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
 

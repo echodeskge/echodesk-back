@@ -262,6 +262,25 @@ class TestProfile(EchoDeskTenantTestCase):
         resp = self.api_get(PROFILE_URL)
         self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
 
+    def test_profile_is_leave_manager_true_for_manager_role(self):
+        manager = self.create_manager(email='profile-mgr@test.com')
+        resp = self.api_get(PROFILE_URL, user=manager)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertTrue(resp.data['is_leave_manager'])
+
+    def test_profile_is_leave_manager_true_with_direct_report(self):
+        lead = self.create_user(email='profile-lead@test.com', role='agent')
+        self.create_user(email='profile-report@test.com', manager=lead)
+        resp = self.api_get(PROFILE_URL, user=lead)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertTrue(resp.data['is_leave_manager'])
+
+    def test_profile_is_leave_manager_false_for_agent(self):
+        agent = self.create_user(email='profile-agent@test.com', role='agent')
+        resp = self.api_get(PROFILE_URL, user=agent)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertFalse(resp.data['is_leave_manager'])
+
 
 class TestAuthThrottling(EchoDeskTenantTestCase):
     """Tests for rate limiting on auth endpoints."""

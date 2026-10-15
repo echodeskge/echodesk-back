@@ -120,7 +120,12 @@ class User(AbstractBaseUser):
     phone_number = models.CharField(max_length=20, blank=True)
     job_title = models.CharField(max_length=100, blank=True)
     department = models.ForeignKey('Department', on_delete=models.SET_NULL, null=True, blank=True, related_name='employees', help_text='Department this user belongs to')
-    
+    manager = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='managed_employees',
+        help_text='Direct manager of this user (approves their leave requests)'
+    )
+
     # Permission flags
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
