@@ -605,19 +605,43 @@ class KanbanBoardSerializer(serializers.Serializer):
 
 
 class TicketTimeLogSerializer(serializers.ModelSerializer):
-    """Serializer for TicketTimeLog model."""
+    """Serializer for TicketTimeLog model.
+
+    ``ticket`` stays the ticket title (legacy, used by the web dashboard);
+    ``ticket_id`` / ``ticket_title`` / ``column_id`` are additive so clients
+    can deep-link without parsing the title.
+    """
     ticket = serializers.StringRelatedField(read_only=True)
+    ticket_id = serializers.IntegerField(read_only=True)
+    ticket_title = serializers.CharField(source='ticket.title', read_only=True)
     column = TicketColumnSerializer(read_only=True)
+    column_id = serializers.IntegerField(read_only=True)
     user = UserMinimalSerializer(read_only=True)
-    duration_display = serializers.ReadOnlyField()
-    
+    duration_display = serializers.CharField(read_only=True)
+
     class Meta:
         model = TicketTimeLog
         fields = [
-            'id', 'ticket', 'column', 'user', 'entered_at', 'exited_at',
-            'duration_seconds', 'duration_display'
+            'id', 'ticket', 'ticket_id', 'ticket_title', 'column', 'column_id',
+            'user', 'entered_at', 'exited_at', 'duration_seconds', 'duration_display'
         ]
         read_only_fields = fields
+
+
+class TimeByColumnSerializer(serializers.Serializer):
+    """One row of ``my_time_summary.time_by_column`` (keys match the ORM values())."""
+    column__name = serializers.CharField()
+    column__color = serializers.CharField()
+    total_seconds = serializers.IntegerField()
+    session_count = serializers.IntegerField()
+    avg_seconds = serializers.FloatField()
+
+
+class DailyBreakdownSerializer(serializers.Serializer):
+    """One row of ``my_time_summary.daily_breakdown``."""
+    date = serializers.DateField()
+    total_seconds = serializers.IntegerField()
+    session_count = serializers.IntegerField()
 
 
 class TimeTrackingSummarySerializer(serializers.Serializer):
@@ -626,10 +650,75 @@ class TimeTrackingSummarySerializer(serializers.Serializer):
     start_date = serializers.DateTimeField()
     total_time_seconds = serializers.IntegerField()
     total_sessions = serializers.IntegerField()
-    time_by_column = serializers.ListField()
-    daily_breakdown = serializers.ListField()
+    time_by_column = TimeByColumnSerializer(many=True)
+    daily_breakdown = DailyBreakdownSerializer(many=True)
     recent_activity = TicketTimeLogSerializer(many=True)
     active_sessions = TicketTimeLogSerializer(many=True)
+
+
+class TeamSummaryUserInfoSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    full_name = serializers.CharField()
+    email = serializers.EmailField()
+
+
+class TeamSummaryUserSerializer(serializers.Serializer):
+    """Per-user aggregate row of ``team_summary``."""
+    user = TeamSummaryUserInfoSerializer()
+    total_seconds = serializers.IntegerField(help_text='Sum of completed sessions in the period')
+    sessions = serializers.IntegerField(help_text='Completed sessions (duration_seconds set)')
+    active_sessions = serializers.IntegerField(help_text='Sessions still open (exited_at is null)')
+    last_activity = serializers.DateTimeField(allow_null=True, help_text='Most recent entered_at')
+
+
+class TeamSummaryTotalsSerializer(serializers.Serializer):
+    total_seconds = serializers.IntegerField()
+    sessions = serializers.IntegerField()
+    users = serializers.IntegerField()
+
+
+class TeamSummaryPeriodSerializer(serializers.Serializer):
+    start_date = serializers.DateTimeField()
+    end_date = serializers.DateTimeField()
+    days = serializers.IntegerField()
+
+
+class TeamSummarySerializer(serializers.Serializer):
+    """Response of ``GET /api/time-logs/team_summary/``."""
+    period = TeamSummaryPeriodSerializer()
+    users = TeamSummaryUserSerializer(many=True)
+    totals = TeamSummaryTotalsSerializer()
+
+
+class TicketTimeColumnRefSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    color = serializers.CharField()
+
+
+class TicketTimeActiveSerializer(serializers.Serializer):
+    """The currently open time log of a ticket."""
+    log_id = serializers.IntegerField()
+    column = TicketTimeColumnRefSerializer()
+    entered_at = serializers.DateTimeField()
+    elapsed_seconds = serializers.IntegerField(help_text='Server-side snapshot; keep ticking client-side')
+
+
+class TicketTimeByColumnSerializer(serializers.Serializer):
+    column_id = serializers.IntegerField()
+    column_name = serializers.CharField()
+    column_color = serializers.CharField()
+    total_seconds = serializers.IntegerField()
+    sessions = serializers.IntegerField(help_text='Completed sessions in this column')
+
+
+class TicketTimeSummarySerializer(serializers.Serializer):
+    """Response of ``GET /api/time-logs/ticket_summary/?ticket=<id>``."""
+    ticket_id = serializers.IntegerField()
+    total_seconds = serializers.IntegerField(help_text='Sum of completed sessions (excludes the active one)')
+    active = TicketTimeActiveSerializer(allow_null=True)
+    by_column = TicketTimeByColumnSerializer(many=True)
+    logs = TicketTimeLogSerializer(many=True, help_text='Last 20 logs, newest first')
 
 
 # ============================================================================

@@ -3,10 +3,12 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 import django_filters
-from django.db.models import Q, F, Count, Prefetch, Exists, OuterRef, Subquery, IntegerField
+from django.db.models import Q, F, Max, Count, Prefetch, Exists, OuterRef, Subquery, IntegerField
 from django.db import transaction
 from django.utils import timezone
-from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse, inline_serializer
+from drf_spectacular.utils import (
+    extend_schema, extend_schema_view, OpenApiParameter, OpenApiResponse, inline_serializer,
+)
 from rest_framework import serializers as drf_serializers
 from drf_spectacular.openapi import OpenApiTypes
 from .models import (
@@ -21,7 +23,8 @@ from .serializers import (
     TicketColumnCreateSerializer, TicketColumnUpdateSerializer,
     KanbanBoardSerializer, ChecklistItemSerializer,
     TicketAssignmentSerializer, TicketTimeLogSerializer,
-    TimeTrackingSummarySerializer, BoardSerializer, TicketPaymentSerializer,
+    TimeTrackingSummarySerializer, TeamSummarySerializer, TicketTimeSummarySerializer,
+    BoardSerializer, TicketPaymentSerializer,
     ItemListSerializer, ItemListMinimalSerializer, ListItemSerializer, ListItemMinimalSerializer,
     TicketFormSerializer, TicketFormMinimalSerializer, TicketFormSubmissionSerializer,
     TicketAttachmentSerializer, TicketHistorySerializer,
@@ -85,6 +88,44 @@ def _parse_position(raw):
         return int(raw), None
     except (TypeError, ValueError):
         return None, 'position_in_column must be a number'
+
+
+def ticket_visibility_q(user):
+    """Q limiting tickets to what a non-staff user may see (shared by every
+    endpoint that resolves a ticket on the user's behalf)."""
+    user_groups = user.tenant_groups.all()
+    return (
+        Q(created_by=user) |
+        Q(assigned_to=user) |
+        Q(assigned_users=user) |
+        Q(assigned_groups__in=user_groups) |
+        Q(column__board__order_users=user) |  # Board order users
+        Q(column__board__board_users=user) |  # Board users
+        Q(column__board__board_groups__in=user_groups)  # Board groups
+    )
+
+
+def close_active_time_log(ticket, column):
+    """Close the open time log of ``ticket`` in ``column`` (no-op unless the
+    column tracks time and an open log exists). Returns the closed log or None."""
+    if not column or not column.track_time:
+        return None
+    active_time_log = TicketTimeLog.objects.filter(
+        ticket=ticket,
+        column=column,
+        exited_at__isnull=True
+    ).first()
+    if active_time_log:
+        active_time_log.exited_at = timezone.now()
+        active_time_log.calculate_duration()
+    return active_time_log
+
+
+def open_time_log(ticket, column, user):
+    """Start a time log for ``ticket`` in ``column`` when the column tracks time."""
+    if not column or not column.track_time:
+        return None
+    return TicketTimeLog.objects.create(ticket=ticket, column=column, user=user)
 
 
 class BoardPermission(permissions.BasePermission):
@@ -474,20 +515,10 @@ class TicketViewSet(viewsets.ModelViewSet):
 
         # Non-staff users can only see their tickets or tickets on boards they have access to
         if not self.request.user.is_staff:
-            user_groups = self.request.user.tenant_groups.all()
-
             # Users can see tickets if:
             # 1. They created it, are assigned to it, or in assigned groups
             # 2. They have access to the board (via order_users, board_users, or board_groups)
-            queryset = queryset.filter(
-                Q(created_by=self.request.user) |
-                Q(assigned_to=self.request.user) |
-                Q(assigned_users=self.request.user) |
-                Q(assigned_groups__in=user_groups) |
-                Q(column__board__order_users=self.request.user) |  # Board order users
-                Q(column__board__board_users=self.request.user) |  # Board users
-                Q(column__board__board_groups__in=user_groups)     # Board groups
-            ).distinct()
+            queryset = queryset.filter(ticket_visibility_q(self.request.user)).distinct()
 
         # Additional filtering by query parameters
         priority_filter = self.request.query_params.get('priority')
@@ -514,17 +545,25 @@ class TicketViewSet(viewsets.ModelViewSet):
         ticket = serializer.save(created_by=self.request.user)
 
         # If the assigned column has time tracking enabled, create initial time log
-        if ticket.column and ticket.column.track_time:
-            TicketTimeLog.objects.create(
-                ticket=ticket,
-                column=ticket.column,
-                user=self.request.user
-            )
+        open_time_log(ticket, ticket.column, self.request.user)
 
     def perform_update(self, serializer):
-        """Tag the instance with the acting user so history + broadcasts can attribute it."""
+        """Save the ticket via PUT/PATCH.
+
+        Tags the instance with the acting user so TicketHistory and the board
+        broadcast can attribute the change, then runs a column change through
+        the same open/close time-log logic as ``move_to_column``.
+        """
+        old_column = serializer.instance.column
         serializer.instance._current_user = self.request.user
-        serializer.save()
+        with transaction.atomic():
+            ticket = serializer.save()
+            new_column = ticket.column
+            old_id = old_column.id if old_column else None
+            new_id = new_column.id if new_column else None
+            if old_id != new_id:
+                close_active_time_log(ticket, old_column)
+                open_time_log(ticket, new_column, self.request.user)
 
     def destroy(self, request, *args, **kwargs):
         """Delete a ticket with permission check based on tenant settings."""
@@ -700,18 +739,7 @@ class TicketViewSet(viewsets.ModelViewSet):
             old_column = ticket.column
 
             # Handle time tracking for old column (if enabled and ticket is leaving a column)
-            if old_column and old_column.track_time:
-                # Find the active time log for this ticket in the old column
-                active_time_log = TicketTimeLog.objects.filter(
-                    ticket=ticket,
-                    column=old_column,
-                    exited_at__isnull=True
-                ).first()
-
-                if active_time_log:
-                    from django.utils import timezone
-                    active_time_log.exited_at = timezone.now()
-                    active_time_log.calculate_duration()
+            close_active_time_log(ticket, old_column)
 
             # Rebuild both orders in memory: pull the ticket out of the source,
             # drop it into the target at the requested (clamped) index, and
@@ -734,13 +762,7 @@ class TicketViewSet(viewsets.ModelViewSet):
             ticket.save()
 
             # Handle time tracking for new column (if enabled)
-            if new_column.track_time:
-                # Create a new time log entry for the new column
-                TicketTimeLog.objects.create(
-                    ticket=ticket,
-                    column=new_column,
-                    user=request.user
-                )
+            open_time_log(ticket, new_column, request.user)
 
         serializer = self.get_serializer(ticket)
         return Response(serializer.data)
@@ -1111,53 +1133,99 @@ class TicketAssignmentViewSet(viewsets.ModelViewSet):
         )
 
 
+TIME_SUMMARY_MAX_DAYS = 365
+
+
+def _parse_days(raw, default=30):
+    """Parse ``?days=`` and clamp it to 1..TIME_SUMMARY_MAX_DAYS. Raises ValueError."""
+    days = int(default if raw in (None, '') else raw)
+    return max(1, min(days, TIME_SUMMARY_MAX_DAYS))
+
+
+def _parse_boundary(raw, end_of_day=False):
+    """Parse an ISO date (YYYY-MM-DD) or datetime query value into an aware datetime.
+
+    A bare date is treated as the start of that day, or as the *exclusive* end
+    boundary (start of the next day) when ``end_of_day`` is set, so
+    ``end_date=2026-10-16`` includes the whole 16th.
+    """
+    import datetime as dt
+    from django.utils.dateparse import parse_date, parse_datetime
+
+    # parse_date first: parse_datetime also accepts a bare YYYY-MM-DD and would
+    # swallow the end-of-day handling.
+    day = parse_date(raw)
+    if day is not None:
+        if end_of_day:
+            day = day + dt.timedelta(days=1)
+        value = dt.datetime.combine(day, dt.time.min)
+    else:
+        value = parse_datetime(raw)
+        if value is None:
+            raise ValueError(raw)
+    if timezone.is_naive(value):
+        value = timezone.make_aware(value, dt.timezone.utc)
+    return value
+
+
+@extend_schema_view(
+    retrieve=extend_schema(
+        parameters=[OpenApiParameter('id', OpenApiTypes.STR, OpenApiParameter.PATH)],
+    ),
+)
 @extend_schema(tags=['Time Tracking'])
 class TicketTimeLogViewSet(viewsets.ReadOnlyModelViewSet):
     """ViewSet for viewing ticket time logs."""
+    # ``queryset`` is only here so drf-spectacular can resolve the model (and
+    # therefore the ``ticket``/``column``/``user`` filter params); the real
+    # scope comes from get_queryset().
+    queryset = TicketTimeLog.objects.none()
     serializer_class = TicketTimeLogSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['ticket', 'column', 'user']
     ordering_fields = ['entered_at', 'exited_at', 'duration_seconds']
     ordering = ['-entered_at']
-    
+
     def get_queryset(self):
         """Return time logs for tickets the user has access to."""
         if self.request.user.is_staff:
             return TicketTimeLog.objects.all().select_related(
                 'ticket', 'column', 'user'
             )
-        
+
         # Non-staff users can only see time logs for tickets they have access to
         return TicketTimeLog.objects.filter(
-            Q(ticket__created_by=self.request.user) | 
+            Q(ticket__created_by=self.request.user) |
             Q(ticket__assigned_to=self.request.user) |
             Q(ticket__assigned_users=self.request.user)
         ).select_related('ticket', 'column', 'user')
-    
+
     @extend_schema(
         parameters=[
             OpenApiParameter(
                 name='days',
                 type=OpenApiTypes.INT,
                 location=OpenApiParameter.QUERY,
-                description='Number of days to include in summary (default: 30)',
+                description='Number of days to include in summary (default: 30, clamped to 1..365)',
                 default=30
             )
         ],
-        responses={200: TimeTrackingSummarySerializer},
+        responses={
+            200: TimeTrackingSummarySerializer,
+            400: OpenApiResponse(description='days is not an integer'),
+        },
         tags=['Time Tracking']
     )
     @action(detail=False, methods=['get'])
     def my_time_summary(self, request):
         """Get time tracking summary for the current user."""
         from django.db.models import Sum, Count, Avg
-        from datetime import datetime, timedelta
-        from django.utils import timezone
-        
+        from datetime import timedelta
+
         # Get date range from query params (default to last 30 days)
         try:
-            days = int(request.query_params.get('days', 30))
+            days = _parse_days(request.query_params.get('days'))
         except (ValueError, TypeError):
             return Response(
                 {'error': 'days must be a valid integer'},
@@ -1231,6 +1299,230 @@ class TicketTimeLogViewSet(viewsets.ReadOnlyModelViewSet):
             'daily_breakdown': daily_breakdown,
             'recent_activity': recent_logs_data,
             'active_sessions': active_sessions_data
+        })
+
+    @extend_schema(
+        operation_id='time_logs_team_summary',
+        summary='Team time summary',
+        description=(
+            'Per-user aggregate of ticket time logs over a period, computed in the '
+            'database. Only users with at least one log in the period are listed. '
+            'Requires staff or the `advanced_analytics` feature. Note that the feature '
+            'is granted tenant-wide (subscription feature intersected with the caller\'s '
+            'group features), so every non-staff member of a group holding '
+            '`advanced_analytics` sees every colleague\'s hours, email and last '
+            'activity -- the same scope as the dashboard\'s user statistics page. '
+            'The window is `[start_date, end_date)` on `entered_at`; defaults to the '
+            'last `days` days.'
+        ),
+        parameters=[
+            OpenApiParameter(
+                name='days', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY,
+                description='Window length in days ending at end_date (default 30, clamped to 1..365). '
+                            'Ignored when start_date is given.',
+                default=30,
+            ),
+            OpenApiParameter(
+                name='start_date', type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                description='ISO date (YYYY-MM-DD, start of day UTC) or ISO datetime. Inclusive.',
+            ),
+            OpenApiParameter(
+                name='end_date', type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                description='ISO date (whole day included) or ISO datetime (exclusive). Defaults to now.',
+            ),
+        ],
+        responses={
+            200: TeamSummarySerializer,
+            400: OpenApiResponse(description='Invalid days/start_date/end_date, or start_date >= end_date'),
+            403: OpenApiResponse(description='Not staff and no advanced_analytics feature'),
+        },
+        tags=['Time Tracking'],
+    )
+    @action(detail=False, methods=['get'])
+    def team_summary(self, request):
+        """DB-side per-user time aggregate for the team statistics table.
+
+        Authorisation is deliberately "staff OR advanced_analytics" (plan Part C
+        F4 / mobile WP12). ``User.has_feature`` resolves tenant-wide (the
+        tenant's subscription features intersected with the user's group
+        features), so a non-staff user in a group that holds
+        ``advanced_analytics`` can read every colleague's totals. Tighten to
+        ``is_staff and has_feature`` here if that ever needs to be narrower.
+        """
+        from datetime import timedelta
+        from django.db.models import Sum
+        from django.db.models.functions import Coalesce
+
+        user = request.user
+        if not (user.is_staff or user.has_feature('advanced_analytics')):
+            return Response(
+                {'error': 'You do not have permission to view team statistics.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            days = _parse_days(request.query_params.get('days'))
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'days must be a valid integer'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        now = timezone.now()
+        try:
+            raw_end = request.query_params.get('end_date')
+            end = _parse_boundary(raw_end, end_of_day=True) if raw_end else now
+            raw_start = request.query_params.get('start_date')
+            start = _parse_boundary(raw_start) if raw_start else end - timedelta(days=days)
+        except ValueError:
+            return Response(
+                {'error': 'start_date and end_date must be ISO dates (YYYY-MM-DD) or datetimes'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if start >= end:
+            return Response(
+                {'error': 'start_date must be before end_date'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        rows = (
+            TicketTimeLog.objects
+            .filter(entered_at__gte=start, entered_at__lt=end)
+            .values('user_id', 'user__first_name', 'user__last_name', 'user__email')
+            .annotate(
+                # Coalesce: Sum() is NULL for a user whose only logs in the
+                # window are still open, and Postgres sorts NULLs first on
+                # DESC -- such users must sort last (0 seconds), not first.
+                total_seconds=Coalesce(Sum('duration_seconds'), 0),
+                sessions=Count('id', filter=Q(duration_seconds__isnull=False)),
+                active_sessions=Count('id', filter=Q(exited_at__isnull=True)),
+                last_activity=Max('entered_at'),
+            )
+            .order_by('-total_seconds', 'user__email')
+        )
+
+        users = []
+        total_seconds = 0
+        total_sessions = 0
+        for row in rows:
+            seconds = row['total_seconds'] or 0
+            total_seconds += seconds
+            total_sessions += row['sessions']
+            full_name = f"{row['user__first_name'] or ''} {row['user__last_name'] or ''}".strip()
+            users.append({
+                'user': {
+                    'id': row['user_id'],
+                    'full_name': full_name or row['user__email'],
+                    'email': row['user__email'],
+                },
+                'total_seconds': seconds,
+                'sessions': row['sessions'],
+                'active_sessions': row['active_sessions'],
+                'last_activity': row['last_activity'],
+            })
+
+        return Response({
+            'period': {
+                'start_date': start,
+                'end_date': end,
+                'days': max(1, round((end - start).total_seconds() / 86400)),
+            },
+            'users': users,
+            'totals': {
+                'total_seconds': total_seconds,
+                'sessions': total_sessions,
+                'users': len(users),
+            },
+        })
+
+    @extend_schema(
+        operation_id='time_logs_ticket_summary',
+        summary='Ticket time summary',
+        description=(
+            'Time spent by one ticket: completed total, the currently open log (if any), '
+            'per-column history and the last 20 logs. Visible to anyone who can view the ticket.'
+        ),
+        parameters=[
+            OpenApiParameter(
+                name='ticket', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY,
+                required=True, description='Ticket id',
+            ),
+        ],
+        responses={
+            200: TicketTimeSummarySerializer,
+            400: OpenApiResponse(description='ticket missing or not an integer'),
+            404: OpenApiResponse(description='Ticket not found or not visible to the user'),
+        },
+        tags=['Time Tracking'],
+    )
+    @action(detail=False, methods=['get'])
+    def ticket_summary(self, request):
+        """Per-ticket time panel data (total, active log, per-column history)."""
+        from django.db.models import Sum
+
+        raw_ticket = request.query_params.get('ticket')
+        try:
+            ticket_id = int(raw_ticket)
+        except (TypeError, ValueError):
+            return Response(
+                {'error': 'ticket must be a valid integer'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        tickets = Ticket.objects.all()
+        if not request.user.is_staff:
+            tickets = tickets.filter(ticket_visibility_q(request.user)).distinct()
+        if not tickets.filter(pk=ticket_id).exists():
+            return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        logs = TicketTimeLog.objects.filter(ticket_id=ticket_id)
+        completed = logs.filter(duration_seconds__isnull=False)
+
+        total_seconds = completed.aggregate(total=Sum('duration_seconds'))['total'] or 0
+
+        by_column = [
+            {
+                'column_id': row['column_id'],
+                'column_name': row['column__name'],
+                'column_color': row['column__color'],
+                'total_seconds': row['total_seconds'] or 0,
+                'sessions': row['sessions'],
+            }
+            for row in (
+                completed
+                .values('column_id', 'column__name', 'column__color')
+                .annotate(total_seconds=Sum('duration_seconds'), sessions=Count('id'))
+                .order_by('-total_seconds', 'column_id')
+            )
+        ]
+
+        active_log = (
+            logs.filter(exited_at__isnull=True)
+            .select_related('column')
+            .order_by('-entered_at')
+            .first()
+        )
+        active = None
+        if active_log:
+            active = {
+                'log_id': active_log.id,
+                'column': {
+                    'id': active_log.column_id,
+                    'name': active_log.column.name,
+                    'color': active_log.column.color,
+                },
+                'entered_at': active_log.entered_at,
+                'elapsed_seconds': max(0, int((timezone.now() - active_log.entered_at).total_seconds())),
+            }
+
+        recent = logs.select_related('ticket', 'column', 'user').order_by('-entered_at')[:20]
+
+        return Response({
+            'ticket_id': ticket_id,
+            'total_seconds': total_seconds,
+            'active': active,
+            'by_column': by_column,
+            'logs': TicketTimeLogSerializer(recent, many=True).data,
         })
 
 
