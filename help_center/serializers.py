@@ -1,8 +1,54 @@
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
+
 from .models import HelpCategory, HelpArticle
 
 
-class HelpCategoryListSerializer(serializers.ModelSerializer):
+SUPPORTED_LANGUAGES = ('en', 'ka', 'ru')
+
+
+def get_request_language(context, default='en'):
+    """Resolve the `lang` query param from a serializer context (falls back to `en`)."""
+    request = context.get('request') if context else None
+    if request is not None and hasattr(request, 'query_params'):
+        return request.query_params.get('lang', default) or default
+    return default
+
+
+def get_visibility_mode(request):
+    """
+    Resolve which visibility flag applies to a public help request.
+
+    Returns ``'dashboard'`` when ``for_dashboard=true`` is sent, ``'public'``
+    when ``for_public=true`` is sent (and ``for_dashboard`` is not), else
+    ``None`` (no visibility filtering).
+
+    ``for_dashboard`` takes precedence over ``for_public`` so that clients
+    which send both (e.g. the web dashboard search widget) get dashboard
+    content rather than silently falling back to the public catalogue.
+    """
+    if request is None or not hasattr(request, 'query_params'):
+        return None
+    if request.query_params.get('for_dashboard') == 'true':
+        return 'dashboard'
+    if request.query_params.get('for_public') == 'true':
+        return 'public'
+    return None
+
+
+class LocalisedSerializerMixin:
+    """Shared `lang` resolution for the localised public serializers."""
+
+    def _get_language(self):
+        return get_request_language(self.context)
+
+
+# =============================================================================
+# Category serializers
+# =============================================================================
+
+class HelpCategoryListSerializer(LocalisedSerializerMixin, serializers.ModelSerializer):
     """Serializer for category listing"""
     name = serializers.SerializerMethodField()
     description = serializers.SerializerMethodField()
@@ -17,72 +63,19 @@ class HelpCategoryListSerializer(serializers.ModelSerializer):
             'article_count', 'created_at', 'updated_at'
         ]
 
-    def get_name(self, obj):
-        lang = self.context.get('request', {})
-        if hasattr(lang, 'query_params'):
-            lang = lang.query_params.get('lang', 'en')
-        else:
-            lang = 'en'
-        return obj.get_name(lang)
-
-    def get_description(self, obj):
-        lang = self.context.get('request', {})
-        if hasattr(lang, 'query_params'):
-            lang = lang.query_params.get('lang', 'en')
-        else:
-            lang = 'en'
-        return obj.get_description(lang)
-
-    def get_article_count(self, obj):
-        if hasattr(obj, '_article_count'):
-            return obj._article_count
-        return obj.articles.filter(is_active=True).count()
-
-
-class HelpCategoryDetailSerializer(serializers.ModelSerializer):
-    """Serializer for category detail with articles"""
-    name = serializers.SerializerMethodField()
-    description = serializers.SerializerMethodField()
-    articles = serializers.SerializerMethodField()
-    article_count = serializers.SerializerMethodField()
-
-    class Meta:
-        model = HelpCategory
-        fields = [
-            'id', 'name', 'slug', 'description', 'icon',
-            'position', 'is_active', 'show_on_public',
-            'show_in_dashboard', 'required_feature_key',
-            'article_count', 'articles', 'created_at', 'updated_at'
-        ]
-
-    def _get_language(self):
-        request = self.context.get('request')
-        if request and hasattr(request, 'query_params'):
-            return request.query_params.get('lang', 'en')
-        return 'en'
-
+    @extend_schema_field(OpenApiTypes.STR)
     def get_name(self, obj):
         return obj.get_name(self._get_language())
 
+    @extend_schema_field(OpenApiTypes.STR)
     def get_description(self, obj):
         return obj.get_description(self._get_language())
 
+    @extend_schema_field(OpenApiTypes.INT)
     def get_article_count(self, obj):
         if hasattr(obj, '_article_count'):
             return obj._article_count
         return obj.articles.filter(is_active=True).count()
-
-    def get_articles(self, obj):
-        articles = obj.articles.filter(is_active=True)
-        request = self.context.get('request')
-
-        # Filter based on visibility
-        if request and request.query_params.get('for_public') == 'true':
-            articles = articles.filter(show_on_public=True)
-        elif request and request.query_params.get('for_dashboard') == 'true':
-            articles = articles.filter(show_in_dashboard=True)
-
-        return HelpArticleListSerializer(articles, many=True, context=self.context).data
 
 
 class HelpCategoryAdminSerializer(serializers.ModelSerializer):
@@ -93,7 +86,11 @@ class HelpCategoryAdminSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
-class HelpArticleListSerializer(serializers.ModelSerializer):
+# =============================================================================
+# Article serializers
+# =============================================================================
+
+class HelpArticleListSerializer(LocalisedSerializerMixin, serializers.ModelSerializer):
     """Serializer for article listing"""
     title = serializers.SerializerMethodField()
     summary = serializers.SerializerMethodField()
@@ -111,26 +108,34 @@ class HelpArticleListSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at'
         ]
 
+    @extend_schema_field(OpenApiTypes.STR)
     def get_title(self, obj):
-        lang = self._get_language()
-        return obj.get_title(lang)
+        return obj.get_title(self._get_language())
 
+    @extend_schema_field(OpenApiTypes.STR)
     def get_summary(self, obj):
-        lang = self._get_language()
-        return obj.get_summary(lang)
+        return obj.get_summary(self._get_language())
 
+    @extend_schema_field(OpenApiTypes.STR)
     def get_category_name(self, obj):
-        lang = self._get_language()
-        return obj.category.get_name(lang)
-
-    def _get_language(self):
-        request = self.context.get('request')
-        if request and hasattr(request, 'query_params'):
-            return request.query_params.get('lang', 'en')
-        return 'en'
+        return obj.category.get_name(self._get_language())
 
 
-class HelpArticleDetailSerializer(serializers.ModelSerializer):
+class HelpGuideStepSerializer(serializers.Serializer):
+    """One localised step of a step-by-step guide (schema only, read-only)."""
+    step = serializers.IntegerField()
+    title = serializers.CharField()
+    content = serializers.CharField(help_text='Localised HTML fragment')
+    image = serializers.CharField(allow_blank=True)
+
+
+class HelpFAQItemSerializer(serializers.Serializer):
+    """One localised FAQ question/answer pair (schema only, read-only)."""
+    question = serializers.CharField()
+    answer = serializers.CharField(help_text='Localised HTML fragment')
+
+
+class HelpArticleDetailSerializer(LocalisedSerializerMixin, serializers.ModelSerializer):
     """Serializer for article detail view"""
     title = serializers.SerializerMethodField()
     summary = serializers.SerializerMethodField()
@@ -151,18 +156,19 @@ class HelpArticleDetailSerializer(serializers.ModelSerializer):
             'category', 'created_at', 'updated_at', 'published_at'
         ]
 
+    @extend_schema_field(OpenApiTypes.STR)
     def get_title(self, obj):
-        lang = self._get_language()
-        return obj.get_title(lang)
+        return obj.get_title(self._get_language())
 
+    @extend_schema_field(OpenApiTypes.STR)
     def get_summary(self, obj):
-        lang = self._get_language()
-        return obj.get_summary(lang)
+        return obj.get_summary(self._get_language())
 
+    @extend_schema_field(OpenApiTypes.STR)
     def get_content(self, obj):
-        lang = self._get_language()
-        return obj.get_content(lang)
+        return obj.get_content(self._get_language())
 
+    @extend_schema_field(HelpGuideStepSerializer(many=True))
     def get_guide_steps(self, obj):
         if not obj.guide_steps:
             return []
@@ -179,6 +185,7 @@ class HelpArticleDetailSerializer(serializers.ModelSerializer):
             localized_steps.append(localized_step)
         return localized_steps
 
+    @extend_schema_field(HelpFAQItemSerializer(many=True))
     def get_faq_items(self, obj):
         if not obj.faq_items:
             return []
@@ -193,12 +200,6 @@ class HelpArticleDetailSerializer(serializers.ModelSerializer):
             localized_items.append(localized_item)
         return localized_items
 
-    def _get_language(self):
-        request = self.context.get('request')
-        if request and hasattr(request, 'query_params'):
-            return request.query_params.get('lang', 'en')
-        return 'en'
-
 
 class HelpArticleAdminSerializer(serializers.ModelSerializer):
     """Serializer for admin CRUD - returns raw JSON fields"""
@@ -206,3 +207,35 @@ class HelpArticleAdminSerializer(serializers.ModelSerializer):
     class Meta:
         model = HelpArticle
         fields = '__all__'
+
+
+# =============================================================================
+# Category detail (needs HelpArticleListSerializer defined above)
+# =============================================================================
+
+class HelpCategoryDetailSerializer(HelpCategoryListSerializer):
+    """Serializer for category detail with its (non-paginated) active articles"""
+    articles = serializers.SerializerMethodField()
+
+    class Meta(HelpCategoryListSerializer.Meta):
+        fields = [
+            'id', 'name', 'slug', 'description', 'icon',
+            'position', 'is_active', 'show_on_public',
+            'show_in_dashboard', 'required_feature_key',
+            'article_count', 'articles', 'created_at', 'updated_at'
+        ]
+
+    @extend_schema_field(HelpArticleListSerializer(many=True))
+    def get_articles(self, obj):
+        # select_related avoids one category query per article when the
+        # list serializer resolves category_name / category_slug.
+        articles = obj.articles.filter(is_active=True).select_related('category')
+
+        # Filter based on visibility (for_dashboard wins over for_public)
+        mode = get_visibility_mode(self.context.get('request'))
+        if mode == 'dashboard':
+            articles = articles.filter(show_in_dashboard=True)
+        elif mode == 'public':
+            articles = articles.filter(show_on_public=True)
+
+        return HelpArticleListSerializer(articles, many=True, context=self.context).data
