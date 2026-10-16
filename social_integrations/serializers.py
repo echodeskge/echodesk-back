@@ -1,4 +1,7 @@
+from typing import Optional
 from rest_framework import serializers
+from drf_spectacular.utils import extend_schema_field, extend_schema_serializer
+from drf_spectacular.types import OpenApiTypes
 from .models import (
     FacebookPageConnection, FacebookMessage,
     InstagramAccountConnection, InstagramMessage,
@@ -681,6 +684,70 @@ class EmailMessageSerializer(serializers.ModelSerializer):
         ]
 
 
+@extend_schema_serializer(component_name='EmailMessageLite')
+class EmailMessageListSerializer(EmailMessageSerializer):
+    """Lightweight row for ``GET /api/social/email-messages/?lite=1``
+    (and ``GET /api/social/email-messages/lite/``). OpenAPI component
+    ``EmailMessageLite``.
+
+    Drops ``body_text`` / ``body_html`` / ``attachments`` (the bulk of every
+    row) and adds ``snippet`` (first 160 characters of ``body_text`` with
+    whitespace collapsed) and ``attachments_count`` so a phone can render an
+    inbox list from a ~10x smaller payload. Everything else — sender,
+    recipients, subject, dates, flags, labels, connection — is identical to
+    :class:`EmailMessageSerializer`.
+    """
+    SNIPPET_LENGTH = 160
+
+    snippet = serializers.SerializerMethodField()
+    attachments_count = serializers.SerializerMethodField()
+
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_snippet(self, obj) -> str:
+        text = ' '.join((obj.body_text or '').split())
+        return text[:self.SNIPPET_LENGTH]
+
+    @extend_schema_field(OpenApiTypes.INT)
+    def get_attachments_count(self, obj) -> int:
+        attachments = obj.attachments
+        return len(attachments) if isinstance(attachments, list) else 0
+
+    class Meta(EmailMessageSerializer.Meta):
+        fields = [
+            'id', 'message_id', 'thread_id', 'in_reply_to',
+            'from_email', 'from_name', 'to_emails', 'cc_emails', 'bcc_emails', 'reply_to',
+            'subject', 'snippet', 'attachments_count',
+            'timestamp', 'folder', 'uid',
+            'is_from_business', 'is_read', 'is_starred', 'is_answered', 'is_draft', 'labels',
+            'has_business_reply',
+            'is_read_by_staff', 'read_by_staff_at',
+            'is_deleted', 'deleted_at',
+            'connection_id', 'connection_email', 'connection_display_name',
+            'created_at', 'updated_at'
+        ]
+
+
+class EmailMessageDetailSerializer(EmailMessageSerializer):
+    """``GET /api/social/email-messages/{id}/`` row.
+
+    Adds ``body_html_safe``: ``body_html`` reduced to an allow-list of tags
+    (p/br/a/b/i/u/strong/em/ul/ol/li/blockquote/h1-h6/img/table/tr/td/th/
+    span/div, ...) with scripts, styles, event handlers and non-http(s)
+    URLs removed — safe to feed straight into a native HTML renderer.
+    ``body_html`` itself is still returned raw for clients that sanitise
+    themselves (the web dashboard uses DOMPurify).
+    """
+    body_html_safe = serializers.SerializerMethodField()
+
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_body_html_safe(self, obj) -> str:
+        from .html_sanitizer import sanitize_email_html
+        return sanitize_email_html(obj.body_html)
+
+    class Meta(EmailMessageSerializer.Meta):
+        fields = EmailMessageSerializer.Meta.fields + ['body_html_safe']
+
+
 class EmailSendSerializer(serializers.Serializer):
     """Serializer for sending email messages"""
     to_emails = serializers.ListField(
@@ -704,12 +771,245 @@ class EmailSendSerializer(serializers.Serializer):
     body_text = serializers.CharField(required=False, allow_blank=True, help_text="Plain text body")
     body_html = serializers.CharField(required=False, allow_blank=True, help_text="HTML body")
     reply_to_message_id = serializers.IntegerField(required=False, allow_null=True, help_text="ID of message being replied to")
+    connection_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text="Send from this email connection (pk). Defaults to the first active connection.",
+    )
 
     def validate(self, data):
         """Ensure at least one body is provided"""
         if not data.get('body_text') and not data.get('body_html'):
             raise serializers.ValidationError("At least one of body_text or body_html must be provided")
         return data
+
+
+class EmailSendMultipartSerializer(EmailSendSerializer):
+    """Schema-only view of the ``multipart/form-data`` send body.
+
+    Identical to :class:`EmailSendSerializer` plus ``attachments``: repeat the
+    form key ``attachments`` once per file (React Native: ``{uri, name, type}``
+    entries). List fields (``to_emails`` etc.) are also repeated keys.
+    """
+    attachments = serializers.ListField(
+        child=serializers.FileField(allow_empty_file=True),
+        required=False,
+        help_text="Files to attach — repeat the 'attachments' form key once per file",
+    )
+
+
+class EmailSendResponseSerializer(serializers.Serializer):
+    status = serializers.CharField(help_text="'success'")
+    message_id = serializers.IntegerField(allow_null=True, help_text="pk of the stored sent EmailMessage")
+    data = EmailMessageSerializer(allow_null=True)
+
+
+class EmailErrorResponseSerializer(serializers.Serializer):
+    """Error body used by the email function views."""
+    error = serializers.CharField()
+    details = serializers.CharField(required=False)
+
+
+class EmailActionResponseSerializer(serializers.Serializer):
+    status = serializers.CharField(help_text="'success'")
+    action = serializers.CharField()
+    affected_count = serializers.IntegerField()
+
+
+class EmailConnectionStatusAssignedUserSerializer(serializers.Serializer):
+    id = serializers.IntegerField(help_text="EmailConnectionUserAssignment pk")
+    user_id = serializers.IntegerField()
+    user_email = serializers.EmailField()
+    user_name = serializers.CharField()
+    assigned_at = serializers.DateTimeField()
+
+
+class EmailConnectionStatusItemSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    email_address = serializers.EmailField()
+    display_name = serializers.CharField(allow_blank=True)
+    imap_server = serializers.CharField()
+    smtp_server = serializers.CharField()
+    is_active = serializers.BooleanField()
+    last_sync_at = serializers.DateTimeField(allow_null=True)
+    last_sync_error = serializers.CharField(allow_blank=True)
+    auto_disabled_at = serializers.DateTimeField(allow_null=True)
+    sync_failure_count = serializers.IntegerField()
+    sync_folder = serializers.CharField()
+    connected_at = serializers.DateTimeField()
+    signature_enabled = serializers.BooleanField()
+    signature_html = serializers.CharField(allow_blank=True)
+    signature_text = serializers.CharField(allow_blank=True)
+    assigned_users = EmailConnectionStatusAssignedUserSerializer(
+        many=True, help_text="Only populated for staff/superusers; [] otherwise",
+    )
+
+
+class EmailConnectionStatusResponseSerializer(serializers.Serializer):
+    connected = serializers.BooleanField()
+    connections = EmailConnectionStatusItemSerializer(many=True)
+    connection = EmailConnectionStatusItemSerializer(
+        allow_null=True, help_text="First accessible connection (back-compat) or null",
+    )
+
+
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailConnectionIdRequest'.
+@extend_schema_serializer(component_name='EmailConnectionId')
+class EmailConnectionIdRequestSerializer(serializers.Serializer):
+    connection_id = serializers.IntegerField(help_text="EmailConnection pk")
+
+
+class EmailConnectionResponseSerializer(serializers.Serializer):
+    message = serializers.CharField()
+    connection = EmailConnectionSerializer()
+
+
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailConnectRequest'.
+@extend_schema_serializer(component_name='EmailConnect')
+class EmailConnectRequestSerializer(EmailConnectionCreateSerializer):
+    """Body of POST /email/connect/ (same as EmailConnectionCreateSerializer)."""
+
+
+class EmailConnectResponseSerializer(serializers.Serializer):
+    status = serializers.CharField(help_text="'success'")
+    message = serializers.CharField()
+    created = serializers.BooleanField(help_text="False when an existing connection for the address was updated")
+    connection = EmailConnectionSerializer()
+
+
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailConnectionUpdateRequest'.
+@extend_schema_serializer(component_name='EmailConnectionUpdate')
+class EmailConnectionUpdateRequestSerializer(serializers.Serializer):
+    connection_id = serializers.IntegerField()
+    display_name = serializers.CharField(required=False, allow_blank=True)
+    signature_enabled = serializers.BooleanField(required=False)
+    signature_html = serializers.CharField(required=False, allow_blank=True)
+    signature_text = serializers.CharField(required=False, allow_blank=True)
+    imap_server = serializers.CharField(required=False)
+    imap_port = serializers.IntegerField(required=False)
+    imap_use_ssl = serializers.BooleanField(required=False)
+    smtp_server = serializers.CharField(required=False)
+    smtp_port = serializers.IntegerField(required=False)
+    smtp_use_tls = serializers.BooleanField(required=False)
+    smtp_use_ssl = serializers.BooleanField(required=False)
+    username = serializers.CharField(required=False)
+    password = serializers.CharField(required=False, write_only=True)
+    sync_folder = serializers.CharField(required=False)
+    sync_days_back = serializers.IntegerField(required=False, min_value=0)
+
+
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailReactivateRequest'.
+@extend_schema_serializer(component_name='EmailReactivate')
+class EmailReactivateRequestSerializer(serializers.Serializer):
+    connection_id = serializers.IntegerField()
+    password = serializers.CharField(required=False, write_only=True, help_text="New password; triggers an SMTP test too")
+    username = serializers.CharField(required=False)
+    imap_server = serializers.CharField(required=False)
+    imap_port = serializers.IntegerField(required=False)
+    imap_use_ssl = serializers.BooleanField(required=False)
+    smtp_server = serializers.CharField(required=False)
+    smtp_port = serializers.IntegerField(required=False)
+    smtp_use_tls = serializers.BooleanField(required=False)
+    smtp_use_ssl = serializers.BooleanField(required=False)
+
+
+class EmailDisconnectDeletedSerializer(serializers.Serializer):
+    messages = serializers.IntegerField()
+    drafts = serializers.IntegerField()
+
+
+class EmailDisconnectResponseSerializer(serializers.Serializer):
+    status = serializers.CharField(help_text="'success'")
+    message = serializers.CharField()
+    deleted = EmailDisconnectDeletedSerializer()
+
+
+class EmailConnectionFoldersSerializer(serializers.Serializer):
+    connection_id = serializers.IntegerField()
+    email = serializers.EmailField()
+    folders = serializers.ListField(child=serializers.CharField(), help_text="IMAP folder names")
+    success = serializers.BooleanField(required=False, help_text="Only in the all-connections shape")
+    error = serializers.CharField(required=False, help_text="Only when success is false")
+
+
+class EmailFoldersResponseSerializer(serializers.Serializer):
+    """Two shapes: with ?connection_id → {connection_id, email, folders};
+    without → {connections: [{connection_id, email, folders, success, error?}]}."""
+    connection_id = serializers.IntegerField(required=False)
+    email = serializers.EmailField(required=False)
+    folders = serializers.ListField(child=serializers.CharField(), required=False)
+    connections = EmailConnectionFoldersSerializer(many=True, required=False)
+
+
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailSyncRequest'.
+@extend_schema_serializer(component_name='EmailSync')
+class EmailSyncRequestSerializer(serializers.Serializer):
+    connection_id = serializers.IntegerField(required=False, allow_null=True, help_text="Omit to sync every active connection")
+
+
+class EmailSyncResultSerializer(serializers.Serializer):
+    connection_id = serializers.IntegerField()
+    email_address = serializers.EmailField()
+    new_messages = serializers.IntegerField()
+
+
+class EmailSyncResponseSerializer(serializers.Serializer):
+    status = serializers.CharField(help_text="'success'")
+    new_messages = serializers.IntegerField()
+    sync_results = EmailSyncResultSerializer(many=True)
+
+
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailSyncDaysRequest'.
+@extend_schema_serializer(component_name='EmailSyncDays')
+class EmailSyncDaysRequestSerializer(serializers.Serializer):
+    connection_id = serializers.IntegerField(required=False, allow_null=True)
+    sync_days_back = serializers.IntegerField(min_value=0, help_text="0 = sync all history")
+
+
+class EmailSyncDaysResponseSerializer(serializers.Serializer):
+    status = serializers.CharField(help_text="'success'")
+    sync_days_back = serializers.IntegerField()
+    meaning = serializers.CharField()
+
+
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailMoveRequest'.
+@extend_schema_serializer(component_name='EmailMove')
+class EmailMoveRequestSerializer(serializers.Serializer):
+    message_id = serializers.CharField(help_text="RFC Message-ID header value (EmailMessage.message_id), NOT the pk")
+    source_folder = serializers.CharField()
+    target_folder = serializers.CharField()
+
+
+class EmailMoveResponseSerializer(serializers.Serializer):
+    success = serializers.BooleanField()
+    message = serializers.CharField()
+
+
+class EmailThreadSerializer(EmailMessageSerializer):
+    """Row of GET /email-messages/threads/: the latest message of a thread
+    plus per-thread counters and the external party."""
+    message_count = serializers.IntegerField()
+    unread_count = serializers.IntegerField(help_text="Customer messages not yet read by staff")
+    customer_email = serializers.CharField(allow_blank=True)
+    customer_name = serializers.CharField(allow_blank=True)
+
+    class Meta(EmailMessageSerializer.Meta):
+        fields = EmailMessageSerializer.Meta.fields + [
+            'message_count', 'unread_count', 'customer_email', 'customer_name',
+        ]
+
+
+class EmailMessageResponseSerializer(serializers.Serializer):
+    message = serializers.CharField()
+
+
+class SocialUnreadCountResponseSerializer(serializers.Serializer):
+    total = serializers.IntegerField()
+    facebook = serializers.IntegerField()
+    instagram = serializers.IntegerField()
+    whatsapp = serializers.IntegerField()
+    email = serializers.IntegerField(help_text="Unread INBOX messages from customers on connections the user can access")
+    widget = serializers.IntegerField()
+    telegram = serializers.IntegerField()
 
 
 class EmailDraftSerializer(serializers.ModelSerializer):
@@ -728,8 +1028,13 @@ class EmailDraftSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_by', 'created_by_name', 'created_at', 'updated_at']
+        extra_kwargs = {
+            # Resolved server-side on create: reply_to_message's connection,
+            # else this value, else the first active connection.
+            'connection': {'required': False},
+        }
 
-    def get_created_by_name(self, obj):
+    def get_created_by_name(self, obj) -> str:
         return obj.created_by.get_full_name() or obj.created_by.email
 
 
@@ -789,12 +1094,12 @@ class EmailConnectionUserAssignmentSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'assigned_by', 'assigned_at']
 
-    def get_user_name(self, obj):
+    def get_user_name(self, obj) -> Optional[str]:
         if obj.user:
             return obj.user.get_full_name() or obj.user.email
         return None
 
-    def get_assigned_by_name(self, obj):
+    def get_assigned_by_name(self, obj) -> Optional[str]:
         if obj.assigned_by:
             return obj.assigned_by.get_full_name() or obj.assigned_by.email
         return None
@@ -832,6 +1137,26 @@ class EmailConnectionWithAssignmentsSerializer(serializers.ModelSerializer):
             'id', 'last_sync_at', 'last_sync_error', 'auto_disabled_at',
             'sync_failure_count', 'created_at', 'updated_at',
         ]
+
+
+class EmailAssignedUsersResponseSerializer(serializers.Serializer):
+    connection_id = serializers.IntegerField()
+    connection_email = serializers.EmailField(required=False)
+    message = serializers.CharField(required=False, help_text="Only on PUT")
+    assigned_users = EmailConnectionUserAssignmentSerializer(many=True)
+
+
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailAssignedUsersUpdateRequest'.
+@extend_schema_serializer(component_name='EmailAssignedUsersUpdate')
+class EmailAssignedUsersUpdateRequestSerializer(serializers.Serializer):
+    user_ids = serializers.ListField(child=serializers.IntegerField(), help_text="Replaces the full assignment list")
+
+
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailAssignmentCreateRequest'.
+@extend_schema_serializer(component_name='EmailAssignmentCreate')
+class EmailAssignmentCreateRequestSerializer(serializers.Serializer):
+    connection_id = serializers.IntegerField()
+    user_id = serializers.IntegerField()
 
 
 # =============================================================================
@@ -948,7 +1273,7 @@ class EmailSignatureSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_by', 'created_by_name', 'created_at', 'updated_at']
 
-    def get_created_by_name(self, obj):
+    def get_created_by_name(self, obj) -> Optional[str]:
         if obj.created_by:
             return obj.created_by.get_full_name() or obj.created_by.email
         return None
