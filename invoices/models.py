@@ -10,6 +10,8 @@ This module contains all models for the Invoice Management feature:
 """
 
 from django.db import models
+from django.db.models.signals import post_delete
+from django.dispatch import receiver
 from django.core.validators import MinValueValidator, MaxValueValidator
 from django.utils.translation import gettext_lazy as _
 from django.utils import timezone
@@ -178,6 +180,12 @@ class Invoice(models.Model):
         ('cancelled', _('Cancelled')),
     ]
 
+    # Statuses that can become overdue once the due date has passed. Drafts,
+    # paid and cancelled invoices are never overdue. The stored 'overdue'
+    # status (only ever written by update_payment_status) is included so a
+    # row that was explicitly flagged still shows up in the overdue filters.
+    OVERDUE_ELIGIBLE_STATUSES = ('sent', 'viewed', 'partially_paid', 'overdue')
+
     # Basic Information
     invoice_number = models.CharField(
         max_length=50,
@@ -336,6 +344,19 @@ class Invoice(models.Model):
             return False
         return timezone.now().date() > self.due_date
 
+    @classmethod
+    def overdue_q(cls, today=None):
+        """
+        Queryset-level equivalent of ``is_overdue()``: open invoices whose due
+        date is in the past. Shared by the list filters (``?overdue=true`` /
+        ``?status=overdue``) and the stats endpoint so they always agree.
+        """
+        today = today or timezone.now().date()
+        return models.Q(
+            due_date__lt=today,
+            status__in=cls.OVERDUE_ELIGIBLE_STATUSES,
+        )
+
     def mark_as_paid(self):
         """Mark invoice as paid"""
         self.status = 'paid'
@@ -353,6 +374,31 @@ class Invoice(models.Model):
         elif self.is_overdue():
             self.status = 'overdue'
         self.save()
+
+    def recompute_paid_amount(self):
+        """
+        Re-derive ``paid_amount`` (and the payment-driven status) from the
+        payment rows. Used after a payment is saved or deleted so the invoice
+        never drifts from its ledger.
+        """
+        total_paid = self.payments.aggregate(
+            total=models.Sum('amount')
+        )['total'] or Decimal('0.00')
+
+        self.paid_amount = total_paid
+        # paid_date is re-set by update_payment_status() when still fully paid.
+        self.paid_date = None
+
+        if total_paid <= 0:
+            # Every payment is gone: fall back to the pre-payment state. The
+            # overdue case is handled by update_payment_status() below.
+            if self.status in ('paid', 'partially_paid'):
+                self.status = 'sent'
+            if self.status in ('draft', 'cancelled'):
+                self.save()
+                return
+
+        self.update_payment_status()
 
     def generate_pdf(self):
         """Generate PDF for this invoice"""
@@ -588,12 +634,28 @@ class InvoicePayment(models.Model):
 
         # Update invoice paid amount and status
         if self.invoice:
-            total_paid = self.invoice.payments.aggregate(
-                total=models.Sum('amount')
-            )['total'] or Decimal('0')
+            self.invoice.recompute_paid_amount()
 
-            self.invoice.paid_amount = total_paid
-            self.invoice.update_payment_status()
+
+@receiver(post_delete, sender=InvoicePayment, dispatch_uid='invoices.payment_deleted_recompute')
+def recompute_invoice_on_payment_delete(sender, instance, origin=None, **kwargs):
+    """
+    Deleting (or bulk-deleting) a payment must pull the invoice's paid_amount
+    and status back in line with the remaining payments.
+
+    Skipped when the deletion is the cascade of the invoice itself: the invoice
+    row is going away, so there is nothing to recompute (and saving it mid-
+    delete would fire the invoice notification signals for nothing).
+    """
+    if isinstance(origin, Invoice):
+        return
+    if isinstance(origin, models.QuerySet) and origin.model is Invoice:
+        return
+
+    invoice = Invoice.objects.filter(pk=instance.invoice_id).first()
+    if invoice is None:
+        return
+    invoice.recompute_paid_amount()
 
 
 class InvoiceTemplate(models.Model):

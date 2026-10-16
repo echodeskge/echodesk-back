@@ -13,6 +13,10 @@ from django.http import FileResponse, HttpResponse
 from django.db import transaction
 from django.db.models import Q, Sum, Count, Prefetch
 from datetime import datetime, timedelta
+from drf_spectacular.utils import (
+    extend_schema, extend_schema_view, OpenApiParameter, OpenApiResponse,
+)
+from drf_spectacular.types import OpenApiTypes
 
 from .models import (
     InvoiceSettings,
@@ -30,14 +34,49 @@ from .serializers import (
     InvoicePaymentSerializer,
     InvoiceTemplateSerializer,
     ClientSerializer,
-    ListItemMaterialSerializer
+    ListItemMaterialSerializer,
+    # schema-only
+    MessageResponseSerializer,
+    ErrorResponseSerializer,
+    InvoiceStatsSerializer,
+    InvoiceSendEmailRequestSerializer,
+    InvoiceMarkPaidRequestSerializer,
+    InvoiceLineItemReorderRequestSerializer,
+    InvoiceAvailableItemListSerializer,
+    InvoiceLogoUploadSerializer,
+    InvoiceBadgeUploadSerializer,
+    InvoiceSignatureUploadSerializer,
 )
+from .filters import InvoiceFilterSet
 from ecommerce_crm.models import EcommerceClient, Product
 from tickets.models import ItemList, ListItem
+from tickets.serializers import ItemListMinimalSerializer
 from tenants.permissions import require_subscription_feature
 from .permissions import CanManageInvoices
 
 
+ERROR_400 = OpenApiResponse(response=ErrorResponseSerializer, description='Rejected: `{"error": "..."}`')
+
+INVOICE_ID_PARAM = OpenApiParameter(
+    'invoice_id', OpenApiTypes.INT, OpenApiParameter.QUERY,
+    description='Only rows belonging to this invoice. Without it every row in the tenant is returned.',
+)
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary='Get the invoice settings (singleton)',
+        description='Returns the tenant\'s single InvoiceSettings object (created on first call). Not paginated; page/page_size are ignored.',
+        responses={200: InvoiceSettingsSerializer},
+    ),
+    create=extend_schema(
+        summary='Update the invoice settings',
+        description='Partial update of the singleton (same as PATCH). Responds 200, not 201.',
+        responses={200: InvoiceSettingsSerializer},
+    ),
+    update=extend_schema(responses={200: InvoiceSettingsSerializer}),
+    partial_update=extend_schema(responses={200: InvoiceSettingsSerializer}),
+)
 class InvoiceSettingsViewSet(viewsets.ModelViewSet):
     """
     API endpoint for invoice settings management
@@ -70,6 +109,11 @@ class InvoiceSettingsViewSet(viewsets.ModelViewSet):
         serializer.save()
         return Response(serializer.data)
 
+    @extend_schema(
+        summary='Upload the company logo',
+        request={'multipart/form-data': InvoiceLogoUploadSerializer},
+        responses={200: InvoiceSettingsSerializer, 400: ERROR_400},
+    )
     @action(detail=False, methods=['post'], url_path='upload-logo')
     def upload_logo(self, request):
         """Upload company logo"""
@@ -87,6 +131,11 @@ class InvoiceSettingsViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(settings)
         return Response(serializer.data)
 
+    @extend_schema(
+        summary='Upload the company badge / seal',
+        request={'multipart/form-data': InvoiceBadgeUploadSerializer},
+        responses={200: InvoiceSettingsSerializer, 400: ERROR_400},
+    )
     @action(detail=False, methods=['post'], url_path='upload-badge')
     def upload_badge(self, request):
         """Upload company badge/seal"""
@@ -104,6 +153,11 @@ class InvoiceSettingsViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(settings)
         return Response(serializer.data)
 
+    @extend_schema(
+        summary='Upload the signature image',
+        request={'multipart/form-data': InvoiceSignatureUploadSerializer},
+        responses={200: InvoiceSettingsSerializer, 400: ERROR_400},
+    )
     @action(detail=False, methods=['post'], url_path='upload-signature')
     def upload_signature(self, request):
         """Upload signature image"""
@@ -121,6 +175,7 @@ class InvoiceSettingsViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(settings)
         return Response(serializer.data)
 
+    @extend_schema(summary='Remove the company logo', responses={200: MessageResponseSerializer})
     @action(detail=False, methods=['delete'], url_path='remove-logo')
     def remove_logo(self, request):
         """Remove company logo"""
@@ -131,6 +186,7 @@ class InvoiceSettingsViewSet(viewsets.ModelViewSet):
 
         return Response({'message': 'Logo removed successfully'})
 
+    @extend_schema(summary='Remove the company badge', responses={200: MessageResponseSerializer})
     @action(detail=False, methods=['delete'], url_path='remove-badge')
     def remove_badge(self, request):
         """Remove company badge"""
@@ -141,6 +197,7 @@ class InvoiceSettingsViewSet(viewsets.ModelViewSet):
 
         return Response({'message': 'Badge removed successfully'})
 
+    @extend_schema(summary='Remove the signature image', responses={200: MessageResponseSerializer})
     @action(detail=False, methods=['delete'], url_path='remove-signature')
     def remove_signature(self, request):
         """Remove signature"""
@@ -151,6 +208,10 @@ class InvoiceSettingsViewSet(viewsets.ModelViewSet):
 
         return Response({'message': 'Signature removed successfully'})
 
+    @extend_schema(
+        summary='Debug: subscription state for invoice_management',
+        responses={200: OpenApiTypes.OBJECT},
+    )
     @action(detail=False, methods=['get'], url_path='debug-subscription')
     def debug_subscription(self, request):
         """Debug endpoint to check subscription state"""
@@ -184,25 +245,69 @@ class InvoiceSettingsViewSet(viewsets.ModelViewSet):
             'has_invoice_management_function': has_feature_result,
         })
 
-    @action(detail=False, methods=['get'], url_path='available-itemlists')
+    @extend_schema(
+        # Keep the historical operation id: a list-typed response would
+        # otherwise rename it to *_list and break the web's generated import.
+        operation_id='invoices_settings_available_itemlists_retrieve',
+        summary='Item lists usable as the client / materials source',
+        description='Bare (non-paginated) list of active ItemLists.',
+        responses={200: InvoiceAvailableItemListSerializer(many=True)},
+    )
+    # pagination_class=None: the action returns a bare array; without this the
+    # schema would wrap it in the viewset's paginated envelope.
+    @action(detail=False, methods=['get'], url_path='available-itemlists', pagination_class=None)
     def available_itemlists(self, request):
         """Get list of available item lists that can be used for clients"""
-        from tickets.models import ItemList
-        from tickets.serializers import ItemListMinimalSerializer
-
         item_lists = ItemList.objects.filter(is_active=True)
         serializer = ItemListMinimalSerializer(item_lists, many=True)
         return Response(serializer.data)
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='List invoices',
+        description=(
+            'Paginated invoice list. Filters: `status`, `client`, `client_itemlist_item`, '
+            '`currency`, `date_from` / `date_to` (issue_date), `overdue=true`. '
+            '`status=overdue` and `overdue=true` are the same computed filter (open invoice, '
+            'due_date in the past) because a past-due invoice keeps its stored `sent` status. '
+            '`search` matches invoice_number, the cached client_name, the e-commerce client\'s '
+            'first/last name and email, and the client ListItem label / custom_data.email.'
+        ),
+    ),
+    create=extend_schema(
+        summary='Create an invoice',
+        description='Returns the full InvoiceDetail of the new draft (invoice_number is generated server-side).',
+        responses={201: InvoiceDetailSerializer},
+    ),
+    update=extend_schema(
+        summary='Replace a draft invoice',
+        description='Only drafts can be edited. Passing `line_items` replaces all line items. Returns InvoiceDetail.',
+        responses={200: InvoiceDetailSerializer, 400: ERROR_400},
+    ),
+    partial_update=extend_schema(
+        summary='Edit a draft invoice',
+        description='Only drafts can be edited. Passing `line_items` replaces all line items. Returns InvoiceDetail.',
+        responses={200: InvoiceDetailSerializer, 400: ERROR_400},
+    ),
+    destroy=extend_schema(
+        summary='Delete a draft invoice',
+        responses={204: None, 400: ERROR_400},
+    ),
+)
 class InvoiceViewSet(viewsets.ModelViewSet):
     """
     API endpoint for invoice management
     """
     permission_classes = [IsAuthenticated, CanManageInvoices]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'client', 'currency']
-    search_fields = ['invoice_number', 'client__first_name', 'client__last_name', 'client__email']
+    filterset_class = InvoiceFilterSet
+    search_fields = [
+        'invoice_number',
+        'client_name',
+        'client__first_name', 'client__last_name', 'client__email',
+        'client_itemlist_item__label', 'client_itemlist_item__custom_data__email',
+    ]
     ordering_fields = ['created_at', 'issue_date', 'due_date', 'total']
     ordering = ['-created_at']
 
@@ -231,36 +336,8 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         return InvoiceDetailSerializer
 
     def list(self, request, *args, **kwargs):
-        """List invoices with filters"""
-        queryset = self.filter_queryset(self.get_queryset())
-
-        # Additional filters
-        status_filter = request.query_params.get('status')
-        if status_filter:
-            queryset = queryset.filter(status=status_filter)
-
-        date_from = request.query_params.get('date_from')
-        date_to = request.query_params.get('date_to')
-        if date_from:
-            queryset = queryset.filter(issue_date__gte=date_from)
-        if date_to:
-            queryset = queryset.filter(issue_date__lte=date_to)
-
-        # Check for overdue invoices
-        overdue = request.query_params.get('overdue')
-        if overdue == 'true':
-            queryset = queryset.filter(
-                due_date__lt=timezone.now().date(),
-                status__in=['sent', 'viewed', 'partially_paid']
-            )
-
-        page = self.paginate_queryset(queryset)
-        if page is not None:
-            serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
-
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
+        """List invoices. All filters (status/overdue/date range/...) live in InvoiceFilterSet."""
+        return super().list(request, *args, **kwargs)
 
     def retrieve(self, request, *args, **kwargs):
         """Get invoice details"""
@@ -288,7 +365,16 @@ class InvoiceViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        return super().update(request, *args, **kwargs)
+        partial = kwargs.pop('partial', False)
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        invoice = serializer.save()
+
+        # Same shape as create/retrieve so clients don't need a follow-up GET.
+        # Re-fetch through get_queryset() so the annotations/prefetches match.
+        invoice = self.get_queryset().get(pk=invoice.pk)
+        detail_serializer = InvoiceDetailSerializer(invoice, context=self.get_serializer_context())
+        return Response(detail_serializer.data)
 
     def destroy(self, request, *args, **kwargs):
         """Delete invoice (only if draft)"""
@@ -302,6 +388,12 @@ class InvoiceViewSet(viewsets.ModelViewSet):
 
         return super().destroy(request, *args, **kwargs)
 
+    @extend_schema(
+        summary='Finalize a draft (draft -> sent)',
+        description='No request body. Queues PDF generation; `pdf_url` stays null until the Celery task finishes.',
+        request=None,
+        responses={200: InvoiceDetailSerializer, 400: ERROR_400},
+    )
     @action(detail=True, methods=['post'])
     def finalize(self, request, pk=None):
         """Finalize invoice and generate PDF"""
@@ -324,6 +416,16 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(invoice)
         return Response(serializer.data)
 
+    @extend_schema(
+        summary='Email the invoice to the client',
+        description=(
+            'Queues a Celery task that sends the email via SendGrid and sets `sent_date` '
+            'immediately. Drafts are rejected. When `attach_pdf` is true and the PDF has not '
+            'been generated yet it is rendered before sending.'
+        ),
+        request=InvoiceSendEmailRequestSerializer,
+        responses={200: MessageResponseSerializer, 400: ERROR_400},
+    )
     @action(detail=True, methods=['post'])
     def send_email(self, request, pk=None):
         """Send invoice via email"""
@@ -369,6 +471,23 @@ class InvoiceViewSet(viewsets.ModelViewSet):
 
         return Response({'message': 'Invoice email queued for delivery'})
 
+    @extend_schema(
+        summary='Download the invoice PDF',
+        description=(
+            'Raw `application/pdf` bytes (`Content-Disposition: inline; filename="<invoice_number>.pdf"`). '
+            'Rendered synchronously with WeasyPrint when `pdf_file` is empty or `regenerate=true`. '
+            'Needs the usual Token header; do not call it through a JSON client.'
+        ),
+        parameters=[
+            OpenApiParameter('regenerate', OpenApiTypes.BOOL, OpenApiParameter.QUERY,
+                             description='Force a re-render even if a PDF already exists.'),
+        ],
+        responses={
+            (200, 'application/pdf'): OpenApiTypes.BINARY,
+            404: ERROR_400,
+            500: ERROR_400,
+        },
+    )
     @action(detail=True, methods=['get'])
     def pdf(self, request, pk=None):
         """Download invoice PDF"""
@@ -407,6 +526,13 @@ class InvoiceViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
+    @extend_schema(
+        summary='Export the invoice as an .xlsx workbook',
+        description='Raw xlsx bytes (`Content-Disposition: attachment; filename="<invoice_number>.xlsx"`), built synchronously.',
+        responses={
+            (200, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'): OpenApiTypes.BINARY,
+        },
+    )
     @action(detail=True, methods=['get'])
     def excel(self, request, pk=None):
         """Export invoice to Excel"""
@@ -561,13 +687,30 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         response['Content-Disposition'] = f'attachment; filename="{invoice.invoice_number}.xlsx"'
         return response
 
+    @extend_schema(
+        summary='Mark the invoice fully paid',
+        description=(
+            'Records one payment for the remaining balance and sets status=paid / paid_date. '
+            'Idempotent: already-paid invoices are returned unchanged. Cancelled invoices are rejected. '
+            'Body is optional.'
+        ),
+        request=InvoiceMarkPaidRequestSerializer,
+        responses={200: InvoiceDetailSerializer, 400: ERROR_400},
+    )
     @action(detail=True, methods=['post'])
     def mark_paid(self, request, pk=None):
         """Quick mark invoice as paid"""
+        invoice = self.get_object()
+        if invoice.status == 'cancelled':
+            return Response(
+                {'error': 'Cancelled invoices cannot be marked as paid'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         with transaction.atomic():
             # Lock the invoice row so a double-submit (or concurrent request)
             # can't each insert a full-balance payment and over-pay the invoice.
-            invoice = Invoice.objects.select_for_update().get(pk=self.get_object().pk)
+            invoice = Invoice.objects.select_for_update().get(pk=invoice.pk)
 
             # Idempotent: if it's already fully paid, don't add another payment.
             if invoice.status != 'paid':
@@ -586,6 +729,12 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(invoice)
         return Response(serializer.data)
 
+    @extend_schema(
+        summary='Duplicate an invoice into a new draft',
+        description='No request body. Copies client, currency, discount, notes, terms, template and line items; dates reset to today / +30 days.',
+        request=None,
+        responses={201: InvoiceDetailSerializer, 400: ERROR_400},
+    )
     @action(detail=True, methods=['post'])
     def duplicate(self, request, pk=None):
         """Duplicate an existing invoice"""
@@ -639,6 +788,15 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         detail_serializer = InvoiceDetailSerializer(new_invoice, context={'request': request})
         return Response(detail_serializer.data, status=status.HTTP_201_CREATED)
 
+    @extend_schema(
+        summary='Invoice KPI tiles',
+        description=(
+            'Bare object (not paginated). `current_month` buckets by created_at and includes every status; '
+            '`outstanding_amount` sums `total` of invoices not paid/cancelled (drafts included); '
+            '`overdue_count` uses the same rule as `?overdue=true`. Sums ignore currency.'
+        ),
+        responses={200: InvoiceStatsSerializer},
+    )
     @action(detail=False, methods=['get'])
     def stats(self, request):
         """Get invoice statistics"""
@@ -653,10 +811,7 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         total_invoiced = current_month.aggregate(Sum('total'))['total__sum'] or 0
         total_paid = current_month.filter(status='paid').aggregate(Sum('total'))['total__sum'] or 0
         outstanding = queryset.exclude(status__in=['paid', 'cancelled']).aggregate(Sum('total'))['total__sum'] or 0
-        overdue_count = queryset.filter(
-            due_date__lt=now.date(),
-            status__in=['sent', 'viewed', 'partially_paid']
-        ).count()
+        overdue_count = queryset.filter(Invoice.overdue_q(now.date())).count()
 
         return Response({
             'current_month': {
@@ -669,6 +824,9 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         })
 
 
+@extend_schema_view(
+    list=extend_schema(summary='List line items', parameters=[INVOICE_ID_PARAM]),
+)
 class InvoiceLineItemViewSet(viewsets.ModelViewSet):
     """
     API endpoint for invoice line items
@@ -693,6 +851,11 @@ class InvoiceLineItemViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
+    @extend_schema(
+        summary='Reorder line items',
+        request=InvoiceLineItemReorderRequestSerializer,
+        responses={200: MessageResponseSerializer},
+    )
     @action(detail=False, methods=['post'], url_path='reorder')
     def reorder(self, request):
         """Reorder line items"""
@@ -707,6 +870,21 @@ class InvoiceLineItemViewSet(viewsets.ModelViewSet):
         return Response({'message': 'Line items reordered successfully'})
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='List payments',
+        description='Ordered by -payment_date. `search` / `ordering` are not wired on this endpoint.',
+        parameters=[INVOICE_ID_PARAM],
+    ),
+    create=extend_schema(
+        summary='Record a payment',
+        description=(
+            '`amount` must be > 0 and <= the invoice balance (total - paid_amount); cancelled '
+            'invoices are rejected. Saving recomputes the invoice paid_amount and status '
+            '(paid / partially_paid). Deleting a payment recomputes them too.'
+        ),
+    ),
+)
 class InvoicePaymentViewSet(viewsets.ModelViewSet):
     """
     API endpoint for invoice payments
@@ -774,11 +952,25 @@ class InvoiceTemplateViewSet(viewsets.ModelViewSet):
         )
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='Clients selectable on an invoice',
+        description=(
+            'Rows come from the client ItemList configured in settings (search on label) or, when '
+            'none is configured, from active e-commerce clients (search on first/last name, email). '
+            'The returned `id` is what `POST /api/invoices/invoices/` expects in `client`.'
+        ),
+    ),
+)
 class ClientViewSet(viewsets.ReadOnlyModelViewSet):
     """
     API endpoint for client selection in invoices
     Returns clients from the configured client_itemlist in InvoiceSettings
     """
+    # Schema-time only: get_queryset() needs the tenant's settings row, which
+    # does not exist while the OpenAPI schema is generated. Gives the `{id}`
+    # path parameter its integer type.
+    queryset = ListItem.objects.none()
     serializer_class = ClientSerializer
     permission_classes = [IsAuthenticated, CanManageInvoices]
     filter_backends = [filters.SearchFilter]
@@ -814,6 +1006,16 @@ class ClientViewSet(viewsets.ReadOnlyModelViewSet):
             return queryset
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='Materials selectable as invoice line items',
+        description=(
+            'Bare (non-paginated) list of the active items of the materials ItemList configured in '
+            'settings; empty when none is configured. Use `item_source=list_item` + `list_item=<id>` '
+            'on the line item.'
+        ),
+    ),
+)
 class InvoiceMaterialViewSet(viewsets.ReadOnlyModelViewSet):
     """
     API endpoint for materials (from ItemList) selection
@@ -823,6 +1025,9 @@ class InvoiceMaterialViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated, CanManageInvoices]
     filter_backends = [filters.SearchFilter]
     search_fields = ['label', 'custom_data']
+    # list() has never paginated (it returns a bare array); declare it so the
+    # schema does too and stops advertising page/page_size.
+    pagination_class = None
 
     def list(self, request, *args, **kwargs):
         """List materials from configured materials ItemList in InvoiceSettings"""
