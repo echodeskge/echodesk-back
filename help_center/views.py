@@ -1,16 +1,66 @@
-from rest_framework import viewsets, filters, status
-from rest_framework.decorators import api_view, action
+from django.db.models import Count, Q
+from django.utils.http import http_date, parse_http_date_safe
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    extend_schema,
+    extend_schema_view,
+)
+from rest_framework import filters, status, viewsets
+from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.permissions import AllowAny, IsAdminUser
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, IsAdminUser, AllowAny
-from django.db.models import Q
-from .models import HelpCategory, HelpArticle
+
+from .models import HelpArticle, HelpCategory
 from .serializers import (
-    HelpCategoryListSerializer,
-    HelpCategoryDetailSerializer,
-    HelpCategoryAdminSerializer,
-    HelpArticleListSerializer,
-    HelpArticleDetailSerializer,
+    SUPPORTED_LANGUAGES,
     HelpArticleAdminSerializer,
+    HelpArticleDetailSerializer,
+    HelpArticleListSerializer,
+    HelpCategoryAdminSerializer,
+    HelpCategoryDetailSerializer,
+    HelpCategoryListSerializer,
+    get_visibility_mode,
+)
+
+
+# =============================================================================
+# Shared OpenAPI query parameters for the public endpoints
+# =============================================================================
+
+LANG_PARAM = OpenApiParameter(
+    'lang', OpenApiTypes.STR, OpenApiParameter.QUERY,
+    enum=list(SUPPORTED_LANGUAGES),
+    description='Language for the localised fields (name, title, summary, content, ...). Defaults to `en`.',
+)
+FOR_DASHBOARD_PARAM = OpenApiParameter(
+    'for_dashboard', OpenApiTypes.BOOL, OpenApiParameter.QUERY,
+    description='`true` → only content flagged `show_in_dashboard` (tenant dashboard help). '
+                'Takes precedence over `for_public` when both are sent.',
+)
+FOR_PUBLIC_PARAM = OpenApiParameter(
+    'for_public', OpenApiTypes.BOOL, OpenApiParameter.QUERY,
+    description='`true` → only content flagged `show_on_public` (public /docs site). '
+                'Ignored when `for_dashboard=true`.',
+)
+VISIBILITY_PARAMS = [LANG_PARAM, FOR_DASHBOARD_PARAM, FOR_PUBLIC_PARAM]
+
+CATEGORY_PARAM = OpenApiParameter(
+    'category', OpenApiTypes.STR, OpenApiParameter.QUERY,
+    description='Filter by category slug.',
+)
+CONTENT_TYPE_PARAM = OpenApiParameter(
+    'content_type', OpenApiTypes.STR, OpenApiParameter.QUERY,
+    enum=[key for key, _ in HelpArticle.CONTENT_TYPE_CHOICES],
+    description='Filter by article content type.',
+)
+FEATURED_PARAM = OpenApiParameter(
+    'featured', OpenApiTypes.BOOL, OpenApiParameter.QUERY,
+    description='`true` → only featured articles.',
+)
+ORDERING_PARAM = OpenApiParameter(
+    'ordering', OpenApiTypes.STR, OpenApiParameter.QUERY,
+    description='Sort field; prefix with `-` for descending. One of `position`, `created_at`, `updated_at`.',
 )
 
 
@@ -18,6 +68,19 @@ from .serializers import (
 # Public ViewSets (No Authentication Required)
 # =============================================================================
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='List help categories',
+        description='Active help categories ordered by position. Content is global (shared across tenants).',
+        parameters=VISIBILITY_PARAMS + [ORDERING_PARAM],
+    ),
+    retrieve=extend_schema(
+        summary='Get a help category with its articles',
+        description='One active category (by slug) with its active articles embedded '
+                    '(not paginated; `for_dashboard`/`for_public` filter the embedded articles too).',
+        parameters=VISIBILITY_PARAMS,
+    ),
+)
 class PublicHelpCategoryViewSet(viewsets.ReadOnlyModelViewSet):
     """
     Public read-only ViewSet for help categories.
@@ -25,21 +88,25 @@ class PublicHelpCategoryViewSet(viewsets.ReadOnlyModelViewSet):
     """
     permission_classes = [AllowAny]
     lookup_field = 'slug'
+    # No SearchFilter: the view never exposed a working `search` param, and
+    # leaving the project default in place advertised a bogus one in the schema.
+    filter_backends = [filters.OrderingFilter]
+    ordering_fields = ['position', 'created_at', 'updated_at']
+    queryset = HelpCategory.objects.none()  # real queryset built in get_queryset()
 
     def get_queryset(self):
-        from django.db.models import Count, Q
+        # article_count is annotated DB-side; the list serializer never walks
+        # `articles`, so there is nothing to prefetch here.
         queryset = HelpCategory.objects.filter(is_active=True).annotate(
             _article_count=Count('articles', filter=Q(articles__is_active=True))
-        ).prefetch_related('articles')
+        )
 
-        # Filter by visibility
-        for_public = self.request.query_params.get('for_public')
-        for_dashboard = self.request.query_params.get('for_dashboard')
-
-        if for_public == 'true':
-            queryset = queryset.filter(show_on_public=True)
-        elif for_dashboard == 'true':
+        # Filter by visibility (for_dashboard wins over for_public)
+        mode = get_visibility_mode(self.request)
+        if mode == 'dashboard':
             queryset = queryset.filter(show_in_dashboard=True)
+        elif mode == 'public':
+            queryset = queryset.filter(show_on_public=True)
 
         return queryset.order_by('position', 'created_at')
 
@@ -49,6 +116,25 @@ class PublicHelpCategoryViewSet(viewsets.ReadOnlyModelViewSet):
         return HelpCategoryListSerializer
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='List help articles',
+        description='Active articles in active categories. Paginated. '
+                    'Default ordering: category position, article position, newest first.',
+        parameters=VISIBILITY_PARAMS + [CATEGORY_PARAM, CONTENT_TYPE_PARAM, FEATURED_PARAM, ORDERING_PARAM],
+    ),
+    retrieve=extend_schema(
+        summary='Get a help article',
+        description='One active article by slug (slugs are unique across categories). '
+                    'The response carries a `Last-Modified` header (from `updated_at`) and honours '
+                    '`If-Modified-Since` with `304 Not Modified`.',
+        parameters=VISIBILITY_PARAMS,
+        responses={
+            200: HelpArticleDetailSerializer,
+            304: None,
+        },
+    ),
+)
 class PublicHelpArticleViewSet(viewsets.ReadOnlyModelViewSet):
     """
     Public read-only ViewSet for help articles.
@@ -59,6 +145,7 @@ class PublicHelpArticleViewSet(viewsets.ReadOnlyModelViewSet):
     filter_backends = [filters.OrderingFilter]
     ordering_fields = ['position', 'created_at', 'updated_at']
     ordering = ['category__position', 'position', '-created_at']
+    queryset = HelpArticle.objects.none()  # real queryset built in get_queryset()
 
     def get_queryset(self):
         queryset = HelpArticle.objects.filter(
@@ -66,14 +153,12 @@ class PublicHelpArticleViewSet(viewsets.ReadOnlyModelViewSet):
             category__is_active=True
         ).select_related('category')
 
-        # Filter by visibility
-        for_public = self.request.query_params.get('for_public')
-        for_dashboard = self.request.query_params.get('for_dashboard')
-
-        if for_public == 'true':
-            queryset = queryset.filter(show_on_public=True, category__show_on_public=True)
-        elif for_dashboard == 'true':
+        # Filter by visibility (for_dashboard wins over for_public)
+        mode = get_visibility_mode(self.request)
+        if mode == 'dashboard':
             queryset = queryset.filter(show_in_dashboard=True, category__show_in_dashboard=True)
+        elif mode == 'public':
+            queryset = queryset.filter(show_on_public=True, category__show_on_public=True)
 
         # Filter by category
         category = self.request.query_params.get('category')
@@ -97,7 +182,34 @@ class PublicHelpArticleViewSet(viewsets.ReadOnlyModelViewSet):
             return HelpArticleDetailSerializer
         return HelpArticleListSerializer
 
-    @action(detail=False, methods=['get'])
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        last_modified = int(instance.updated_at.timestamp()) if instance.updated_at else None
+
+        # Conditional GET: 304 when the client's copy is still current.
+        if_modified_since = parse_http_date_safe(request.META.get('HTTP_IF_MODIFIED_SINCE', ''))
+        if last_modified is not None and if_modified_since is not None and last_modified <= if_modified_since:
+            response = Response(status=status.HTTP_304_NOT_MODIFIED)
+        else:
+            serializer = self.get_serializer(instance)
+            response = Response(serializer.data)
+
+        if last_modified is not None:
+            response['Last-Modified'] = http_date(last_modified)
+        # Without this, browsers / NSURLCache would apply heuristic freshness
+        # to a Last-Modified response and could show stale articles after an
+        # admin edit. `no-cache` keeps today's always-revalidate behaviour.
+        response['Cache-Control'] = 'no-cache'
+        return response
+
+    @extend_schema(
+        operation_id='help_public_articles_featured_list',
+        summary='Featured help articles',
+        description='Up to 6 articles flagged `is_featured`, same filters as the list. Bare list, not paginated.',
+        parameters=VISIBILITY_PARAMS + [CATEGORY_PARAM, CONTENT_TYPE_PARAM],
+        responses={200: HelpArticleListSerializer(many=True)},
+    )
+    @action(detail=False, methods=['get'], pagination_class=None)
     def featured(self, request):
         """Get featured articles"""
         queryset = self.get_queryset().filter(is_featured=True)[:6]
@@ -105,27 +217,41 @@ class PublicHelpArticleViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(serializer.data)
 
 
+@extend_schema(
+    operation_id='help_public_search_list',
+    summary='Search help articles',
+    description='Case-insensitive substring search over title, summary, content and FAQ items '
+                '(all languages). Returns at most 20 matches as a bare list; `q` shorter than 2 '
+                'characters returns `[]`. No authentication required.',
+    parameters=[
+        OpenApiParameter(
+            'q', OpenApiTypes.STR, OpenApiParameter.QUERY, required=True,
+            description='Search text (minimum 2 characters).',
+        ),
+    ] + VISIBILITY_PARAMS,
+    responses={200: HelpArticleListSerializer(many=True)},
+)
 @api_view(['GET'])
+@permission_classes([AllowAny])
 def search_help(request):
     """
     Search help articles by query.
     Public endpoint - no authentication required.
     """
     query = request.query_params.get('q', '')
-    lang = request.query_params.get('lang', 'en')
-    for_public = request.query_params.get('for_public', 'true')
-    for_dashboard = request.query_params.get('for_dashboard', 'false')
 
     if len(query) < 2:
         return Response([])
 
     queryset = HelpArticle.objects.filter(is_active=True, category__is_active=True)
 
-    # Apply visibility filters
-    if for_public == 'true':
-        queryset = queryset.filter(show_on_public=True)
-    elif for_dashboard == 'true':
-        queryset = queryset.filter(show_in_dashboard=True)
+    # Apply visibility filters (for_dashboard wins over for_public; same
+    # category-level gating as the article list).
+    mode = get_visibility_mode(request)
+    if mode == 'dashboard':
+        queryset = queryset.filter(show_in_dashboard=True, category__show_in_dashboard=True)
+    elif mode == 'public':
+        queryset = queryset.filter(show_on_public=True, category__show_on_public=True)
 
     # Search in title, summary, and content (JSON fields contain the search term)
     queryset = queryset.filter(
