@@ -183,11 +183,17 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
                 'url': nav_url,
                 'ticket_id': ticket_id,
                 'leave_request_id': notification.metadata.get('leave_request_id'),
+                # Chat-style notifications (team chat, social inbox) carry the
+                # thread + sender so a push tap can deep-link straight into it.
+                'conversation_id': notification.metadata.get('conversation_id'),
+                'sender_id': notification.metadata.get('sender_id'),
             },
             url=nav_url,
             tag=f'echodesk-{ticket_id or notification.id}',
             badge=unread_count,
         )
+
+    return notification
 
 
 def _dispatch_push(user, tenant_schema, title, body, data, url, tag, badge):
@@ -232,6 +238,65 @@ def _dispatch_push(user, tenant_schema, title, body, data, url, tag, badge):
             deliver_push_notification_task.apply(kwargs=kwargs)
         except Exception as inline_err:
             print(f"[notification_utils] Inline push delivery failed: {inline_err}")
+
+
+# ---------------------------------------------------------------------------
+# Team chat notification helper
+# ---------------------------------------------------------------------------
+
+TEAM_CHAT_PREVIEW_LENGTH = 120
+
+
+def team_chat_message_preview(message):
+    """Short, human-readable preview of a team chat message for notifications."""
+    text = (message.text or '').strip()
+    if message.message_type == 'image':
+        return text[:TEAM_CHAT_PREVIEW_LENGTH] if text else 'Sent a photo'
+    if message.message_type == 'voice':
+        return 'Sent a voice message'
+    if message.message_type == 'file':
+        name = message.file_name or ''
+        return f'Sent a file: {name}'[:TEAM_CHAT_PREVIEW_LENGTH] if name else 'Sent a file'
+    return text[:TEAM_CHAT_PREVIEW_LENGTH]
+
+
+def create_team_chat_message_notification(message, recipient=None):
+    """
+    Notify the other participant of a new team chat message.
+
+    Goes through ``create_notification`` so the recipient gets the in-app row,
+    the notifications websocket event and the push (Web Push + Expo) with the
+    same preference handling as every other notification type
+    (``NotificationPreference`` for ``team_chat_message``). The notification
+    links to the sender's thread (``/team-chat?user=<sender_id>``) and the
+    metadata/push data carry ``conversation_id`` and ``sender_id`` so a mobile
+    push tap can open the exact conversation.
+
+    Returns the Notification (or None when the recipient has in-app
+    notifications for this type disabled or there is no recipient).
+    """
+    sender = message.sender
+    if recipient is None:
+        recipient = message.conversation.get_other_participant(sender)
+    if recipient is None or recipient.id == sender.id:
+        return None
+
+    title = sender.get_full_name() or sender.email
+    return create_notification(
+        user=recipient,
+        notification_type='team_chat_message',
+        title=title,
+        message=team_chat_message_preview(message),
+        ticket_id=None,
+        metadata={
+            'conversation_id': message.conversation_id,
+            'sender_id': sender.id,
+            'sender_name': title,
+            'message_id': message.id,
+            'message_type': message.message_type,
+        },
+        link_url=f'/team-chat?user={sender.id}',
+    )
 
 
 # ---------------------------------------------------------------------------
