@@ -1021,6 +1021,7 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
                 {
                     'type': 'chat_message',
                     'message': message_data['message'],
+                    'conversation': message_data['conversation_id'],
                     'conversation_id': message_data['conversation_id']
                 }
             )
@@ -1029,7 +1030,13 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
             await self.send(text_data=json.dumps({
                 'type': 'message_sent',
                 'message': message_data['message'],
+                'conversation': message_data['conversation_id'],
                 'conversation_id': message_data['conversation_id']
+            }))
+        else:
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': 'Message could not be sent'
             }))
 
     async def handle_typing(self, data):
@@ -1078,10 +1085,12 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
     # Event handlers for messages from channel layer
     async def chat_message(self, event):
         """Send new message to WebSocket"""
+        conversation_id = event.get('conversation_id', event.get('conversation'))
         await self.send(text_data=json.dumps({
             'type': 'new_message',
             'message': event['message'],
-            'conversation_id': event['conversation_id']
+            'conversation': conversation_id,
+            'conversation_id': conversation_id
         }))
 
     async def typing_indicator(self, event):
@@ -1155,11 +1164,27 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def create_message(self, recipient_id=None, conversation_id=None, text='', message_type='text'):
-        """Create a new message in the database"""
+        """
+        Create a new message in the database.
+
+        The websocket path only carries text (attachments go through
+        ``POST /api/team-chat/messages/``), so the type is forced to ``text``
+        and an empty body is rejected. The message is serialized with
+        ``TeamChatMessageSerializer`` — the same shape the REST API and the
+        REST-triggered ``new_message`` frames use — and the recipient gets the
+        same in-app/push notification as for a REST-created message.
+        """
         try:
             with schema_context(self.tenant_schema):
                 from django.contrib.auth import get_user_model
+                from users.notification_utils import create_team_chat_message_notification
+                from users.serializers import TeamChatMessageSerializer
                 User = get_user_model()
+
+                text = (text or '').strip()
+                if not text:
+                    print("[TeamChatWS] Rejecting empty websocket message")
+                    return None
 
                 # Get or create conversation
                 if conversation_id:
@@ -1168,8 +1193,14 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
                         participants=self.user
                     )
                     recipient = conversation.get_other_participant(self.user)
+                    if recipient is None:
+                        print(f"[TeamChatWS] Conversation {conversation_id} has no other participant")
+                        return None
                 else:
                     recipient = User.objects.get(id=recipient_id)
+                    if recipient.id == self.user.id:
+                        print("[TeamChatWS] Rejecting message to self")
+                        return None
 
                     # Find existing conversation
                     conversation = TeamChatConversation.objects.filter(
@@ -1182,31 +1213,28 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
                         conversation = TeamChatConversation.objects.create()
                         conversation.participants.add(self.user, recipient)
 
-                # Create message
+                # Create message (websocket messages are text-only)
                 message = TeamChatMessage.objects.create(
                     conversation=conversation,
                     sender=self.user,
-                    message_type=message_type,
+                    message_type='text',
                     text=text
                 )
 
                 # Update conversation timestamp
                 conversation.save()
 
-                # Serialize message
-                message_data = {
-                    'id': message.id,
-                    'conversation_id': conversation.id,
-                    'sender': {
-                        'id': self.user.id,
-                        'email': self.user.email,
-                        'full_name': self.user.get_full_name()
-                    },
-                    'message_type': message.message_type,
-                    'text': message.text,
-                    'is_read': message.is_read,
-                    'created_at': message.created_at.isoformat()
-                }
+                # Serialize message with the REST serializer (one shape for all
+                # clients); keep `conversation_id` as an alias of `conversation`
+                # for clients written against the old websocket payload.
+                message_data = dict(TeamChatMessageSerializer(message).data)
+                message_data.setdefault('conversation_id', conversation.id)
+
+                # In-app notification + push for the recipient; never fail the send
+                try:
+                    create_team_chat_message_notification(message, recipient=recipient)
+                except Exception as notify_err:
+                    print(f"[TeamChatWS] Error creating team chat notification: {notify_err}")
 
                 return {
                     'message': message_data,
@@ -1277,6 +1305,7 @@ async def send_team_chat_message(tenant_schema, recipient_id, message_data, conv
         {
             'type': 'chat_message',
             'message': message_data,
+            'conversation': conversation_id,
             'conversation_id': conversation_id
         }
     )
