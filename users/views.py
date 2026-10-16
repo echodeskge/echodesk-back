@@ -9,13 +9,17 @@ from django.db import transaction, IntegrityError
 from django.db.models import Count
 from django.utils import timezone
 from django.conf import settings
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import (
+    OpenApiParameter, extend_schema, extend_schema_view, inline_serializer,
+)
 import secrets
 import string
 import logging
 from .tasks import send_user_invitation_email_task, send_new_password_email_task
 from .models import Department, TenantGroup, Notification, NotificationPreference, UserOnlineStatus, TeamChatConversation, TeamChatMessage, HiddenTeamChatConversation
 from .serializers import (
-    UserSerializer, UserCreateSerializer, UserUpdateSerializer,
+    UserSerializer, UserCreateSerializer, UserUpdateSerializer, UserDirectorySerializer,
     GroupSerializer, GroupCreateSerializer, PermissionSerializer,
     BulkUserActionSerializer, PasswordChangeSerializer, DepartmentSerializer,
     TenantGroupSerializer, TenantGroupCreateSerializer, NotificationSerializer,
@@ -29,11 +33,54 @@ logger = logging.getLogger(__name__)
 User = get_user_model()
 
 
+LITE_PARAM = OpenApiParameter(
+    name='lite', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY, required=False,
+    description=(
+        'When `1`/`true`, rows use the slim `UserDirectory` shape (no permission '
+        'or feature computation, a constant number of queries per page) instead '
+        'of the full `User` object.'
+    ),
+)
+
+
+def _wants_lite(request):
+    """``?lite=1`` / ``?lite=true`` selects the slim directory serializer."""
+    value = request.query_params.get('lite', '')
+    return str(value).lower() in ('1', 'true', 'yes')
+
+
+def _directory_queryset():
+    """Users with exactly what UserDirectorySerializer reads, nothing more."""
+    return User.objects.select_related('department', 'manager').prefetch_related('tenant_groups')
+
+
+def _can_manage_users(user):
+    return user.has_permission('manage_users') or user.is_staff
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary='List departments',
+        description='Active departments by default; `include_inactive=true` adds the inactive ones.',
+        parameters=[
+            OpenApiParameter(
+                name='include_inactive', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY,
+                required=False, description='`true` also returns departments with `is_active=false`.',
+            ),
+        ],
+    ),
+)
 class DepartmentViewSet(viewsets.ModelViewSet):
-    """ViewSet for managing departments"""
+    """ViewSet for managing departments.
+
+    Anyone authenticated can read; creating, editing and deleting a department
+    needs the `manage_users` permission (or is_staff), like user management.
+    """
     queryset = Department.objects.all()
     serializer_class = DepartmentSerializer
     permission_classes = [permissions.IsAuthenticated]
+    search_fields = ['name', 'description']
+    ordering_fields = ['id', 'name', 'is_active', 'created_at', 'updated_at']
 
     def get_queryset(self):
         # Only show active departments by default, unless explicitly requested
@@ -42,6 +89,22 @@ class DepartmentViewSet(viewsets.ModelViewSet):
         else:
             qs = Department.objects.filter(is_active=True)
         return qs.annotate(_employee_count=Count('employees'))
+
+    def _check_write_permission(self):
+        if not _can_manage_users(self.request.user):
+            raise PermissionDenied("You don't have permission to manage departments")
+
+    def perform_create(self, serializer):
+        self._check_write_permission()
+        serializer.save()
+
+    def perform_update(self, serializer):
+        self._check_write_permission()
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._check_write_permission()
+        instance.delete()
 
 
 class PermissionViewSet(viewsets.ReadOnlyModelViewSet):
@@ -111,39 +174,111 @@ class GroupViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
+USER_GROUP_PARAM = OpenApiParameter(
+    name='group', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False,
+    description='Only members of this tenant group (id).',
+)
+
+# Query parameters the `directory` action shares with the list endpoint. The
+# list gets them from the filter backends automatically; the action is not a
+# `list` action in DRF's eyes, so they are spelled out for the schema.
+USER_DIRECTORY_PARAMS = [
+    OpenApiParameter(name='search', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False,
+                     description='Case-insensitive match on first name, last name, email, phone number or job title.'),
+    OpenApiParameter(name='role', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False,
+                     enum=[r for r, _ in User.ROLE_CHOICES]),
+    OpenApiParameter(name='status', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False,
+                     enum=[s for s, _ in User.STATUS_CHOICES]),
+    OpenApiParameter(name='department', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False,
+                     description='Department id.'),
+    OpenApiParameter(name='manager', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False,
+                     description='Id of the direct manager.'),
+    OpenApiParameter(name='is_active', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY, required=False),
+    OpenApiParameter(name='is_staff', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY, required=False),
+    USER_GROUP_PARAM,
+    OpenApiParameter(name='ordering', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False,
+                     description='One of the list ordering fields, optionally prefixed with `-`.'),
+    OpenApiParameter(name='page', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False),
+    OpenApiParameter(name='page_size', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False),
+]
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary='List users',
+        description=(
+            'Paginated users of the tenant. Filters: `role`, `status`, `department`, '
+            '`manager`, `is_active`, `is_staff`, `group`; `search` matches name, '
+            'email, phone number and job title. `lite=1` switches rows to the slim '
+            '`UserDirectory` shape (see `/api/users/directory/` for the typed variant).'
+        ),
+        parameters=[USER_GROUP_PARAM, LITE_PARAM],
+    ),
+    retrieve=extend_schema(
+        summary='Get a user',
+        description='`lite=1` returns the slim `UserDirectory` shape instead of the full `User`.',
+        parameters=[LITE_PARAM],
+    ),
+)
 class UserViewSet(viewsets.ModelViewSet):
     """ViewSet for managing users"""
     queryset = User.objects.prefetch_related('tenant_groups', 'tenant_groups__features').all()
     serializer_class = UserSerializer
     permission_classes = [permissions.IsAuthenticated]
-    
+    search_fields = ['first_name', 'last_name', 'email', 'phone_number', 'job_title']
+    filterset_fields = ['role', 'status', 'department', 'is_active', 'is_staff', 'manager']
+    # Whitelist of sortable model fields. Without it DRF accepts any serializer
+    # field name, and computed ones (full_name, …) raised FieldError → 500.
+    ordering_fields = [
+        'id', 'email', 'first_name', 'last_name', 'role', 'status', 'job_title',
+        'is_active', 'is_staff', 'date_joined', 'last_login', 'department__name',
+    ]
+
+    # Actions that can serve the slim directory rows.
+    LITE_ACTIONS = ('list', 'retrieve', 'directory')
+
+    def _use_lite(self):
+        if self.action == 'directory':
+            return True
+        return self.action in self.LITE_ACTIONS and _wants_lite(self.request)
+
     def get_serializer_class(self):
         if self.action == 'create':
             return UserCreateSerializer
         elif self.action in ['update', 'partial_update']:
             return UserUpdateSerializer
+        elif self._use_lite():
+            return UserDirectorySerializer
         return UserSerializer
-    
+
     def get_queryset(self):
-        queryset = User.objects.select_related('department', 'manager', 'booking_staff').prefetch_related('tenant_groups', 'tenant_groups__features').all()
+        if self._use_lite():
+            queryset = _directory_queryset()
+        else:
+            queryset = User.objects.select_related('department', 'manager', 'booking_staff').prefetch_related('tenant_groups', 'tenant_groups__features').all()
 
-        # Filter by role if specified
-        role = self.request.query_params.get('role', None)
-        if role is not None:
-            queryset = queryset.filter(role=role)
-
-        # Filter by status if specified
-        status_filter = self.request.query_params.get('status', None)
-        if status_filter is not None:
-            queryset = queryset.filter(status=status_filter)
-
-        # Filter by group if specified
+        # role / status / department / manager / is_active / is_staff are
+        # handled by DjangoFilterBackend (filterset_fields); `group` is not a
+        # model field, so it stays a hand-rolled filter.
         group_id = self.request.query_params.get('group', None)
         if group_id is not None:
             queryset = queryset.filter(tenant_groups__id=group_id)
 
         return queryset.distinct()
-    
+
+    @extend_schema(
+        summary='People directory',
+        description=(
+            'Paginated slim user rows (`UserDirectory`) with the same filters, '
+            'search and ordering as the user list. Equivalent to `/api/users/?lite=1`.'
+        ),
+        parameters=USER_DIRECTORY_PARAMS,
+        responses=UserDirectorySerializer(many=True),
+    )
+    @action(detail=False, methods=['get'], serializer_class=UserDirectorySerializer)
+    def directory(self, request):
+        return self.list(request)
+
     def perform_create(self, serializer):
         # Check if user has permission to manage users
         if not self.request.user.has_permission('manage_users') and not self.request.user.is_staff:
@@ -344,17 +479,29 @@ class UserViewSet(viewsets.ModelViewSet):
         )
 
 
+TENANT_GROUP_MEMBERS_RESPONSE = inline_serializer(
+    name='TenantGroupMembersResponse',
+    fields={
+        'count': drf_serializers.IntegerField(),
+        'group': drf_serializers.CharField(help_text='Group name'),
+        'members': UserSerializer(many=True),
+    },
+)
+
+
 class TenantGroupViewSet(viewsets.ModelViewSet):
     """ViewSet for managing TenantGroups with custom permissions"""
     queryset = TenantGroup.objects.prefetch_related('members', 'features').annotate(_member_count=Count('members')).all()
     serializer_class = TenantGroupSerializer
     permission_classes = [permissions.IsAuthenticated]
+    search_fields = ['name', 'description']
+    ordering_fields = ['id', 'name', 'is_active', 'created_at', 'updated_at']
 
     def get_serializer_class(self):
         if self.action in ['create', 'update', 'partial_update']:
             return TenantGroupCreateSerializer
         return TenantGroupSerializer
-    
+
     def perform_create(self, serializer):
         # Check if user has permission to manage groups
         if not self.request.user.has_permission('manage_groups') and not self.request.user.is_staff:
@@ -368,7 +515,10 @@ class TenantGroupViewSet(viewsets.ModelViewSet):
         # Check if user has permission to manage groups
         if not self.request.user.has_permission('manage_groups') and not self.request.user.is_staff:
             raise PermissionDenied("You don't have permission to manage groups")
-        serializer.save()
+        try:
+            serializer.save()
+        except IntegrityError:
+            raise drf_serializers.ValidationError({'name': ['A group with this name already exists']})
 
     def perform_destroy(self, instance):
         # Check if user has permission to manage groups
@@ -424,17 +574,28 @@ class TenantGroupViewSet(viewsets.ModelViewSet):
             'removed_users': [user.email for user in users]
         })
     
+    @extend_schema(
+        summary='Group members',
+        description=(
+            'All members of the group (not paginated). `lite=1` returns each member '
+            'as a slim `UserDirectory` row instead of the full `User`; the paginated '
+            'equivalent is `/api/users/directory/?group=<id>`.'
+        ),
+        parameters=[LITE_PARAM],
+        responses=TENANT_GROUP_MEMBERS_RESPONSE,
+    )
     @action(detail=True, methods=['get'])
     def members(self, request, pk=None):
         """Get all members of this tenant group"""
         tenant_group = self.get_object()
-        members = tenant_group.members.select_related('department').prefetch_related(
-            'tenant_groups', 'tenant_groups__features',
-        ).all()
-
-        # Use the UserSerializer to return user data
-        from .serializers import UserSerializer
-        serializer = UserSerializer(members, many=True)
+        if _wants_lite(request):
+            members = _directory_queryset().filter(tenant_groups=tenant_group)
+            serializer = UserDirectorySerializer(members, many=True)
+        else:
+            members = tenant_group.members.select_related('department', 'manager').prefetch_related(
+                'tenant_groups', 'tenant_groups__features',
+            ).all()
+            serializer = UserSerializer(members, many=True)
 
         return Response({
             'count': len(members),
