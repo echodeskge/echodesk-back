@@ -106,23 +106,31 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
         return None  # User disabled this notification type
 
     # --- Phase 5: batching / debounce (30-second window) ---
-    recent = Notification.objects.filter(
-        user=user,
-        notification_type=notification_type,
-        ticket_id=ticket_id,
-        created_at__gte=timezone.now() - timedelta(seconds=30),
-    ).first()
+    recent_filter = {
+        'user': user,
+        'notification_type': notification_type,
+        'ticket_id': ticket_id,
+        'created_at__gte': timezone.now() - timedelta(seconds=30),
+    }
+    # Chat-style notifications batch per thread, not per type: a message from
+    # a second colleague inside the window must not be folded into the first
+    # colleague's row (it would keep the first title while message, metadata
+    # and link moved to the second one).
+    if metadata.get('conversation_id') is not None:
+        recent_filter['metadata__conversation_id'] = metadata['conversation_id']
+    recent = Notification.objects.filter(**recent_filter).first()
 
     if recent:
         # Update the existing notification instead of creating a new one
         batch_count = recent.metadata.get('batch_count', 1) + 1
+        recent.title = title
         recent.message = f"{message} (+{batch_count - 1} more)"
         recent.metadata['batch_count'] = batch_count
         recent.metadata.update(metadata)
         recent.is_read = False  # Re-mark as unread
         if link_url:
             recent.link_url = link_url
-        recent.save(update_fields=['message', 'metadata', 'is_read', 'link_url'])
+        recent.save(update_fields=['title', 'message', 'metadata', 'is_read', 'link_url'])
         notification = recent
     else:
         notification = Notification.objects.create(
@@ -183,11 +191,17 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
                 'url': nav_url,
                 'ticket_id': ticket_id,
                 'leave_request_id': notification.metadata.get('leave_request_id'),
+                # Chat-style notifications (team chat, social inbox) carry the
+                # thread + sender so a push tap can deep-link straight into it.
+                'conversation_id': notification.metadata.get('conversation_id'),
+                'sender_id': notification.metadata.get('sender_id'),
             },
             url=nav_url,
             tag=f'echodesk-{ticket_id or notification.id}',
             badge=unread_count,
         )
+
+    return notification
 
 
 def _dispatch_push(user, tenant_schema, title, body, data, url, tag, badge):
@@ -232,6 +246,98 @@ def _dispatch_push(user, tenant_schema, title, body, data, url, tag, badge):
             deliver_push_notification_task.apply(kwargs=kwargs)
         except Exception as inline_err:
             print(f"[notification_utils] Inline push delivery failed: {inline_err}")
+
+
+# ---------------------------------------------------------------------------
+# Team chat notification helper
+# ---------------------------------------------------------------------------
+
+TEAM_CHAT_PREVIEW_LENGTH = 120
+
+# A recipient with an open team-chat socket gets the message live over that
+# socket (the dashboard widget plays its own sound, the mobile app updates the
+# thread), so no in-app/push notification is created for them. Presence is
+# ``UserOnlineStatus.is_online``, which the consumer sets on connect/disconnect
+# and refreshes (``last_seen``) on the client's periodic ping. A row that has
+# not been refreshed within this window is treated as stale — e.g. a server
+# restart that skipped the disconnect handler — so the notification is sent
+# rather than lost.
+TEAM_CHAT_PRESENCE_STALE_AFTER = timedelta(minutes=2)
+
+
+def has_open_team_chat_socket(user):
+    """
+    True when ``user`` currently has a live team-chat websocket (one query).
+
+    See ``TEAM_CHAT_PRESENCE_STALE_AFTER`` for how a stale "online" row is
+    handled.
+    """
+    from users.models import UserOnlineStatus
+
+    return UserOnlineStatus.objects.filter(
+        user=user,
+        is_online=True,
+        last_seen__gte=timezone.now() - TEAM_CHAT_PRESENCE_STALE_AFTER,
+    ).exists()
+
+
+def team_chat_message_preview(message):
+    """Short, human-readable preview of a team chat message for notifications."""
+    text = (message.text or '').strip()
+    if message.message_type == 'image':
+        return text[:TEAM_CHAT_PREVIEW_LENGTH] if text else 'Sent a photo'
+    if message.message_type == 'voice':
+        return 'Sent a voice message'
+    if message.message_type == 'file':
+        name = message.file_name or ''
+        return f'Sent a file: {name}'[:TEAM_CHAT_PREVIEW_LENGTH] if name else 'Sent a file'
+    return text[:TEAM_CHAT_PREVIEW_LENGTH]
+
+
+def create_team_chat_message_notification(message, recipient=None):
+    """
+    Notify the other participant of a new team chat message.
+
+    Goes through ``create_notification`` so the recipient gets the in-app row,
+    the notifications websocket event and the push (Web Push + Expo) with the
+    same preference handling as every other notification type
+    (``NotificationPreference`` for ``team_chat_message``). The notification
+    links to the sender's thread (``/team-chat?user=<sender_id>``) and the
+    metadata/push data carry ``conversation_id`` and ``sender_id`` so a mobile
+    push tap can open the exact conversation.
+
+    Skipped when the recipient has an open team-chat socket: they receive the
+    ``new_message`` frame live and the dashboard widget already alerts on it,
+    so a notification would only duplicate the sound/toast/bell row.
+
+    Returns the Notification (or None when the recipient is online, has
+    in-app notifications for this type disabled, or there is no recipient).
+    """
+    sender = message.sender
+    if recipient is None:
+        recipient = message.conversation.get_other_participant(sender)
+    if recipient is None or recipient.id == sender.id:
+        return None
+
+    if has_open_team_chat_socket(recipient):
+        return None
+
+    title = sender.get_full_name() or sender.email
+    return create_notification(
+        user=recipient,
+        notification_type='team_chat_message',
+        title=title,
+        message=team_chat_message_preview(message),
+        ticket_id=None,
+        metadata={
+            'conversation_id': message.conversation_id,
+            'sender_id': sender.id,
+            'sender_name': title,
+            'message_id': message.id,
+            'message_type': message.message_type,
+        },
+        link_url=f'/team-chat?user={sender.id}',
+    )
 
 
 # ---------------------------------------------------------------------------

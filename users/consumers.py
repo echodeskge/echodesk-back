@@ -5,6 +5,7 @@ Includes notification updates and ticket board collaboration.
 
 import json
 import asyncio
+import time
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 from django.contrib.auth.models import AnonymousUser
@@ -828,7 +829,16 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
     - {"type": "typing_indicator", "user_id": 123, "is_typing": true}
     - {"type": "read_receipt", "message_ids": [...], "read_by": 123}
     - {"type": "user_online", "user_id": 123, "is_online": true}
+
+    Presence: ``UserOnlineStatus.is_online`` is set on connect/disconnect and
+    ``last_seen`` is refreshed on the client's periodic ``ping`` (at most once
+    per ``PRESENCE_HEARTBEAT_SECONDS`` per connection). The notification layer
+    treats an online row older than ``TEAM_CHAT_PRESENCE_STALE_AFTER`` as
+    stale, so a connection that died without its disconnect handler (server
+    restart) stops suppressing chat notifications after that window.
     """
+
+    PRESENCE_HEARTBEAT_SECONDS = 30
 
     async def connect(self):
         self.tenant_schema = self.scope['url_route']['kwargs']['tenant_schema']
@@ -870,6 +880,7 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
             # Update online status (wrapped in try/catch to not fail connection)
             try:
                 await self.set_online_status(True)
+                self._presence_touched_at = time.monotonic()
             except Exception as e:
                 print(f"[TeamChatWS] Error setting online status: {e}")
 
@@ -957,6 +968,7 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
                     'type': 'pong',
                     'timestamp': data.get('timestamp')
                 }))
+                await self.touch_presence()
 
             elif message_type == 'message':
                 # Send a new message
@@ -1021,6 +1033,7 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
                 {
                     'type': 'chat_message',
                     'message': message_data['message'],
+                    'conversation': message_data['conversation_id'],
                     'conversation_id': message_data['conversation_id']
                 }
             )
@@ -1029,7 +1042,13 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
             await self.send(text_data=json.dumps({
                 'type': 'message_sent',
                 'message': message_data['message'],
+                'conversation': message_data['conversation_id'],
                 'conversation_id': message_data['conversation_id']
+            }))
+        else:
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': 'Message could not be sent'
             }))
 
     async def handle_typing(self, data):
@@ -1078,10 +1097,12 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
     # Event handlers for messages from channel layer
     async def chat_message(self, event):
         """Send new message to WebSocket"""
+        conversation_id = event.get('conversation_id', event.get('conversation'))
         await self.send(text_data=json.dumps({
             'type': 'new_message',
             'message': event['message'],
-            'conversation_id': event['conversation_id']
+            'conversation': conversation_id,
+            'conversation_id': conversation_id
         }))
 
     async def typing_indicator(self, event):
@@ -1114,7 +1135,34 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
             'user_name': event['user_name']
         }))
 
+    async def touch_presence(self):
+        """
+        Refresh ``last_seen`` for the connected user, throttled per connection.
+
+        Called on every client ping (web and mobile ping every 25-30 s); the
+        write happens at most once per ``PRESENCE_HEARTBEAT_SECONDS``.
+        """
+        user = getattr(self, 'user', None)
+        if user is None or user.is_anonymous:
+            return
+        now = time.monotonic()
+        last = getattr(self, '_presence_touched_at', None)
+        if last is not None and now - last < self.PRESENCE_HEARTBEAT_SECONDS:
+            return
+        self._presence_touched_at = now
+        try:
+            await self.refresh_last_seen()
+        except Exception as e:
+            print(f"[TeamChatWS] Error refreshing presence: {e}")
+
     # Database operations
+    @database_sync_to_async
+    def refresh_last_seen(self):
+        """Bump ``last_seen`` on the user's presence row (keeps it non-stale)."""
+        from django.utils import timezone
+        with schema_context(self.tenant_schema):
+            UserOnlineStatus.objects.filter(user=self.user).update(last_seen=timezone.now())
+
     @database_sync_to_async
     def set_online_status(self, is_online):
         """Update user's online status"""
@@ -1155,11 +1203,27 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def create_message(self, recipient_id=None, conversation_id=None, text='', message_type='text'):
-        """Create a new message in the database"""
+        """
+        Create a new message in the database.
+
+        The websocket path only carries text (attachments go through
+        ``POST /api/team-chat/messages/``), so the type is forced to ``text``
+        and an empty body is rejected. The message is serialized with
+        ``TeamChatMessageSerializer`` — the same shape the REST API and the
+        REST-triggered ``new_message`` frames use — and the recipient gets the
+        same in-app/push notification as for a REST-created message.
+        """
         try:
             with schema_context(self.tenant_schema):
                 from django.contrib.auth import get_user_model
+                from users.notification_utils import create_team_chat_message_notification
+                from users.serializers import TeamChatMessageSerializer
                 User = get_user_model()
+
+                text = (text or '').strip()
+                if not text:
+                    print("[TeamChatWS] Rejecting empty websocket message")
+                    return None
 
                 # Get or create conversation
                 if conversation_id:
@@ -1168,8 +1232,14 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
                         participants=self.user
                     )
                     recipient = conversation.get_other_participant(self.user)
+                    if recipient is None:
+                        print(f"[TeamChatWS] Conversation {conversation_id} has no other participant")
+                        return None
                 else:
                     recipient = User.objects.get(id=recipient_id)
+                    if recipient.id == self.user.id:
+                        print("[TeamChatWS] Rejecting message to self")
+                        return None
 
                     # Find existing conversation
                     conversation = TeamChatConversation.objects.filter(
@@ -1182,31 +1252,28 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
                         conversation = TeamChatConversation.objects.create()
                         conversation.participants.add(self.user, recipient)
 
-                # Create message
+                # Create message (websocket messages are text-only)
                 message = TeamChatMessage.objects.create(
                     conversation=conversation,
                     sender=self.user,
-                    message_type=message_type,
+                    message_type='text',
                     text=text
                 )
 
                 # Update conversation timestamp
                 conversation.save()
 
-                # Serialize message
-                message_data = {
-                    'id': message.id,
-                    'conversation_id': conversation.id,
-                    'sender': {
-                        'id': self.user.id,
-                        'email': self.user.email,
-                        'full_name': self.user.get_full_name()
-                    },
-                    'message_type': message.message_type,
-                    'text': message.text,
-                    'is_read': message.is_read,
-                    'created_at': message.created_at.isoformat()
-                }
+                # Serialize message with the REST serializer (one shape for all
+                # clients); keep `conversation_id` as an alias of `conversation`
+                # for clients written against the old websocket payload.
+                message_data = dict(TeamChatMessageSerializer(message).data)
+                message_data.setdefault('conversation_id', conversation.id)
+
+                # In-app notification + push for the recipient; never fail the send
+                try:
+                    create_team_chat_message_notification(message, recipient=recipient)
+                except Exception as notify_err:
+                    print(f"[TeamChatWS] Error creating team chat notification: {notify_err}")
 
                 return {
                     'message': message_data,
@@ -1277,6 +1344,7 @@ async def send_team_chat_message(tenant_schema, recipient_id, message_data, conv
         {
             'type': 'chat_message',
             'message': message_data,
+            'conversation': conversation_id,
             'conversation_id': conversation_id
         }
     )

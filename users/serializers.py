@@ -534,6 +534,100 @@ class NotificationPreferenceSerializer(serializers.ModelSerializer):
 
 # Team Chat Serializers
 
+import mimetypes
+import os
+
+from drf_spectacular.types import OpenApiTypes
+
+
+# Attachment policy for POST /api/team-chat/messages/. One hard cap for every
+# type; the allow-list is by extension first (React Native and browsers always
+# send a filename) with the declared content type as a fallback for
+# extension-less uploads.
+TEAM_CHAT_MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
+
+TEAM_CHAT_IMAGE_EXTENSIONS = {
+    'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'avif',
+}
+TEAM_CHAT_AUDIO_EXTENSIONS = {
+    'mp3', 'm4a', 'aac', 'wav', 'ogg', 'oga', 'opus', 'webm', 'weba', '3gp', 'amr', 'caf',
+}
+TEAM_CHAT_DOCUMENT_EXTENSIONS = {
+    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'csv', 'txt', 'rtf', 'odt', 'ods',
+    'zip',
+}
+TEAM_CHAT_ALLOWED_EXTENSIONS = (
+    TEAM_CHAT_IMAGE_EXTENSIONS | TEAM_CHAT_AUDIO_EXTENSIONS | TEAM_CHAT_DOCUMENT_EXTENSIONS
+)
+TEAM_CHAT_ALLOWED_MIME_TYPES = {
+    'application/pdf', 'application/zip', 'application/x-zip-compressed',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.ms-powerpoint',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'application/vnd.oasis.opendocument.text',
+    'application/vnd.oasis.opendocument.spreadsheet',
+    'text/plain', 'text/csv', 'application/rtf',
+}
+
+
+def _file_extension(name):
+    return os.path.splitext(name or '')[1].lstrip('.').lower()
+
+
+def resolve_upload_mime_type(uploaded_file):
+    """
+    Best-effort MIME type for a chat attachment.
+
+    Prefers the content type the client declared for the upload (React Native
+    and browsers set it from the picked file), falling back to a guess from the
+    filename, then to ``application/octet-stream``.
+    """
+    declared = (getattr(uploaded_file, 'content_type', '') or '').split(';')[0].strip().lower()
+    if declared and declared != 'application/octet-stream':
+        return declared
+    guessed = mimetypes.guess_type(getattr(uploaded_file, 'name', '') or '')[0]
+    return guessed or declared or 'application/octet-stream'
+
+
+def validate_team_chat_file(uploaded_file, message_type='file'):
+    """
+    Enforce the attachment policy for a chat upload.
+
+    Raises ``serializers.ValidationError`` when the file is too large, has a
+    type outside the allow-list, or does not match the declared message type
+    (an ``image`` message must carry an image, a ``voice`` message an audio
+    file).
+    """
+    if uploaded_file.size > TEAM_CHAT_MAX_FILE_SIZE:
+        raise serializers.ValidationError(
+            f"File size exceeds maximum allowed ({TEAM_CHAT_MAX_FILE_SIZE // (1024 * 1024)}MB)"
+        )
+
+    ext = _file_extension(uploaded_file.name)
+    mime = resolve_upload_mime_type(uploaded_file)
+    is_image = ext in TEAM_CHAT_IMAGE_EXTENSIONS or (not ext and mime.startswith('image/'))
+    is_audio = ext in TEAM_CHAT_AUDIO_EXTENSIONS or (
+        not ext and (mime.startswith('audio/') or mime == 'video/webm')
+    )
+    is_document = ext in TEAM_CHAT_DOCUMENT_EXTENSIONS or (
+        not ext and mime in TEAM_CHAT_ALLOWED_MIME_TYPES
+    )
+
+    if not (is_image or is_audio or is_document):
+        raise serializers.ValidationError(
+            "File type not allowed. Allowed: images, audio, PDF, Word, Excel, "
+            "PowerPoint, text/CSV and ZIP files."
+        )
+    if message_type == 'image' and not is_image:
+        raise serializers.ValidationError("File is not a valid image")
+    if message_type == 'voice' and not is_audio:
+        raise serializers.ValidationError("File is not a valid audio recording")
+    return uploaded_file
+
+
 class UserOnlineStatusSerializer(serializers.ModelSerializer):
     """Serializer for user online status"""
     class Meta:
@@ -551,15 +645,18 @@ class TeamChatUserSerializer(serializers.ModelSerializer):
         model = User
         fields = ['id', 'email', 'first_name', 'last_name', 'full_name', 'is_online', 'last_seen']
 
+    @extend_schema_field(OpenApiTypes.STR)
     def get_full_name(self, obj):
         return obj.get_full_name()
 
+    @extend_schema_field(OpenApiTypes.BOOL)
     def get_is_online(self, obj):
         try:
             return obj.online_status.is_online
         except UserOnlineStatus.DoesNotExist:
             return False
 
+    @extend_schema_field(serializers.DateTimeField(allow_null=True))
     def get_last_seen(self, obj):
         try:
             return obj.online_status.last_seen
@@ -568,21 +665,29 @@ class TeamChatUserSerializer(serializers.ModelSerializer):
 
 
 class TeamChatMessageSerializer(serializers.ModelSerializer):
-    """Serializer for team chat messages"""
+    """
+    Serializer for team chat messages.
+
+    Used for every message payload (REST responses, the websocket
+    ``new_message`` / ``message_sent`` frames and the conversation
+    ``last_message`` / ``messages`` fields) so clients see one shape.
+    ``conversation`` and ``sender`` are never writable: a message cannot be
+    moved to another thread or re-attributed through an update.
+    """
     sender = TeamChatUserSerializer(read_only=True)
-    sender_id = serializers.IntegerField(write_only=True, required=False)
     file_url = serializers.SerializerMethodField()
 
     class Meta:
         model = TeamChatMessage
         fields = [
-            'id', 'conversation', 'sender', 'sender_id',
+            'id', 'conversation', 'sender',
             'message_type', 'text', 'file', 'file_url', 'file_name',
             'file_size', 'file_mime_type', 'voice_duration',
             'is_read', 'read_at', 'created_at'
         ]
-        read_only_fields = ['id', 'sender', 'created_at']
+        read_only_fields = ['id', 'conversation', 'sender', 'is_read', 'read_at', 'created_at']
 
+    @extend_schema_field(serializers.URLField(allow_null=True))
     def get_file_url(self, obj):
         if obj.file:
             request = self.context.get('request')
@@ -592,14 +697,20 @@ class TeamChatMessageSerializer(serializers.ModelSerializer):
         return None
 
     def create(self, validated_data):
-        # Remove sender_id if present, sender is set from request.user
-        validated_data.pop('sender_id', None)
+        # sender is always the authenticated user
         validated_data['sender'] = self.context['request'].user
         return super().create(validated_data)
 
 
 class TeamChatConversationSerializer(serializers.ModelSerializer):
-    """Serializer for team chat conversations"""
+    """
+    Serializer for team chat conversations.
+
+    The viewset annotates ``unread_for_me`` and prefetches the latest message
+    (``prefetched_last_messages``) and the participants; the method fields use
+    those when present and fall back to the model helpers for plain instances
+    (e.g. the ``with/{user_id}`` response).
+    """
     participants = TeamChatUserSerializer(many=True, read_only=True)
     last_message = serializers.SerializerMethodField()
     unread_count = serializers.SerializerMethodField()
@@ -614,48 +725,80 @@ class TeamChatConversationSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
+    @extend_schema_field(TeamChatMessageSerializer(allow_null=True))
     def get_last_message(self, obj):
-        last_msg = obj.get_last_message()
+        prefetched = getattr(obj, 'prefetched_last_messages', None)
+        if prefetched is not None:
+            last_msg = prefetched[0] if prefetched else None
+        else:
+            last_msg = obj.get_last_message()
         if last_msg:
             return TeamChatMessageSerializer(last_msg, context=self.context).data
         return None
 
+    @extend_schema_field(OpenApiTypes.INT)
     def get_unread_count(self, obj):
+        annotated = getattr(obj, 'unread_for_me', None)
+        if annotated is not None:
+            return annotated
         user = self.context.get('request').user
         return obj.get_unread_count(user)
 
+    @extend_schema_field(TeamChatUserSerializer(allow_null=True))
     def get_other_participant(self, obj):
         user = self.context.get('request').user
-        other = obj.get_other_participant(user)
+        # participants is prefetched by the viewset; iterating the cache avoids
+        # one query per row. Plain instances fall back to a single query.
+        other = next(
+            (p for p in obj.participants.all() if p.id != user.id),
+            None,
+        )
         if other:
             return TeamChatUserSerializer(other).data
         return None
 
 
 class TeamChatConversationDetailSerializer(TeamChatConversationSerializer):
-    """Detailed serializer including messages"""
+    """Detailed serializer including the latest 50 messages (oldest first)."""
     messages = serializers.SerializerMethodField()
 
     class Meta(TeamChatConversationSerializer.Meta):
         fields = TeamChatConversationSerializer.Meta.fields + ['messages']
 
+    @extend_schema_field(TeamChatMessageSerializer(many=True))
     def get_messages(self, obj):
-        # Get messages with pagination
-        messages = obj.messages.all()[:50]  # Default last 50 messages
-        return TeamChatMessageSerializer(messages, many=True, context=self.context).data
+        latest = list(
+            obj.messages.select_related('sender', 'sender__online_status')
+            .order_by('-created_at', '-id')[:50]
+        )
+        latest.reverse()
+        return TeamChatMessageSerializer(latest, many=True, context=self.context).data
 
 
 class TeamChatCreateMessageSerializer(serializers.Serializer):
-    """Serializer for creating a new message"""
-    recipient_id = serializers.IntegerField(required=False)
-    conversation_id = serializers.IntegerField(required=False)
+    """Serializer for creating a new message (multipart/form-data)."""
+    recipient_id = serializers.IntegerField(
+        required=False,
+        help_text='Colleague to message; the 1:1 conversation is created on demand. '
+                  'Either this or conversation_id is required.',
+    )
+    conversation_id = serializers.IntegerField(
+        required=False,
+        help_text='Existing conversation to post into. Either this or recipient_id is required.',
+    )
     message_type = serializers.ChoiceField(
         choices=TeamChatMessage.MESSAGE_TYPE_CHOICES,
         default='text'
     )
     text = serializers.CharField(required=False, allow_blank=True)
-    file = serializers.FileField(required=False)
-    voice_duration = serializers.IntegerField(required=False)
+    file = serializers.FileField(
+        required=False,
+        help_text='Required for image/file/voice messages. Max 25 MB; images, audio, '
+                  'PDF, Word, Excel, PowerPoint, text/CSV and ZIP are accepted.',
+    )
+    voice_duration = serializers.IntegerField(
+        required=False, min_value=0, help_text='Voice recording length in seconds',
+    )
 
     def validate(self, attrs):
         if not attrs.get('recipient_id') and not attrs.get('conversation_id'):
@@ -670,32 +813,41 @@ class TeamChatCreateMessageSerializer(serializers.Serializer):
         if message_type in ['file', 'image', 'voice'] and not attrs.get('file'):
             raise serializers.ValidationError(f"File is required for {message_type} messages")
 
+        uploaded = attrs.get('file')
+        if uploaded is not None:
+            try:
+                validate_team_chat_file(uploaded, message_type)
+            except serializers.ValidationError as exc:
+                raise serializers.ValidationError({'file': exc.detail})
+
         return attrs
 
 
 class TeamChatFileUploadSerializer(serializers.Serializer):
-    """Serializer for file uploads"""
-    file = serializers.FileField()
+    """
+    Pre-flight validator for ``POST /api/team-chat/upload/``.
+
+    Applies ``validate_team_chat_file`` — the one attachment policy shared
+    with ``TeamChatCreateMessageSerializer`` — so a file that passes here is
+    guaranteed to be accepted by ``POST /api/team-chat/messages/``.
+    """
+    file = serializers.FileField(
+        help_text='Max 25 MB; images, audio, PDF, Word, Excel, PowerPoint, text/CSV and ZIP.',
+    )
     message_type = serializers.ChoiceField(
         choices=['image', 'file', 'voice'],
         default='file'
     )
-    voice_duration = serializers.IntegerField(required=False)
+    voice_duration = serializers.IntegerField(required=False, min_value=0)
 
     def validate_file(self, value):
-        # File size limits
-        max_sizes = {
-            'image': 10 * 1024 * 1024,  # 10MB
-            'file': 25 * 1024 * 1024,   # 25MB
-            'voice': 5 * 1024 * 1024,   # 5MB
-        }
+        message_type = self.initial_data.get('message_type') or 'file'
+        return validate_team_chat_file(value, message_type)
 
-        message_type = self.initial_data.get('message_type', 'file')
-        max_size = max_sizes.get(message_type, max_sizes['file'])
 
-        if value.size > max_size:
-            raise serializers.ValidationError(
-                f"File size exceeds maximum allowed ({max_size // (1024 * 1024)}MB)"
-            )
-
-        return value
+class TeamChatFileUploadResultSerializer(serializers.Serializer):
+    """Response of the pre-flight /api/team-chat/upload/ validator."""
+    file_name = serializers.CharField()
+    file_size = serializers.IntegerField()
+    file_mime_type = serializers.CharField()
+    message = serializers.CharField()

@@ -513,6 +513,8 @@ class Notification(models.Model):
         ('message_assigned', 'Message Assigned'),
         # AI companion
         ('ai_handoff_requested', 'AI Handoff Requested'),
+        # Team chat (colleague-to-colleague)
+        ('team_chat_message', 'Team Chat Message'),
         # Invoices
         ('invoice_created', 'Invoice Created'),
         ('invoice_paid', 'Invoice Paid'),
