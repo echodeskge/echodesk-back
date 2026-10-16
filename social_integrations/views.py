@@ -9671,37 +9671,61 @@ def whatsapp_send_template_message(request):
 # =============================================================================
 
 EMAIL_ACCESS_RULES_DOC = (
-    "Mailbox visibility (EmailConnectionUserAssignment): admins, superusers, "
-    "staff and users with the manage_social_connections permission see every "
-    "connection; a user who is assigned to at least one connection sees only "
-    "the connections they are assigned to; a user with no assignments at all "
-    "keeps the historical behaviour and sees every connection."
+    "Mailbox visibility (EmailConnectionUserAssignment) is decided per "
+    "connection, with the same rule as /email/status/, /unread-count/ and the "
+    "unified conversations: a connection with no user assignments is a shared "
+    "inbox visible to everyone; a connection with assignments is visible only "
+    "to its assignees. Admins, superusers, staff and users with the "
+    "manage_social_connections permission see every connection. A user can "
+    "therefore only ever receive messages of connections listed in "
+    "/email/status/ `connections`."
 )
+
+_EMAIL_ACCESS_CACHE_ATTR = '_echodesk_email_connection_access'
 
 
 def _email_connection_access(user):
-    """Return the EmailConnection ids ``user`` may read, or ``None`` for no restriction.
+    """Return the EmailConnection ids ``user`` may use, or ``None`` for no restriction.
 
-    Rules (see ``EMAIL_ACCESS_RULES_DOC``):
+    Connection-centric rule (see ``EMAIL_ACCESS_RULES_DOC``), identical to the
+    predicate ``email_connection_status`` / ``unread_messages_count`` /
+    ``unified_conversations`` already apply:
 
     - role ``admin`` / ``is_superuser`` / ``is_staff`` / ``manage_social_connections``
       permission → ``None`` (everything).
-    - user has ≥1 ``EmailConnectionUserAssignment`` → the set of assigned
-      connection ids (only those mailboxes).
-    - user has no assignments → ``None`` (unchanged legacy behaviour: tenants
-      that never configured assignments keep a shared inbox).
+    - otherwise → the ids of every connection that either has **no**
+      ``EmailConnectionUserAssignment`` at all (shared inbox) **or** is
+      assigned to ``user``.
+
+    The result is memoised on the ``user`` instance so a request that
+    evaluates it several times (``threads``) runs the query once.
     """
-    if user.is_superuser or user.is_staff or getattr(user, 'role', None) == 'admin':
-        return None
-    if user.has_permission('manage_social_connections'):
-        return None
-    assigned_ids = set(
-        EmailConnectionUserAssignment.objects.filter(user=user)
-        .values_list('connection_id', flat=True)
-    )
-    if not assigned_ids:
-        return None
-    return assigned_ids
+    cached = getattr(user, _EMAIL_ACCESS_CACHE_ATTR, _EMAIL_ACCESS_CACHE_ATTR)
+    if cached is not _EMAIL_ACCESS_CACHE_ATTR:
+        return cached
+
+    if (
+        user.is_superuser
+        or user.is_staff
+        or getattr(user, 'role', None) == 'admin'
+        or user.has_permission('manage_social_connections')
+    ):
+        allowed = None
+    else:
+        assignments = EmailConnectionUserAssignment.objects.filter(connection=OuterRef('pk'))
+        allowed = set(
+            EmailConnection.objects.annotate(
+                has_assignments=Exists(assignments),
+                is_assignee=Exists(assignments.filter(user=user)),
+            ).filter(
+                Q(has_assignments=False) | Q(is_assignee=True)
+            ).values_list('id', flat=True)
+        )
+    try:
+        setattr(user, _EMAIL_ACCESS_CACHE_ATTR, allowed)
+    except AttributeError:  # pragma: no cover - exotic user proxies
+        pass
+    return allowed
 
 
 def _restrict_email_queryset(queryset, user):
@@ -9710,6 +9734,15 @@ def _restrict_email_queryset(queryset, user):
     if allowed is None:
         return queryset
     return queryset.filter(connection_id__in=allowed)
+
+
+def _accessible_email_connections(user, **filters):
+    """EmailConnection queryset limited to the mailboxes ``user`` may use."""
+    queryset = EmailConnection.objects.filter(**filters)
+    allowed = _email_connection_access(user)
+    if allowed is None:
+        return queryset
+    return queryset.filter(id__in=allowed)
 
 
 def _can_access_email_connection(user, connection_id):
@@ -10182,7 +10215,10 @@ def email_disconnect(request):
         "form key once per file and repeat list keys (`to_emails`, `cc_emails`, "
         "`bcc_emails`) once per address. At least one of `body_text` / "
         "`body_html` is required. The tenant / connection signature is appended "
-        "server-side. The sent copy is stored in folder 'Sent' and returned as `data`."
+        "server-side. The sent copy is stored in folder 'Sent' and returned as `data`. "
+        "`connection_id` must be an active mailbox the user can access (404 "
+        "otherwise); when omitted the first accessible active mailbox is used. "
+        + EMAIL_ACCESS_RULES_DOC
     ),
     request={
         'multipart/form-data': EmailSendMultipartSerializer,
@@ -10208,12 +10244,14 @@ def email_send(request):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     try:
-        # Support sending from a specific connection
+        # Support sending from a specific connection. Only mailboxes the
+        # user may access (EMAIL_ACCESS_RULES_DOC) are candidates.
         connection_id = request.data.get('connection_id')
+        accessible = _accessible_email_connections(request.user, is_active=True)
         if connection_id:
-            connection = EmailConnection.objects.filter(id=connection_id, is_active=True).first()
+            connection = accessible.filter(id=connection_id).first()
         else:
-            connection = EmailConnection.objects.filter(is_active=True).first()
+            connection = accessible.first()
         if not connection:
             return Response({
                 'error': 'No active email connection found'
@@ -10369,7 +10407,9 @@ def email_action(request):
         "Live IMAP LIST (10s timeout per connection, serial — cache client-side). "
         "With `connection_id`: `{connection_id, email, folders}`. Without: "
         "`{connections: [{connection_id, email, folders, success, error?}]}` "
-        "for every active connection. 404 when there is no active connection."
+        "for every active connection the user can access. 404 when there is no "
+        "accessible active connection (or `connection_id` is not one). "
+        + EMAIL_ACCESS_RULES_DOC
     ),
     parameters=[
         OpenApiParameter('connection_id', OpenApiTypes.INT, OpenApiParameter.QUERY, required=False,
@@ -10394,11 +10434,13 @@ def email_folders(request):
 
     try:
         connection_id = request.query_params.get('connection_id')
+        # Only mailboxes the user may access (EMAIL_ACCESS_RULES_DOC).
+        accessible = _accessible_email_connections(request.user, is_active=True)
 
         if connection_id:
             # Get folders for specific connection
             try:
-                connection = EmailConnection.objects.get(id=connection_id, is_active=True)
+                connection = accessible.get(id=connection_id)
             except EmailConnection.DoesNotExist:
                 return Response({
                     'error': 'Email connection not found or inactive'
@@ -10418,8 +10460,8 @@ def email_folders(request):
                     'details': result.get('error', 'Unknown error')
                 }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         else:
-            # Get folders for all active connections
-            connections = EmailConnection.objects.filter(is_active=True)
+            # Get folders for all accessible active connections
+            connections = accessible.order_by('id')
 
             if not connections.exists():
                 return Response({
@@ -10713,7 +10755,12 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
             )
         ).order_by('-timestamp')
 
-        # Mailbox assignment enforcement (no-op for admins / unassigned users).
+        if self.action in ('list', 'lite') and self._lite():
+            # Lite rows never read body_html — keep the biggest column out of
+            # the SELECT (body_text stays: the snippet is cut from it).
+            queryset = queryset.defer('body_html')
+
+        # Mailbox assignment enforcement (no-op for admins / staff).
         queryset = _restrict_email_queryset(queryset, self.request.user)
 
         # Filter by connection_id (specific email account)
@@ -10852,6 +10899,8 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
             thread_id__in=thread_ids,
             is_deleted=False,
         ), request.user).select_related('connection').order_by('thread_id', '-timestamp')
+        if self._lite():
+            latest_msgs = latest_msgs.defer('body_html')
 
         # Build {thread_id: latest_msg} — pick first per thread_id
         latest_by_thread = {}
@@ -10864,7 +10913,7 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
             thread_id__in=thread_ids,
             is_from_business=False,
             is_deleted=False,
-        ).order_by('thread_id', 'timestamp')
+        ).only('id', 'thread_id', 'from_email', 'from_name', 'to_emails').order_by('thread_id', 'timestamp')
 
         customer_by_thread = {}
         for msg in customer_msgs:
@@ -10879,7 +10928,7 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
                 thread_id__in=threads_needing_business,
                 is_from_business=True,
                 is_deleted=False,
-            ).order_by('thread_id', 'timestamp')
+            ).only('id', 'thread_id', 'from_email', 'from_name', 'to_emails').order_by('thread_id', 'timestamp')
 
             for msg in business_msgs:
                 if msg.thread_id not in business_by_thread:
@@ -10922,7 +10971,7 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
 
     @extend_schema(
         summary="IMAP folders of the first active connection (legacy)",
-        description="Prefer GET /api/social/email/folders/. Live IMAP LIST on the first active connection; returns [{name, delimiter, flags}].",
+        description="Prefer GET /api/social/email/folders/. Live IMAP LIST on the first active connection the user can access; returns [{name, delimiter, flags}].",
         responses={200: EmailFolderSerializer(many=True), 400: EmailErrorResponseSerializer},
     )
     @action(detail=False, methods=['get'], pagination_class=None, filter_backends=[])
@@ -10932,7 +10981,7 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
         """
         from .email_utils import get_available_folders
 
-        connection = EmailConnection.objects.filter(is_active=True).first()
+        connection = _accessible_email_connections(request.user, is_active=True).first()
         if not connection:
             return Response({'error': 'No active email connection'}, status=400)
 
@@ -11003,8 +11052,8 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
         description=(
             "The connection is resolved server-side: the `reply_to_message`'s "
             "connection when replying, else the `connection` given in the body "
-            "(must be active and accessible), else the first active connection. "
-            "400 when none is available."
+            "(must be active and accessible), else the first accessible active "
+            "connection. 400 when none is available. " + EMAIL_ACCESS_RULES_DOC
         ),
     ),
     update=extend_schema(summary="Replace an email draft"),
@@ -11033,7 +11082,7 @@ class EmailDraftViewSet(viewsets.ModelViewSet):
         elif requested is not None:
             connection = requested
         else:
-            connection = EmailConnection.objects.filter(is_active=True).first()
+            connection = _accessible_email_connections(user, is_active=True).first()
 
         if (
             not connection

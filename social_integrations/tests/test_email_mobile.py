@@ -3,7 +3,8 @@ Tests for the mobile-oriented email additions (Phase 3 package F3):
 
 - ``?lite=1`` / ``/lite/`` list rows (snippet + attachments_count, no bodies)
 - ``body_html_safe`` on the detail endpoint and the allow-list sanitiser
-- EmailConnectionUserAssignment enforcement on messages / threads / action / move
+- EmailConnectionUserAssignment enforcement (connection-centric, same rule as
+  /email/status/) on messages / threads / action / move / drafts / send / folders
 - ``move`` and draft creation use the message's own connection
 - send body contract (JSON and multipart) and the OpenAPI declarations
 """
@@ -176,47 +177,107 @@ class TestEmailMessageDetailSafeHtml(SocialIntegrationTestCase):
 class TestEmailAssignmentEnforcement(SocialIntegrationTestCase):
     """Mailbox visibility on the message endpoints.
 
+    Connection-centric rule — the same one ``/email/status/``,
+    ``/unread-count/`` and the unified conversations apply:
+
+    - a connection with no assignments (``conn_shared``) is visible to everyone
+    - a connection with assignments is visible only to its assignees
     - admins / staff / superusers / manage_social_connections → everything
-    - a user with ≥1 assignment → only assigned connections
-    - a user with no assignments → everything (legacy behaviour, documented)
+
+    Fixture: ``conn_a`` assigned to ``assigned``, ``conn_b`` assigned to
+    ``other``, ``conn_shared`` unassigned; ``unassigned`` has no assignment.
     """
 
     def setUp(self):
         super().setUp()
         self.conn_a = self.create_email_connection(email_address='a@example.com')
         self.conn_b = self.create_email_connection(email_address='b@example.com')
+        self.conn_shared = self.create_email_connection(email_address='shared@example.com')
         self.msg_a = self.create_email_message(connection=self.conn_a, thread_id='thread-a', subject='A mail')
         self.msg_b = self.create_email_message(connection=self.conn_b, thread_id='thread-b', subject='B mail')
+        self.msg_shared = self.create_email_message(
+            connection=self.conn_shared, thread_id='thread-shared', subject='Shared mail',
+        )
 
         self.assigned = self.create_user(email='assigned-a@test.com')
         EmailConnectionUserAssignment.objects.create(
             connection=self.conn_a, user=self.assigned, assigned_by=self.assigned,
+        )
+        self.other = self.create_user(email='assigned-b@test.com')
+        EmailConnectionUserAssignment.objects.create(
+            connection=self.conn_b, user=self.other, assigned_by=self.other,
         )
         self.unassigned = self.create_user(email='unassigned@test.com')
         self.admin = self.create_admin(email='email-admin@test.com')
         self.manager_perm = self.create_user(
             email='perm@test.com', can_manage_social_connections=True,
         )
+        self.all_ids = {self.msg_a.id, self.msg_b.id, self.msg_shared.id}
 
     def _ids(self, resp):
         data = resp.json()
         rows = data['results'] if isinstance(data, dict) else data
         return {r['id'] for r in rows}
 
-    def test_assigned_user_sees_only_assigned_connection(self):
-        self.assertEqual(self._ids(self.api_get(LIST_URL, user=self.assigned)), {self.msg_a.id})
+    def _status_connection_ids(self, user):
+        return {c['id'] for c in self.api_get('/api/social/email/status/', user=user).json()['connections']}
 
-    def test_assigned_user_cannot_bypass_with_connection_id(self):
+    # -- list ---------------------------------------------------------------
+
+    def test_assigned_user_sees_assigned_and_shared_connections(self):
+        self.assertEqual(
+            self._ids(self.api_get(LIST_URL, user=self.assigned)), {self.msg_a.id, self.msg_shared.id},
+        )
+        self.assertEqual(
+            self._ids(self.api_get(LIST_URL, user=self.other)), {self.msg_b.id, self.msg_shared.id},
+        )
+
+    def test_unassigned_user_sees_only_shared_connections(self):
+        self.assertEqual(self._ids(self.api_get(LIST_URL, user=self.unassigned)), {self.msg_shared.id})
+
+    def test_unassigned_user_sees_everything_when_tenant_has_no_assignments(self):
+        EmailConnectionUserAssignment.objects.all().delete()
+        self.assertEqual(self._ids(self.api_get(LIST_URL, user=self.unassigned)), self.all_ids)
+
+    def test_list_matches_status_connections(self):
+        """The contract the mobile app relies on: messages only come from status.connections."""
+        for user in (self.assigned, self.other, self.unassigned, self.admin):
+            rows = self.api_get(LIST_URL, user=user).json()['results']
+            self.assertEqual(
+                {r['connection_id'] for r in rows}, self._status_connection_ids(user), user.email,
+            )
+
+    def test_connection_id_filter_cannot_bypass(self):
         resp = self.api_get(f'{LIST_URL}?connection_id={self.conn_b.id}', user=self.assigned)
         self.assertEqual(resp.json()['count'], 0)
+        resp = self.api_get(f'{LIST_URL}?connection_id={self.conn_shared.id}', user=self.assigned)
+        self.assertEqual(self._ids(resp), {self.msg_shared.id})
+        resp = self.api_get(f'{LIST_URL}?connection_id={self.conn_a.id}', user=self.unassigned)
+        self.assertEqual(resp.json()['count'], 0)
 
-    def test_assigned_user_retrieve_other_mailbox_404(self):
-        self.assertEqual(self.api_get(f'{LIST_URL}{self.msg_b.id}/', user=self.assigned).status_code, 404)
+    def test_lite_list_respects_assignment(self):
+        self.assertEqual(
+            self._ids(self.api_get(f'{LIST_URL}?lite=1', user=self.unassigned)), {self.msg_shared.id},
+        )
+
+    # -- retrieve -----------------------------------------------------------
+
+    def test_retrieve(self):
         self.assertEqual(self.api_get(f'{LIST_URL}{self.msg_a.id}/', user=self.assigned).status_code, 200)
+        self.assertEqual(self.api_get(f'{LIST_URL}{self.msg_shared.id}/', user=self.assigned).status_code, 200)
+        self.assertEqual(self.api_get(f'{LIST_URL}{self.msg_b.id}/', user=self.assigned).status_code, 404)
+        self.assertEqual(self.api_get(f'{LIST_URL}{self.msg_shared.id}/', user=self.unassigned).status_code, 200)
+        self.assertEqual(self.api_get(f'{LIST_URL}{self.msg_a.id}/', user=self.unassigned).status_code, 404)
 
-    def test_assigned_user_threads_filtered(self):
+    # -- threads ------------------------------------------------------------
+
+    def test_threads_filtered(self):
         threads = self.api_get(f'{LIST_URL}threads/', user=self.assigned).json()
-        self.assertEqual({t['thread_id'] for t in threads}, {'thread-a'})
+        self.assertEqual({t['thread_id'] for t in threads}, {'thread-a', 'thread-shared'})
+        threads = self.api_get(f'{LIST_URL}threads/', user=self.unassigned).json()
+        self.assertEqual({t['thread_id'] for t in threads}, {'thread-shared'})
+        threads = self.api_get(f'{LIST_URL}threads/?lite=1', user=self.unassigned).json()
+        self.assertEqual({t['thread_id'] for t in threads}, {'thread-shared'})
 
     def test_threads_shared_thread_id_across_connections(self):
         """A thread_id present on both mailboxes must only yield the accessible copy."""
@@ -230,36 +291,58 @@ class TestEmailAssignmentEnforcement(SocialIntegrationTestCase):
         self.assertNotEqual(shared['id'], other.id)
         self.assertEqual(shared['connection_id'], self.conn_a.id)
 
-    def test_unassigned_user_keeps_legacy_full_access(self):
-        self.assertEqual(self._ids(self.api_get(LIST_URL, user=self.unassigned)), {self.msg_a.id, self.msg_b.id})
+    def test_access_predicate_is_cached_per_user(self):
+        from social_integrations.views import _email_connection_access
+        first = _email_connection_access(self.assigned)
+        self.assertEqual(first, {self.conn_a.id, self.conn_shared.id})
+        with self.assertNumQueries(0):
+            self.assertEqual(_email_connection_access(self.assigned), first)
+
+    # -- privileged users ---------------------------------------------------
 
     def test_admin_sees_everything(self):
-        self.assertEqual(self._ids(self.api_get(LIST_URL, user=self.admin)), {self.msg_a.id, self.msg_b.id})
+        self.assertEqual(self._ids(self.api_get(LIST_URL, user=self.admin)), self.all_ids)
 
     def test_manage_social_connections_permission_sees_everything(self):
-        self.assertEqual(self._ids(self.api_get(LIST_URL, user=self.manager_perm)), {self.msg_a.id, self.msg_b.id})
+        self.assertEqual(self._ids(self.api_get(LIST_URL, user=self.manager_perm)), self.all_ids)
 
     def test_staff_flag_sees_everything(self):
         staff = self.create_user(email='staff@test.com', is_staff=True)
         EmailConnectionUserAssignment.objects.create(connection=self.conn_a, user=staff, assigned_by=staff)
-        self.assertEqual(self._ids(self.api_get(LIST_URL, user=staff)), {self.msg_a.id, self.msg_b.id})
+        self.assertEqual(self._ids(self.api_get(LIST_URL, user=staff)), self.all_ids)
 
-    def test_action_ignores_inaccessible_messages(self):
+    # -- /email/action/ -----------------------------------------------------
+
+    def test_action_inaccessible_message_404(self):
         resp = self.api_post(ACTION_URL, {'message_ids': [self.msg_b.id], 'action': 'star'}, user=self.assigned)
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
         self.msg_b.refresh_from_db()
         self.assertFalse(self.msg_b.is_starred)
+        resp = self.api_post(ACTION_URL, {'message_ids': [self.msg_a.id], 'action': 'star'}, user=self.unassigned)
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_action_shared_message_ok(self):
+        for user in (self.assigned, self.unassigned):
+            resp = self.api_post(
+                ACTION_URL, {'message_ids': [self.msg_shared.id], 'action': 'mark_read'}, user=user,
+            )
+            self.assertEqual(resp.status_code, status.HTTP_200_OK, user.email)
+            self.assertEqual(resp.json()['affected_count'], 1)
 
     def test_action_mixed_ids_only_affects_accessible(self):
         resp = self.api_post(
-            ACTION_URL, {'message_ids': [self.msg_a.id, self.msg_b.id], 'action': 'mark_read'}, user=self.assigned,
+            ACTION_URL,
+            {'message_ids': [self.msg_a.id, self.msg_b.id, self.msg_shared.id], 'action': 'mark_read'},
+            user=self.assigned,
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(resp.json()['affected_count'], 1)
+        self.assertEqual(resp.json()['affected_count'], 2)
         self.msg_a.refresh_from_db()
         self.msg_b.refresh_from_db()
+        self.msg_shared.refresh_from_db()
         self.assertTrue(self.msg_a.is_read)
         self.assertFalse(self.msg_b.is_read)
+        self.assertTrue(self.msg_shared.is_read)
 
     def test_action_by_thread_respects_assignment(self):
         resp = self.api_post(ACTION_URL, {'thread_id': 'thread-b', 'action': 'delete'}, user=self.assigned)
@@ -272,15 +355,115 @@ class TestEmailAssignmentEnforcement(SocialIntegrationTestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(resp.json()['affected_count'], 1)
 
+    # -- move ---------------------------------------------------------------
+
+    def _move(self, message, user):
+        return self.api_post(
+            f'{LIST_URL}move/',
+            {'message_id': message.message_id, 'source_folder': 'INBOX', 'target_folder': 'Archive'},
+            user=user,
+        )
+
     @patch('social_integrations.email_utils.move_email_to_folder', return_value=True)
     def test_move_inaccessible_message_404(self, mocked_move):
+        self.assertEqual(self._move(self.msg_b, self.assigned).status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self._move(self.msg_a, self.unassigned).status_code, status.HTTP_404_NOT_FOUND)
+        mocked_move.assert_not_called()
+
+    @patch('social_integrations.email_utils.move_email_to_folder', return_value=True)
+    def test_move_shared_and_assigned_ok(self, mocked_move):
+        self.assertEqual(self._move(self.msg_shared, self.unassigned).status_code, status.HTTP_200_OK)
+        self.assertEqual(self._move(self.msg_a, self.assigned).status_code, status.HTTP_200_OK)
+        self.assertEqual(mocked_move.call_count, 2)
+
+    # -- drafts -------------------------------------------------------------
+
+    DRAFT_URL = '/api/social/email-drafts/'
+
+    def _draft(self, user, **extra):
+        body = {'to_emails': [], 'subject': 'New', 'body_text': 'hi'}
+        body.update(extra)
+        return self.api_post(self.DRAFT_URL, body, user=user)
+
+    def test_draft_explicit_connection_access(self):
+        self.assertEqual(self._draft(self.assigned, connection=self.conn_b.id).status_code, 400)
+        self.assertEqual(self._draft(self.unassigned, connection=self.conn_a.id).status_code, 400)
+        resp = self._draft(self.assigned, connection=self.conn_shared.id)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        resp = self._draft(self.unassigned, connection=self.conn_shared.id)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+
+    def test_draft_fallback_is_first_accessible_connection(self):
+        """conn_a is the first active connection by pk but not accessible to ``unassigned``."""
+        resp = self._draft(self.unassigned)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        self.assertEqual(resp.json()['connection'], self.conn_shared.id)
+
+    def test_reply_draft_on_inaccessible_message_400(self):
+        self.assertEqual(self._draft(self.assigned, reply_to_message=self.msg_b.id).status_code, 400)
+        resp = self._draft(self.unassigned, reply_to_message=self.msg_shared.id)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        self.assertEqual(resp.json()['connection'], self.conn_shared.id)
+
+    # -- send ---------------------------------------------------------------
+
+    SEND_URL = '/api/social/email/send/'
+
+    def _fake_send(self, **kwargs):
+        message = self.create_email_message(
+            connection=kwargs['connection'], folder='Sent', is_from_business=True,
+        )
+        return message.message_id, message
+
+    @patch('social_integrations.email_utils.send_email_smtp')
+    def test_send_from_inaccessible_connection_404(self, mocked_send):
+        body = {'to_emails': ['to@example.com'], 'body_text': 'b', 'connection_id': self.conn_b.id}
+        self.assertEqual(self.api_post(self.SEND_URL, body, user=self.assigned).status_code, 404)
+        body['connection_id'] = self.conn_a.id
+        self.assertEqual(self.api_post(self.SEND_URL, body, user=self.unassigned).status_code, 404)
+        mocked_send.assert_not_called()
+
+    @patch('social_integrations.email_utils.send_email_smtp')
+    def test_send_defaults_to_first_accessible_connection(self, mocked_send):
+        mocked_send.side_effect = lambda **kw: self._fake_send(**kw)
+        resp = self.api_post(self.SEND_URL, {'to_emails': ['to@example.com'], 'body_text': 'b'}, user=self.unassigned)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertEqual(mocked_send.call_args.kwargs['connection'].id, self.conn_shared.id)
         resp = self.api_post(
-            f'{LIST_URL}move/',
-            {'message_id': self.msg_b.message_id, 'source_folder': 'INBOX', 'target_folder': 'Archive'},
+            self.SEND_URL,
+            {'to_emails': ['to@example.com'], 'body_text': 'b', 'connection_id': self.conn_shared.id},
             user=self.assigned,
         )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+
+    # -- folders ------------------------------------------------------------
+
+    FOLDERS_URL = '/api/social/email/folders/'
+
+    @patch('social_integrations.email_utils.get_imap_folders', return_value={'success': True, 'folders': ['INBOX']})
+    def test_folders_inaccessible_connection_404(self, mocked_folders):
+        resp = self.api_get(f'{self.FOLDERS_URL}?connection_id={self.conn_b.id}', user=self.assigned)
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
-        mocked_move.assert_not_called()
+        mocked_folders.assert_not_called()
+        resp = self.api_get(f'{self.FOLDERS_URL}?connection_id={self.conn_shared.id}', user=self.unassigned)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.json()['connection_id'], self.conn_shared.id)
+
+    @patch('social_integrations.email_utils.get_imap_folders', return_value={'success': True, 'folders': ['INBOX']})
+    def test_folders_all_lists_only_accessible(self, mocked_folders):
+        resp = self.api_get(self.FOLDERS_URL, user=self.assigned)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            {c['connection_id'] for c in resp.json()['connections']}, {self.conn_a.id, self.conn_shared.id},
+        )
+        resp = self.api_get(self.FOLDERS_URL, user=self.admin)
+        self.assertEqual(len(resp.json()['connections']), 3)
+
+    @patch('social_integrations.email_utils.get_available_folders', return_value=[{'name': 'INBOX', 'delimiter': '/', 'flags': []}])
+    def test_legacy_folders_uses_first_accessible_connection(self, mocked_folders):
+        resp = self.api_get(f'{LIST_URL}folders/', user=self.unassigned)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(mocked_folders.call_args[0][0].id, self.conn_shared.id)
 
 
 class TestEmailMoveUsesMessageConnection(SocialIntegrationTestCase):
@@ -400,8 +583,13 @@ class TestEmailDraftConnection(SocialIntegrationTestCase):
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_assigned_user_cannot_draft_on_other_mailbox(self):
+        """conn_second is assigned to someone else, so it is not a shared inbox for ``agent``."""
         EmailConnectionUserAssignment.objects.create(
             connection=self.conn_first, user=self.agent, assigned_by=self.agent,
+        )
+        other = self.create_user(email='draft-other@test.com')
+        EmailConnectionUserAssignment.objects.create(
+            connection=self.conn_second, user=other, assigned_by=other,
         )
         resp = self.api_post(
             self.url,
@@ -572,7 +760,10 @@ class TestEmailOpenApiSchema(SocialIntegrationTestCase):
         )
         self.assertIn('EmailMessageActionRequest', paths['/api/social/email/action/']['post']['requestBody']['content']['application/json']['schema']['$ref'])
         self.assertEqual({p['name'] for p in paths['/api/social/email/folders/']['get']['parameters']}, {'connection_id'})
-        self.assertIn('EmailMoveRequest', paths['/api/social/email-messages/move/']['post']['requestBody']['content']['application/json']['schema']['$ref'])
+        self.assertEqual(
+            paths['/api/social/email-messages/move/']['post']['requestBody']['content']['application/json']['schema']['$ref'],
+            '#/components/schemas/EmailMoveRequest',
+        )
         self.assertIn('requestBody', paths['/api/social/email/sync/']['post'])
         self.assertIn('requestBody', paths['/api/social/email/signature/']['patch'])
         self.assertIn('requestBody', paths['/api/social/email/assignments/create/']['post'])
@@ -580,3 +771,27 @@ class TestEmailOpenApiSchema(SocialIntegrationTestCase):
             paths['/api/social/unread-count/']['get']['responses']['200']['content']['application/json']['schema']['$ref'],
             '#/components/schemas/SocialUnreadCountResponse',
         )
+
+    def test_request_component_names(self):
+        """COMPONENT_SPLIT_REQUEST appends 'Request' itself — the names must not double it."""
+        components = self._schema()['components']['schemas']
+        expected = {
+            '/api/social/email-messages/move/': ('post', 'EmailMoveRequest'),
+            '/api/social/email/connect/': ('post', 'EmailConnectRequest'),
+            '/api/social/email/update/': ('post', 'EmailConnectionUpdateRequest'),
+            '/api/social/email/reactivate/': ('post', 'EmailReactivateRequest'),
+            '/api/social/email/disconnect/': ('post', 'EmailConnectionIdRequest'),
+            '/api/social/email/sync/': ('post', 'EmailSyncRequest'),
+            '/api/social/email/sync/settings/': ('post', 'EmailSyncDaysRequest'),
+            '/api/social/email/assignments/create/': ('post', 'EmailAssignmentCreateRequest'),
+        }
+        paths = self._schema()['paths']
+        for route, (method, name) in expected.items():
+            self.assertIn(name, components, name)
+            self.assertNotIn(name + 'Request', components, name)
+            self.assertEqual(
+                paths[route][method]['requestBody']['content']['application/json']['schema']['$ref'],
+                f'#/components/schemas/{name}', route,
+            )
+        self.assertIn('EmailAssignedUsersUpdateRequest', components)
+        self.assertNotIn('EmailAssignedUsersUpdateRequestRequest', components)

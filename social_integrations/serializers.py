@@ -852,6 +852,8 @@ class EmailConnectionStatusResponseSerializer(serializers.Serializer):
     )
 
 
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailConnectionIdRequest'.
+@extend_schema_serializer(component_name='EmailConnectionId')
 class EmailConnectionIdRequestSerializer(serializers.Serializer):
     connection_id = serializers.IntegerField(help_text="EmailConnection pk")
 
@@ -861,6 +863,8 @@ class EmailConnectionResponseSerializer(serializers.Serializer):
     connection = EmailConnectionSerializer()
 
 
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailConnectRequest'.
+@extend_schema_serializer(component_name='EmailConnect')
 class EmailConnectRequestSerializer(EmailConnectionCreateSerializer):
     """Body of POST /email/connect/ (same as EmailConnectionCreateSerializer)."""
 
@@ -872,6 +876,8 @@ class EmailConnectResponseSerializer(serializers.Serializer):
     connection = EmailConnectionSerializer()
 
 
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailConnectionUpdateRequest'.
+@extend_schema_serializer(component_name='EmailConnectionUpdate')
 class EmailConnectionUpdateRequestSerializer(serializers.Serializer):
     connection_id = serializers.IntegerField()
     display_name = serializers.CharField(required=False, allow_blank=True)
@@ -891,6 +897,8 @@ class EmailConnectionUpdateRequestSerializer(serializers.Serializer):
     sync_days_back = serializers.IntegerField(required=False, min_value=0)
 
 
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailReactivateRequest'.
+@extend_schema_serializer(component_name='EmailReactivate')
 class EmailReactivateRequestSerializer(serializers.Serializer):
     connection_id = serializers.IntegerField()
     password = serializers.CharField(required=False, write_only=True, help_text="New password; triggers an SMTP test too")
@@ -932,6 +940,8 @@ class EmailFoldersResponseSerializer(serializers.Serializer):
     connections = EmailConnectionFoldersSerializer(many=True, required=False)
 
 
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailSyncRequest'.
+@extend_schema_serializer(component_name='EmailSync')
 class EmailSyncRequestSerializer(serializers.Serializer):
     connection_id = serializers.IntegerField(required=False, allow_null=True, help_text="Omit to sync every active connection")
 
@@ -948,6 +958,8 @@ class EmailSyncResponseSerializer(serializers.Serializer):
     sync_results = EmailSyncResultSerializer(many=True)
 
 
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailSyncDaysRequest'.
+@extend_schema_serializer(component_name='EmailSyncDays')
 class EmailSyncDaysRequestSerializer(serializers.Serializer):
     connection_id = serializers.IntegerField(required=False, allow_null=True)
     sync_days_back = serializers.IntegerField(min_value=0, help_text="0 = sync all history")
@@ -959,6 +971,8 @@ class EmailSyncDaysResponseSerializer(serializers.Serializer):
     meaning = serializers.CharField()
 
 
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailMoveRequest'.
+@extend_schema_serializer(component_name='EmailMove')
 class EmailMoveRequestSerializer(serializers.Serializer):
     message_id = serializers.CharField(help_text="RFC Message-ID header value (EmailMessage.message_id), NOT the pk")
     source_folder = serializers.CharField()
@@ -1132,10 +1146,14 @@ class EmailAssignedUsersResponseSerializer(serializers.Serializer):
     assigned_users = EmailConnectionUserAssignmentSerializer(many=True)
 
 
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailAssignedUsersUpdateRequest'.
+@extend_schema_serializer(component_name='EmailAssignedUsersUpdate')
 class EmailAssignedUsersUpdateRequestSerializer(serializers.Serializer):
     user_ids = serializers.ListField(child=serializers.IntegerField(), help_text="Replaces the full assignment list")
 
 
+# COMPONENT_SPLIT_REQUEST appends 'Request' itself -> component 'EmailAssignmentCreateRequest'.
+@extend_schema_serializer(component_name='EmailAssignmentCreate')
 class EmailAssignmentCreateRequestSerializer(serializers.Serializer):
     connection_id = serializers.IntegerField()
     user_id = serializers.IntegerField()
