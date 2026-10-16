@@ -1307,8 +1307,13 @@ class TicketTimeLogViewSet(viewsets.ReadOnlyModelViewSet):
         description=(
             'Per-user aggregate of ticket time logs over a period, computed in the '
             'database. Only users with at least one log in the period are listed. '
-            'Requires staff or the `advanced_analytics` feature. The window is '
-            '`[start_date, end_date)` on `entered_at`; defaults to the last `days` days.'
+            'Requires staff or the `advanced_analytics` feature. Note that the feature '
+            'is granted tenant-wide (subscription feature intersected with the caller\'s '
+            'group features), so every non-staff member of a group holding '
+            '`advanced_analytics` sees every colleague\'s hours, email and last '
+            'activity -- the same scope as the dashboard\'s user statistics page. '
+            'The window is `[start_date, end_date)` on `entered_at`; defaults to the '
+            'last `days` days.'
         ),
         parameters=[
             OpenApiParameter(
@@ -1335,9 +1340,18 @@ class TicketTimeLogViewSet(viewsets.ReadOnlyModelViewSet):
     )
     @action(detail=False, methods=['get'])
     def team_summary(self, request):
-        """DB-side per-user time aggregate for the team statistics table."""
+        """DB-side per-user time aggregate for the team statistics table.
+
+        Authorisation is deliberately "staff OR advanced_analytics" (plan Part C
+        F4 / mobile WP12). ``User.has_feature`` resolves tenant-wide (the
+        tenant's subscription features intersected with the user's group
+        features), so a non-staff user in a group that holds
+        ``advanced_analytics`` can read every colleague's totals. Tighten to
+        ``is_staff and has_feature`` here if that ever needs to be narrower.
+        """
         from datetime import timedelta
         from django.db.models import Sum
+        from django.db.models.functions import Coalesce
 
         user = request.user
         if not (user.is_staff or user.has_feature('advanced_analytics')):
@@ -1376,7 +1390,10 @@ class TicketTimeLogViewSet(viewsets.ReadOnlyModelViewSet):
             .filter(entered_at__gte=start, entered_at__lt=end)
             .values('user_id', 'user__first_name', 'user__last_name', 'user__email')
             .annotate(
-                total_seconds=Sum('duration_seconds'),
+                # Coalesce: Sum() is NULL for a user whose only logs in the
+                # window are still open, and Postgres sorts NULLs first on
+                # DESC -- such users must sort last (0 seconds), not first.
+                total_seconds=Coalesce(Sum('duration_seconds'), 0),
                 sessions=Count('id', filter=Q(duration_seconds__isnull=False)),
                 active_sessions=Count('id', filter=Q(exited_at__isnull=True)),
                 last_activity=Max('entered_at'),

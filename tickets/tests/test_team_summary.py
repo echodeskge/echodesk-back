@@ -1,9 +1,14 @@
 """Tests for the DB-side time aggregates: team_summary and ticket_summary."""
 from datetime import timedelta
+from decimal import Decimal
 from unittest.mock import patch
 
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
+from tenants.feature_models import Feature
+from tenants.models import TenantSubscription
 from tickets.models import TicketTimeLog
 from tickets.tests.conftest import TicketTestCase
 
@@ -18,6 +23,11 @@ def _backdate(log, days_ago, duration=None):
     TicketTimeLog.objects.filter(pk=log.pk).update(**fields)
     log.refresh_from_db()
     return log
+
+
+def _time_log_queries(captured):
+    """Queries from a CaptureQueriesContext that touch the time-log table."""
+    return [q['sql'] for q in captured.captured_queries if 'tickets_tickettimelog' in q['sql']]
 
 
 class TestTeamSummaryPermissions(TicketTestCase):
@@ -44,6 +54,47 @@ class TestTeamSummaryPermissions(TicketTestCase):
         with patch('users.models.User.has_feature', return_value=False):
             resp = self.api_get('/api/time-logs/team_summary/', user=admin)
         self.assertEqual(resp.status_code, 200)
+
+
+class TestTeamSummaryFeatureWiring(TicketTestCase):
+    """Exercise the real subscription -> group -> user feature path (no has_feature patch)."""
+
+    def _grant_advanced_analytics(self):
+        feature, _ = Feature.objects.get_or_create(
+            key='advanced_analytics',
+            defaults={
+                'name': 'Advanced Analytics',
+                'price_per_user_gel': Decimal('0'),
+                'price_unlimited_gel': Decimal('0'),
+                'category': 'support',
+                'is_active': True,
+            },
+        )
+        subscription, _ = TenantSubscription.objects.get_or_create(
+            tenant=self.tenant,
+            defaults={'is_active': True, 'starts_at': timezone.now(), 'agent_count': 10},
+        )
+        subscription.selected_features.add(feature)
+        return feature
+
+    def test_group_feature_grants_access(self):
+        feature = self._grant_advanced_analytics()
+        group = self.create_tenant_group(name='Analysts')
+        group.features.add(feature)
+        user = self.create_user(email='ts-analyst@test.com')
+        user.tenant_groups.add(group)
+
+        self.assertTrue(user.has_feature('advanced_analytics'))
+        resp = self.api_get('/api/time-logs/team_summary/', user=user)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_subscription_feature_without_group_is_forbidden(self):
+        self._grant_advanced_analytics()
+        user = self.create_user(email='ts-nogroup@test.com')
+
+        self.assertFalse(user.has_feature('advanced_analytics'))
+        resp = self.api_get('/api/time-logs/team_summary/', user=user)
+        self.assertEqual(resp.status_code, 403)
 
 
 class TestTeamSummaryAggregation(TicketTestCase):
@@ -83,6 +134,31 @@ class TestTeamSummaryAggregation(TicketTestCase):
         self.assertEqual(bob['user']['full_name'], 'bob@test.com')  # falls back to email
         self.assertEqual(bob['total_seconds'], 600)
         self.assertEqual(bob['active_sessions'], 0)
+
+    def test_active_only_user_sorts_last(self):
+        """Sum(duration) is NULL for a user with only open logs; they must not
+        float to the top of the DESC ordering (Postgres NULLS FIRST)."""
+        _backdate(self.create_time_log(self.ticket, self.col2, self.alice), 0)  # active only
+        _backdate(self.create_time_log(self.ticket, self.col2, self.bob), 1, duration=60)
+
+        resp = self.api_get('/api/time-logs/team_summary/', user=self.admin)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([u['user']['id'] for u in resp.data['users']], [self.bob.id, self.alice.id])
+        self.assertEqual(resp.data['users'][1]['total_seconds'], 0)
+        self.assertEqual(resp.data['users'][1]['active_sessions'], 1)
+
+    def test_single_aggregate_query(self):
+        """The per-user table is one GROUP BY, however many users/logs there are."""
+        for i in range(5):
+            user = self.create_user(email=f'ts-many-{i}@test.com')
+            for j in range(3):
+                _backdate(self.create_time_log(self.ticket, self.col2, user), j, duration=10)
+
+        with CaptureQueriesContext(connection) as captured:
+            resp = self.api_get('/api/time-logs/team_summary/', user=self.admin)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data['users']), 5)
+        self.assertEqual(len(_time_log_queries(captured)), 1)
 
     def test_users_without_logs_are_not_listed(self):
         _backdate(self.create_time_log(self.ticket, self.col2, self.alice), 1, duration=10)
@@ -187,6 +263,18 @@ class TestTicketSummary(TicketTestCase):
         resp = self.api_get(f'/api/time-logs/ticket_summary/?ticket={self.ticket.id}', user=self.admin)
         self.assertEqual(len(resp.data['logs']), 20)
         self.assertEqual(resp.data['total_seconds'], 25)
+
+    def test_bounded_query_count(self):
+        """total + by_column + active + recent slice: 4 time-log queries, not one per log."""
+        for i in range(25):
+            _backdate(self.create_time_log(self.ticket, self.col2, self.admin), i, duration=1)
+        self.create_time_log(self.ticket, self.col2, self.admin)  # active
+
+        with CaptureQueriesContext(connection) as captured:
+            resp = self.api_get(f'/api/time-logs/ticket_summary/?ticket={self.ticket.id}', user=self.admin)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data['logs']), 20)
+        self.assertEqual(len(_time_log_queries(captured)), 4)
 
     def test_ticket_param_required(self):
         resp = self.api_get('/api/time-logs/ticket_summary/', user=self.admin)

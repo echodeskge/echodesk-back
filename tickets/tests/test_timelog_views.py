@@ -1,7 +1,7 @@
 """Tests for TicketTimeLogViewSet."""
 from django.utils import timezone
 from datetime import timedelta
-from tickets.models import TicketTimeLog
+from tickets.models import TicketHistory, TicketTimeLog
 from tickets.tests.conftest import TicketTestCase
 
 
@@ -154,6 +154,21 @@ class TestTicketUpdateTimeLogs(TicketTestCase):
         self.assertEqual(log.column, self.col_track)
         self.assertEqual(log.user, self.admin)
         self.assertIsNone(log.exited_at)
+
+    def test_patch_column_change_keeps_history_attribution(self):
+        """perform_update folds two behaviours: the _current_user tag that the
+        history/broadcast signals read, and the time-log open/close. Both must
+        survive a single PATCH."""
+        ticket = self.create_ticket(title='T', column=self.col_todo, created_by=self.admin)
+        resp = self.api_patch(f'/api/tickets/{ticket.id}/', {'column_id': self.col_track.id}, user=self.admin)
+        self.assertEqual(resp.status_code, 200)
+
+        entry = TicketHistory.objects.get(ticket=ticket, field_name='column_id')
+        self.assertEqual(entry.user_id, self.admin.id)
+        self.assertEqual(entry.action, 'status_changed')
+        self.assertTrue(
+            TicketTimeLog.objects.filter(ticket=ticket, column=self.col_track, exited_at__isnull=True).exists()
+        )
 
     def test_patch_out_of_tracked_column_closes_log(self):
         ticket = self.create_ticket(title='T', column=self.col_track, created_by=self.admin)
