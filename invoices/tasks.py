@@ -144,7 +144,17 @@ def send_invoice_email(self, schema_name, invoice_id, recipient_email,
         for cc_addr in set(all_cc):
             mail.add_cc(Cc(cc_addr))
 
-        # Attach PDF
+        # Attach PDF. Right after finalize the async generate_invoice_pdf task
+        # may not have finished yet; render it here rather than silently
+        # sending the email without the attachment.
+        if attach_pdf and not invoice.pdf_file:
+            try:
+                invoice.generate_pdf()
+            except Exception as e:
+                logger.warning(
+                    f"Could not generate PDF for invoice {invoice_id} before emailing: {e}"
+                )
+
         if attach_pdf and invoice.pdf_file:
             try:
                 pdf_data = invoice.pdf_file.read()
