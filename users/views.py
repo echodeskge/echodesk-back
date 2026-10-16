@@ -616,7 +616,6 @@ from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
     OpenApiParameter, extend_schema, extend_schema_view, inline_serializer,
 )
-import mimetypes
 
 from .notification_utils import create_team_chat_message_notification
 from .serializers import TeamChatFileUploadResultSerializer, resolve_upload_mime_type
@@ -657,6 +656,8 @@ TEAM_CHAT_ERROR_RESPONSE = inline_serializer(
     name='TeamChatError',
     fields={'error': drf_serializers.CharField()},
 )
+
+TEAM_CHAT_LIST_SCOPES = ('today', 'all')
 
 
 def _team_chat_ws_notify(conversation, message, tenant_schema=None):
@@ -743,8 +744,11 @@ class TeamChatUserListView(APIView):
         parameters=[
             OpenApiParameter(
                 name='scope', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
-                enum=['today', 'all'], required=False,
-                description="`today` (default): only conversations active today; `all`: every conversation.",
+                enum=list(TEAM_CHAT_LIST_SCOPES), required=False,
+                description=(
+                    "`today` (default): only conversations active today; `all`: every conversation. "
+                    "Any other value is a 400 (`{\"scope\": [...]}`)."
+                ),
             ),
         ],
     ),
@@ -813,12 +817,18 @@ class TeamChatConversationViewSet(viewsets.ModelViewSet):
             ),
         )
 
-        if self.action == 'list' and self.request.query_params.get('scope', 'today') != 'all':
-            today_start = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            queryset = queryset.filter(
-                Q(latest_message_time__gte=today_start)
-                | Q(latest_message_time__isnull=True, updated_at__gte=today_start)
-            )
+        if self.action == 'list':
+            scope = self.request.query_params.get('scope', 'today')
+            if scope not in TEAM_CHAT_LIST_SCOPES:
+                raise drf_serializers.ValidationError({
+                    'scope': [f"Invalid scope '{scope}'. Use one of: {', '.join(TEAM_CHAT_LIST_SCOPES)}."],
+                })
+            if scope != 'all':
+                today_start = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                queryset = queryset.filter(
+                    Q(latest_message_time__gte=today_start)
+                    | Q(latest_message_time__isnull=True, updated_at__gte=today_start)
+                )
 
         return queryset.order_by('-latest_message_time', '-updated_at')
 
@@ -1019,11 +1029,13 @@ class IsTeamChatMessageSenderOrReadOnly(permissions.BasePermission):
             'multipart/form-data. Give `recipient_id` (the 1:1 conversation is created on demand) or '
             '`conversation_id`. `text` is required for text messages, `file` for image/file/voice '
             '(max 25 MB; images, audio, PDF, Word, Excel, PowerPoint, text/CSV, ZIP). The recipient gets '
-            'a websocket `new_message` frame plus an in-app/push notification of type `team_chat_message`.'
+            'a websocket `new_message` frame; when they have no open team-chat socket they also get an '
+            'in-app/push notification of type `team_chat_message`. 400 when `recipient_id` is the caller.'
         ),
         request=TeamChatCreateMessageSerializer,
         responses={
             201: TeamChatMessageSerializer,
+            400: TEAM_CHAT_ERROR_RESPONSE,
             404: TEAM_CHAT_ERROR_RESPONSE,
         },
     ),
@@ -1075,6 +1087,11 @@ class TeamChatMessageViewSet(viewsets.ModelViewSet):
                 )
         else:
             # Get recipient and find/create conversation
+            if recipient_id == request.user.id:
+                return Response(
+                    {'error': 'You cannot send a message to yourself'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             try:
                 recipient = User.objects.get(id=recipient_id)
             except User.DoesNotExist:
@@ -1162,32 +1179,27 @@ class TeamChatMessageViewSet(viewsets.ModelViewSet):
 
 @extend_schema(
     summary='Validate a chat attachment without storing it',
+    description=(
+        'Pre-flight check with exactly the policy `POST /api/team-chat/messages/` applies '
+        '(max 25 MB; images, audio, PDF, Word, Excel, PowerPoint, text/CSV, ZIP; an `image` '
+        'message must carry an image, a `voice` message an audio file). Errors come back as '
+        '`{"file": [...]}` 400, like the create endpoint.'
+    ),
     request=TeamChatFileUploadSerializer,
-    responses={200: TeamChatFileUploadResultSerializer, 400: TEAM_CHAT_ERROR_RESPONSE},
+    responses={200: TeamChatFileUploadResultSerializer},
 )
 @api_view(['POST'])
 def upload_team_chat_file(request):
-    """Upload a file for team chat"""
+    """Validate a file for team chat (same rules as message creation)."""
     serializer = TeamChatFileUploadSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
 
     file = serializer.validated_data['file']
-    message_type = serializer.validated_data.get('message_type', 'file')
-
-    # Determine content type
-    content_type = mimetypes.guess_type(file.name)[0] or 'application/octet-stream'
-
-    # For images, verify it's actually an image
-    if message_type == 'image' and not content_type.startswith('image/'):
-        return Response(
-            {'error': 'File is not a valid image'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
 
     return Response({
         'file_name': file.name,
         'file_size': file.size,
-        'file_mime_type': content_type,
+        'file_mime_type': resolve_upload_mime_type(file),
         'message': 'File validated successfully. Include this file in your message creation request.'
     })
 

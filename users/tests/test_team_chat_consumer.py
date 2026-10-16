@@ -9,6 +9,9 @@ Tests for the TeamChatConsumer websocket consumer (users.consumers.TeamChatConsu
 - handle_send_message: the recipient's group event and the sender's
   `message_sent` echo both carry `conversation` and `conversation_id`;
   a failed create sends an error frame
+- presence: a recipient with an open socket (UserOnlineStatus.is_online)
+  gets no notification; the client's `ping` refreshes `last_seen`, throttled
+  per connection
 - chat_message handler: the `new_message` frame carries both keys
 
 Follows the mock-channel-layer pattern of notifications/tests/test_notification_consumers.py.
@@ -27,6 +30,7 @@ from users.tests.conftest import EchoDeskTenantTestCase
 from users.consumers import TeamChatConsumer
 from users.models import (
     TeamChatConversation, TeamChatMessage, Notification, NotificationPreference,
+    UserOnlineStatus,
 )
 
 User = get_user_model()
@@ -198,6 +202,16 @@ class TestCreateMessage(TeamChatConsumerTestBase):
         self.assertFalse(Notification.objects.filter(user=self.recipient).exists())
         self.mock_push.assert_not_called()
 
+    def test_online_recipient_gets_no_notification(self):
+        """An open team-chat socket on the recipient's side means the
+        `new_message` frame is enough — no bell row, no push."""
+        UserOnlineStatus.objects.create(user=self.recipient, is_online=True)
+        consumer = _build_consumer(self.sender)
+        result = self._create(consumer, recipient_id=self.recipient.pk, text='live')
+        self.assertIsNotNone(result)
+        self.assertFalse(Notification.objects.filter(user=self.recipient).exists())
+        self.mock_push.assert_not_called()
+
     def test_notification_failure_does_not_block_message(self):
         consumer = _build_consumer(self.sender)
         with patch('users.notification_utils.create_team_chat_message_notification',
@@ -255,6 +269,50 @@ class TestHandleSendMessage(TeamChatConsumerTestBase):
         frame = json.loads(consumer.send.call_args.kwargs['text_data'])
         self.assertEqual(frame['type'], 'error')
         self.assertEqual(consumer.channel_layer.sent, [])
+
+
+class TestPresenceHeartbeat(TeamChatConsumerTestBase):
+    """The client's ping keeps the presence row fresh (throttled per connection)."""
+
+    def test_ping_answers_pong_and_touches_presence_once_per_window(self):
+        consumer = _build_consumer(self.sender)
+        with patch.object(consumer, 'refresh_last_seen', new=AsyncMock()) as refresh:
+            for ts in (1, 2, 3):
+                async_to_sync(consumer.receive)(text_data=json.dumps({'type': 'ping', 'timestamp': ts}))
+        frames = [json.loads(c.kwargs['text_data']) for c in consumer.send.call_args_list]
+        self.assertEqual([f['type'] for f in frames], ['pong', 'pong', 'pong'])
+        self.assertEqual([f['timestamp'] for f in frames], [1, 2, 3])
+        # three pings inside PRESENCE_HEARTBEAT_SECONDS → one DB write
+        self.assertEqual(refresh.await_count, 1)
+
+    def test_ping_touches_presence_again_after_window(self):
+        consumer = _build_consumer(self.sender)
+        with patch.object(consumer, 'refresh_last_seen', new=AsyncMock()) as refresh:
+            async_to_sync(consumer.receive)(text_data=json.dumps({'type': 'ping'}))
+            consumer._presence_touched_at -= consumer.PRESENCE_HEARTBEAT_SECONDS + 1
+            async_to_sync(consumer.receive)(text_data=json.dumps({'type': 'ping'}))
+        self.assertEqual(refresh.await_count, 2)
+
+    def test_refresh_failure_does_not_break_the_socket(self):
+        consumer = _build_consumer(self.sender)
+        with patch.object(consumer, 'refresh_last_seen', new=AsyncMock(side_effect=RuntimeError('db'))):
+            async_to_sync(consumer.receive)(text_data=json.dumps({'type': 'ping', 'timestamp': 9}))
+        frame = json.loads(consumer.send.call_args.kwargs['text_data'])
+        self.assertEqual(frame, {'type': 'pong', 'timestamp': 9})
+
+    def test_refresh_last_seen_bumps_row(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        UserOnlineStatus.objects.create(user=self.sender, is_online=True)
+        stale = timezone.now() - timedelta(minutes=10)
+        UserOnlineStatus.objects.filter(user=self.sender).update(last_seen=stale)
+
+        consumer = _build_consumer(self.sender)
+        TeamChatConsumer.__dict__['refresh_last_seen'].func(consumer)
+
+        row = UserOnlineStatus.objects.get(user=self.sender)
+        self.assertGreater(row.last_seen, stale + timedelta(minutes=9))
+        self.assertTrue(row.is_online)
 
 
 class TestChatMessageHandler(TeamChatConsumerTestBase):

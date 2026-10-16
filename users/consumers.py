@@ -5,6 +5,7 @@ Includes notification updates and ticket board collaboration.
 
 import json
 import asyncio
+import time
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 from django.contrib.auth.models import AnonymousUser
@@ -828,7 +829,16 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
     - {"type": "typing_indicator", "user_id": 123, "is_typing": true}
     - {"type": "read_receipt", "message_ids": [...], "read_by": 123}
     - {"type": "user_online", "user_id": 123, "is_online": true}
+
+    Presence: ``UserOnlineStatus.is_online`` is set on connect/disconnect and
+    ``last_seen`` is refreshed on the client's periodic ``ping`` (at most once
+    per ``PRESENCE_HEARTBEAT_SECONDS`` per connection). The notification layer
+    treats an online row older than ``TEAM_CHAT_PRESENCE_STALE_AFTER`` as
+    stale, so a connection that died without its disconnect handler (server
+    restart) stops suppressing chat notifications after that window.
     """
+
+    PRESENCE_HEARTBEAT_SECONDS = 30
 
     async def connect(self):
         self.tenant_schema = self.scope['url_route']['kwargs']['tenant_schema']
@@ -870,6 +880,7 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
             # Update online status (wrapped in try/catch to not fail connection)
             try:
                 await self.set_online_status(True)
+                self._presence_touched_at = time.monotonic()
             except Exception as e:
                 print(f"[TeamChatWS] Error setting online status: {e}")
 
@@ -957,6 +968,7 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
                     'type': 'pong',
                     'timestamp': data.get('timestamp')
                 }))
+                await self.touch_presence()
 
             elif message_type == 'message':
                 # Send a new message
@@ -1123,7 +1135,34 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
             'user_name': event['user_name']
         }))
 
+    async def touch_presence(self):
+        """
+        Refresh ``last_seen`` for the connected user, throttled per connection.
+
+        Called on every client ping (web and mobile ping every 25-30 s); the
+        write happens at most once per ``PRESENCE_HEARTBEAT_SECONDS``.
+        """
+        user = getattr(self, 'user', None)
+        if user is None or user.is_anonymous:
+            return
+        now = time.monotonic()
+        last = getattr(self, '_presence_touched_at', None)
+        if last is not None and now - last < self.PRESENCE_HEARTBEAT_SECONDS:
+            return
+        self._presence_touched_at = now
+        try:
+            await self.refresh_last_seen()
+        except Exception as e:
+            print(f"[TeamChatWS] Error refreshing presence: {e}")
+
     # Database operations
+    @database_sync_to_async
+    def refresh_last_seen(self):
+        """Bump ``last_seen`` on the user's presence row (keeps it non-stale)."""
+        from django.utils import timezone
+        with schema_context(self.tenant_schema):
+            UserOnlineStatus.objects.filter(user=self.user).update(last_seen=timezone.now())
+
     @database_sync_to_async
     def set_online_status(self, is_online):
         """Update user's online status"""

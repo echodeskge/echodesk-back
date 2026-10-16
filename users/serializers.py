@@ -824,31 +824,25 @@ class TeamChatCreateMessageSerializer(serializers.Serializer):
 
 
 class TeamChatFileUploadSerializer(serializers.Serializer):
-    """Serializer for file uploads"""
-    file = serializers.FileField()
+    """
+    Pre-flight validator for ``POST /api/team-chat/upload/``.
+
+    Applies ``validate_team_chat_file`` — the one attachment policy shared
+    with ``TeamChatCreateMessageSerializer`` — so a file that passes here is
+    guaranteed to be accepted by ``POST /api/team-chat/messages/``.
+    """
+    file = serializers.FileField(
+        help_text='Max 25 MB; images, audio, PDF, Word, Excel, PowerPoint, text/CSV and ZIP.',
+    )
     message_type = serializers.ChoiceField(
         choices=['image', 'file', 'voice'],
         default='file'
     )
-    voice_duration = serializers.IntegerField(required=False)
+    voice_duration = serializers.IntegerField(required=False, min_value=0)
 
     def validate_file(self, value):
-        # File size limits
-        max_sizes = {
-            'image': 10 * 1024 * 1024,  # 10MB
-            'file': 25 * 1024 * 1024,   # 25MB
-            'voice': 5 * 1024 * 1024,   # 5MB
-        }
-
-        message_type = self.initial_data.get('message_type', 'file')
-        max_size = max_sizes.get(message_type, max_sizes['file'])
-
-        if value.size > max_size:
-            raise serializers.ValidationError(
-                f"File size exceeds maximum allowed ({max_size // (1024 * 1024)}MB)"
-            )
-
-        return value
+        message_type = self.initial_data.get('message_type') or 'file'
+        return validate_team_chat_file(value, message_type)
 
 
 class TeamChatFileUploadResultSerializer(serializers.Serializer):

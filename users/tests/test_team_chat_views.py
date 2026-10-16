@@ -10,7 +10,12 @@ Tests for Team Chat endpoints:
   - POST /api/team-chat/conversations/<id>/unhide/         → unhide conversation
   - POST /api/team-chat/messages/                          → create message
   - POST /api/team-chat/messages/<id>/mark_read/           → mark single read
+  - POST /api/team-chat/upload/                            → pre-flight attachment check
   - GET  /api/team-chat/unread-count/                      → unread count
+
+Also covered: the recipient notification (skipped while the recipient has an
+open team-chat socket; batched per conversation), the constant query count of
+the conversation list, and the shared attachment policy.
 """
 import shutil
 import tempfile
@@ -347,6 +352,19 @@ class TestCreateMessage(TeamChatTestMixin, EchoDeskTenantTestCase):
         }, user=self.user1)
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_create_message_to_self_returns_400(self):
+        """recipient_id == me must not pick an arbitrary existing conversation."""
+        count_before = TeamChatConversation.objects.count()
+        resp = self._multipart_post(MESSAGES_URL, {
+            'recipient_id': self.user1.pk,
+            'text': 'note to self',
+            'message_type': 'text',
+        }, user=self.user1)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('error', resp.data)
+        self.assertEqual(TeamChatConversation.objects.count(), count_before)
+        self.assertFalse(TeamChatMessage.objects.filter(sender=self.user1).exists())
+
     def test_unauthenticated_returns_401(self):
         resp = self.api_post(MESSAGES_URL, {'text': 'Hello'})
         self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
@@ -598,6 +616,51 @@ class TestConversationListScope(TeamChatTestMixin, EchoDeskTenantTestCase):
         self.assertEqual(len(resp.data['results']), 2)
         self.assertGreaterEqual(resp.data['count'], 3)
         self.assertIsNotNone(resp.data['next'])
+
+    def test_invalid_scope_returns_400(self):
+        resp = self.api_get(CONVERSATIONS_URL, user=self.user1, data={'scope': 'yesterday'})
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('scope', resp.data)
+
+    def _seed_conversations(self, count, label):
+        """`count` conversations with user1, each with 3 messages (2 unread for user1)."""
+        for i in range(count):
+            u = self.create_user(email=f'scope-{label}{i}@test.com', first_name=f'P{i}')
+            conv = self._make_conversation(self.user1, u)
+            self._make_message(conv, u, f'{label} {i} a')
+            self._make_message(conv, self.user1, f'{label} {i} mine')
+            self._make_message(conv, u, f'{label} {i} b')
+
+    def test_scope_all_list_query_count_is_constant(self):
+        """
+        The list is built from a fixed set of queries (rows, count, participants,
+        their presence, latest message per conversation): adding conversations
+        must not add queries (no N+1 for unread_count / last_message /
+        other_participant).
+        """
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        client = self.authenticated_client(self.user1)
+        self._seed_conversations(3, 'few')
+        with CaptureQueriesContext(connection) as few:
+            resp = client.get(CONVERSATIONS_URL, {'scope': 'all', 'page_size': 50},
+                              HTTP_HOST='tenant.test.com')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['count'], 3)
+
+        self._seed_conversations(9, 'many')
+        with self.assertNumQueries(len(few.captured_queries)):
+            resp = client.get(CONVERSATIONS_URL, {'scope': 'all', 'page_size': 50},
+                              HTTP_HOST='tenant.test.com')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['count'], 12)
+        for row in resp.data['results']:
+            self.assertEqual(row['unread_count'], 2)
+            self.assertTrue(row['last_message']['text'].endswith(' b'))
+            self.assertNotEqual(row['other_participant']['id'], self.user1.pk)
+        # sanity: this really is a handful of queries, not one per row
+        self.assertLessEqual(len(few.captured_queries), 12)
 
 
 # ============================================================
@@ -1060,3 +1123,151 @@ class TestCreateMessageNotification(LocalMediaMixin, TeamChatTestMixin, EchoDesk
         self.assertEqual(event['message']['text'], 'over the wire')
         self.assertIn('file_url', event['message'])
         self.assertIn('is_online', event['message']['sender'])
+
+    # --- presence: an online recipient gets the socket frame only ---
+
+    def test_online_recipient_is_not_notified(self):
+        """
+        With the team-chat socket open (UserOnlineStatus.is_online, fresh
+        last_seen) the recipient sees the message live — no bell row, no
+        second sound/toast, no push.
+        """
+        UserOnlineStatus.objects.create(user=self.user2, is_online=True)
+        resp = self._send_text('seen live')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(Notification.objects.filter(user=self.user2).exists())
+        self._push.assert_not_called()
+
+    def test_offline_recipient_is_notified(self):
+        UserOnlineStatus.objects.create(user=self.user2, is_online=False)
+        resp = self._send_text('while away')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            Notification.objects.filter(user=self.user2, notification_type='team_chat_message').exists()
+        )
+        self._push.assert_called_once()
+
+    def test_stale_online_row_still_notifies(self):
+        """An 'online' row nobody refreshed for a while is a dead socket."""
+        from users.notification_utils import TEAM_CHAT_PRESENCE_STALE_AFTER
+        UserOnlineStatus.objects.create(user=self.user2, is_online=True)
+        UserOnlineStatus.objects.filter(user=self.user2).update(
+            last_seen=timezone.now() - TEAM_CHAT_PRESENCE_STALE_AFTER - timedelta(seconds=5)
+        )
+        resp = self._send_text('after a restart')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(Notification.objects.filter(user=self.user2).exists())
+        self._push.assert_called_once()
+
+    def test_sender_presence_is_irrelevant(self):
+        UserOnlineStatus.objects.create(user=self.user1, is_online=True)
+        resp = self._send_text('I am online, you are not')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(Notification.objects.filter(user=self.user2).exists())
+
+    # --- batching is per conversation ---
+
+    def test_same_thread_batches_into_one_row(self):
+        self._send_text('one')
+        resp = self._send_text('two')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        rows = Notification.objects.filter(user=self.user2, notification_type='team_chat_message')
+        self.assertEqual(rows.count(), 1)
+        row = rows.get()
+        self.assertEqual(row.title, 'Nino K')
+        self.assertEqual(row.message, 'two (+1 more)')
+        self.assertEqual(row.metadata['batch_count'], 2)
+        self.assertEqual(row.metadata['message_id'], resp.data['id'])
+        self.assertEqual(row.link_url, f'/team-chat?user={self.user1.pk}')
+
+    def test_messages_from_two_colleagues_are_not_batched_together(self):
+        """
+        A second colleague writing within the 30 s window gets their own row:
+        title, preview, metadata and deep-link all belong to the same sender.
+        """
+        user3 = self.create_user(email='notif-bob@test.com', first_name='Bob', last_name='M')
+        conv3 = self._make_conversation(user3, self.user2)
+        Notification.objects.filter(user=user3).delete()
+
+        self._send_text('from nino')
+        resp = self._multipart_post(MESSAGES_URL, {
+            'conversation_id': conv3.pk, 'text': 'from bob', 'message_type': 'text',
+        }, user=user3)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+        rows = {
+            n.metadata['sender_id']: n
+            for n in Notification.objects.filter(user=self.user2, notification_type='team_chat_message')
+        }
+        self.assertEqual(set(rows), {self.user1.pk, user3.pk})
+        nino, bob = rows[self.user1.pk], rows[user3.pk]
+        self.assertEqual((nino.title, nino.message), ('Nino K', 'from nino'))
+        self.assertEqual(nino.metadata['conversation_id'], self.conv.pk)
+        self.assertEqual(nino.link_url, f'/team-chat?user={self.user1.pk}')
+        self.assertEqual((bob.title, bob.message), ('Bob M', 'from bob'))
+        self.assertEqual(bob.metadata['conversation_id'], conv3.pk)
+        self.assertEqual(bob.link_url, f'/team-chat?user={user3.pk}')
+        self.assertNotIn('batch_count', bob.metadata)
+
+
+# ============================================================
+# Pre-flight upload validator shares the create-message policy
+# ============================================================
+class TestUploadValidator(TeamChatTestMixin, EchoDeskTenantTestCase):
+
+    UPLOAD_URL = '/api/team-chat/upload/'
+
+    def setUp(self):
+        super().setUp()
+        self.user1 = self.create_user(email='upload1@test.com')
+
+    def _upload(self, message_type, upload):
+        return self._multipart_post(
+            self.UPLOAD_URL, {'message_type': message_type, 'file': upload}, user=self.user1,
+        )
+
+    def test_image_over_old_10mb_cap_passes_with_shared_policy(self):
+        """An 11 MB image is accepted by /messages/ — /upload/ must agree
+        (the old per-type 10 MB image cap is gone)."""
+        size = 11 * 1024 * 1024
+        upload = SimpleUploadedFile('big.jpg', b'\xff\xd8\xff' + b'\0' * (size - 3),
+                                    content_type='image/jpeg')
+        resp = self._upload('image', upload)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(resp.data['file_mime_type'], 'image/jpeg')
+        self.assertEqual(resp.data['file_name'], 'big.jpg')
+        self.assertEqual(resp.data['file_size'], size)
+
+    def test_over_shared_cap_rejected(self):
+        upload = SimpleUploadedFile('big.pdf', b'x' * 2048, content_type='application/pdf')
+        with patch('users.serializers.TEAM_CHAT_MAX_FILE_SIZE', 1024):
+            resp = self._upload('file', upload)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('file', resp.data)
+
+    def test_disallowed_extension_rejected(self):
+        upload = SimpleUploadedFile('virus.exe', b'MZ', content_type='application/octet-stream')
+        resp = self._upload('file', upload)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('file', resp.data)
+
+    def test_image_type_mismatch_rejected(self):
+        upload = SimpleUploadedFile('doc.pdf', b'%PDF', content_type='application/pdf')
+        resp = self._upload('image', upload)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('file', resp.data)
+
+    def test_voice_type_mismatch_rejected(self):
+        upload = SimpleUploadedFile('photo.png', b'\x89PNG', content_type='image/png')
+        resp = self._upload('voice', upload)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('file', resp.data)
+
+    def test_mime_resolved_like_create(self):
+        upload = SimpleUploadedFile('sheet.xlsx', b'PK..', content_type='application/octet-stream')
+        resp = self._upload('file', upload)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(
+            resp.data['file_mime_type'],
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
