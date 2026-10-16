@@ -225,8 +225,11 @@ class PublicHelpArticleViewSet(viewsets.ReadOnlyModelViewSet):
                 'characters returns `[]`. No authentication required.',
     parameters=[
         OpenApiParameter(
-            'q', OpenApiTypes.STR, OpenApiParameter.QUERY, required=True,
-            description='Search text (minimum 2 characters).',
+            # Not marked required: the TypeScript generator emits required
+            # parameters after optional ones, which is invalid TS. The view
+            # returns [] for a missing/short query anyway.
+            'q', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+            description='Search text (minimum 2 characters; missing or shorter returns []).',
         ),
     ] + VISIBILITY_PARAMS,
     responses={200: HelpArticleListSerializer(many=True)},
