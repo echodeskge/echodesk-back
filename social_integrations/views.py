@@ -23,7 +23,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 import secrets
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiTypes
+from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiTypes
 from .models import (
     FacebookPageConnection, FacebookMessage, OrphanedFacebookMessage,
     InstagramAccountConnection, InstagramMessage,
@@ -51,6 +51,19 @@ from .serializers import (
     EmailSendSerializer, EmailDraftSerializer, EmailMessageActionSerializer, EmailFolderSerializer,
     EmailConnectionUserAssignmentSerializer, EmailConnectionUserAssignmentCreateSerializer,
     EmailConnectionWithAssignmentsSerializer,
+    EmailMessageListSerializer, EmailMessageDetailSerializer, EmailThreadSerializer,
+    EmailSendMultipartSerializer, EmailSendResponseSerializer, EmailErrorResponseSerializer,
+    EmailActionResponseSerializer, EmailConnectionStatusResponseSerializer,
+    EmailConnectionIdRequestSerializer, EmailConnectionResponseSerializer,
+    EmailConnectRequestSerializer, EmailConnectResponseSerializer,
+    EmailConnectionUpdateRequestSerializer, EmailReactivateRequestSerializer,
+    EmailDisconnectResponseSerializer, EmailFoldersResponseSerializer,
+    EmailSyncRequestSerializer, EmailSyncResponseSerializer,
+    EmailSyncDaysRequestSerializer, EmailSyncDaysResponseSerializer,
+    EmailMoveRequestSerializer, EmailMoveResponseSerializer,
+    EmailAssignedUsersResponseSerializer, EmailAssignedUsersUpdateRequestSerializer,
+    EmailAssignmentCreateRequestSerializer, EmailMessageResponseSerializer,
+    SocialUnreadCountResponseSerializer,
     TikTokShopAccountSerializer, TikTokMessageSerializer, TikTokSendMessageSerializer,
     EmailSignatureSerializer, QuickReplySerializer, QuickReplyUseSerializer, QuickReplyVariablesSerializer,
     SocialClientSerializer, SocialClientListSerializer, SocialClientCreateSerializer,
@@ -6646,6 +6659,19 @@ def unified_conversations(request):
     })
 
 
+@extend_schema(
+    summary="Unread counts per platform",
+    description=(
+        "Badge counts. Each value is the number of incoming customer messages "
+        "staff has not read yet (is_read_by_staff=False), excluding archived "
+        "conversations and soft-deleted messages. `email` counts only INBOX "
+        "messages on connections the user can access (EmailConnectionUserAssignment: "
+        "unassigned connections count for everyone, assigned ones only for their "
+        "users and staff). When chat assignment is enabled, only chats assigned "
+        "to me or to nobody are counted."
+    ),
+    responses={200: SocialUnreadCountResponseSerializer, 500: EmailErrorResponseSerializer},
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def unread_messages_count(request):
@@ -6653,6 +6679,12 @@ def unread_messages_count(request):
     Get the total count of unread messages across all social platforms.
     Returns counts for Facebook, Instagram, WhatsApp, Email, and total.
     Unread = incoming messages from customers that staff hasn't read yet.
+
+    ``email`` = non-deleted INBOX messages with is_from_business=False and
+    is_read_by_staff=False, on email connections the user can access
+    (connections without assignments count for everyone; assigned ones only
+    for their users and staff/superusers). Sent mail, other folders and
+    archived threads are never counted.
 
     Archived (history) conversations are excluded — the sidebar badge only
     reflects chats visible in the active list.
@@ -9638,6 +9670,66 @@ def whatsapp_send_template_message(request):
 # Email Integration Views
 # =============================================================================
 
+EMAIL_ACCESS_RULES_DOC = (
+    "Mailbox visibility (EmailConnectionUserAssignment): admins, superusers, "
+    "staff and users with the manage_social_connections permission see every "
+    "connection; a user who is assigned to at least one connection sees only "
+    "the connections they are assigned to; a user with no assignments at all "
+    "keeps the historical behaviour and sees every connection."
+)
+
+
+def _email_connection_access(user):
+    """Return the EmailConnection ids ``user`` may read, or ``None`` for no restriction.
+
+    Rules (see ``EMAIL_ACCESS_RULES_DOC``):
+
+    - role ``admin`` / ``is_superuser`` / ``is_staff`` / ``manage_social_connections``
+      permission → ``None`` (everything).
+    - user has ≥1 ``EmailConnectionUserAssignment`` → the set of assigned
+      connection ids (only those mailboxes).
+    - user has no assignments → ``None`` (unchanged legacy behaviour: tenants
+      that never configured assignments keep a shared inbox).
+    """
+    if user.is_superuser or user.is_staff or getattr(user, 'role', None) == 'admin':
+        return None
+    if user.has_permission('manage_social_connections'):
+        return None
+    assigned_ids = set(
+        EmailConnectionUserAssignment.objects.filter(user=user)
+        .values_list('connection_id', flat=True)
+    )
+    if not assigned_ids:
+        return None
+    return assigned_ids
+
+
+def _restrict_email_queryset(queryset, user):
+    """Apply ``_email_connection_access`` to an EmailMessage queryset."""
+    allowed = _email_connection_access(user)
+    if allowed is None:
+        return queryset
+    return queryset.filter(connection_id__in=allowed)
+
+
+def _can_access_email_connection(user, connection_id):
+    allowed = _email_connection_access(user)
+    return allowed is None or connection_id in allowed
+
+
+@extend_schema(
+    summary="Email connection status",
+    description=(
+        "Connections the current user can access plus a `connected` flag. "
+        "Drives the module gate and the account picker. `connection` is the "
+        "first accessible connection (back-compat) or null. "
+        "`assigned_users` is only populated for staff/superusers. "
+        "Visibility here: a connection with no user assignments is listed for "
+        "everyone; a connection with assignments is listed only for its "
+        "assigned users and for staff/superusers."
+    ),
+    responses={200: EmailConnectionStatusResponseSerializer, 500: EmailErrorResponseSerializer},
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def email_connection_status(request):
@@ -9709,6 +9801,17 @@ def email_connection_status(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary="Connect an email account",
+    description="Tests IMAP and SMTP with the given credentials, then creates (201) or updates (200) the connection for that address. Admin / manage_social_connections only.",
+    request=EmailConnectRequestSerializer,
+    responses={
+        200: EmailConnectResponseSerializer,
+        201: EmailConnectResponseSerializer,
+        400: EmailErrorResponseSerializer,
+        500: EmailErrorResponseSerializer,
+    },
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def email_connect(request):
@@ -9814,6 +9917,17 @@ def email_connect(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary="Update an email connection",
+    description="Partial update of display name, per-connection signature, IMAP/SMTP settings and sync options. Admin / manage_social_connections only.",
+    request=EmailConnectionUpdateRequestSerializer,
+    responses={
+        200: EmailConnectionResponseSerializer,
+        400: EmailErrorResponseSerializer,
+        404: EmailErrorResponseSerializer,
+        500: EmailErrorResponseSerializer,
+    },
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def email_update_connection(request):
@@ -9881,6 +9995,17 @@ def email_update_connection(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary="Reactivate an auto-disabled email connection",
+    description="Re-tests IMAP (and SMTP when a new password is given) and, on success, sets is_active=True and clears auto_disabled_at. Admin / manage_social_connections only.",
+    request=EmailReactivateRequestSerializer,
+    responses={
+        200: EmailConnectionResponseSerializer,
+        400: EmailErrorResponseSerializer,
+        404: EmailErrorResponseSerializer,
+        500: EmailErrorResponseSerializer,
+    },
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def email_reactivate(request):
@@ -9988,6 +10113,17 @@ def email_reactivate(request):
         )
 
 
+@extend_schema(
+    summary="Disconnect an email account",
+    description="Deletes the connection and cascades to its messages and drafts. Admin / manage_social_connections only.",
+    request=EmailConnectionIdRequestSerializer,
+    responses={
+        200: EmailDisconnectResponseSerializer,
+        400: EmailErrorResponseSerializer,
+        404: EmailErrorResponseSerializer,
+        500: EmailErrorResponseSerializer,
+    },
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def email_disconnect(request):
@@ -10036,6 +10172,29 @@ def email_disconnect(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary="Send an email",
+    description=(
+        "Send a new message, a reply (`reply_to_message_id` = pk of the message "
+        "being answered; it must belong to the chosen connection) or a forward "
+        "(plain send with the quoted body). Accepts `application/json`, or "
+        "`multipart/form-data` when attaching files: repeat the `attachments` "
+        "form key once per file and repeat list keys (`to_emails`, `cc_emails`, "
+        "`bcc_emails`) once per address. At least one of `body_text` / "
+        "`body_html` is required. The tenant / connection signature is appended "
+        "server-side. The sent copy is stored in folder 'Sent' and returned as `data`."
+    ),
+    request={
+        'multipart/form-data': EmailSendMultipartSerializer,
+        'application/json': EmailSendSerializer,
+    },
+    responses={
+        200: EmailSendResponseSerializer,
+        400: OpenApiTypes.OBJECT,
+        404: EmailErrorResponseSerializer,
+        500: EmailErrorResponseSerializer,
+    },
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanSendSocialMessages])
 def email_send(request):
@@ -10108,6 +10267,25 @@ def email_send(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary="Act on email messages",
+    description=(
+        "Bulk action on messages selected by `message_ids` (pks) or by "
+        "`thread_id`; one of the two is required. Actions: mark_read / "
+        "mark_unread (also toggles is_read_by_staff), star / unstar, label / "
+        "unlabel (needs `label`), move (needs `folder`; updates the DB folder "
+        "only — use /email-messages/move/ for a real IMAP move), delete (soft) "
+        "/ restore. Messages on connections the user cannot access are "
+        "ignored; 404 when nothing matched. " + EMAIL_ACCESS_RULES_DOC
+    ),
+    request=EmailMessageActionSerializer,
+    responses={
+        200: EmailActionResponseSerializer,
+        400: OpenApiTypes.OBJECT,
+        404: EmailErrorResponseSerializer,
+        500: EmailErrorResponseSerializer,
+    },
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def email_action(request):
@@ -10125,6 +10303,9 @@ def email_action(request):
             messages = EmailMessage.objects.filter(thread_id=data['thread_id'])
         else:
             messages = EmailMessage.objects.filter(id__in=data['message_ids'])
+
+        # Mailbox assignment enforcement (no-op for admins / unassigned users).
+        messages = _restrict_email_queryset(messages, request.user)
 
         affected_count = messages.count()
 
@@ -10182,6 +10363,24 @@ def email_action(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary="List IMAP folders",
+    description=(
+        "Live IMAP LIST (10s timeout per connection, serial — cache client-side). "
+        "With `connection_id`: `{connection_id, email, folders}`. Without: "
+        "`{connections: [{connection_id, email, folders, success, error?}]}` "
+        "for every active connection. 404 when there is no active connection."
+    ),
+    parameters=[
+        OpenApiParameter('connection_id', OpenApiTypes.INT, OpenApiParameter.QUERY, required=False,
+                         description="Only this connection (pk)"),
+    ],
+    responses={
+        200: EmailFoldersResponseSerializer,
+        404: EmailErrorResponseSerializer,
+        500: EmailErrorResponseSerializer,
+    },
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def email_folders(request):
@@ -10253,6 +10452,16 @@ def email_folders(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary="Trigger an IMAP sync",
+    description="Synchronous IMAP sync of one (`connection_id`) or every active connection. Admin / manage_social_connections only; can take minutes.",
+    request=EmailSyncRequestSerializer,
+    responses={
+        200: EmailSyncResponseSerializer,
+        404: EmailErrorResponseSerializer,
+        500: EmailErrorResponseSerializer,
+    },
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def email_sync(request):
@@ -10297,6 +10506,14 @@ def email_sync(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary="Debug email sync",
+    description="Folder-by-folder diagnostics for one connection (or the first active one) without syncing. Admin / manage_social_connections only.",
+    parameters=[
+        OpenApiParameter('connection_id', OpenApiTypes.INT, OpenApiParameter.QUERY, required=False),
+    ],
+    responses={200: OpenApiTypes.OBJECT, 404: EmailErrorResponseSerializer, 500: EmailErrorResponseSerializer},
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def email_sync_debug(request):
@@ -10327,6 +10544,17 @@ def email_sync_debug(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary="Update sync history window",
+    description="Sets sync_days_back for one connection (or the first active one). 0 = sync all history. Admin / manage_social_connections only.",
+    request=EmailSyncDaysRequestSerializer,
+    responses={
+        200: EmailSyncDaysResponseSerializer,
+        400: EmailErrorResponseSerializer,
+        404: EmailErrorResponseSerializer,
+        500: EmailErrorResponseSerializer,
+    },
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def email_update_sync_days(request):
@@ -10377,10 +10605,95 @@ def email_update_sync_days(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+_EMAIL_LITE_PARAM = OpenApiParameter(
+    'lite', OpenApiTypes.BOOL, OpenApiParameter.QUERY, required=False,
+    description=(
+        "`1`/`true`: rows use EmailMessageList (no body_text/body_html/attachments; "
+        "adds snippet + attachments_count) — ~10x smaller for list screens."
+    ),
+)
+
+
+def _truthy_param(value) -> bool:
+    return str(value).lower() in ('1', 'true', 'yes') if value is not None else False
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary="List email messages",
+        description=(
+            "Non-deleted messages ordered by -timestamp, paginated "
+            "(page / page_size ≤ 100, default 20). Every row ships the full "
+            "bodies unless `lite=1`. " + EMAIL_ACCESS_RULES_DOC
+        ),
+        parameters=[
+            OpenApiParameter('folder', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+                             description="Exact IMAP folder name, e.g. INBOX or Sent"),
+            OpenApiParameter('starred', OpenApiTypes.BOOL, OpenApiParameter.QUERY, required=False,
+                             description="`true` → only starred messages (any other value is ignored)"),
+            OpenApiParameter('is_read', OpenApiTypes.BOOL, OpenApiParameter.QUERY, required=False,
+                             description="`true` / `false` → filter by IMAP SEEN flag"),
+            OpenApiParameter('label', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+                             description="Only messages carrying this label"),
+            OpenApiParameter('thread_id', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+                             description="All messages of one conversation"),
+            OpenApiParameter('connection_id', OpenApiTypes.INT, OpenApiParameter.QUERY, required=False,
+                             description="Only this email account (pk)"),
+            OpenApiParameter('search', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+                             description="icontains on subject, from_email, from_name, body_text"),
+            _EMAIL_LITE_PARAM,
+        ],
+        responses={200: EmailMessageSerializer(many=True)},
+    ),
+    retrieve=extend_schema(
+        summary="Email message detail",
+        description="Single message incl. `body_html_safe` (sanitised HTML). 404 if soft-deleted or on a mailbox the user cannot access.",
+        responses={200: EmailMessageDetailSerializer},
+    ),
+)
 class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
     """ViewSet for viewing email messages"""
     serializer_class = EmailMessageSerializer
     permission_classes = [IsAuthenticated, CanViewSocialMessages]
+    # Lets drf-spectacular derive the model / `id` type at schema time.
+    queryset = EmailMessage.objects.none()
+
+    def _lite(self) -> bool:
+        return _truthy_param(self.request.query_params.get('lite'))
+
+    def get_serializer_class(self):
+        if self.action == 'retrieve':
+            return EmailMessageDetailSerializer
+        if self.action == 'lite':
+            return EmailMessageListSerializer
+        if self.action in ('list', 'threads') and self._lite():
+            return EmailMessageListSerializer
+        return EmailMessageSerializer
+
+    @extend_schema(
+        summary="List email messages (lite rows)",
+        description=(
+            "Same query, filters and pagination as the main list, but every row "
+            "is an EmailMessageLite (no body_text / body_html / attachments; "
+            "adds snippet and attachments_count). Identical to "
+            "`GET /email-messages/?lite=1`; this route exists so the generated "
+            "client has a typed function. " + EMAIL_ACCESS_RULES_DOC
+        ),
+        parameters=[
+            OpenApiParameter('folder', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter('starred', OpenApiTypes.BOOL, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter('is_read', OpenApiTypes.BOOL, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter('label', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter('thread_id', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter('connection_id', OpenApiTypes.INT, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter('search', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False),
+        ],
+        responses={200: EmailMessageListSerializer(many=True)},
+    )
+    @action(detail=False, methods=['get'], url_path='lite')
+    def lite(self, request):
+        """Paginated list with lite rows (see EmailMessageListSerializer)."""
+        return self.list(request)
 
     def get_queryset(self):
         queryset = EmailMessage.objects.filter(
@@ -10399,6 +10712,9 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
                 )
             )
         ).order_by('-timestamp')
+
+        # Mailbox assignment enforcement (no-op for admins / unassigned users).
+        queryset = _restrict_email_queryset(queryset, self.request.user)
 
         # Filter by connection_id (specific email account)
         connection_id = self.request.query_params.get('connection_id')
@@ -10442,7 +10758,24 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
 
         return queryset
 
-    @action(detail=False, methods=['get'])
+    @extend_schema(
+        summary="Email threads (conversations)",
+        description=(
+            "Bare array (not paginated, hard cap 50) of the latest message per "
+            "thread_id with message_count, unread_count (customer messages not "
+            "read by staff), customer_email and customer_name. Honors "
+            "SocialIntegrationSettings.chat_assignment_enabled (only my / "
+            "unassigned threads). `lite=1` drops the bodies. " + EMAIL_ACCESS_RULES_DOC
+        ),
+        parameters=[
+            OpenApiParameter('folder', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+                             description="IMAP folder; omit or 'All' for every folder"),
+            OpenApiParameter('connection_id', OpenApiTypes.INT, OpenApiParameter.QUERY, required=False),
+            _EMAIL_LITE_PARAM,
+        ],
+        responses={200: EmailThreadSerializer(many=True)},
+    )
+    @action(detail=False, methods=['get'], pagination_class=None, filter_backends=[])
     def threads(self, request):
         """
         Get email threads (grouped conversations).
@@ -10456,8 +10789,11 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
         settings_obj = get_social_settings(self.request)
         assignment_enabled = settings_obj and settings_obj.chat_assignment_enabled
 
-        # Build base queryset
-        base_queryset = EmailMessage.objects.filter(is_deleted=False)
+        # Build base queryset (mailbox assignment enforcement first)
+        base_queryset = _restrict_email_queryset(
+            EmailMessage.objects.filter(is_deleted=False), request.user,
+        )
+        row_serializer = self.get_serializer_class()
 
         # Filter by connection_id (specific email account)
         connection_id = request.query_params.get('connection_id')
@@ -10509,11 +10845,13 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
             for t in threads_page
         }
 
-        # Batch query: fetch latest message per thread (by timestamp match)
-        latest_msgs = EmailMessage.objects.filter(
+        # Batch query: fetch latest message per thread (by timestamp match).
+        # Re-apply the mailbox restriction: a thread_id can be shared by two
+        # connections when the same mail reached both mailboxes.
+        latest_msgs = _restrict_email_queryset(EmailMessage.objects.filter(
             thread_id__in=thread_ids,
             is_deleted=False,
-        ).select_related('connection').order_by('thread_id', '-timestamp')
+        ), request.user).select_related('connection').order_by('thread_id', '-timestamp')
 
         # Build {thread_id: latest_msg} — pick first per thread_id
         latest_by_thread = {}
@@ -10555,7 +10893,7 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
                 continue
 
             meta = thread_meta[thread_id]
-            msg_data = EmailMessageSerializer(latest_msg).data
+            msg_data = row_serializer(latest_msg).data
             msg_data['message_count'] = meta['message_count']
             msg_data['unread_count'] = meta['unread_count']
 
@@ -10582,7 +10920,12 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
 
         return Response(result)
 
-    @action(detail=False, methods=['get'])
+    @extend_schema(
+        summary="IMAP folders of the first active connection (legacy)",
+        description="Prefer GET /api/social/email/folders/. Live IMAP LIST on the first active connection; returns [{name, delimiter, flags}].",
+        responses={200: EmailFolderSerializer(many=True), 400: EmailErrorResponseSerializer},
+    )
+    @action(detail=False, methods=['get'], pagination_class=None, filter_backends=[])
     def folders(self, request):
         """
         Get list of available IMAP folders.
@@ -10596,6 +10939,23 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
         folders = get_available_folders(connection)
         return Response(folders)
 
+    @extend_schema(
+        summary="Move an email on the IMAP server",
+        description=(
+            "Real IMAP move (synchronous) followed by a DB folder update. "
+            "`message_id` is the RFC Message-ID header (EmailMessage.message_id), "
+            "not the pk. The move runs on the connection that owns the message. "
+            "404 when the message is unknown or on a mailbox the user cannot "
+            "access; 400 when its connection is inactive. " + EMAIL_ACCESS_RULES_DOC
+        ),
+        request=EmailMoveRequestSerializer,
+        responses={
+            200: EmailMoveResponseSerializer,
+            400: EmailErrorResponseSerializer,
+            404: EmailErrorResponseSerializer,
+            500: EmailErrorResponseSerializer,
+        },
+    )
     @action(detail=False, methods=['post'])
     def move(self, request):
         """
@@ -10611,24 +10971,51 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
         if not all([message_id, source_folder, target_folder]):
             return Response({'error': 'message_id, source_folder, and target_folder are required'}, status=400)
 
-        connection = EmailConnection.objects.filter(is_active=True).first()
-        if not connection:
+        # Use the connection that owns the message — a tenant may have several
+        # mailboxes, and the first active one is not necessarily the right one.
+        message = _restrict_email_queryset(
+            EmailMessage.objects.filter(message_id=message_id), request.user,
+        ).select_related('connection').first()
+        if not message:
+            return Response({'error': 'Message not found'}, status=404)
+
+        connection = message.connection
+        if not connection.is_active:
             return Response({'error': 'No active email connection'}, status=400)
 
         success = move_email_to_folder(connection, message_id, source_folder, target_folder)
 
         if success:
             # Update the folder in our database
-            EmailMessage.objects.filter(message_id=message_id).update(folder=target_folder)
+            EmailMessage.objects.filter(
+                connection=connection, message_id=message_id,
+            ).update(folder=target_folder)
             return Response({'success': True, 'message': f'Email moved to {target_folder}'})
         else:
             return Response({'error': 'Failed to move email'}, status=500)
 
 
+@extend_schema_view(
+    list=extend_schema(summary="List my email drafts", description="Drafts created by the current user, newest first."),
+    retrieve=extend_schema(summary="Email draft detail"),
+    create=extend_schema(
+        summary="Create an email draft",
+        description=(
+            "The connection is resolved server-side: the `reply_to_message`'s "
+            "connection when replying, else the `connection` given in the body "
+            "(must be active and accessible), else the first active connection. "
+            "400 when none is available."
+        ),
+    ),
+    update=extend_schema(summary="Replace an email draft"),
+    partial_update=extend_schema(summary="Update an email draft"),
+    destroy=extend_schema(summary="Delete an email draft"),
+)
 class EmailDraftViewSet(viewsets.ModelViewSet):
     """ViewSet for managing email drafts"""
     serializer_class = EmailDraftSerializer
     permission_classes = [IsAuthenticated, CanSendSocialMessages]
+    queryset = EmailDraft.objects.none()
 
     def get_queryset(self):
         return EmailDraft.objects.filter(
@@ -10636,13 +11023,27 @@ class EmailDraftViewSet(viewsets.ModelViewSet):
         ).select_related('connection', 'reply_to_message', 'created_by').order_by('-updated_at')
 
     def perform_create(self, serializer):
-        # Get the active email connection
-        connection = EmailConnection.objects.filter(is_active=True).first()
-        if not connection:
+        user = self.request.user
+        reply_to_message = serializer.validated_data.get('reply_to_message')
+        requested = serializer.validated_data.get('connection')
+
+        if reply_to_message is not None:
+            # A reply draft belongs to the mailbox the original arrived in.
+            connection = reply_to_message.connection
+        elif requested is not None:
+            connection = requested
+        else:
+            connection = EmailConnection.objects.filter(is_active=True).first()
+
+        if (
+            not connection
+            or not connection.is_active
+            or not _can_access_email_connection(user, connection.id)
+        ):
             raise drf_serializers.ValidationError("No active email connection found")
 
         serializer.save(
-            created_by=self.request.user,
+            created_by=user,
             connection=connection
         )
 
@@ -10651,6 +11052,10 @@ class EmailDraftViewSet(viewsets.ModelViewSet):
 # Email User Assignment Views
 # =============================================================================
 
+@extend_schema(
+    summary="List email connections with assigned users",
+    responses={200: EmailConnectionWithAssignmentsSerializer(many=True), 500: EmailErrorResponseSerializer},
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def email_assignments_list(request):
@@ -10669,6 +11074,22 @@ def email_assignments_list(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    methods=['GET'],
+    summary="Users assigned to an email connection",
+    responses={200: EmailAssignedUsersResponseSerializer, 404: EmailErrorResponseSerializer, 500: EmailErrorResponseSerializer},
+)
+@extend_schema(
+    methods=['PUT'],
+    summary="Replace the users assigned to an email connection",
+    request=EmailAssignedUsersUpdateRequestSerializer,
+    responses={
+        200: EmailAssignedUsersResponseSerializer,
+        400: EmailErrorResponseSerializer,
+        404: EmailErrorResponseSerializer,
+        500: EmailErrorResponseSerializer,
+    },
+)
 @api_view(['GET', 'PUT'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def email_connection_assigned_users(request, connection_id):
@@ -10732,6 +11153,16 @@ def email_connection_assigned_users(request, connection_id):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary="Assign a user to an email connection",
+    request=EmailAssignmentCreateRequestSerializer,
+    responses={
+        201: EmailConnectionUserAssignmentSerializer,
+        400: EmailErrorResponseSerializer,
+        404: EmailErrorResponseSerializer,
+        500: EmailErrorResponseSerializer,
+    },
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def email_assignment_create(request):
@@ -10789,6 +11220,10 @@ def email_assignment_create(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary="Remove an email connection assignment",
+    responses={200: EmailMessageResponseSerializer, 404: EmailErrorResponseSerializer, 500: EmailErrorResponseSerializer},
+)
 @api_view(['DELETE'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def email_assignment_delete(request, assignment_id):
@@ -11344,6 +11779,19 @@ class TikTokMessageViewSet(viewsets.ReadOnlyModelViewSet):
 # Email Signature Views
 # =============================================================================
 
+@extend_schema(
+    methods=['GET'],
+    summary="Tenant email signature",
+    description="Singleton per tenant (created on first read). A connection's own signature takes precedence when its signature_enabled is true.",
+    responses={200: EmailSignatureSerializer},
+)
+@extend_schema(
+    methods=['PATCH'],
+    summary="Update the tenant email signature",
+    description="Partial update. Admin / manage_social_settings only.",
+    request=EmailSignatureSerializer,
+    responses={200: EmailSignatureSerializer, 400: OpenApiTypes.OBJECT},
+)
 @api_view(['GET', 'PATCH'])
 @permission_classes([IsAuthenticated, CanManageSocialSettings])
 def email_signature_view(request):
