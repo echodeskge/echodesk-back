@@ -611,14 +611,113 @@ def tenant_homepage(request):
 from rest_framework.views import APIView
 from rest_framework.decorators import api_view
 from rest_framework.parsers import MultiPartParser, FormParser
-from django.db.models import Q, Max
+from django.db.models import Q, Max, Prefetch
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import (
+    OpenApiParameter, extend_schema, extend_schema_view, inline_serializer,
+)
 import mimetypes
+
+from .notification_utils import create_team_chat_message_notification
+from .serializers import TeamChatFileUploadResultSerializer, resolve_upload_mime_type
+
+
+TEAM_CHAT_MARK_READ_RESPONSE = inline_serializer(
+    name='TeamChatMarkReadResponse',
+    fields={'marked_read': drf_serializers.IntegerField()},
+)
+TEAM_CHAT_HIDE_RESPONSE = inline_serializer(
+    name='TeamChatHideResponse',
+    fields={
+        'success': drf_serializers.BooleanField(),
+        'message': drf_serializers.CharField(),
+        'created': drf_serializers.BooleanField(),
+    },
+)
+TEAM_CHAT_UNHIDE_RESPONSE = inline_serializer(
+    name='TeamChatUnhideResponse',
+    fields={
+        'success': drf_serializers.BooleanField(),
+        'message': drf_serializers.CharField(),
+        'was_hidden': drf_serializers.BooleanField(),
+    },
+)
+TEAM_CHAT_CLEAR_HISTORY_RESPONSE = inline_serializer(
+    name='TeamChatClearHistoryResponse',
+    fields={
+        'message': drf_serializers.CharField(),
+        'deleted_count': drf_serializers.IntegerField(),
+    },
+)
+TEAM_CHAT_UNREAD_COUNT_RESPONSE = inline_serializer(
+    name='TeamChatUnreadCount',
+    fields={'count': drf_serializers.IntegerField()},
+)
+TEAM_CHAT_ERROR_RESPONSE = inline_serializer(
+    name='TeamChatError',
+    fields={'error': drf_serializers.CharField()},
+)
+
+
+def _team_chat_ws_notify(conversation, message, tenant_schema=None):
+    """
+    Push a ``new_message`` frame to the recipient's team-chat websocket group.
+
+    Shared by the REST create path; the consumer does its own group_send with
+    the same payload shape. Never raises — a dropped socket must not fail the
+    request that created the message.
+    """
+    try:
+        from channels.layers import get_channel_layer
+        from asgiref.sync import async_to_sync
+
+        channel_layer = get_channel_layer()
+        if not channel_layer:
+            return
+
+        recipient = conversation.get_other_participant(message.sender)
+        if not recipient:
+            return
+
+        if tenant_schema is None:
+            from django.db import connection
+            tenant_schema = connection.schema_name
+
+        group_name = f"team_chat_{tenant_schema}_{recipient.id}"
+        message_data = dict(TeamChatMessageSerializer(message).data)
+        # Websocket payloads also carry `conversation_id` on the message (the
+        # key the consumer-built payload used to have) next to `conversation`.
+        message_data.setdefault('conversation_id', conversation.id)
+
+        async_to_sync(channel_layer.group_send)(
+            group_name,
+            {
+                'type': 'chat_message',
+                'message': message_data,
+                'conversation': conversation.id,
+                'conversation_id': conversation.id,
+            }
+        )
+    except (ConnectionError, OSError) as e:
+        # Connection reset by peer (errno 104) and similar transient errors
+        # are expected when clients disconnect before receiving the message
+        logger.warning(f"WebSocket notification could not be delivered (client may have disconnected): {e}")
+    except Exception as e:
+        logger.error(f"Failed to send WebSocket notification: {e}")
 
 
 class TeamChatUserListView(APIView):
     """List all users in tenant with online status for team chat"""
     permission_classes = [permissions.IsAuthenticated]
+    serializer_class = TeamChatUserSerializer
 
+    @extend_schema(
+        # keep the operation id the dashboard's generated client was built with
+        operation_id='team_chat_users_retrieve',
+        summary='Team chat directory',
+        description='Active colleagues (everyone except the caller) with presence. Bare list, not paginated.',
+        responses=TeamChatUserSerializer(many=True),
+    )
     def get(self, request):
         # Get all active users except the current user
         # Use select_related to avoid N+1 query on online_status
@@ -633,54 +732,136 @@ class TeamChatUserListView(APIView):
         return Response(serializer.data)
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='Recent team chat conversations',
+        description=(
+            'Conversations the caller takes part in (hidden ones excluded), newest activity first. '
+            'By default (`scope=today`) only conversations active today in server time are returned — '
+            'the behaviour of the dashboard widget. Pass `scope=all` for the full history.'
+        ),
+        parameters=[
+            OpenApiParameter(
+                name='scope', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+                enum=['today', 'all'], required=False,
+                description="`today` (default): only conversations active today; `all`: every conversation.",
+            ),
+        ],
+    ),
+    retrieve=extend_schema(
+        summary='Conversation with its latest 50 messages',
+        description='Messages are the latest 50 in ascending (oldest first) order. Not limited to today.',
+        responses=TeamChatConversationDetailSerializer,
+    ),
+)
 class TeamChatConversationViewSet(viewsets.ModelViewSet):
     """ViewSet for team chat conversations"""
     permission_classes = [permissions.IsAuthenticated]
+    # Schema generation runs as AnonymousUser; the real queryset is built in
+    # get_queryset. The generated web client passes ids as strings — keep that.
+    queryset = TeamChatConversation.objects.none()
+    schema_path_param_types = {'id': OpenApiTypes.STR, 'user_id': OpenApiTypes.STR}
 
     def get_queryset(self):
-        """Conversations the user is part of — scoped to today's activity.
+        """Conversations the user takes part in.
 
-        "Recent Chats" in the sidebar shows only conversations whose last
-        message was sent today (server TZ). Brand-new conversations without
-        messages are also included if created/updated today so a freshly
-        opened chat doesn't immediately vanish.
+        - ``list``: hidden conversations are excluded and, unless
+          ``?scope=all`` is given, only conversations active today (server TZ)
+          are returned — "Recent Chats" in the dashboard widget. Brand-new
+          conversations without messages count as active if updated today.
+        - detail actions (``retrieve``, ``mark_read``, ``hide_for_me``,
+          ``clear_history``): any conversation of the caller, no date limit.
+        - ``unhide``: hidden conversations are included (that is the point).
         """
-        # Get IDs of conversations hidden by this user
-        hidden_conversation_ids = HiddenTeamChatConversation.objects.filter(
-            user=self.request.user
-        ).values_list('conversation_id', flat=True)
+        if getattr(self, 'swagger_fake_view', False):
+            return TeamChatConversation.objects.none()
 
-        from django.utils import timezone
-        today_start = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        user = self.request.user
 
-        return TeamChatConversation.objects.filter(
-            participants=self.request.user
-        ).exclude(
-            id__in=hidden_conversation_ids
-        ).prefetch_related(
+        queryset = TeamChatConversation.objects.filter(participants=user)
+
+        if self.action != 'unhide':
+            hidden_conversation_ids = HiddenTeamChatConversation.objects.filter(
+                user=user
+            ).values_list('conversation_id', flat=True)
+            queryset = queryset.exclude(id__in=hidden_conversation_ids)
+
+        # Newest message per conversation, prefetched in one query instead of
+        # loading the whole history of every conversation.
+        latest_message_ids = (
+            TeamChatMessage.objects
+            .filter(conversation__participants=user)
+            .order_by()
+            .values('conversation_id')
+            .annotate(latest_id=Max('id'))
+            .values('latest_id')
+        )
+        latest_messages = (
+            TeamChatMessage.objects
+            .filter(id__in=latest_message_ids)
+            .select_related('sender', 'sender__online_status')
+        )
+
+        queryset = queryset.prefetch_related(
             'participants', 'participants__online_status',
-            'messages', 'messages__sender', 'messages__sender__online_status'
+            Prefetch('messages', queryset=latest_messages, to_attr='prefetched_last_messages'),
         ).annotate(
-            latest_message_time=Max('messages__created_at')
-        ).filter(
-            Q(latest_message_time__gte=today_start)
-            | Q(latest_message_time__isnull=True, updated_at__gte=today_start)
-        ).order_by('-latest_message_time', '-updated_at')
+            latest_message_time=Max('messages__created_at'),
+            unread_for_me=Count(
+                'messages',
+                filter=Q(messages__is_read=False) & ~Q(messages__sender_id=user.id),
+            ),
+        )
+
+        if self.action == 'list' and self.request.query_params.get('scope', 'today') != 'all':
+            today_start = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            queryset = queryset.filter(
+                Q(latest_message_time__gte=today_start)
+                | Q(latest_message_time__isnull=True, updated_at__gte=today_start)
+            )
+
+        return queryset.order_by('-latest_message_time', '-updated_at')
 
     def get_serializer_class(self):
-        if self.action == 'retrieve':
+        if self.action in ('retrieve', 'with_user'):
             return TeamChatConversationDetailSerializer
         return TeamChatConversationSerializer
 
+    @extend_schema(
+        summary='Get or create the 1:1 conversation with a colleague',
+        description=(
+            'Returns the conversation with `user_id` (creating it if needed) including its latest 50 '
+            'messages, oldest first. Un-hides the conversation for the caller. 400 when `user_id` is '
+            'the caller, 404 when no such user.'
+        ),
+        parameters=[
+            OpenApiParameter(
+                name='user_id', type=OpenApiTypes.STR, location=OpenApiParameter.PATH,
+                description='Id of the colleague (numeric; the generated clients pass it as a string).',
+            ),
+        ],
+        request=None,
+        responses={
+            200: TeamChatConversationDetailSerializer,
+            400: TEAM_CHAT_ERROR_RESPONSE,
+            404: TEAM_CHAT_ERROR_RESPONSE,
+        },
+    )
     @action(detail=False, methods=['get', 'post'], url_path='with/(?P<user_id>[^/.]+)')
     def with_user(self, request, user_id=None):
         """Get or create a conversation with a specific user"""
         try:
-            other_user = User.objects.get(id=user_id)
-        except User.DoesNotExist:
+            other_user = User.objects.get(id=int(user_id))
+        except (User.DoesNotExist, TypeError, ValueError):
             return Response(
                 {'error': 'User not found'},
                 status=status.HTTP_404_NOT_FOUND
+            )
+
+        if other_user.id == request.user.id:
+            return Response(
+                {'error': 'You cannot start a conversation with yourself'},
+                status=status.HTTP_400_BAD_REQUEST
             )
 
         # Find existing conversation between these two users (atomic to prevent race condition)
@@ -709,6 +890,11 @@ class TeamChatConversationViewSet(viewsets.ModelViewSet):
         )
         return Response(serializer.data)
 
+    @extend_schema(
+        summary='Mark every message from the other participant as read',
+        request=None,
+        responses={200: TEAM_CHAT_MARK_READ_RESPONSE},
+    )
     @action(detail=True, methods=['post'])
     def mark_read(self, request, pk=None):
         """Mark all messages in conversation as read"""
@@ -726,6 +912,11 @@ class TeamChatConversationViewSet(viewsets.ModelViewSet):
 
         return Response({'marked_read': updated})
 
+    @extend_schema(
+        summary='Delete every message in the conversation (for both participants)',
+        request=None,
+        responses={200: TEAM_CHAT_CLEAR_HISTORY_RESPONSE},
+    )
     @action(detail=True, methods=['delete', 'post'])
     def clear_history(self, request, pk=None):
         """Clear all messages in a conversation (affects all users)"""
@@ -743,6 +934,11 @@ class TeamChatConversationViewSet(viewsets.ModelViewSet):
             'deleted_count': deleted_count
         })
 
+    @extend_schema(
+        summary='Hide the conversation from my list only',
+        request=None,
+        responses={200: TEAM_CHAT_HIDE_RESPONSE},
+    )
     @action(detail=True, methods=['post'])
     def hide_for_me(self, request, pk=None):
         """
@@ -767,6 +963,11 @@ class TeamChatConversationViewSet(viewsets.ModelViewSet):
             'created': created
         })
 
+    @extend_schema(
+        summary='Restore a conversation hidden with hide_for_me',
+        request=None,
+        responses={200: TEAM_CHAT_UNHIDE_RESPONSE},
+    )
     @action(detail=True, methods=['post'])
     def unhide(self, request, pk=None):
         """
@@ -787,14 +988,66 @@ class TeamChatConversationViewSet(viewsets.ModelViewSet):
         })
 
 
+class IsTeamChatMessageSenderOrReadOnly(permissions.BasePermission):
+    """
+    Only the author may edit or delete a message.
+
+    Reads and the ``mark_read`` action (which the recipient calls) stay open to
+    every participant of the conversation — the queryset already scopes those.
+    """
+    message = 'Only the sender can edit or delete this message.'
+
+    def has_object_permission(self, request, view, obj):
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        if getattr(view, 'action', None) == 'mark_read':
+            return True
+        return obj.sender_id == request.user.id
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary='Message history',
+        description=(
+            'Messages from the caller\'s conversations, newest first, page/page_size paginated. '
+            'Filter with `conversation=<id>` to page through one thread.'
+        ),
+    ),
+    create=extend_schema(
+        summary='Send a message',
+        description=(
+            'multipart/form-data. Give `recipient_id` (the 1:1 conversation is created on demand) or '
+            '`conversation_id`. `text` is required for text messages, `file` for image/file/voice '
+            '(max 25 MB; images, audio, PDF, Word, Excel, PowerPoint, text/CSV, ZIP). The recipient gets '
+            'a websocket `new_message` frame plus an in-app/push notification of type `team_chat_message`.'
+        ),
+        request=TeamChatCreateMessageSerializer,
+        responses={
+            201: TeamChatMessageSerializer,
+            404: TEAM_CHAT_ERROR_RESPONSE,
+        },
+    ),
+    update=extend_schema(summary='Edit my message (sender only)'),
+    partial_update=extend_schema(summary='Edit my message (sender only)'),
+    destroy=extend_schema(summary='Delete my message (sender only)'),
+)
 class TeamChatMessageViewSet(viewsets.ModelViewSet):
     """ViewSet for team chat messages"""
     serializer_class = TeamChatMessageSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, IsTeamChatMessageSenderOrReadOnly]
     parser_classes = [MultiPartParser, FormParser]
+    # Schema generation runs as AnonymousUser; keep `{id}` a string for the
+    # dashboard's generated client.
+    queryset = TeamChatMessage.objects.none()
+    schema_path_param_types = {'id': OpenApiTypes.STR}
+    filterset_fields = ['conversation']
+    ordering_fields = ['created_at', 'id']
+    ordering = ['-created_at', '-id']
 
     def get_queryset(self):
         """Only show messages from conversations the user is part of"""
+        if getattr(self, 'swagger_fake_view', False):
+            return TeamChatMessage.objects.none()
         return TeamChatMessage.objects.filter(
             conversation__participants=self.request.user
         ).select_related('sender', 'sender__online_status', 'conversation')
@@ -854,7 +1107,7 @@ class TeamChatMessageViewSet(viewsets.ModelViewSet):
             message_data['file'] = file
             message_data['file_name'] = file.name
             message_data['file_size'] = file.size
-            message_data['file_mime_type'] = mimetypes.guess_type(file.name)[0] or 'application/octet-stream'
+            message_data['file_mime_type'] = resolve_upload_mime_type(file)
 
         # Handle voice duration
         voice_duration = data.get('voice_duration')
@@ -872,50 +1125,28 @@ class TeamChatMessageViewSet(viewsets.ModelViewSet):
             context={'request': request}
         )
 
-        # Send WebSocket notification
+        # Real-time frame for an open chat + in-app/push notification
         self._notify_recipient(conversation, message)
+        self._create_recipient_notification(message)
 
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
 
     def _notify_recipient(self, conversation, message):
         """Send WebSocket notification to recipient"""
+        _team_chat_ws_notify(conversation, message)
+
+    def _create_recipient_notification(self, message):
+        """In-app notification + push for the recipient (never fails the request)."""
         try:
-            from channels.layers import get_channel_layer
-            from asgiref.sync import async_to_sync
-
-            channel_layer = get_channel_layer()
-            if not channel_layer:
-                return
-
-            # Get recipient (other participant)
-            recipient = conversation.get_other_participant(message.sender)
-            if not recipient:
-                return
-
-            # Get tenant schema
-            from django.db import connection
-            tenant_schema = connection.schema_name
-
-            # Send to recipient's channel group
-            group_name = f"team_chat_{tenant_schema}_{recipient.id}"
-
-            message_data = TeamChatMessageSerializer(message).data
-
-            async_to_sync(channel_layer.group_send)(
-                group_name,
-                {
-                    'type': 'chat_message',
-                    'message': message_data,
-                    'conversation_id': conversation.id,
-                }
-            )
-        except (ConnectionError, OSError) as e:
-            # Connection reset by peer (errno 104) and similar transient errors
-            # are expected when clients disconnect before receiving the message
-            logger.warning(f"WebSocket notification could not be delivered (client may have disconnected): {e}")
+            create_team_chat_message_notification(message)
         except Exception as e:
-            logger.error(f"Failed to send WebSocket notification: {e}")
+            logger.error(f"Failed to create team chat notification: {e}")
 
+    @extend_schema(
+        summary='Mark one message as read (no-op for the sender)',
+        request=None,
+        responses={200: TeamChatMessageSerializer},
+    )
     @action(detail=True, methods=['post'])
     def mark_read(self, request, pk=None):
         """Mark a single message as read"""
@@ -929,6 +1160,11 @@ class TeamChatMessageViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
+@extend_schema(
+    summary='Validate a chat attachment without storing it',
+    request=TeamChatFileUploadSerializer,
+    responses={200: TeamChatFileUploadResultSerializer, 400: TEAM_CHAT_ERROR_RESPONSE},
+)
 @api_view(['POST'])
 def upload_team_chat_file(request):
     """Upload a file for team chat"""
@@ -956,6 +1192,10 @@ def upload_team_chat_file(request):
     })
 
 
+@extend_schema(
+    summary='Unread team chat messages across all conversations',
+    responses={200: TEAM_CHAT_UNREAD_COUNT_RESPONSE},
+)
 @api_view(['GET'])
 def team_chat_unread_count(request):
     """Get total unread message count for team chat"""
