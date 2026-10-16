@@ -4,7 +4,7 @@ from django.contrib.auth.models import Group, Permission
 from django.contrib.auth.password_validation import validate_password
 from django.contrib.contenttypes.models import ContentType
 from django.utils import timezone
-from drf_spectacular.utils import extend_schema_field
+from drf_spectacular.utils import extend_schema_field, inline_serializer
 from .models import Department, TenantGroup, Notification, NotificationPreference, UserOnlineStatus, TeamChatConversation, TeamChatMessage
 from tenants.feature_models import Feature
 
@@ -29,7 +29,8 @@ class DepartmentSerializer(serializers.ModelSerializer):
         model = Department
         fields = ['id', 'name', 'description', 'is_active', 'employee_count', 'created_at', 'updated_at']
         read_only_fields = ['created_at', 'updated_at']
-    
+
+    @extend_schema_field(serializers.IntegerField())
     def get_employee_count(self, obj):
         return getattr(obj, '_employee_count', obj.employees.count())
 
@@ -120,9 +121,11 @@ class TenantGroupSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['created_at', 'updated_at', 'member_count', 'feature_keys']
 
+    @extend_schema_field(serializers.IntegerField())
     def get_member_count(self, obj):
         return getattr(obj, '_member_count', obj.members.count())
 
+    @extend_schema_field(serializers.ListField(child=serializers.CharField()))
     def get_feature_keys(self, obj):
         """Return list of feature keys for easy checking"""
         return obj.get_feature_keys()
@@ -169,22 +172,90 @@ class TenantGroupCreateSerializer(serializers.ModelSerializer):
         return instance
 
 
+class DirectoryDepartmentSerializer(serializers.ModelSerializer):
+    """Department reference as embedded in directory rows."""
+
+    class Meta:
+        model = Department
+        fields = ['id', 'name']
+        read_only_fields = fields
+
+
+class DirectoryGroupSerializer(serializers.ModelSerializer):
+    """Tenant group reference as embedded in directory rows."""
+
+    class Meta:
+        model = TenantGroup
+        fields = ['id', 'name']
+        read_only_fields = fields
+
+
+class UserDirectorySerializer(serializers.ModelSerializer):
+    """
+    Slim, read-only user row for the people directory (``?lite=1``).
+
+    Everything here comes from the user row itself, ``select_related``
+    ``department``/``manager`` and a ``prefetch_related('tenant_groups')``;
+    there is no per-row permission or feature computation, so a page of
+    rows costs a constant number of queries.
+    """
+    full_name = serializers.SerializerMethodField()
+    department = DirectoryDepartmentSerializer(read_only=True, allow_null=True)
+    manager = serializers.PrimaryKeyRelatedField(read_only=True, allow_null=True)
+    manager_name = serializers.SerializerMethodField()
+    tenant_groups = DirectoryGroupSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = User
+        fields = [
+            'id', 'email', 'first_name', 'last_name', 'full_name',
+            'phone_number', 'job_title', 'role', 'status',
+            'is_active', 'is_staff',
+            'department', 'manager', 'manager_name', 'tenant_groups',
+            'last_login',
+        ]
+        read_only_fields = fields
+
+    @extend_schema_field(serializers.CharField())
+    def get_full_name(self, obj):
+        return obj.get_full_name()
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_manager_name(self, obj):
+        if obj.manager_id and obj.manager:
+            return obj.manager.get_full_name() or obj.manager.email
+        return None
+
+
+USER_ALL_PERMISSIONS_SCHEMA = inline_serializer(
+    name='UserAllPermissions',
+    fields={
+        'individual': serializers.ListField(child=serializers.CharField()),
+        'group': serializers.ListField(child=serializers.CharField()),
+        'all': serializers.ListField(child=serializers.CharField()),
+    },
+)
+
+
 class UserSerializer(serializers.ModelSerializer):
     """Serializer for User model with permissions and groups"""
-    full_name = serializers.ReadOnlyField()
+    # The model exposes get_full_name(); there is no ``full_name`` attribute,
+    # so a plain ReadOnlyField was silently skipped and the key never appeared.
+    full_name = serializers.CharField(source='get_full_name', read_only=True)
     permissions = serializers.SerializerMethodField()
     group_permissions = serializers.SerializerMethodField()
     all_permissions = serializers.SerializerMethodField()
     feature_keys = serializers.SerializerMethodField()
     is_booking_staff = serializers.SerializerMethodField()
-    groups = GroupSerializer(many=True, read_only=True)
+    # NB: no ``groups`` field. User dropped PermissionsMixin, so Django auth
+    # groups do not exist on the model and the key was never in the output.
     tenant_groups = TenantGroupSerializer(many=True, read_only=True)
-    department = DepartmentSerializer(read_only=True)
+    department = DepartmentSerializer(read_only=True, allow_null=True)
     department_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
     # The manager is written through manager_id on the create/update
     # serializers; here it is read-only so the user list/detail show who
     # the user reports to without another round trip.
-    manager = serializers.PrimaryKeyRelatedField(read_only=True)
+    manager = serializers.PrimaryKeyRelatedField(read_only=True, allow_null=True)
     manager_name = serializers.SerializerMethodField()
     group_ids = serializers.ListField(
         child=serializers.IntegerField(),
@@ -213,7 +284,7 @@ class UserSerializer(serializers.ModelSerializer):
             'manager', 'manager_name',
             'is_active', 'is_staff', 'is_booking_staff', 'date_joined', 'last_login',
             'permissions', 'group_permissions', 'all_permissions', 'feature_keys',
-            'groups', 'group_ids', 'tenant_groups', 'tenant_group_ids', 'user_permission_ids'
+            'group_ids', 'tenant_groups', 'tenant_group_ids', 'user_permission_ids'
         ]
         read_only_fields = [
             'id', 'date_joined', 'last_login', 'feature_keys', 'is_booking_staff',
@@ -227,30 +298,38 @@ class UserSerializer(serializers.ModelSerializer):
             return obj.manager.get_full_name() or obj.manager.email
         return None
 
+    @extend_schema_field(serializers.ListField(child=serializers.CharField()))
     def get_permissions(self, obj):
         """Get user's direct permissions"""
         return obj.get_user_permissions_list()
 
+    @extend_schema_field(serializers.ListField(child=serializers.CharField()))
     def get_group_permissions(self, obj):
         """Get permissions from groups"""
         return obj.get_group_permissions_list()
 
+    @extend_schema_field(serializers.ListField(child=serializers.CharField()))
     def get_feature_keys(self, obj):
         """Get all feature keys this user has access to"""
         return obj.get_feature_keys()
 
+    @extend_schema_field(USER_ALL_PERMISSIONS_SCHEMA)
     def get_all_permissions(self, obj):
         """Get all permissions (user + group) as a dictionary"""
         return obj.get_all_permissions_dict()
 
+    @extend_schema_field(serializers.BooleanField())
     def get_is_booking_staff(self, obj):
         """Check if user is assigned as booking staff"""
         return hasattr(obj, 'booking_staff')
 
     def update(self, instance, validated_data):
-        group_ids = validated_data.pop('group_ids', None)
+        # Django auth groups / user_permissions no longer exist on User
+        # (PermissionsMixin was removed); accept and ignore the legacy ids
+        # instead of raising AttributeError.
+        validated_data.pop('group_ids', None)
+        validated_data.pop('user_permission_ids', None)
         tenant_group_ids = validated_data.pop('tenant_group_ids', None)
-        user_permission_ids = validated_data.pop('user_permission_ids', None)
         department_id = validated_data.pop('department_id', None)
         
         for attr, value in validated_data.items():
@@ -268,19 +347,11 @@ class UserSerializer(serializers.ModelSerializer):
                 instance.department = None
         
         instance.save()
-        
-        if group_ids is not None:
-            groups = Group.objects.filter(id__in=group_ids)
-            instance.groups.set(groups)
-        
+
         if tenant_group_ids is not None:
             tenant_groups = TenantGroup.objects.filter(id__in=tenant_group_ids)
             instance.tenant_groups.set(tenant_groups)
-        
-        if user_permission_ids is not None:
-            permissions = Permission.objects.filter(id__in=user_permission_ids)
-            instance.user_permissions.set(permissions)
-        
+
         return instance
 
 
@@ -423,9 +494,12 @@ class UserUpdateSerializer(ManagerIdMixin, EmailUniquenessMixin, serializers.Mod
         }
 
     def update(self, instance, validated_data):
-        group_ids = validated_data.pop('group_ids', None)
+        # Django auth groups / user_permissions no longer exist on User
+        # (PermissionsMixin was removed): the ids are accepted for backwards
+        # compatibility and ignored, as UserCreateSerializer already does.
+        validated_data.pop('group_ids', None)
+        validated_data.pop('user_permission_ids', None)
         tenant_group_ids = validated_data.pop('tenant_group_ids', None)
-        user_permission_ids = validated_data.pop('user_permission_ids', None)
         has_manager, manager = self.pop_manager(validated_data)
 
         for attr, value in validated_data.items():
@@ -433,19 +507,11 @@ class UserUpdateSerializer(ManagerIdMixin, EmailUniquenessMixin, serializers.Mod
         if has_manager:
             instance.manager = manager
         instance.save()
-        
-        if group_ids is not None:
-            groups = Group.objects.filter(id__in=group_ids)
-            instance.groups.set(groups)
-        
+
         if tenant_group_ids is not None:
             tenant_groups = TenantGroup.objects.filter(id__in=tenant_group_ids)
             instance.tenant_groups.set(tenant_groups)
-        
-        if user_permission_ids is not None:
-            permissions = Permission.objects.filter(id__in=user_permission_ids)
-            instance.user_permissions.set(permissions)
-        
+
         return instance
 
 
