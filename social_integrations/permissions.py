@@ -30,6 +30,20 @@ class CanManageSocialConnections(permissions.BasePermission):
         )
 
 
+class CanManageWidgetConnections(CanManageSocialConnections):
+    """CanManageSocialConnections plus a staff/superuser bypass.
+
+    Widget connections were editable by every tenant user before the parity
+    work; tenant staff (who may not hold role=admin) keep that access.
+    """
+
+    def has_permission(self, request, view):
+        user = request.user
+        if user and user.is_authenticated and (user.is_staff or user.is_superuser):
+            return True
+        return super().has_permission(request, view)
+
+
 class CanViewSocialMessages(permissions.BasePermission):
     """
     Permission to view social media messages
