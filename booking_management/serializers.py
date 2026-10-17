@@ -1,4 +1,8 @@
+from decimal import Decimal
+from datetime import timedelta
 from rest_framework import serializers
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field
 from django.utils import timezone
 from rest_framework_simplejwt.tokens import RefreshToken
 from .models import (
@@ -15,9 +19,14 @@ from .utils_text import localized_text
 # BOOKING CLIENT SERIALIZERS (using unified Client model)
 # ============================================================================
 
+@extend_schema_field(OpenApiTypes.DOUBLE)
+class RemainingAmountField(serializers.ReadOnlyField):
+    """total_amount - paid_amount (a Decimal, which renders as a JSON number)."""
+
+
 class BookingClientSerializer(serializers.ModelSerializer):
     """Serializer for booking client (using unified Client model)"""
-    full_name = serializers.ReadOnlyField()
+    full_name = serializers.CharField(read_only=True)
     phone_number = serializers.CharField(source='phone', read_only=True)
 
     class Meta:
@@ -158,14 +167,14 @@ class ServiceCategorySerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'description', 'icon', 'display_order', 'is_active', 'name_display', 'description_display']
         read_only_fields = ['id']
 
-    def get_name_display(self, obj):
+    def get_name_display(self, obj) -> str:
         """Get name in requested language"""
         language = self.context.get('language', 'en')
         if isinstance(obj.name, dict):
             return localized_text(obj.name, language)
         return obj.name
 
-    def get_description_display(self, obj):
+    def get_description_display(self, obj) -> str:
         """Get description in requested language"""
         language = self.context.get('language', 'en')
         if isinstance(obj.description, dict):
@@ -201,7 +210,7 @@ class ServiceMinimalSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'name_display']
         read_only_fields = fields
 
-    def get_name_display(self, obj):
+    def get_name_display(self, obj) -> str:
         """Get localized name"""
         if isinstance(obj.name, dict):
             language = self.context.get('language', 'en')
@@ -220,7 +229,7 @@ class BookingStaffSerializer(serializers.ModelSerializer):
         fields = ['id', 'user', 'bio', 'profile_image', 'average_rating', 'total_ratings', 'is_active_for_bookings', 'services', 'services_count']
         read_only_fields = ['id', 'average_rating', 'total_ratings']
 
-    def get_services_count(self, obj):
+    def get_services_count(self, obj) -> int:
         # Use prefetch cache if available to avoid extra COUNT query
         if hasattr(obj, '_prefetched_objects_cache') and 'services' in obj._prefetched_objects_cache:
             return len(obj._prefetched_objects_cache['services'])
@@ -309,7 +318,7 @@ class StaffAvailabilitySerializer(serializers.ModelSerializer):
         fields = ['id', 'staff', 'day_of_week', 'day_name', 'start_time', 'end_time', 'is_available', 'break_start', 'break_end']
         read_only_fields = ['id']
 
-    def get_day_name(self, obj):
+    def get_day_name(self, obj) -> str:
         return obj.get_day_of_week_display()
 
 
@@ -342,19 +351,19 @@ class ServiceListSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id']
 
-    def get_name_display(self, obj):
+    def get_name_display(self, obj) -> str:
         language = self.context.get('language', 'en')
         if isinstance(obj.name, dict):
             return localized_text(obj.name, language)
         return obj.name
 
-    def get_description_display(self, obj):
+    def get_description_display(self, obj) -> str:
         language = self.context.get('language', 'en')
         if isinstance(obj.description, dict):
             return localized_text(obj.description, language)
         return obj.description if obj.description else ''
 
-    def get_deposit_amount(self, obj):
+    def get_deposit_amount(self, obj) -> float:
         return float(obj.calculate_deposit_amount())
 
 
@@ -379,6 +388,19 @@ class ServiceCreateSerializer(serializers.ModelSerializer):
             'staff_ids', 'status', 'image'
         ]
 
+    def validate_category_id(self, value):
+        if value is not None and not ServiceCategory.objects.filter(id=value).exists():
+            raise serializers.ValidationError('Category not found')
+        return value
+
+    def validate_staff_ids(self, value):
+        if value:
+            existing = set(BookingStaff.objects.filter(id__in=value).values_list('id', flat=True))
+            missing = sorted(set(value) - existing)
+            if missing:
+                raise serializers.ValidationError(f'Staff not found: {missing}')
+        return value
+
     def create(self, validated_data):
         category_id = validated_data.pop('category_id', None)
         staff_ids = validated_data.pop('staff_ids', [])
@@ -395,10 +417,12 @@ class ServiceCreateSerializer(serializers.ModelSerializer):
         return service
 
     def update(self, instance, validated_data):
+        # category_id: absent = keep, null = no category
+        has_category = 'category_id' in validated_data
         category_id = validated_data.pop('category_id', None)
         staff_ids = validated_data.pop('staff_ids', None)
 
-        if category_id is not None:
+        if has_category:
             instance.category_id = category_id
 
         for attr, value in validated_data.items():
@@ -421,7 +445,7 @@ class BookingListSerializer(serializers.ModelSerializer):
     """Serializer for Booking list view"""
     client = BookingClientSerializer(read_only=True)
     service = ServiceListSerializer(read_only=True)
-    staff = BookingStaffSerializer(read_only=True)
+    staff = BookingStaffSerializer(read_only=True, allow_null=True)
 
     class Meta:
         model = Booking
@@ -433,12 +457,23 @@ class BookingListSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'booking_number']
 
 
+class ManualPaymentSerializer(serializers.Serializer):
+    """One payment recorded by staff (see Booking.manual_payments)."""
+    amount = serializers.CharField(help_text='Decimal as a string, e.g. "25.00"')
+    method = serializers.ChoiceField(choices=['cash', 'card', 'transfer', 'other'])
+    note = serializers.CharField(allow_blank=True)
+    recorded_by = serializers.IntegerField(allow_null=True)
+    recorded_by_name = serializers.CharField(allow_blank=True)
+    recorded_at = serializers.DateTimeField()
+
+
 class BookingDetailSerializer(serializers.ModelSerializer):
     """Serializer for Booking detail view"""
     client = BookingClientSerializer(read_only=True)
     service = ServiceListSerializer(read_only=True)
-    staff = BookingStaffSerializer(read_only=True)
-    remaining_amount = serializers.ReadOnlyField()
+    staff = BookingStaffSerializer(read_only=True, allow_null=True)
+    remaining_amount = RemainingAmountField()
+    manual_payments = ManualPaymentSerializer(many=True, read_only=True)
 
     class Meta:
         model = Booking
@@ -448,9 +483,215 @@ class BookingDetailSerializer(serializers.ModelSerializer):
             'bog_order_id', 'payment_url', 'client_notes', 'staff_notes', 'contact_email',
             'rating', 'review',
             'cancelled_at', 'cancelled_by', 'cancellation_reason',
-            'created_at', 'updated_at', 'confirmed_at', 'completed_at'
+            'created_at', 'updated_at', 'confirmed_at', 'completed_at',
+            'manual_payments',
         ]
         read_only_fields = ['id', 'booking_number', 'remaining_amount']
+
+
+# ----------------------------------------------------------------------------
+# Admin: slim rows for phone lists (?lite=1 / bookings/rows/)
+# ----------------------------------------------------------------------------
+
+class BookingRowClientSerializer(serializers.ModelSerializer):
+    full_name = serializers.CharField(read_only=True)
+    phone_number = serializers.CharField(source='phone', read_only=True, allow_null=True)
+
+    class Meta:
+        model = Client
+        fields = ['id', 'full_name', 'phone_number', 'email']
+        read_only_fields = fields
+
+
+class BookingRowServiceSerializer(serializers.ModelSerializer):
+    name_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Service
+        fields = ['id', 'name_display', 'duration_minutes']
+        read_only_fields = fields
+
+    def get_name_display(self, obj) -> str:
+        if isinstance(obj.name, dict):
+            return localized_text(obj.name, self.context.get('language', 'en'))
+        return obj.name or ''
+
+
+class BookingRowStaffSerializer(serializers.ModelSerializer):
+    full_name = serializers.SerializerMethodField()
+    user_id = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = BookingStaff
+        fields = ['id', 'user_id', 'full_name', 'profile_image']
+        read_only_fields = fields
+
+    def get_full_name(self, obj) -> str:
+        return obj.user.get_full_name() or obj.user.email
+
+
+class BookingRowSerializer(serializers.ModelSerializer):
+    """Slim booking row: no nested service roster, for phone lists."""
+    client = BookingRowClientSerializer(read_only=True)
+    service = BookingRowServiceSerializer(read_only=True)
+    staff = BookingRowStaffSerializer(read_only=True, allow_null=True)
+
+    class Meta:
+        model = Booking
+        fields = [
+            'id', 'booking_number', 'client', 'service', 'staff', 'date', 'start_time', 'end_time',
+            'status', 'payment_status', 'payment_method', 'total_amount', 'deposit_amount', 'paid_amount',
+            'client_notes', 'created_at',
+        ]
+        read_only_fields = fields
+
+
+class AdminBookingUpdateSerializer(serializers.ModelSerializer):
+    """PATCH/PUT /admin/bookings/{id}/: notes and price only.
+
+    Status, time, staff and payments change through the actions (confirm,
+    check_in, complete, no_show, cancel, reschedule, assign_staff,
+    record_payment), which apply their rules and notifications.
+    """
+    total_amount = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=0, required=False)
+
+    class Meta:
+        model = Booking
+        fields = ['staff_notes', 'client_notes', 'total_amount']
+        extra_kwargs = {
+            'staff_notes': {'required': False},
+            'client_notes': {'required': False},
+        }
+
+
+# ----------------------------------------------------------------------------
+# Admin booking action bodies / responses (for the OpenAPI schema + validation)
+# ----------------------------------------------------------------------------
+
+class BookingConfirmRequestSerializer(serializers.Serializer):
+    force = serializers.BooleanField(
+        required=False, default=False,
+        help_text='Confirm an unpaid online-card booking anyway',
+    )
+
+
+class BookingCancelRequestSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=False, allow_blank=True, help_text='Empty = "Cancelled by admin"')
+    refund = serializers.BooleanField(
+        required=False, default=True,
+        help_text='Refund the online payment (only when something was paid online)',
+    )
+
+
+class BookingAssignStaffRequestSerializer(serializers.Serializer):
+    staff_id = serializers.IntegerField()
+
+
+class BookingRescheduleRequestSerializer(serializers.Serializer):
+    date = serializers.DateField(help_text='YYYY-MM-DD')
+    start_time = serializers.CharField(help_text='HH:MM (HH:MM:SS also accepted)')
+
+
+class BookingRecordPaymentRequestSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal('0.01'))
+    method = serializers.ChoiceField(choices=['cash', 'card', 'transfer', 'other'], default='cash')
+    note = serializers.CharField(required=False, allow_blank=True, default='', max_length=500)
+
+
+class BookingErrorSerializer(serializers.Serializer):
+    error = serializers.CharField()
+
+
+class AdminSlotStaffSerializer(serializers.Serializer):
+    staff_id = serializers.IntegerField()
+    staff_name = serializers.CharField()
+
+
+class AdminSlotSerializer(serializers.Serializer):
+    start_time = serializers.CharField(help_text='HH:MM')
+    end_time = serializers.CharField(help_text='HH:MM (service duration, without the buffer)')
+    staff_id = serializers.IntegerField(help_text='First free staff member at this time')
+    staff_name = serializers.CharField()
+    available_staff = AdminSlotStaffSerializer(many=True)
+
+
+class AdminSlotsResponseSerializer(serializers.Serializer):
+    date = serializers.DateField()
+    service_id = serializers.IntegerField()
+    staff_id = serializers.IntegerField(allow_null=True)
+    slots = AdminSlotSerializer(many=True)
+
+
+class DashboardStatusCountSerializer(serializers.Serializer):
+    status = serializers.CharField()
+    count = serializers.IntegerField()
+
+
+class DashboardPopularServiceSerializer(serializers.Serializer):
+    service__name = serializers.JSONField(help_text='Service name ({"en": ..., "ka": ...} or a string)')
+    count = serializers.IntegerField()
+
+
+class DashboardTodaySerializer(serializers.Serializer):
+    total_bookings = serializers.IntegerField()
+    confirmed = serializers.IntegerField()
+    pending = serializers.IntegerField()
+    completed = serializers.IntegerField()
+    status_breakdown = DashboardStatusCountSerializer(many=True)
+    bookings = BookingListSerializer(many=True, help_text='BookingRow shape when lite=1')
+
+
+class DashboardWeekSerializer(serializers.Serializer):
+    total_bookings = serializers.IntegerField()
+    revenue = serializers.FloatField()
+    popular_services = DashboardPopularServiceSerializer(many=True)
+
+
+class DashboardOverallSerializer(serializers.Serializer):
+    total_clients = serializers.IntegerField()
+    total_revenue = serializers.FloatField()
+    active_staff = serializers.IntegerField()
+
+
+class BookingDashboardSerializer(serializers.Serializer):
+    today = DashboardTodaySerializer()
+    week = DashboardWeekSerializer()
+    overall = DashboardOverallSerializer()
+
+
+class StaffDayAvailabilitySerializer(serializers.Serializer):
+    start_time = serializers.TimeField()
+    end_time = serializers.TimeField()
+    break_start = serializers.TimeField(allow_null=True)
+    break_end = serializers.TimeField(allow_null=True)
+
+
+class StaffScheduleEntrySerializer(serializers.Serializer):
+    staff = BookingStaffSerializer()
+    availability = StaffDayAvailabilitySerializer(allow_null=True, help_text='null = not working that day')
+    bookings = BookingListSerializer(many=True, help_text='BookingRow shape when lite=1')
+    booking_count = serializers.IntegerField()
+
+
+class StaffScheduleSerializer(serializers.Serializer):
+    date = serializers.CharField()
+    schedule = StaffScheduleEntrySerializer(many=True)
+
+
+class AvailableUserSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    email = serializers.EmailField()
+    first_name = serializers.CharField()
+    last_name = serializers.CharField()
+    full_name = serializers.CharField()
+
+
+class BookingClientStatsSerializer(serializers.Serializer):
+    total_bookings = serializers.IntegerField()
+    completed_bookings = serializers.IntegerField()
+    cancelled_bookings = serializers.IntegerField()
+    total_spent = serializers.FloatField()
+    last_booking = BookingListSerializer(allow_null=True)
 
 
 class BookingCreateSerializer(serializers.ModelSerializer):
@@ -610,6 +851,7 @@ class PublicBookingStaffSerializer(BookingStaffSerializer):
 class PublicServiceSerializer(ServiceListSerializer):
     staff_members = serializers.SerializerMethodField()
 
+    @extend_schema_field(PublicBookingStaffSerializer(many=True))
     def get_staff_members(self, obj):
         staff = [s for s in obj.staff_members.all() if s.is_active_for_bookings]
         return PublicBookingStaffSerializer(staff, many=True, context=self.context).data
@@ -620,7 +862,7 @@ class PublicBookingSerializer(serializers.ModelSerializer):
     client = BookingClientSerializer(read_only=True)
     service = PublicServiceSerializer(read_only=True)
     staff = PublicBookingStaffSerializer(read_only=True)
-    remaining_amount = serializers.ReadOnlyField()
+    remaining_amount = RemainingAmountField()
     # Whether the customer may still cancel / move it online, per the
     # business's notice period — so every page can show or hide the buttons.
     can_cancel = serializers.SerializerMethodField()
@@ -751,6 +993,68 @@ class RecurringBookingCreateSerializer(serializers.ModelSerializer):
         return RecurringBooking.objects.create(**validated_data)
 
 
+class AdminRecurringBookingCreateSerializer(serializers.Serializer):
+    """POST /admin/recurring-bookings/: a repeating booking for a customer.
+
+    The first booking is created by the nightly task on next_booking_date
+    (the next preferred weekday after today on the business's clock).
+    """
+    client_id = serializers.IntegerField()
+    service_id = serializers.IntegerField()
+    staff_id = serializers.IntegerField(required=False, allow_null=True)
+    frequency = serializers.ChoiceField(choices=RecurringBooking.FREQUENCY_CHOICES)
+    preferred_day_of_week = serializers.ChoiceField(choices=StaffAvailability.DAY_CHOICES, help_text='0=Monday … 6=Sunday')
+    preferred_time = serializers.TimeField()
+    end_date = serializers.DateField(required=False, allow_null=True)
+    max_occurrences = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+
+    def validate(self, attrs):
+        from .utils import get_booking_settings, staff_can_perform, tenant_now
+
+        try:
+            attrs['client'] = Client.objects.get(id=attrs['client_id'])
+        except Client.DoesNotExist:
+            raise serializers.ValidationError({'client_id': 'Client not found'})
+        try:
+            attrs['service'] = Service.objects.get(id=attrs['service_id'], status='active')
+        except Service.DoesNotExist:
+            raise serializers.ValidationError({'service_id': 'Service not found'})
+        attrs['staff'] = None
+        if attrs.get('staff_id'):
+            try:
+                attrs['staff'] = BookingStaff.objects.get(id=attrs['staff_id'])
+            except BookingStaff.DoesNotExist:
+                raise serializers.ValidationError({'staff_id': 'Staff not found'})
+            if not staff_can_perform(attrs['service'], attrs['staff']):
+                raise serializers.ValidationError({'staff_id': 'This staff member does not provide this service'})
+
+        today = tenant_now(get_booking_settings()).date()
+        days_ahead = attrs['preferred_day_of_week'] - today.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        attrs['next_booking_date'] = today + timedelta(days=days_ahead)
+        if attrs.get('end_date') and attrs['end_date'] < attrs['next_booking_date']:
+            raise serializers.ValidationError({'end_date': 'The series would end before its first booking'})
+        return attrs
+
+    def create(self, validated_data):
+        client = validated_data['client']
+        if not client.is_booking_enabled:
+            client.is_booking_enabled = True
+            client.save(update_fields=['is_booking_enabled'])
+        return RecurringBooking.objects.create(
+            client=client,
+            service=validated_data['service'],
+            staff=validated_data['staff'],
+            frequency=validated_data['frequency'],
+            preferred_day_of_week=validated_data['preferred_day_of_week'],
+            preferred_time=validated_data['preferred_time'],
+            next_booking_date=validated_data['next_booking_date'],
+            end_date=validated_data.get('end_date'),
+            max_occurrences=validated_data.get('max_occurrences'),
+        )
+
+
 # ============================================================================
 # BOOKING SETTINGS SERIALIZERS
 # ============================================================================
@@ -856,10 +1160,10 @@ class BookingSettingsSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('Unknown timezone')
         return value
 
-    def get_has_bog_client_id(self, obj):
+    def get_has_bog_client_id(self, obj) -> bool:
         return bool(obj.bog_client_id)
 
-    def get_has_bog_client_secret(self, obj):
+    def get_has_bog_client_secret(self, obj) -> bool:
         return bool(obj.bog_client_secret)
 
     def update(self, instance, validated_data):
@@ -971,6 +1275,11 @@ class AdminBookingCreateSerializer(serializers.Serializer):
 
         service = validated_data['service']
         client = validated_data.get('client')
+        if client is not None and not client.is_booking_enabled:
+            # An existing contact booked by hand becomes a booking client, so
+            # they show up under Clients with their history.
+            client.is_booking_enabled = True
+            client.save(update_fields=['is_booking_enabled'])
         if client is None:
             client, _ = find_or_create_client(
                 validated_data['first_name'].strip(), validated_data.get('last_name', '').strip(),

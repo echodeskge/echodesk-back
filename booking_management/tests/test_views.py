@@ -398,6 +398,8 @@ class TestAdminBookingViewSet(BookingViewTestMixin, BookingTestCase):
             self.service, client=self.bk_client, staff=self.staff,
             date=date.today() + timedelta(days=14),
         )
+        # The new staff member must be working then
+        self.create_availability(staff2, day_of_week=booking.date.weekday())
         resp = self.api_post(f'{ADMIN_BOOKING_URL}{booking.id}/assign_staff/', {
             'staff_id': staff2.id,
         }, user=self.admin)
