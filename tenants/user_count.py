@@ -18,7 +18,7 @@ own admin counts (registration flows seed ``current_users=1`` for them).
 import logging
 
 from django.contrib.auth import get_user_model
-from django.db import connection
+from django.db import connection, transaction
 from tenant_schemas.utils import get_public_schema_name, schema_context
 
 logger = logging.getLogger(__name__)
@@ -70,7 +70,9 @@ def sync_current_schema_user_count():
         if tenant is None:
             return None
     try:
-        return sync_subscription_user_count(tenant)
+        # Savepoint, so a failed COUNT/UPDATE cannot abort an outer transaction.
+        with transaction.atomic():
+            return sync_subscription_user_count(tenant)
     except Exception:
         # Never let usage bookkeeping break a user write.
         logger.exception('Failed to sync user count for schema %s', schema)

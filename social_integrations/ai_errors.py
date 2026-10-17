@@ -28,6 +28,7 @@ class AINotConfiguredErrorSerializer(serializers.Serializer):
         help_text="Always 'ai_not_configured'",
     )
     detail = serializers.CharField(help_text='Human-readable explanation')
+    error = serializers.CharField(help_text='Same text as detail (the web reads `error`)')
 
 
 AI_NOT_CONFIGURED_RESPONSE = OpenApiResponse(
@@ -41,6 +42,11 @@ AI_NOT_CONFIGURED_RESPONSE = OpenApiResponse(
 
 def ai_not_configured_response():
     return Response(
-        {'code': AI_NOT_CONFIGURED_CODE, 'detail': AI_NOT_CONFIGURED_DETAIL},
+        {
+            'code': AI_NOT_CONFIGURED_CODE,
+            'detail': AI_NOT_CONFIGURED_DETAIL,
+            # The web summary dialog toasts `error`; keep it until it reads `detail`.
+            'error': AI_NOT_CONFIGURED_DETAIL,
+        },
         status=status.HTTP_503_SERVICE_UNAVAILABLE,
     )

@@ -466,6 +466,8 @@ class TestAiNotConfigured(AICompanionTestCase):
         self.assertEqual(resp.status_code, status.HTTP_503_SERVICE_UNAVAILABLE, resp.data)
         self.assertEqual(resp.data['code'], AI_NOT_CONFIGURED_CODE)
         self.assertTrue(resp.data['detail'])
+        # The web dialog toasts `error`.
+        self.assertEqual(resp.data['error'], resp.data['detail'])
 
     def test_generate_structured_raises_not_configured(self):
         from social_integrations.services import ai_providers
