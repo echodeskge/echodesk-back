@@ -702,6 +702,43 @@ class NotificationPreferenceSerializer(serializers.ModelSerializer):
         read_only_fields = ['id']
 
 
+def _notification_type_keys():
+    """Valid notification_type values, read at call time so types added by
+    other modules are accepted without touching this serializer."""
+    return {key for key, _ in Notification.NOTIFICATION_TYPES}
+
+
+class NotificationPreferenceBulkItemSerializer(serializers.Serializer):
+    """One item of PUT /api/notification-preferences/bulk/.
+
+    Omitted channels keep their stored value (True for a new row).
+    """
+    notification_type = serializers.CharField(
+        max_length=50,
+        help_text='A Notification.notification_type key (see GET /api/notification-preferences/types/)',
+    )
+    in_app = serializers.BooleanField(required=False)
+    sound = serializers.BooleanField(required=False)
+    push = serializers.BooleanField(required=False)
+
+    def validate_notification_type(self, value):
+        if value not in _notification_type_keys():
+            raise serializers.ValidationError(f'Unknown notification type "{value}".')
+        return value
+
+
+class NotificationPreferenceTypeSerializer(serializers.Serializer):
+    """A notification type with the user's effective delivery preference."""
+    notification_type = serializers.CharField()
+    label = serializers.CharField()
+    in_app = serializers.BooleanField()
+    sound = serializers.BooleanField()
+    push = serializers.BooleanField()
+    is_customized = serializers.BooleanField(
+        help_text='True when the user has a stored row for this type (otherwise defaults are shown)'
+    )
+
+
 # Team Chat Serializers
 
 import mimetypes

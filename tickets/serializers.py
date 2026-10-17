@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
+from drf_spectacular.utils import extend_schema_field, inline_serializer
 from .models import (
     Ticket, Tag, TicketComment, TicketColumn, ChecklistItem,
     TicketAssignment, TicketTimeLog, Board, TicketPayment,
@@ -36,6 +37,33 @@ class DepartmentMinimalSerializer(serializers.ModelSerializer):
         model = Department
         fields = ['id', 'name', 'description']
         read_only_fields = ['id', 'name', 'description']
+
+
+class BoardPaymentSummarySerializer(serializers.Serializer):
+    """Schema-only: Board.payment_summary (null on list responses)."""
+    total_tickets = serializers.IntegerField()
+    total_orders = serializers.IntegerField()
+    total_price = serializers.DecimalField(max_digits=12, decimal_places=2, allow_null=True)
+    total_paid = serializers.DecimalField(max_digits=12, decimal_places=2, allow_null=True)
+    paid_tickets = serializers.IntegerField()
+    unpaid_tickets = serializers.IntegerField()
+    overdue_tickets = serializers.IntegerField()
+    remaining_balance = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+
+class TicketFormRefSerializer(serializers.Serializer):
+    """Schema-only: compact form reference used by TicketFormMinimal."""
+    id = serializers.IntegerField()
+    title = serializers.CharField()
+    description = serializers.CharField()
+    is_active = serializers.BooleanField()
+
+
+class SubmissionTicketDataSerializer(serializers.Serializer):
+    """Schema-only: TicketFormSubmission.ticket_data."""
+    id = serializers.IntegerField()
+    title = serializers.CharField()
+    status = serializers.CharField()
 
 
 class BoardSerializer(serializers.ModelSerializer):
@@ -78,6 +106,7 @@ class BoardSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['created_at', 'updated_at', 'created_by']
     
+    @extend_schema_field(BoardPaymentSummarySerializer(allow_null=True))
     def get_payment_summary(self, obj):
         """Get payment summary for this board.
 
@@ -152,13 +181,25 @@ class TicketColumnSerializer(serializers.ModelSerializer):
         return value
 
 
+def validate_hex_color(value):
+    """Shared #RRGGBB check for column and tag colours."""
+    import re
+    if not re.match(r'^#[0-9A-Fa-f]{6}$', value or ''):
+        raise serializers.ValidationError('Color must be a valid hex color code (e.g., #3B82F6)')
+    return value
+
+
 class TicketColumnCreateSerializer(serializers.ModelSerializer):
-    """Serializer for creating ticket columns."""
-    
+    """Serializer for creating ticket columns. The response carries the new id."""
+
     class Meta:
         model = TicketColumn
-        fields = ['name', 'description', 'color', 'position', 'is_default', 'is_closed_status', 'track_time', 'board']
-        
+        fields = ['id', 'name', 'description', 'color', 'position', 'is_default', 'is_closed_status', 'track_time', 'board']
+        read_only_fields = ['id']
+
+    def validate_color(self, value):
+        return validate_hex_color(value)
+
     def create(self, validated_data):
         # Set created_by from request context
         validated_data['created_by'] = self.context['request'].user
@@ -166,11 +207,15 @@ class TicketColumnCreateSerializer(serializers.ModelSerializer):
 
 
 class TicketColumnUpdateSerializer(serializers.ModelSerializer):
-    """Serializer for updating ticket columns."""
-    
+    """Serializer for updating ticket columns. The response carries the id."""
+
     class Meta:
         model = TicketColumn
-        fields = ['name', 'description', 'color', 'position', 'is_default', 'is_closed_status', 'track_time', 'board']
+        fields = ['id', 'name', 'description', 'color', 'position', 'is_default', 'is_closed_status', 'track_time', 'board']
+        read_only_fields = ['id']
+
+    def validate_color(self, value):
+        return validate_hex_color(value)
 
 
 class TagSerializer(serializers.ModelSerializer):
@@ -729,7 +774,7 @@ class ListItemSerializer(serializers.ModelSerializer):
     """Serializer for ListItem model with recursive children support."""
     created_by = UserMinimalSerializer(read_only=True)
     children = serializers.SerializerMethodField()
-    full_path = serializers.ReadOnlyField(source='get_full_path')
+    full_path = serializers.CharField(source='get_full_path', read_only=True)
 
     class Meta:
         model = ListItem
@@ -761,9 +806,16 @@ class ListItemSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
+# Recursive children: annotate after the class exists so the schema emits
+# an array of ListItem instead of a string.
+ListItemSerializer.get_children = extend_schema_field(
+    ListItemSerializer(many=True, read_only=True)
+)(ListItemSerializer.get_children)
+
+
 class ListItemMinimalSerializer(serializers.ModelSerializer):
     """Minimal serializer for ListItem without children (to avoid deep recursion)."""
-    full_path = serializers.ReadOnlyField(source='get_full_path')
+    full_path = serializers.CharField(source='get_full_path', read_only=True)
     item_list = serializers.PrimaryKeyRelatedField(read_only=True)
 
     class Meta:
@@ -804,6 +856,7 @@ class ItemListSerializer(serializers.ModelSerializer):
         self.context['_active_items'] = active_items
         return super().to_representation(instance)
 
+    @extend_schema_field(serializers.IntegerField())
     def get_items_count(self, obj):
         """Get the number of active items in this list (uses prefetched cache)."""
         active_items = self.context.get('_active_items')
@@ -813,6 +866,7 @@ class ItemListSerializer(serializers.ModelSerializer):
             return obj._active_items_count
         return obj.items.filter(is_active=True).count()
 
+    @extend_schema_field(ListItemSerializer(many=True))
     def get_root_items(self, obj):
         """Root-level active items (without parents)."""
         active_items = self.context.get('_active_items')
@@ -840,6 +894,7 @@ class ItemListMinimalSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
+    @extend_schema_field(serializers.IntegerField())
     def get_items_count(self, obj):
         """Get the number of active items in this list."""
         if hasattr(obj, '_active_items_count'):
@@ -867,9 +922,18 @@ class TicketFormMinimalSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
+    @extend_schema_field(TicketFormRefSerializer(many=True))
     def get_child_forms(self, obj):
-        """Get child forms without deep nesting."""
-        child_forms = obj.child_forms.filter(is_active=True)
+        """Get active child forms without deep nesting.
+
+        Filters the prefetched ``child_forms`` in memory when available
+        (a ``.filter()`` would bypass the prefetch: one query per form).
+        """
+        cache = getattr(obj, '_prefetched_objects_cache', {})
+        if 'child_forms' in cache:
+            child_forms = [c for c in cache['child_forms'] if c.is_active]
+        else:
+            child_forms = obj.child_forms.filter(is_active=True)
         # Return simple dict to avoid recursion
         return [
             {
@@ -881,6 +945,7 @@ class TicketFormMinimalSerializer(serializers.ModelSerializer):
             for child in child_forms
         ]
 
+    @extend_schema_field(TicketFormRefSerializer(allow_null=True))
     def get_parent_form(self, obj):
         """Get parent form without deep nesting."""
         if obj.parent_form:
@@ -892,6 +957,7 @@ class TicketFormMinimalSerializer(serializers.ModelSerializer):
             }
         return None
 
+    @extend_schema_field(serializers.IntegerField())
     def get_submissions_count(self, obj):
         """Get the number of submissions for this form."""
         if hasattr(obj, '_submissions_count'):
@@ -910,8 +976,11 @@ class TicketFormSerializer(serializers.ModelSerializer):
         allow_empty=True,
         help_text='List of ItemList IDs to attach to this form'
     )
-    parent_form = TicketFormMinimalSerializer(read_only=True)
-    parent_form_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
+    parent_form = TicketFormMinimalSerializer(read_only=True, allow_null=True)
+    parent_form_id = serializers.IntegerField(
+        write_only=True, required=False, allow_null=True,
+        help_text='Parent form id; null or 0 clears the parent',
+    )
     child_forms = TicketFormMinimalSerializer(many=True, read_only=True)
     child_forms_count = serializers.SerializerMethodField()
     submissions_count = serializers.SerializerMethodField()
@@ -926,12 +995,14 @@ class TicketFormSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'created_by']
 
+    @extend_schema_field(serializers.IntegerField())
     def get_child_forms_count(self, obj):
         """Get the number of child forms."""
         if hasattr(obj, '_child_forms_count'):
             return obj._child_forms_count
         return obj.child_forms.count()
 
+    @extend_schema_field(serializers.IntegerField())
     def get_submissions_count(self, obj):
         """Get the number of submissions for this form."""
         if hasattr(obj, '_submissions_count'):
@@ -956,10 +1027,11 @@ class TicketFormSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         item_list_ids = validated_data.pop('item_list_ids', None)
-        parent_form_id = validated_data.pop('parent_form_id', None)
+        _missing = object()
+        parent_form_id = validated_data.pop('parent_form_id', _missing)
 
-        # Handle parent_form field
-        if parent_form_id is not None:
+        # parent_form_id: absent = unchanged; null or 0 = clear; id = set
+        if parent_form_id is not _missing:
             if parent_form_id:
                 validated_data['parent_form_id'] = parent_form_id
             else:
@@ -997,6 +1069,7 @@ class TicketFormSubmissionSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'submitted_at', 'submitted_by']
 
+    @extend_schema_field(SubmissionTicketDataSerializer(allow_null=True))
     def get_ticket_data(self, obj):
         """Get minimal ticket data."""
         from .models import Ticket
@@ -1093,6 +1166,7 @@ class BoardTelegramConnectionSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'board', 'created_by', 'created_at', 'updated_at']
 
+    @extend_schema_field(serializers.BooleanField())
     def get_has_token(self, obj):
         return bool(obj.bot_token)
 
@@ -1113,3 +1187,10 @@ class BoardTelegramConnectionSerializer(serializers.ModelSerializer):
         instance.is_active = validated_data.get('is_active', instance.is_active)
         instance.save()
         return instance
+
+
+class BoardTelegramConnectionCreateSerializer(BoardTelegramConnectionSerializer):
+    """Schema-only request body for POST telegram-connection: the bot token is
+    required on create (the view enforces it via
+    ``BoardTelegramConnectionSerializer.create``)."""
+    bot_token_raw = serializers.CharField(write_only=True, required=True)

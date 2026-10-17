@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from drf_spectacular.utils import extend_schema_field
+from drf_spectacular.utils import extend_schema_field, extend_schema_serializer
 from .models import (
     Language,
     AttributeDefinition,
@@ -1459,6 +1459,9 @@ class ClientCardSerializer(serializers.ModelSerializer):
         ]
 
 
+# Distinct component names: the tickets app has serializers with the same
+# class names, and the schema kept only one of each.
+@extend_schema_serializer(component_name='EcommerceListItem')
 class ListItemSerializer(serializers.ModelSerializer):
     """Serializer for items within an ItemList"""
     children = serializers.SerializerMethodField()
@@ -1489,6 +1492,7 @@ class ListItemSerializer(serializers.ModelSerializer):
         return ListItemSerializer(children, many=True).data if children else []
 
 
+@extend_schema_serializer(component_name='EcommerceItemListMinimal')
 class ItemListMinimalSerializer(serializers.ModelSerializer):
     """Minimal serializer for public item lists"""
     items_count = serializers.SerializerMethodField()

@@ -15,12 +15,13 @@ class TestColumnCRUD(TicketTestCase):
         }, user=admin)
         self.assertEqual(resp.status_code, 201)
 
-    def test_non_superadmin_cannot_create_column(self):
-        admin = self.create_admin()  # is_staff but not superuser
+    def test_agent_without_manage_columns_cannot_create_column(self):
+        admin = self.create_admin()
+        agent = self.create_user(email='col-agent-create@test.com')  # is_staff but not superuser
         board = self.create_board(created_by=admin)
         resp = self.api_post('/api/columns/', {
             'name': 'New Column', 'board': board.id, 'position': 0
-        }, user=admin)
+        }, user=agent)
         self.assertEqual(resp.status_code, 403)
 
     def test_superadmin_can_update_column(self):
@@ -32,11 +33,12 @@ class TestColumnCRUD(TicketTestCase):
         resp = self.api_patch(f'/api/columns/{col.id}/', {'name': 'New'}, user=admin)
         self.assertEqual(resp.status_code, 200)
 
-    def test_non_superadmin_cannot_update_column(self):
+    def test_agent_without_manage_columns_cannot_update_column(self):
         admin = self.create_admin()
+        agent = self.create_user(email='col-agent-update@test.com')
         board = self.create_board(created_by=admin)
         col = self.create_column(board, name='Col', position=0, created_by=admin)
-        resp = self.api_patch(f'/api/columns/{col.id}/', {'name': 'New'}, user=admin)
+        resp = self.api_patch(f'/api/columns/{col.id}/', {'name': 'New'}, user=agent)
         self.assertEqual(resp.status_code, 403)
 
     def test_superadmin_can_delete_column(self):
@@ -48,11 +50,12 @@ class TestColumnCRUD(TicketTestCase):
         resp = self.api_delete(f'/api/columns/{col.id}/', user=admin)
         self.assertEqual(resp.status_code, 204)
 
-    def test_non_superadmin_cannot_delete_column(self):
+    def test_agent_without_manage_columns_cannot_delete_column(self):
         admin = self.create_admin()
+        agent = self.create_user(email='col-agent-delete@test.com')
         board = self.create_board(created_by=admin)
         col = self.create_column(board, name='Col', position=0, created_by=admin)
-        resp = self.api_delete(f'/api/columns/{col.id}/', user=admin)
+        resp = self.api_delete(f'/api/columns/{col.id}/', user=agent)
         self.assertEqual(resp.status_code, 403)
 
     def test_anyone_authenticated_can_list_columns(self):
@@ -93,11 +96,12 @@ class TestColumnReorder(TicketTestCase):
         resp = self.api_post(f'/api/columns/{col.id}/reorder/', {'position': 2}, user=admin)
         self.assertEqual(resp.status_code, 200)
 
-    def test_non_superadmin_cannot_reorder(self):
-        admin = self.create_admin()  # not superuser
+    def test_agent_without_manage_columns_cannot_reorder(self):
+        admin = self.create_admin()
+        agent = self.create_user(email='col-agent-reorder@test.com')
         board = self.create_board(created_by=admin)
         col = self.create_column(board, name='C', position=0, created_by=admin)
-        resp = self.api_post(f'/api/columns/{col.id}/reorder/', {'position': 2}, user=admin)
+        resp = self.api_post(f'/api/columns/{col.id}/reorder/', {'position': 2}, user=agent)
         self.assertEqual(resp.status_code, 403)
 
     def test_reorder_missing_position(self):

@@ -17,6 +17,7 @@ from .models import (
     ItemList, ListItem, TicketForm, TicketFormSubmission, TicketAttachment,
     BoardTelegramConnection
 )
+from .permissions import CanManageColumns, CanManageTags, CanManageSettings
 from .serializers import (
     TicketSerializer, TicketListSerializer, TagSerializer,
     TicketCommentSerializer, TicketColumnSerializer,
@@ -28,7 +29,8 @@ from .serializers import (
     ItemListSerializer, ItemListMinimalSerializer, ListItemSerializer, ListItemMinimalSerializer,
     TicketFormSerializer, TicketFormMinimalSerializer, TicketFormSubmissionSerializer,
     TicketAttachmentSerializer, TicketHistorySerializer,
-    BoardTelegramConnectionSerializer, TicketCardSerializer
+    BoardTelegramConnectionSerializer, BoardTelegramConnectionCreateSerializer,
+    TicketCardSerializer
 )
 
 
@@ -171,6 +173,13 @@ class BoardPermission(permissions.BasePermission):
             return request.user.has_permission('delete_boards')
         elif view.action == 'set_default':
             return request.user.is_staff or request.user.is_superuser
+        elif (
+            view.action in ('telegram_connection', 'telegram_connection_test')
+            and request.method not in permissions.SAFE_METHODS
+        ):
+            # Writing the bot token / chat id (or sending a test message with
+            # them) is board configuration, not viewing.
+            return request.user.has_permission('edit_boards')
         else:
             # Default to view permission for unknown actions
             return (request.user.has_permission('view_boards') or
@@ -185,9 +194,13 @@ class BoardPermission(permissions.BasePermission):
 class TicketColumnViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing ticket columns (Kanban board columns).
+
+    Anyone authenticated can read columns. Create, update, delete and reorder
+    need staff/superuser or the ``manage_columns`` permission (individual
+    flag or manager/admin role).
     """
     serializer_class = TicketColumnSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [CanManageColumns]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['board']
     ordering = ['position', 'created_at']
@@ -206,42 +219,8 @@ class TicketColumnViewSet(viewsets.ModelViewSet):
             return TicketColumnUpdateSerializer
         return TicketColumnSerializer
 
-    def get_permissions(self):
-        """
-        Only superadmins can create, update, or delete columns.
-        Anyone authenticated can view columns.
-        """
-        if self.action in ['create', 'update', 'partial_update', 'destroy', 'reorder']:
-            permission_classes = [permissions.IsAuthenticated]
-        else:
-            permission_classes = [permissions.IsAuthenticated]
-        
-        return [permission() for permission in permission_classes]
-    
-    def check_superadmin_permission(self, request):
-        """Check if user is superadmin."""
-        if not request.user.is_superuser:
-            from rest_framework.exceptions import PermissionDenied
-            raise PermissionDenied("Only superadmin users can manage ticket statuses.")
-    
-    def create(self, request, *args, **kwargs):
-        """Create a new ticket column (superadmin only)."""
-        self.check_superadmin_permission(request)
-        return super().create(request, *args, **kwargs)
-    
-    def update(self, request, *args, **kwargs):
-        """Update a ticket column (superadmin only)."""
-        self.check_superadmin_permission(request)
-        return super().update(request, *args, **kwargs)
-    
-    def partial_update(self, request, *args, **kwargs):
-        """Partially update a ticket column (superadmin only)."""
-        self.check_superadmin_permission(request)
-        return super().partial_update(request, *args, **kwargs)
-    
     def destroy(self, request, *args, **kwargs):
-        """Delete a ticket column (superadmin only)."""
-        self.check_superadmin_permission(request)
+        """Delete a ticket column (refused while it still holds tickets)."""
         column = self.get_object()
         if column.tickets.exists():
             return Response(
@@ -250,47 +229,86 @@ class TicketColumnViewSet(viewsets.ModelViewSet):
             )
         return super().destroy(request, *args, **kwargs)
 
-    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    @extend_schema(
+        summary='Move a column to a new position on its board',
+        description=(
+            'Moves the column to the 0-based index `position` among the columns '
+            'of its own board (ordered by position, then creation time) and '
+            "renumbers that board's columns 0..n-1. Columns on other boards are "
+            'never touched. Positions past the end are clamped. Returns the '
+            "board's columns in their new order."
+        ),
+        request=inline_serializer(
+            name='TicketColumnReorder',
+            fields={
+                'position': drf_serializers.IntegerField(
+                    min_value=0, help_text='0-based target index on the board'
+                ),
+            },
+        ),
+        responses={
+            200: inline_serializer(
+                name='TicketColumnReorderResponse',
+                fields={
+                    'message': drf_serializers.CharField(),
+                    'board': drf_serializers.IntegerField(),
+                    'columns': TicketColumnSerializer(many=True),
+                },
+            ),
+            400: OpenApiResponse(description='position missing, not a number or negative'),
+            403: OpenApiResponse(description='Needs manage_columns or staff'),
+        },
+    )
+    @action(detail=True, methods=['post'])
     def reorder(self, request, pk=None):
-        """Reorder columns (superadmin only)."""
-        self.check_superadmin_permission(request)
+        """Reorder a column within its own board."""
         column = self.get_object()
         new_position = request.data.get('position')
-        
-        if new_position is None:
+
+        if new_position is None or new_position == '':
             return Response(
-                {'error': 'Position is required'}, 
+                {'error': 'Position is required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+
         try:
             new_position = int(new_position)
-        except ValueError:
+        except (TypeError, ValueError):
             return Response(
-                {'error': 'Position must be a number'}, 
+                {'error': 'Position must be a number'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+        if new_position < 0:
+            return Response(
+                {'error': 'Position cannot be negative'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         with transaction.atomic():
-            # Update positions of other columns
-            if new_position > column.position:
-                # Moving right - decrease position of columns in between
-                TicketColumn.objects.filter(
-                    position__gt=column.position,
-                    position__lte=new_position
-                ).update(position=F('position') - 1)
-            else:
-                # Moving left - increase position of columns in between
-                TicketColumn.objects.filter(
-                    position__gte=new_position,
-                    position__lt=column.position
-                ).update(position=F('position') + 1)
-            
-            # Update the column's position
-            column.position = new_position
-            column.save()
-        
-        return Response({'message': 'Column reordered successfully'})
+            ordered_ids = list(
+                TicketColumn.objects.select_for_update()
+                .filter(board_id=column.board_id)
+                .order_by('position', 'created_at', 'id')
+                .values_list('id', flat=True)
+            )
+            ordered_ids.remove(column.id)
+            new_position = min(new_position, len(ordered_ids))
+            ordered_ids.insert(new_position, column.id)
+            TicketColumn.objects.bulk_update(
+                [TicketColumn(pk=col_id, position=index) for index, col_id in enumerate(ordered_ids)],
+                ['position'],
+            )
+
+        columns = (
+            self.get_queryset()
+            .filter(board_id=column.board_id)
+            .order_by('position', 'created_at', 'id')
+        )
+        return Response({
+            'message': 'Column reordered successfully',
+            'board': column.board_id,
+            'columns': TicketColumnSerializer(columns, many=True, context={'request': request}).data,
+        })
 
     @extend_schema(
         operation_id='kanban_board',
@@ -908,11 +926,12 @@ class TicketViewSet(viewsets.ModelViewSet):
 class TagViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing tags.
-    All authenticated users can create, view, update, and delete tags.
+    Every authenticated user can list and read tags (to label tickets);
+    create, update and delete need staff/superuser or ``manage_tags``.
     """
     queryset = Tag.objects.select_related('created_by').all()
     serializer_class = TagSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [CanManageTags]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['name']
     ordering = ['name']
@@ -1700,6 +1719,17 @@ class BoardViewSet(viewsets.ModelViewSet):
             'tickets_by_column': tickets_by_column
         })
     
+    @extend_schema(
+        summary='Make this board the default board (staff only)',
+        request=None,
+        responses={
+            200: inline_serializer(
+                name='BoardSetDefaultResponse',
+                fields={'status': drf_serializers.CharField()},
+            ),
+            403: OpenApiResponse(description='Only staff can set the default board'),
+        },
+    )
     @action(detail=True, methods=['post'])
     def set_default(self, request, pk=None):
         """Set this board as the default board."""
@@ -1718,6 +1748,46 @@ class BoardViewSet(viewsets.ModelViewSet):
             return Response(BoardSerializer(default_board, context={'request': request}).data)
         return Response({'error': 'No default board found'}, status=status.HTTP_404_NOT_FOUND)
 
+    @extend_schema(
+        methods=['GET'],
+        summary="Get the board's Telegram connection",
+        description='Readable by anyone who can view boards. 404 when none is configured.',
+        request=None,
+        responses={
+            200: BoardTelegramConnectionSerializer,
+            404: OpenApiResponse(description='No Telegram connection configured'),
+        },
+    )
+    @extend_schema(
+        methods=['POST'],
+        summary='Create the Telegram connection (needs edit_boards or staff)',
+        request=BoardTelegramConnectionCreateSerializer,
+        responses={
+            201: BoardTelegramConnectionSerializer,
+            400: OpenApiResponse(description='Connection already exists or bot_token_raw missing'),
+            403: OpenApiResponse(description='Needs edit_boards or staff'),
+        },
+    )
+    @extend_schema(
+        methods=['PUT'],
+        summary='Update the Telegram connection (partial; needs edit_boards or staff)',
+        request=BoardTelegramConnectionSerializer(partial=True),
+        responses={
+            200: BoardTelegramConnectionSerializer,
+            403: OpenApiResponse(description='Needs edit_boards or staff'),
+            404: OpenApiResponse(description='No connection to update'),
+        },
+    )
+    @extend_schema(
+        methods=['DELETE'],
+        summary='Delete the Telegram connection (needs edit_boards or staff)',
+        request=None,
+        responses={
+            204: OpenApiResponse(description='Deleted'),
+            403: OpenApiResponse(description='Needs edit_boards or staff'),
+            404: OpenApiResponse(description='No connection to delete'),
+        },
+    )
     @action(detail=True, methods=['get', 'post', 'put', 'delete'], url_path='telegram-connection')
     def telegram_connection(self, request, pk=None):
         """Manage Telegram bot connection for a board."""
@@ -1760,6 +1830,31 @@ class BoardViewSet(viewsets.ModelViewSet):
             except BoardTelegramConnection.DoesNotExist:
                 return Response({'detail': 'No connection to delete.'}, status=status.HTTP_404_NOT_FOUND)
 
+    @extend_schema(
+        summary='Send a Telegram test message (needs edit_boards or staff)',
+        description=(
+            'Uses bot_token_raw/chat_id from the body when given, otherwise the '
+            "board's saved connection."
+        ),
+        request=inline_serializer(
+            name='BoardTelegramTest',
+            fields={
+                'bot_token_raw': drf_serializers.CharField(required=False),
+                'chat_id': drf_serializers.CharField(required=False),
+            },
+        ),
+        responses={
+            200: inline_serializer(
+                name='BoardTelegramTestResponse',
+                fields={
+                    'status': drf_serializers.CharField(),
+                    'message': drf_serializers.CharField(),
+                },
+            ),
+            400: OpenApiResponse(description='Missing credentials or the message could not be sent'),
+            403: OpenApiResponse(description='Needs edit_boards or staff'),
+        },
+    )
     @action(detail=True, methods=['post'], url_path='telegram-connection/test')
     def telegram_connection_test(self, request, pk=None):
         """Test Telegram bot connection by sending a test message."""
@@ -1915,11 +2010,21 @@ class TicketPaymentViewSet(viewsets.ModelViewSet):
 # New ViewSets for ItemList, ListItem, TicketForm, and TicketFormSubmission
 # ============================================================================
 
+@extend_schema_view(
+    list=extend_schema(parameters=[OpenApiParameter(
+                name='is_active', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY,
+                required=False, description='true|false: only active / only inactive rows',
+            )]),
+)
 class ItemListViewSet(viewsets.ModelViewSet):
-    """ViewSet for managing item lists."""
+    """ViewSet for managing item lists.
+
+    Reads are open to every authenticated user; create, update and delete
+    need staff/superuser or ``manage_settings``.
+    """
     queryset = ItemList.objects.select_related('created_by').prefetch_related('items', 'items__children').all()
     serializer_class = ItemListSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [CanManageSettings]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['title', 'description']
     ordering = ['-created_at']
@@ -1944,7 +2049,13 @@ class ItemListViewSet(viewsets.ModelViewSet):
             return ItemListMinimalSerializer
         return ItemListSerializer
 
-    @action(detail=True, methods=['get'])
+    @extend_schema(
+        summary='Active root-level items of this list, with nested active children',
+        operation_id='item_lists_root_items_retrieve',
+        filters=False,
+        responses={200: ListItemSerializer(many=True)},
+    )
+    @action(detail=True, methods=['get'], pagination_class=None)
     def root_items(self, request, pk=None):
         """Get only root-level items for this list.
 
@@ -1967,14 +2078,26 @@ class ItemListViewSet(viewsets.ModelViewSet):
         )
         return Response(serializer.data)
 
-    @action(detail=False, methods=['get'], permission_classes=[permissions.AllowAny])
+    @extend_schema(
+        summary='Public, active item lists (no auth)',
+        operation_id='item_lists_public_retrieve',
+        filters=False,
+        responses={200: ItemListSerializer(many=True)},
+    )
+    @action(detail=False, methods=['get'], permission_classes=[permissions.AllowAny], pagination_class=None)
     def public(self, request):
         """Get all public item lists accessible to ecommerce clients."""
         queryset = self.get_queryset().filter(is_public=True, is_active=True)
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
-    @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny])
+    @extend_schema(
+        summary='Active items of a public list (no auth)',
+        operation_id='item_lists_public_items_retrieve',
+        filters=False,
+        responses={200: ListItemSerializer(many=True), 404: OpenApiResponse(description='Public list not found')},
+    )
+    @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny], pagination_class=None)
     def public_items(self, request, pk=None):
         """Get items from a public list (only if the list is public).
 
@@ -2003,11 +2126,27 @@ class ItemListViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
+@extend_schema_view(
+    list=extend_schema(parameters=[
+        OpenApiParameter(
+            name='item_list_id', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY,
+            required=False, description='Only items of this list (same as item_list)',
+        ),
+        OpenApiParameter(
+            name='root_only', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY,
+            required=False, description='true: only items without a parent',
+        ),
+    ]),
+)
 class ListItemViewSet(viewsets.ModelViewSet):
-    """ViewSet for managing list items."""
+    """ViewSet for managing list items.
+
+    Reads are open to every authenticated user; create, update, delete and
+    reorder need staff/superuser or ``manage_settings``.
+    """
     queryset = ListItem.objects.select_related('item_list', 'parent').prefetch_related('children').all()
     serializer_class = ListItemSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [CanManageSettings]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['item_list', 'parent', 'is_active']
     search_fields = ['label', 'custom_id']
@@ -2040,7 +2179,13 @@ class ListItemViewSet(viewsets.ModelViewSet):
             return ListItemMinimalSerializer
         return ListItemSerializer
 
-    @action(detail=True, methods=['get'])
+    @extend_schema(
+        summary='Active direct children of this item (plain array)',
+        operation_id='list_items_children_retrieve',
+        filters=False,
+        responses={200: ListItemSerializer(many=True)},
+    )
+    @action(detail=True, methods=['get'], pagination_class=None)
     def children(self, request, pk=None):
         """Get direct children of this item."""
         item = self.get_object()
@@ -2048,7 +2193,13 @@ class ListItemViewSet(viewsets.ModelViewSet):
         serializer = ListItemSerializer(children, many=True, context={'request': request})
         return Response(serializer.data)
 
-    @action(detail=True, methods=['get'])
+    @extend_schema(
+        summary='All descendants of this item, flattened (plain array)',
+        operation_id='list_items_all_descendants_retrieve',
+        filters=False,
+        responses={200: ListItemMinimalSerializer(many=True)},
+    )
+    @action(detail=True, methods=['get'], pagination_class=None)
     def all_descendants(self, request, pk=None):
         """Get all descendants of this item recursively."""
         item = self.get_object()
@@ -2056,6 +2207,14 @@ class ListItemViewSet(viewsets.ModelViewSet):
         serializer = ListItemMinimalSerializer(descendants, many=True, context={'request': request})
         return Response(serializer.data)
 
+    @extend_schema(
+        summary='Move an item among its siblings',
+        request=inline_serializer(
+            name='ListItemReorder',
+            fields={'position': drf_serializers.IntegerField(min_value=0)},
+        ),
+        responses={200: ListItemSerializer, 400: OpenApiResponse(description='Invalid position')},
+    )
     @action(detail=True, methods=['patch'])
     def reorder(self, request, pk=None):
         """Reorder item within its parent or list."""
@@ -2117,6 +2276,18 @@ class ListItemViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
+@extend_schema_view(
+    list=extend_schema(parameters=[
+        OpenApiParameter(
+                name='is_active', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY,
+                required=False, description='true|false: only active / only inactive rows',
+            ),
+        OpenApiParameter(
+            name='is_default', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY,
+            required=False, description='true|false: only the default form / only non-default forms',
+        ),
+    ]),
+)
 class TicketFormViewSet(viewsets.ModelViewSet):
     """ViewSet for managing ticket forms."""
     queryset = TicketForm.objects.all().select_related(
@@ -2132,7 +2303,9 @@ class TicketFormViewSet(viewsets.ModelViewSet):
         'submissions',
     )
     serializer_class = TicketFormSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    # Reads for everyone authenticated; writes (incl. set_default) need
+    # staff/superuser or manage_settings.
+    permission_classes = [CanManageSettings]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['title', 'description']
     ordering = ['-created_at']
@@ -2163,6 +2336,10 @@ class TicketFormViewSet(viewsets.ModelViewSet):
             return TicketFormMinimalSerializer
         return TicketFormSerializer
 
+    @extend_schema(
+        summary='The default active form (or the first active one)',
+        responses={200: TicketFormSerializer, 404: OpenApiResponse(description='No forms found')},
+    )
     @action(detail=False, methods=['get'])
     def default(self, request):
         """Get the default form (uses the shared prefetched queryset)."""
@@ -2176,16 +2353,26 @@ class TicketFormViewSet(viewsets.ModelViewSet):
             return Response(serializer.data)
         return Response({'error': 'No forms found'}, status=status.HTTP_404_NOT_FOUND)
 
+    @extend_schema(
+        summary='Make this form the default form (staff or manage_settings)',
+        description='The request body is ignored.',
+        responses={
+            200: inline_serializer(
+                name='TicketFormSetDefaultResponse',
+                fields={'status': drf_serializers.CharField()},
+            ),
+            403: OpenApiResponse(description='Needs manage_settings or staff'),
+        },
+    )
     @action(detail=True, methods=['post'])
     def set_default(self, request, pk=None):
-        """Set this form as the default form."""
-        if not (request.user.is_staff or request.user.is_superuser):
-            return Response({'error': 'Only staff can set default form'}, status=status.HTTP_403_FORBIDDEN)
+        """Set this form as the default form (permission: CanManageSettings)."""
         form = self.get_object()
         form.is_default = True
         form.save()
         return Response({'status': 'default set'})
 
+    @extend_schema(responses={200: TicketFormSerializer})
     @action(detail=True, methods=['get'])
     def with_lists(self, request, pk=None):
         """Get form with full list details (including items)."""
@@ -2216,11 +2403,22 @@ class TicketFormSubmissionViewSet(viewsets.ModelViewSet):
                 Q(ticket__assigned_to=self.request.user) |
                 Q(ticket__assigned_users=self.request.user) |
                 Q(submitted_by=self.request.user)
-            )
+            ).distinct()
         
         return queryset
 
-    @action(detail=False, methods=['get'])
+    @extend_schema(
+        summary='Submissions of one form',
+        description='`form_id` is required (400 without it). Returns a plain array (not paginated).',
+        operation_id='form_submissions_by_form_retrieve',
+        filters=False,
+        parameters=[OpenApiParameter(
+            name='form_id', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY,
+            required=False, description='Form id (required; validated by the view)',
+        )],
+        responses={200: TicketFormSubmissionSerializer(many=True), 400: OpenApiResponse(description='form_id is required')},
+    )
+    @action(detail=False, methods=['get'], pagination_class=None)
     def by_form(self, request):
         """Get submissions grouped by form."""
         form_id = request.query_params.get('form_id')
@@ -2234,6 +2432,19 @@ class TicketFormSubmissionViewSet(viewsets.ModelViewSet):
         serializer = TicketFormSubmissionSerializer(queryset, many=True, context={'request': request})
         return Response(serializer.data)
 
+    @extend_schema(
+        summary='The latest submission for one ticket',
+        description='`ticket_id` is required (400 without it).',
+        parameters=[OpenApiParameter(
+            name='ticket_id', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY,
+            required=False, description='Ticket id (required; validated by the view)',
+        )],
+        responses={
+            200: TicketFormSubmissionSerializer,
+            400: OpenApiResponse(description='ticket_id is required'),
+            404: OpenApiResponse(description='Submission not found'),
+        },
+    )
     @action(detail=False, methods=['get'])
     def by_ticket(self, request):
         """Get submission for a specific ticket."""
@@ -2244,12 +2455,13 @@ class TicketFormSubmissionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        try:
-            submission = self.get_queryset().get(ticket_id=ticket_id)
-            serializer = TicketFormSubmissionSerializer(submission, context={'request': request})
-            return Response(serializer.data)
-        except TicketFormSubmission.DoesNotExist:
+        # A ticket can hold several submissions; .get() raised
+        # MultipleObjectsReturned (500). Return the newest one.
+        submission = self.get_queryset().filter(ticket_id=ticket_id).order_by('-submitted_at', '-id').first()
+        if submission is None:
             return Response({'error': 'Submission not found'}, status=status.HTTP_404_NOT_FOUND)
+        serializer = TicketFormSubmissionSerializer(submission, context={'request': request})
+        return Response(serializer.data)
 
 
 class TicketAttachmentViewSet(viewsets.ModelViewSet):

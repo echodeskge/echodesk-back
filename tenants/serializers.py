@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from drf_spectacular.utils import extend_schema_field
 from django.contrib.auth import get_user_model, authenticate
 from rest_framework.authtoken.models import Token
 from .models import Tenant, SavedCard, TenantSubscription, DashboardAppearanceSettings, SecurityLog, TenantIPWhitelist
@@ -524,3 +525,39 @@ class TenantIPWhitelistSerializer(serializers.ModelSerializer):
                 })
 
         return attrs
+
+
+class TenantSettingsSerializer(serializers.ModelSerializer):
+    """
+    GET/PATCH /api/tenant-settings/ — workspace settings a tenant admin can
+    change from the dashboard. ``logo`` is managed through the upload-logo /
+    remove-logo endpoints and ``company_name`` (the tenant name) is read-only.
+    """
+    logo = serializers.SerializerMethodField()
+    company_name = serializers.CharField(source='name', read_only=True)
+    min_users_per_ticket = serializers.IntegerField(
+        min_value=0, max_value=100,
+        help_text='Minimum users on a ticket after initial assignment (0 = no minimum)',
+    )
+    # Fields are marked required so the GET response schema lists them as
+    # always present; the only writer (PATCH) uses partial=True, so no field
+    # is required in requests.
+
+    class Meta:
+        model = Tenant
+        fields = (
+            'logo', 'company_name', 'min_users_per_ticket',
+            'only_superadmin_can_delete_tickets', 'preferred_language',
+        )
+        read_only_fields = ('logo', 'company_name')
+        extra_kwargs = {
+            'only_superadmin_can_delete_tickets': {'required': True},
+            'preferred_language': {'required': True},
+        }
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_logo(self, obj):
+        if not obj.logo:
+            return None
+        request = self.context.get('request')
+        return request.build_absolute_uri(obj.logo.url) if request else obj.logo.url
