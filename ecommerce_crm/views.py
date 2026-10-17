@@ -5,7 +5,7 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from .tokens import is_shop_token_for_current_tenant, issue_shop_tokens
 from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiParameter, inline_serializer
 from drf_spectacular.types import OpenApiTypes
-from django_filters.rest_framework import DjangoFilterBackend, FilterSet, CharFilter, NumberFilter, BooleanFilter
+from django_filters.rest_framework import DjangoFilterBackend, FilterSet, CharFilter, NumberFilter, BooleanFilter, ChoiceFilter
 from django.db.models import Q, F, Count, Avg
 from django.core.cache import cache
 from django.utils.decorators import method_decorator
@@ -43,6 +43,11 @@ class ProtectedDestroyMixin:
             )
 
 
+# Defined once: building a new inline_serializer per decorated destroy made
+# drf-spectacular warn about several components named EcommerceDeleteConflict.
+_DELETE_CONFLICT = inline_serializer('EcommerceDeleteConflict', fields={'error': serializers.CharField()})
+
+
 def _destroy_schema(tag, summary):
     return extend_schema(
         tags=[tag],
@@ -51,7 +56,7 @@ def _destroy_schema(tag, summary):
             204: OpenApiResponse(description='Deleted'),
             403: OpenApiResponse(description='Not allowed'),
             409: OpenApiResponse(
-                response=inline_serializer('EcommerceDeleteConflict', fields={'error': serializers.CharField()}),
+                response=_DELETE_CONFLICT,
                 description='Still referenced by orders',
             ),
         },
@@ -303,7 +308,23 @@ class ProductFilter(FilterSet):
     )
     status__in = CharFilter(method='filter_status', help_text='Comma-separated statuses, e.g. active,draft')
     in_stock = BooleanFilter(method='filter_in_stock')
-    low_stock = BooleanFilter(method='filter_low_stock')
+    low_stock = BooleanFilter(
+        method='filter_low_stock',
+        help_text='true: inventory-tracked and 0 < quantity <= low_stock_threshold (sold-out excluded)',
+    )
+    stock = ChoiceFilter(
+        method='filter_stock',
+        choices=(
+            ('low', 'low'),
+            ('out', 'out'),
+            ('low_or_out', 'low_or_out'),
+        ),
+        help_text=(
+            'Inventory-tracked products only. low: 0 < quantity <= low_stock_threshold '
+            '(same as low_stock=true); out: quantity <= 0 (sold out or oversold); '
+            'low_or_out: quantity <= low_stock_threshold (the daily low-stock digest set).'
+        ),
+    )
     attributes = CharFilter(method='filter_by_attributes')
 
     class Meta:
@@ -348,6 +369,16 @@ class ProductFilter(FilterSet):
                 quantity__lte=F('low_stock_threshold'),
                 quantity__gt=0
             )
+        return queryset
+
+    def filter_stock(self, queryset, name, value):
+        tracked = queryset.filter(track_inventory=True)
+        if value == 'low':
+            return tracked.filter(quantity__lte=F('low_stock_threshold'), quantity__gt=0)
+        if value == 'out':
+            return tracked.filter(quantity__lte=0)
+        if value == 'low_or_out':
+            return tracked.filter(quantity__lte=F('low_stock_threshold'))
         return queryset
 
     def filter_by_attributes(self, queryset, name, value):
@@ -627,10 +658,10 @@ class ProductViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMix
         request=inline_serializer(
             name='BulkProductUpdateRequest',
             fields={
-                'product_ids': serializers.ListField(child=serializers.IntegerField()),
+                'product_ids': serializers.ListField(child=serializers.IntegerField(min_value=1)),
                 'status': serializers.ChoiceField(choices=Product.STATUS_CHOICES, required=False),
                 'price': serializers.DecimalField(max_digits=10, decimal_places=2, min_value=0, required=False),
-                'quantity': serializers.IntegerField(required=False),
+                'quantity': serializers.IntegerField(required=False, min_value=0),
                 'is_featured': serializers.BooleanField(required=False),
             },
         ),
@@ -649,9 +680,25 @@ class ProductViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMix
         """Bulk update product status / price / quantity / featured flag"""
         from decimal import Decimal, InvalidOperation
 
-        product_ids = request.data.get('product_ids', [])
-        if not product_ids or not isinstance(product_ids, (list, tuple)):
+        raw_ids = request.data.get('product_ids', [])
+        if not raw_ids or not isinstance(raw_ids, (list, tuple)):
             return Response({'error': 'product_ids is required'}, status=status.HTTP_400_BAD_REQUEST)
+        product_ids = []
+        for raw in raw_ids:
+            if isinstance(raw, bool):
+                pid = None
+            elif isinstance(raw, int):
+                pid = raw
+            elif isinstance(raw, str) and raw.strip().isdigit():
+                pid = int(raw.strip())
+            else:
+                pid = None
+            if pid is None or pid <= 0:
+                return Response(
+                    {'error': 'product_ids must be a list of positive integers'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            product_ids.append(pid)
 
         updates = {}
         if 'status' in request.data and request.data.get('status') not in (None, ''):
@@ -671,10 +718,20 @@ class ProductViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMix
                 return Response({'error': 'Price cannot be negative'}, status=status.HTTP_400_BAD_REQUEST)
             updates['price'] = price.quantize(Decimal('0.01'))
         if request.data.get('quantity') not in (None, ''):
-            try:
-                updates['quantity'] = int(request.data.get('quantity'))
-            except (TypeError, ValueError):
-                return Response({'error': 'Invalid quantity'}, status=status.HTTP_400_BAD_REQUEST)
+            raw_qty = request.data.get('quantity')
+            if isinstance(raw_qty, bool):
+                quantity = None
+            elif isinstance(raw_qty, int):
+                quantity = raw_qty
+            elif isinstance(raw_qty, str) and raw_qty.strip().lstrip('-').isdigit():
+                quantity = int(raw_qty.strip())
+            else:
+                quantity = None
+            if quantity is None:
+                return Response({'error': 'Invalid quantity: send a whole number'}, status=status.HTTP_400_BAD_REQUEST)
+            if quantity < 0:
+                return Response({'error': 'Quantity cannot be negative'}, status=status.HTTP_400_BAD_REQUEST)
+            updates['quantity'] = quantity
         if 'is_featured' in request.data and request.data.get('is_featured') is not None:
             value = request.data.get('is_featured')
             if isinstance(value, str):
@@ -1875,6 +1932,13 @@ class OrderStatusError(Exception):
     """A status change that is not allowed (message is user-facing)."""
 
 
+class OrderStatusPermissionError(OrderStatusError):
+    """A status change this user may not make (answered with 403)."""
+
+
+PAID_CANCEL_MANAGER_ERROR = 'Only managers can cancel a paid order.'
+
+
 def _refund_order(order):
     """Mark ``order`` refunded, put its stock back and free its promo use.
 
@@ -1907,7 +1971,7 @@ def _refund_order(order):
     return order
 
 
-def _apply_order_status(order, new_status, actor=None, data=None):
+def _apply_order_status(order, new_status, actor=None, data=None, can_cancel_paid=True):
     """Move ``order`` to ``new_status`` the way every admin path must.
 
     * cancelled and refunded orders are final (their stock is already back);
@@ -1917,47 +1981,81 @@ def _apply_order_status(order, new_status, actor=None, data=None):
     * other statuses stamp their timestamp, and ``shipped`` accepts
       tracking_number / courier_provider / estimated_delivery_date.
 
+    The order row is locked and re-read before the status is checked, so a
+    refund or cancel that committed in the meantime is seen (no double
+    restock, no refunded -> cancelled flip). ``order`` is refreshed in place.
+    With ``can_cancel_paid=False`` cancelling a paid order raises
+    OrderStatusPermissionError (checked on the locked, fresh row).
+
     Returns the e-mail type to send ('shipped' / 'delivered') or None.
     Raises OrderStatusError for a change that is not allowed.
     """
+    from django.db import transaction
     from django.utils import timezone
 
     data = data or {}
     if new_status not in dict(Order.STATUS_CHOICES):
         raise OrderStatusError('Invalid status')
 
-    if order.status in ORDER_TERMINAL_STATUSES:
-        if new_status == order.status:
+    with transaction.atomic():
+        Order.objects.select_for_update().only('pk').get(pk=order.pk)
+        order.refresh_from_db()
+
+        if order.status in ORDER_TERMINAL_STATUSES:
+            if new_status == order.status:
+                return None
+            raise OrderStatusError(
+                f'This order is {order.status}; its status can no longer be changed.'
+            )
+
+        if new_status == 'cancelled':
+            if not can_cancel_paid and _cancel_needs_manager(order, new_status):
+                raise OrderStatusPermissionError(PAID_CANCEL_MANAGER_ERROR)
+            who = ''
+            if actor is not None:
+                who = getattr(actor, 'email', '') or str(actor)
+            order.cancel(reason=f'Cancelled by {who}' if who else 'Cancelled by staff')
             return None
-        raise OrderStatusError(
-            f'This order is {order.status}; its status can no longer be changed.'
-        )
 
-    if new_status == 'cancelled':
-        who = ''
-        if actor is not None:
-            who = getattr(actor, 'email', '') or str(actor)
-        order.cancel(reason=f'Cancelled by {who}' if who else 'Cancelled by staff')
-        return None
+        if new_status == 'refunded':
+            _refund_order(order)
+            return None
 
-    if new_status == 'refunded':
-        _refund_order(order)
-        return None
-
-    previous = order.status
-    order.status = new_status
-    ts_field = _ORDER_STATUS_TIMESTAMPS.get(new_status)
-    if ts_field and not getattr(order, ts_field):
-        setattr(order, ts_field, timezone.now())
-    if new_status == 'shipped':
-        for field in ('tracking_number', 'courier_provider', 'estimated_delivery_date'):
-            value = data.get(field)
-            if value:
-                setattr(order, field, value)
-    order.save()
+        previous = order.status
+        order.status = new_status
+        ts_field = _ORDER_STATUS_TIMESTAMPS.get(new_status)
+        if ts_field and not getattr(order, ts_field):
+            setattr(order, ts_field, timezone.now())
+        if new_status == 'shipped':
+            for field in ('tracking_number', 'courier_provider', 'estimated_delivery_date'):
+                value = data.get(field)
+                if value:
+                    setattr(order, field, value)
+        order.save()
 
     if new_status != previous and new_status in ('shipped', 'delivered'):
         return new_status
+    return None
+
+
+def _cancel_needs_manager(order, new_status):
+    """Cancelling a paid order restocks and frees the promo with no money
+    returned, and it is final, so only e-commerce managers may do it."""
+    return new_status == 'cancelled' and order.status != 'cancelled' and order.payment_status == 'paid'
+
+
+_PAYMENT_TERMINAL_STATUSES = ('refunded', 'partially_refunded')
+
+
+def _payment_callback_blocked(order):
+    """Why a gateway callback must not touch ``order`` (None when it may).
+
+    Cancelled / refunded orders are final and a refunded payment must never
+    flip back to paid or failed; the callback is logged and ignored."""
+    if order.status in ORDER_TERMINAL_STATUSES:
+        return order.status
+    if order.payment_status in _PAYMENT_TERMINAL_STATUSES:
+        return order.payment_status
     return None
 
 
@@ -2223,6 +2321,19 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
         return super().partial_update(request, *args, **kwargs)
 
     def perform_update(self, serializer):
+        from django.db import transaction
+
+        with transaction.atomic():
+            # Lock and re-read the status so a refund/cancel that committed
+            # after get_object() is not overwritten by serializer.save().
+            locked = Order.objects.select_for_update().only('pk', 'status', 'payment_status').get(
+                pk=serializer.instance.pk
+            )
+            serializer.instance.status = locked.status
+            serializer.instance.payment_status = locked.payment_status
+            self._perform_update_locked(serializer)
+
+    def _perform_update_locked(self, serializer):
         instance = serializer.instance
         new_status = serializer.validated_data.get('status')
         if new_status is None or new_status == instance.status:
@@ -2258,7 +2369,8 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
             'Change order status. Optionally include tracking_number, courier_provider and '
             'estimated_delivery_date when setting status to shipped. "cancelled" restocks the '
             'items and releases the promo code use (same as a customer cancel). "refunded" '
-            'runs the refund flow and needs manager rights. Cancelled and refunded orders '
+            'runs the refund flow and needs manager rights. Cancelling a PAID order also needs '
+            'manager rights (403 otherwise). Cancelled and refunded orders '
             'cannot change status (400). Sends the shipped/delivered customer e-mails.'
         ),
         request=inline_serializer(
@@ -2273,7 +2385,7 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
         responses={
             200: OrderSerializer,
             400: OpenApiResponse(response=_ORDER_ERROR, description='Missing/invalid status or a status change that is not allowed'),
-            403: OpenApiResponse(description='No access (refunded needs manager rights)'),
+            403: OpenApiResponse(response=_ORDER_ERROR, description='No access (refunded, and cancelled on a paid order, need manager rights)'),
         },
     )
     @action(detail=True, methods=['post'])
@@ -2296,8 +2408,17 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        is_manager = is_ecommerce_manager(request.user)
+        if _cancel_needs_manager(order, new_status) and not is_manager:
+            return Response({'error': PAID_CANCEL_MANAGER_ERROR}, status=status.HTTP_403_FORBIDDEN)
+
         try:
-            email_type = _apply_order_status(order, new_status, actor=request.user, data=request.data)
+            email_type = _apply_order_status(
+                order, new_status, actor=request.user, data=request.data,
+                can_cancel_paid=is_manager,
+            )
+        except OrderStatusPermissionError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_403_FORBIDDEN)
         except OrderStatusError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -2330,9 +2451,17 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
     @action(detail=True, methods=['post'], url_path='mark-paid')
     def mark_paid(self, request, pk=None):
         """Mark an order as paid (for cash on delivery or manual payment confirmation)"""
-        from django.utils import timezone as tz
+        from django.db import transaction
 
         order = self.get_object()
+        with transaction.atomic():
+            # Re-read under the row lock: a refund/cancel committed after
+            # get_object() must not be flipped back to paid.
+            order = Order.objects.select_for_update().get(pk=order.pk)
+            return self._mark_paid_locked(request, order)
+
+    def _mark_paid_locked(self, request, order):
+        from django.utils import timezone as tz
 
         if order.payment_status == 'paid':
             return Response({'error': 'Order is already marked as paid'}, status=status.HTTP_400_BAD_REQUEST)
@@ -2359,13 +2488,19 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
 
         order.save()
 
-        # Book Quickshipper courier (no-op if not configured for tenant)
-        try:
-            from .tasks import book_quickshipper_courier
-            from django.db import connection as _db_conn
-            book_quickshipper_courier.delay(_db_conn.schema_name, order.id)
-        except Exception:
-            pass
+        # Book Quickshipper courier (no-op if not configured for tenant),
+        # once the paid state has committed.
+        from django.db import connection as _db_conn, transaction
+        _schema, _order_id = _db_conn.schema_name, order.id
+
+        def _book_courier():
+            try:
+                from .tasks import book_quickshipper_courier
+                book_quickshipper_courier.delay(_schema, _order_id)
+            except Exception:
+                pass
+
+        transaction.on_commit(_book_courier)
 
         serializer = self.get_serializer(order)
         return Response(serializer.data)
@@ -2687,11 +2822,23 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        from .permissions import is_ecommerce_manager
+        is_manager = is_ecommerce_manager(request.user)
+        if not is_manager:
+            paid_ids = [o.id for o in orders if _cancel_needs_manager(o, new_status)]
+            if paid_ids:
+                return Response(
+                    {'error': f'{PAID_CANCEL_MANAGER_ERROR} Paid orders: {paid_ids}'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
         updated_orders = []
         skipped = []
         for order in orders:
             try:
-                email_type = _apply_order_status(order, new_status, actor=request.user)
+                email_type = _apply_order_status(
+                    order, new_status, actor=request.user, can_cancel_paid=is_manager,
+                )
             except OrderStatusError as exc:
                 skipped.append({'id': order.id, 'error': str(exc)})
                 continue
@@ -3079,14 +3226,15 @@ def ecommerce_payment_webhook(request):
                 # BOG confirmed payment but we had cancelled the order (e.g. the
                 # abandoned-order sweeper already restocked it). Money moved, so
                 # don't silently confirm or silently drop — escalate for a human.
-                if order.status == 'cancelled':
+                blocked = _payment_callback_blocked(order)
+                if blocked:
                     logger.error(
-                        'BOG CONFIRMED payment for CANCELLED order %s (bog_order_id=%s) — '
-                        'manual reconciliation required', external_order_id, bog_order_id
+                        'BOG CONFIRMED payment for %s order %s (bog_order_id=%s) — '
+                        'ignored, manual reconciliation required', blocked.upper(), external_order_id, bog_order_id
                     )
                     return Response({
                         'status': 'conflict',
-                        'message': 'Order was cancelled; manual reconciliation required'
+                        'message': f'Order was {blocked}; manual reconciliation required'
                     }, status=status.HTTP_200_OK)
 
                 # Mark paid + auto-confirm.
@@ -3147,6 +3295,9 @@ def ecommerce_payment_webhook(request):
                 if order.payment_status == 'paid':
                     logger.warning('Ignoring rejected webhook for already-paid order %s', external_order_id)
                     return Response({'status': 'ignored', 'message': 'Order already paid'}, status=status.HTTP_200_OK)
+                if order.payment_status in _PAYMENT_TERMINAL_STATUSES or order.status == 'refunded':
+                    logger.warning('Ignoring rejected webhook for refunded order %s', external_order_id)
+                    return Response({'status': 'ignored', 'message': 'Order refunded'}, status=status.HTTP_200_OK)
                 order.payment_status = 'failed'
                 order.payment_metadata.update({
                     'bog_status': bog_status,
@@ -3237,14 +3388,15 @@ def tbc_payment_webhook(request):
                         'message': 'Payment already processed'
                     }, status=status.HTTP_200_OK)
 
-                if order.status == 'cancelled':
+                blocked = _payment_callback_blocked(order)
+                if blocked:
                     logger.error(
-                        'TBC confirmed payment for CANCELLED order %s — manual reconciliation required',
-                        merchant_payment_id
+                        'TBC confirmed payment for %s order %s — ignored, manual reconciliation required',
+                        blocked.upper(), merchant_payment_id
                     )
                     return Response({
                         'status': 'conflict',
-                        'message': 'Order was cancelled; manual reconciliation required'
+                        'message': f'Order was {blocked}; manual reconciliation required'
                     }, status=status.HTTP_200_OK)
 
                 order.payment_status = 'paid'
@@ -3298,6 +3450,9 @@ def tbc_payment_webhook(request):
                 if order.payment_status == 'paid':
                     logger.warning('Ignoring failed TBC webhook for already-paid order %s', merchant_payment_id)
                     return Response({'status': 'ignored', 'message': 'Order already paid'}, status=status.HTTP_200_OK)
+                if order.payment_status in _PAYMENT_TERMINAL_STATUSES or order.status == 'refunded':
+                    logger.warning('Ignoring failed TBC webhook for refunded order %s', merchant_payment_id)
+                    return Response({'status': 'ignored', 'message': 'Order refunded'}, status=status.HTTP_200_OK)
                 order.payment_status = 'failed'
                 order.payment_metadata.update({
                     'tbc_pay_id': pay_id,
@@ -3398,14 +3553,15 @@ def flitt_payment_webhook(request):
                         'message': 'Payment already processed'
                     }, status=status.HTTP_200_OK)
 
-                if order.status == 'cancelled':
+                blocked = _payment_callback_blocked(order)
+                if blocked:
                     logger.error(
-                        'Flitt confirmed payment for CANCELLED order %s — manual reconciliation required',
-                        order_id
+                        'Flitt confirmed payment for %s order %s — ignored, manual reconciliation required',
+                        blocked.upper(), order_id
                     )
                     return Response({
                         'status': 'conflict',
-                        'message': 'Order was cancelled; manual reconciliation required'
+                        'message': f'Order was {blocked}; manual reconciliation required'
                     }, status=status.HTTP_200_OK)
 
                 order.payment_status = 'paid'
@@ -3464,6 +3620,9 @@ def flitt_payment_webhook(request):
                 if order.payment_status == 'paid':
                     logger.warning('Ignoring failed Flitt webhook for already-paid order %s', order_id)
                     return Response({'status': 'ignored', 'message': 'Order already paid'}, status=status.HTTP_200_OK)
+                if order.payment_status in _PAYMENT_TERMINAL_STATUSES or order.status == 'refunded':
+                    logger.warning('Ignoring failed Flitt webhook for refunded order %s', order_id)
+                    return Response({'status': 'ignored', 'message': 'Order refunded'}, status=status.HTTP_200_OK)
                 order.payment_status = 'failed'
                 order.payment_metadata.update({
                     'flitt_payment_id': payment_id,
@@ -4904,42 +5063,48 @@ def quickshipper_webhook(request):
     if order is None:
         return Response({'error': 'Order not matched'}, status=status.HTTP_404_NOT_FOUND)
 
-    update_fields = []
-    if qs_order_id and not order.tracking_number:
-        order.tracking_number = str(qs_order_id)
-        update_fields.append('tracking_number')
-    if not order.courier_provider:
-        order.courier_provider = 'quickshipper'
-        update_fields.append('courier_provider')
+    from django.db import transaction
 
-    # Map upstream status to our local lifecycle. Only progress forward —
-    # never rewind from delivered → shipped, never overwrite cancelled.
-    status_normalized = new_status.lower()
-    now = timezone.now()
-    email_type = None
-    cancel_order = False
-    if status_normalized in {'pickedup', 'picked_up', 'pickup', 'inprogress', 'in_progress', 'delivering', 'shipping'} and order.status not in ('shipped', 'delivered', 'cancelled', 'refunded'):
-        order.status = 'shipped'
-        order.shipped_at = order.shipped_at or now
-        update_fields += ['status', 'shipped_at']
-        email_type = 'shipped'
-    elif status_normalized in {'delivered', 'finished', 'completed'} and order.status not in ('delivered', 'cancelled', 'refunded'):
-        order.status = 'delivered'
-        order.delivered_at = order.delivered_at or now
-        order.shipped_at = order.shipped_at or now
-        update_fields += ['status', 'delivered_at', 'shipped_at']
-        email_type = 'delivered'
-    elif status_normalized in {'cancelled', 'canceled', 'rejected', 'failed'} and order.status not in ('delivered', 'refunded', 'cancelled'):
-        # Through Order.cancel(): restock + promo release under a row lock.
-        cancel_order = True
+    with transaction.atomic():
+        # Re-read the status under the row lock so a refund/cancel that
+        # committed after the lookup above is respected.
+        order = Order.objects.select_for_update().get(pk=order.pk)
+        update_fields = []
+        if qs_order_id and not order.tracking_number:
+            order.tracking_number = str(qs_order_id)
+            update_fields.append('tracking_number')
+        if not order.courier_provider:
+            order.courier_provider = 'quickshipper'
+            update_fields.append('courier_provider')
 
-    if update_fields:
-        order.updated_at = now
-        update_fields.append('updated_at')
-        order.save(update_fields=list(set(update_fields)))
+        # Map upstream status to our local lifecycle. Only progress forward —
+        # never rewind from delivered → shipped, never overwrite cancelled.
+        status_normalized = new_status.lower()
+        now = timezone.now()
+        email_type = None
+        cancel_order = False
+        if status_normalized in {'pickedup', 'picked_up', 'pickup', 'inprogress', 'in_progress', 'delivering', 'shipping'} and order.status not in ('shipped', 'delivered', 'cancelled', 'refunded'):
+            order.status = 'shipped'
+            order.shipped_at = order.shipped_at or now
+            update_fields += ['status', 'shipped_at']
+            email_type = 'shipped'
+        elif status_normalized in {'delivered', 'finished', 'completed'} and order.status not in ('delivered', 'cancelled', 'refunded'):
+            order.status = 'delivered'
+            order.delivered_at = order.delivered_at or now
+            order.shipped_at = order.shipped_at or now
+            update_fields += ['status', 'delivered_at', 'shipped_at']
+            email_type = 'delivered'
+        elif status_normalized in {'cancelled', 'canceled', 'rejected', 'failed'} and order.status not in ('delivered', 'refunded', 'cancelled'):
+            # Through Order.cancel(): restock + promo release under a row lock.
+            cancel_order = True
 
-    if cancel_order:
-        order.cancel(reason=f'Courier reported {new_status}')
+        if update_fields:
+            order.updated_at = now
+            update_fields.append('updated_at')
+            order.save(update_fields=list(set(update_fields)))
+
+        if cancel_order:
+            order.cancel(reason=f'Courier reported {new_status}')
 
     _send_order_status_email(order, email_type)
 

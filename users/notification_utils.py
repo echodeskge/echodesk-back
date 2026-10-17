@@ -209,6 +209,10 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
                 'sender_id': notification.metadata.get('sender_id'),
                 # Missed-call pushes open the call detail.
                 'call_log_id': notification.metadata.get('call_log_id'),
+                # E-commerce pushes: the order (order created / paid) or the
+                # single low-stock product (null for a multi-product digest).
+                'order_id': notification.metadata.get('order_id'),
+                'product_id': notification.metadata.get('product_id'),
                 # Social inbox pushes: lowercase platform key, platform-side
                 # account id and the prefixed inbox chat id (fb_/ig_/wa_/
                 # tg_/widget_<account>_<key>) so a tap needs no URL parsing.

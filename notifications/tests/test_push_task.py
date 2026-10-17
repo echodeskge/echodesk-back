@@ -187,7 +187,7 @@ class TestCreateNotificationDispatch(EchoDeskTenantTestCase):
         self.assertEqual(set(data.keys()), {
             'notification_id', 'notification_type', 'link_url', 'url',
             'ticket_id', 'leave_request_id', 'conversation_id', 'sender_id',
-            'call_log_id',
+            'call_log_id', 'order_id', 'product_id',
             'platform', 'account_id', 'chat_id',
             'ticket_id', 'leave_request_id', 'booking_id', 'conversation_id', 'sender_id',
         })
@@ -203,6 +203,38 @@ class TestCreateNotificationDispatch(EchoDeskTenantTestCase):
         self.assertEqual(data['url'], '/leave/team-requests?id=42')
         self.assertIsNone(data['ticket_id'])
         self.assertEqual(data['leave_request_id'], 42)
+
+    @_ws_patch
+    @patch('notifications.tasks.deliver_push_notification_task.delay')
+    def test_ecommerce_push_carries_order_and_product_ids(self, mock_delay, mock_ws):
+        DevicePushToken.objects.create(
+            user=self.user, token='ExponentPushToken[ecom]', platform='android',
+        )
+        create_notification(
+            user=self.user,
+            notification_type='ecommerce_order_paid',
+            title='Order ORD-1 paid',
+            message='paid',
+            metadata={'order_id': 77, 'order_number': 'ORD-1'},
+            link_url='/ecommerce/orders/77',
+        )
+        data = mock_delay.call_args.kwargs['data']
+        self.assertEqual(data['order_id'], 77)
+        self.assertIsNone(data['product_id'])
+        self.assertEqual(data['url'], '/ecommerce/orders/77')
+
+        mock_delay.reset_mock()
+        create_notification(
+            user=self.user,
+            notification_type='ecommerce_low_stock',
+            title='Low stock: Mug',
+            message='MUG has 1 left',
+            metadata={'product_id': 5, 'product_ids': [5], 'count': 1},
+            link_url='/ecommerce/products/5',
+        )
+        data = mock_delay.call_args.kwargs['data']
+        self.assertEqual(data['product_id'], 5)
+        self.assertIsNone(data['order_id'])
 
     @_ws_patch
     @patch('notifications.tasks.deliver_push_notification_task.delay')

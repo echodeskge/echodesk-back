@@ -11,7 +11,10 @@ Types (users.Notification.NOTIFICATION_TYPES):
 * ``ecommerce_low_stock``: daily low-stock digest (tasks.check_low_stock_products).
 
 Deep links: ``/ecommerce/orders/<id>``, ``/ecommerce/products/<id>`` (one
-product) or ``/ecommerce/products?low_stock=true`` (several).
+product) or ``/ecommerce/products?stock=low_or_out&status=active`` (several).
+The list link uses exactly the digest's set (active, inventory-tracked,
+quantity <= low_stock_threshold, sold-out and oversold included), so the
+admin products list opened with those params shows the same products.
 
 Recipients (``ecommerce_notification_recipients``): active users who can
 use the e-commerce module (superuser, staff of a tenant whose plan has the
@@ -126,7 +129,8 @@ def product_link(product_id):
     return f'/ecommerce/products/{product_id}'
 
 
-LOW_STOCK_LIST_LINK = '/ecommerce/products?low_stock=true'
+# Same query params the admin products list takes (ProductFilter.stock).
+LOW_STOCK_LIST_LINK = '/ecommerce/products?stock=low_or_out&status=active'
 
 
 def notify_order_created(order):
