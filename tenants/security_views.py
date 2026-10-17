@@ -10,7 +10,8 @@ from django.db.models.functions import TruncDate
 from django.utils import timezone
 from datetime import timedelta
 from tenant_schemas.utils import get_public_schema_name
-from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse, inline_serializer
+from rest_framework import serializers
 from drf_spectacular.openapi import OpenApiTypes
 
 from .models import SecurityLog, TenantIPWhitelist, Tenant
@@ -34,6 +35,103 @@ class IsSuperUser(permissions.BasePermission):
         return request.user and request.user.is_superuser
 
 
+class IsStaffOrSuperUser(permissions.BasePermission):
+    """
+    Staff or superusers: the same rule the dashboard uses to show the
+    Security settings page (``is_staff || is_superuser``).
+    """
+    def has_permission(self, request, view):
+        user = request.user
+        return bool(user and user.is_authenticated and (user.is_staff or user.is_superuser))
+
+
+ERROR_SCHEMA = inline_serializer(name='SecurityErrorResponse', fields={'error': serializers.CharField()})
+
+PAGINATED_SECURITY_LOGS = inline_serializer(
+    name='PaginatedSecurityLogList',
+    fields={
+        'count': serializers.IntegerField(),
+        'next': serializers.URLField(allow_null=True),
+        'previous': serializers.URLField(allow_null=True),
+        'results': SecurityLogSerializer(many=True),
+    },
+)
+
+IP_WHITELIST_STATE = inline_serializer(
+    name='IPWhitelistState',
+    fields={
+        'ip_whitelist_enabled': serializers.BooleanField(),
+        'superadmin_bypass_whitelist': serializers.BooleanField(),
+        'message': serializers.CharField(),
+    },
+)
+
+IP_WHITELIST_LOCKOUT = inline_serializer(
+    name='IPWhitelistLockoutError',
+    fields={
+        'error': serializers.CharField(),
+        'code': serializers.ChoiceField(choices=['no_active_entries', 'would_lock_out']),
+        'ip_address': serializers.CharField(required=False),
+    },
+)
+
+
+def _would_lock_out(request, tenant, enabled, bypass, exclude_entry_id=None, entry_overrides=None):
+    """
+    True when the whitelist would end up enabled and the caller's own IP
+    would no longer be let through (and no superuser bypass covers them).
+    """
+    if not enabled:
+        return False
+    if bypass and request.user.is_superuser:
+        return False
+    client_ip = SecurityService.get_client_ip(request)
+    return not SecurityService.ip_matches_whitelist(
+        tenant, client_ip, exclude_entry_id=exclude_entry_id, entry_overrides=entry_overrides,
+    )
+
+
+_TRUE_STRINGS = ('true', '1', 'yes', 'on')
+_FALSE_STRINGS = ('false', '0', 'no', 'off')
+
+
+def _parse_optional_bool(value):
+    """
+    Request booleans from JSON or form bodies: ``None`` stays ``None``;
+    real booleans pass; the usual strings map to True/False. Anything else
+    raises ``ValueError`` (so ``'false'`` never counts as truthy).
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        value = value[0]
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUE_STRINGS:
+            return True
+        if lowered in _FALSE_STRINGS:
+            return False
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise ValueError(value)
+
+
+def _lockout_response(request):
+    client_ip = SecurityService.get_client_ip(request)
+    return Response(
+        {
+            'error': (
+                f'Your current IP address ({client_ip}) is not in the active whitelist, so this '
+                'change would lock you out. Add your IP (or a range that contains it) first, '
+                'or turn on the superadmin bypass if you are a superuser.'
+            ),
+            'code': 'would_lock_out',
+            'ip_address': client_ip,
+        },
+        status=status.HTTP_400_BAD_REQUEST,
+    )
+
+
 # ============================================================
 # Security Logs Endpoints
 # ============================================================
@@ -41,7 +139,7 @@ class IsSuperUser(permissions.BasePermission):
 @extend_schema(
     operation_id='list_security_logs',
     summary='List Security Logs',
-    description='Get paginated list of security logs with filtering options. Superadmin only.',
+    description='Get paginated list of security logs with filtering options. Staff or superuser only.',
     parameters=[
         OpenApiParameter('event_type', OpenApiTypes.STR, description='Filter by event type (login_success, login_failed, logout, token_expired)'),
         OpenApiParameter('user_id', OpenApiTypes.INT, description='Filter by user ID'),
@@ -53,13 +151,13 @@ class IsSuperUser(permissions.BasePermission):
         OpenApiParameter('page_size', OpenApiTypes.INT, description='Items per page (max 200)'),
     ],
     responses={
-        200: OpenApiResponse(description='Paginated list of security logs'),
-        403: OpenApiResponse(description='Not superadmin or not from tenant domain')
+        200: PAGINATED_SECURITY_LOGS,
+        403: OpenApiResponse(description='Not staff/superuser or not from tenant domain')
     },
     tags=['Security']
 )
 @api_view(['GET'])
-@permission_classes([permissions.IsAuthenticated, IsSuperUser])
+@permission_classes([permissions.IsAuthenticated, IsStaffOrSuperUser])
 def list_security_logs(request):
     """List all security logs with filtering and pagination"""
     if not hasattr(request, 'tenant') or request.tenant.schema_name == get_public_schema_name():
@@ -113,34 +211,47 @@ def list_security_logs(request):
 @extend_schema(
     operation_id='security_logs_stats',
     summary='Get Security Logs Statistics',
-    description='Get security event statistics for the dashboard. Superadmin only.',
+    description='Get security event statistics for the dashboard. Staff or superuser only.',
     parameters=[
         OpenApiParameter('days', OpenApiTypes.INT, description='Number of days to include (default 30)'),
     ],
     responses={
-        200: OpenApiResponse(
-            description='Security statistics',
-            response={
-                'type': 'object',
-                'properties': {
-                    'total_logins': {'type': 'integer'},
-                    'failed_logins': {'type': 'integer'},
-                    'unique_ips': {'type': 'integer'},
-                    'unique_users': {'type': 'integer'},
-                    'by_event_type': {'type': 'object'},
-                    'by_device_type': {'type': 'object'},
-                    'by_date': {'type': 'array'},
-                    'recent_failed_logins': {'type': 'array'},
-                    'top_ips': {'type': 'array'}
-                }
-            }
+        200: inline_serializer(
+            name='SecurityLogsStats',
+            fields={
+                'total_logins': serializers.IntegerField(),
+                'failed_logins': serializers.IntegerField(),
+                'unique_ips': serializers.IntegerField(),
+                'unique_users': serializers.IntegerField(),
+                'by_event_type': serializers.DictField(child=serializers.IntegerField()),
+                'by_device_type': serializers.DictField(child=serializers.IntegerField()),
+                'by_date': inline_serializer(
+                    name='SecurityLogsStatsDay', many=True,
+                    fields={
+                        'date': serializers.DateField(),
+                        'login_success': serializers.IntegerField(),
+                        'login_failed': serializers.IntegerField(),
+                        'logout': serializers.IntegerField(),
+                    },
+                ),
+                'recent_failed_logins': SecurityLogSerializer(many=True),
+                'top_ips': inline_serializer(
+                    name='SecurityLogsStatsTopIp', many=True,
+                    fields={
+                        'ip_address': serializers.CharField(),
+                        'count': serializers.IntegerField(),
+                    },
+                ),
+                'period_days': serializers.IntegerField(),
+            },
         ),
-        403: OpenApiResponse(description='Not superadmin or not from tenant domain')
+        400: ERROR_SCHEMA,
+        403: OpenApiResponse(description='Not staff/superuser or not from tenant domain')
     },
     tags=['Security']
 )
 @api_view(['GET'])
-@permission_classes([permissions.IsAuthenticated, IsSuperUser])
+@permission_classes([permissions.IsAuthenticated, IsStaffOrSuperUser])
 def security_logs_stats(request):
     """Get security logs statistics for dashboard"""
     if not hasattr(request, 'tenant') or request.tenant.schema_name == get_public_schema_name():
@@ -149,7 +260,12 @@ def security_logs_stats(request):
             status=status.HTTP_403_FORBIDDEN
         )
 
-    days = int(request.GET.get('days', 30))
+    try:
+        days = int(request.GET.get('days', 30))
+    except (TypeError, ValueError):
+        return Response({'error': 'days must be an integer'}, status=status.HTTP_400_BAD_REQUEST)
+    if days < 1 or days > 3650:
+        return Response({'error': 'days must be between 1 and 3650'}, status=status.HTTP_400_BAD_REQUEST)
     since_date = timezone.now() - timedelta(days=days)
 
     # Filter by current tenant
@@ -214,7 +330,7 @@ def security_logs_stats(request):
         OpenApiParameter('page_size', OpenApiTypes.INT, description='Items per page (max 100)'),
     ],
     responses={
-        200: OpenApiResponse(description='User security logs'),
+        200: PAGINATED_SECURITY_LOGS,
         403: OpenApiResponse(description='Not from tenant domain')
     },
     tags=['Security']
@@ -248,25 +364,25 @@ def my_security_logs(request):
 @extend_schema(
     operation_id='list_ip_whitelist',
     summary='List IP Whitelist',
-    description='Get all IP whitelist entries for the tenant. Superadmin only.',
+    description='Get all IP whitelist entries for the tenant. Staff or superuser only.',
     responses={
         200: OpenApiResponse(
             description='IP whitelist entries with tenant settings',
-            response={
-                'type': 'object',
-                'properties': {
-                    'ip_whitelist_enabled': {'type': 'boolean'},
-                    'superadmin_bypass_whitelist': {'type': 'boolean'},
-                    'entries': {'type': 'array'}
-                }
-            }
+            response=inline_serializer(
+                name='IPWhitelistList',
+                fields={
+                    'ip_whitelist_enabled': serializers.BooleanField(),
+                    'superadmin_bypass_whitelist': serializers.BooleanField(),
+                    'entries': TenantIPWhitelistSerializer(many=True),
+                },
+            ),
         ),
-        403: OpenApiResponse(description='Not superadmin or not from tenant domain')
+        403: OpenApiResponse(description='Not staff/superuser or not from tenant domain')
     },
     tags=['Security']
 )
 @api_view(['GET'])
-@permission_classes([permissions.IsAuthenticated, IsSuperUser])
+@permission_classes([permissions.IsAuthenticated, IsStaffOrSuperUser])
 def list_ip_whitelist(request):
     """List all IP whitelist entries for the tenant"""
     if not hasattr(request, 'tenant') or request.tenant.schema_name == get_public_schema_name():
@@ -288,17 +404,17 @@ def list_ip_whitelist(request):
 @extend_schema(
     operation_id='create_ip_whitelist',
     summary='Create IP Whitelist Entry',
-    description='Add a new IP address or range to the whitelist. Superadmin only.',
+    description='Add a new IP address or range to the whitelist. Staff or superuser only.',
     request=TenantIPWhitelistSerializer,
     responses={
         201: TenantIPWhitelistSerializer,
         400: OpenApiResponse(description='Validation error'),
-        403: OpenApiResponse(description='Not superadmin or not from tenant domain')
+        403: OpenApiResponse(description='Not staff/superuser or not from tenant domain')
     },
     tags=['Security']
 )
 @api_view(['POST'])
-@permission_classes([permissions.IsAuthenticated, IsSuperUser])
+@permission_classes([permissions.IsAuthenticated, IsStaffOrSuperUser])
 def create_ip_whitelist(request):
     """Create a new IP whitelist entry"""
     if not hasattr(request, 'tenant') or request.tenant.schema_name == get_public_schema_name():
@@ -335,18 +451,24 @@ def create_ip_whitelist(request):
 @extend_schema(
     operation_id='manage_ip_whitelist',
     summary='Update or Delete IP Whitelist Entry',
-    description='Update or delete an IP whitelist entry. Superadmin only.',
+    description=(
+        'Update or delete an IP whitelist entry. Staff or superuser only. While the whitelist '
+        "is enabled, a change that would stop letting the caller's current IP through "
+        '(deleting, deactivating or re-addressing the entry that covers it) is refused with '
+        '400 `code: would_lock_out`, unless the caller is a superuser and the bypass is on.'
+    ),
     request=TenantIPWhitelistSerializer,
     responses={
         200: TenantIPWhitelistSerializer,
         204: OpenApiResponse(description='Entry deleted'),
-        403: OpenApiResponse(description='Not superadmin or not from tenant domain'),
+        400: IP_WHITELIST_LOCKOUT,
+        403: OpenApiResponse(description='Not staff/superuser or not from tenant domain'),
         404: OpenApiResponse(description='Entry not found')
     },
     tags=['Security']
 )
 @api_view(['PUT', 'PATCH', 'DELETE'])
-@permission_classes([permissions.IsAuthenticated, IsSuperUser])
+@permission_classes([permissions.IsAuthenticated, IsStaffOrSuperUser])
 def manage_ip_whitelist(request, pk):
     """Update or delete an IP whitelist entry"""
     if not hasattr(request, 'tenant') or request.tenant.schema_name == get_public_schema_name():
@@ -363,7 +485,11 @@ def manage_ip_whitelist(request, pk):
             status=status.HTTP_404_NOT_FOUND
         )
 
+    tenant = request.tenant
     if request.method == 'DELETE':
+        if _would_lock_out(request, tenant, tenant.ip_whitelist_enabled,
+                           tenant.superadmin_bypass_whitelist, exclude_entry_id=entry.pk):
+            return _lockout_response(request)
         ip_info = f"{entry.ip_address}/{entry.cidr_notation}" if entry.cidr_notation else entry.ip_address
         entry.delete()
         logger.info(f"IP whitelist entry deleted by {request.user.email}: {ip_info}")
@@ -372,6 +498,10 @@ def manage_ip_whitelist(request, pk):
     # PUT or PATCH
     serializer = TenantIPWhitelistSerializer(entry, data=request.data, partial=(request.method == 'PATCH'))
     if serializer.is_valid():
+        if _would_lock_out(request, tenant, tenant.ip_whitelist_enabled,
+                           tenant.superadmin_bypass_whitelist,
+                           entry_overrides={entry.pk: serializer.validated_data}):
+            return _lockout_response(request)
         serializer.save()
         return Response(serializer.data)
 
@@ -381,33 +511,36 @@ def manage_ip_whitelist(request, pk):
 @extend_schema(
     operation_id='toggle_ip_whitelist',
     summary='Toggle IP Whitelist',
-    description='Enable or disable IP whitelist for the tenant. Superadmin only.',
-    request={
-        'type': 'object',
-        'properties': {
-            'enabled': {'type': 'boolean', 'description': 'Whether to enable IP whitelist'},
-            'superadmin_bypass': {'type': 'boolean', 'description': 'Whether superadmins can bypass whitelist'}
-        }
-    },
+    description=(
+        'Enable or disable the IP whitelist and/or the superadmin bypass. Staff or superuser '
+        'only. Both fields are optional; omitted ones keep their value. Enabling needs at '
+        'least one active entry (400 `code: no_active_entries`). A change that would leave '
+        "the whitelist on without letting the caller's current IP through is refused with "
+        '400 `code: would_lock_out` (the bypass only counts for superusers). Only a '
+        'superuser can change `superadmin_bypass` (403 `code: bypass_superuser_only`). '
+        'Values that are not booleans (form strings true/false/1/0 are accepted) return '
+        '400 `code: invalid`. The caller IP is the first X-Forwarded-For entry.'
+    ),
+    request=inline_serializer(
+        name='ToggleIPWhitelist',
+        fields={
+            'enabled': serializers.BooleanField(required=False, help_text='Whether to enable IP whitelist'),
+            'superadmin_bypass': serializers.BooleanField(
+                required=False, help_text='Whether superadmins can bypass whitelist'),
+        },
+    ),
     responses={
-        200: OpenApiResponse(
-            description='Settings updated',
-            response={
-                'type': 'object',
-                'properties': {
-                    'ip_whitelist_enabled': {'type': 'boolean'},
-                    'superadmin_bypass_whitelist': {'type': 'boolean'},
-                    'message': {'type': 'string'}
-                }
-            }
-        ),
-        400: OpenApiResponse(description='Cannot enable without entries'),
-        403: OpenApiResponse(description='Not superadmin or not from tenant domain')
+        200: IP_WHITELIST_STATE,
+        400: IP_WHITELIST_LOCKOUT,
+        403: OpenApiResponse(description=(
+            'Not staff/superuser, not from tenant domain, or a non-superuser changing '
+            'superadmin_bypass'
+        ))
     },
     tags=['Security']
 )
 @api_view(['POST'])
-@permission_classes([permissions.IsAuthenticated, IsSuperUser])
+@permission_classes([permissions.IsAuthenticated, IsStaffOrSuperUser])
 def toggle_ip_whitelist(request):
     """Toggle IP whitelist enabled/disabled for the tenant"""
     if not hasattr(request, 'tenant') or request.tenant.schema_name == get_public_schema_name():
@@ -417,8 +550,25 @@ def toggle_ip_whitelist(request):
         )
 
     tenant = request.tenant
-    enabled = request.data.get('enabled')
-    superadmin_bypass = request.data.get('superadmin_bypass')
+    try:
+        enabled = _parse_optional_bool(request.data.get('enabled'))
+        superadmin_bypass = _parse_optional_bool(request.data.get('superadmin_bypass'))
+    except ValueError:
+        return Response(
+            {'error': '`enabled` and `superadmin_bypass` must be booleans.', 'code': 'invalid'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # The bypass protects superusers; a staff user who is not one must not be
+    # able to take it away from them.
+    if (superadmin_bypass is not None
+            and superadmin_bypass != tenant.superadmin_bypass_whitelist
+            and not request.user.is_superuser):
+        return Response(
+            {'error': 'Only a superuser can change the superadmin bypass.',
+             'code': 'bypass_superuser_only'},
+            status=status.HTTP_403_FORBIDDEN
+        )
 
     # If enabling whitelist, ensure there's at least one entry
     if enabled is True:
@@ -429,9 +579,15 @@ def toggle_ip_whitelist(request):
 
         if active_entries == 0:
             return Response(
-                {'error': 'Cannot enable IP whitelist without any active whitelist entries. Add at least one IP address first.'},
+                {'error': 'Cannot enable IP whitelist without any active whitelist entries. Add at least one IP address first.',
+                 'code': 'no_active_entries'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+    final_enabled = tenant.ip_whitelist_enabled if enabled is None else enabled
+    final_bypass = tenant.superadmin_bypass_whitelist if superadmin_bypass is None else superadmin_bypass
+    if _would_lock_out(request, tenant, final_enabled, final_bypass):
+        return _lockout_response(request)
 
     # Update settings
     if enabled is not None:
@@ -458,15 +614,17 @@ def toggle_ip_whitelist(request):
     responses={
         200: OpenApiResponse(
             description='Current IP information',
-            response={
-                'type': 'object',
-                'properties': {
-                    'ip_address': {'type': 'string'},
-                    'city': {'type': 'string'},
-                    'country': {'type': 'string'},
-                    'country_code': {'type': 'string'}
-                }
-            }
+            response=inline_serializer(
+                name='CurrentIPInfo',
+                fields={
+                    'ip_address': serializers.CharField(),
+                    'city': serializers.CharField(),
+                    'country': serializers.CharField(),
+                    'country_code': serializers.CharField(),
+                    'is_whitelisted': serializers.BooleanField(
+                        help_text='Whether this IP matches an active whitelist entry.'),
+                },
+            ),
         ),
         403: OpenApiResponse(description='Not from tenant domain')
     },
@@ -489,5 +647,6 @@ def get_current_ip(request):
         'ip_address': ip_address,
         'city': location.get('city', ''),
         'country': location.get('country', ''),
-        'country_code': location.get('country_code', '')
+        'country_code': location.get('country_code', ''),
+        'is_whitelisted': bool(SecurityService.ip_matches_whitelist(request.tenant, ip_address)),
     })

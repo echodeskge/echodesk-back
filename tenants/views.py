@@ -10,7 +10,8 @@ from django.views.decorators.csrf import ensure_csrf_cookie
 from django.contrib.auth import authenticate
 from tenant_schemas.utils import get_public_schema_name, schema_context
 from django.contrib.auth import get_user_model
-from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse, inline_serializer
+from rest_framework import serializers as drf_serializers
 from drf_spectacular.openapi import OpenApiTypes
 from .models import Tenant, PendingRegistration, PaymentOrder, TenantDomain, DashboardAppearanceSettings
 from .feature_models import Feature
@@ -596,13 +597,15 @@ def get_subscription_me(request):
     operation_id='update_tenant_profile',
     summary='Update User Profile',
     description='Update current user profile information (first_name and last_name only).',
-    request={
+    # Raw schema dicts must sit under a media type, or drf-spectacular reads
+    # their keys ('type', 'properties') as media types.
+    request={'application/json': {
         'type': 'object',
         'properties': {
             'first_name': {'type': 'string'},
             'last_name': {'type': 'string'}
         }
-    },
+    }},
     responses={
         200: OpenApiResponse(
             description='Profile updated successfully',
@@ -657,15 +660,19 @@ def update_tenant_profile(request):
 @extend_schema(
     operation_id='change_tenant_password',
     summary='Change User Password',
-    description='Change password for the current user. Requires old password for verification. All existing tokens will be invalidated.',
-    request={
-        'type': 'object',
-        'properties': {
-            'old_password': {'type': 'string'},
-            'new_password': {'type': 'string', 'minLength': 8}
+    description=(
+        'Change password for the current user. Requires old password for verification. '
+        'All existing tokens (web and every device) are invalidated, so sign in again. '
+        '`old_password` and `new_password` are both required (400 otherwise); they are '
+        'optional in the schema only so the dashboard\'s existing call keeps compiling.'
+    ),
+    request=inline_serializer(
+        name='ChangeTenantPassword',
+        fields={
+            'old_password': drf_serializers.CharField(required=False),
+            'new_password': drf_serializers.CharField(required=False, min_length=8),
         },
-        'required': ['old_password', 'new_password']
-    },
+    ),
     responses={
         200: OpenApiResponse(
             description='Password changed successfully',

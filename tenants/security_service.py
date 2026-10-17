@@ -195,11 +195,18 @@ class SecurityService:
         if tenant.superadmin_bypass_whitelist and is_superuser:
             return True
 
-        # Check whitelist entries
-        whitelist_entries = TenantIPWhitelist.objects.filter(
-            tenant=tenant,
-            is_active=True
-        )
+        return cls.ip_matches_whitelist(tenant, ip_address)
+
+    @staticmethod
+    def ip_matches_whitelist(tenant, ip_address: str, exclude_entry_id=None, entry_overrides=None) -> bool:
+        """
+        Whether ``ip_address`` matches one of the tenant's active whitelist
+        entries, whatever the enabled flag says.
+
+        ``exclude_entry_id`` / ``entry_overrides`` ({entry_id: {field: value}})
+        evaluate a pending delete or edit before it is saved.
+        """
+        from .models import TenantIPWhitelist
 
         try:
             client_ip = ipaddress.ip_address(ip_address)
@@ -207,22 +214,28 @@ class SecurityService:
             logger.warning(f"Invalid IP address format: {ip_address}")
             return False
 
-        for entry in whitelist_entries:
+        overrides = entry_overrides or {}
+        for entry in TenantIPWhitelist.objects.filter(tenant=tenant):
+            if exclude_entry_id is not None and entry.pk == exclude_entry_id:
+                continue
+            values = overrides.get(entry.pk, {})
+            is_active = values.get('is_active', entry.is_active)
+            if not is_active:
+                continue
+            address = values.get('ip_address', entry.ip_address)
+            cidr = values.get('cidr_notation', entry.cidr_notation)
             try:
-                if entry.cidr_notation:
+                if cidr:
                     # Check CIDR range
-                    network = ipaddress.ip_network(
-                        f"{entry.ip_address}/{entry.cidr_notation}",
-                        strict=False
-                    )
+                    network = ipaddress.ip_network(f"{address}/{cidr}", strict=False)
                     if client_ip in network:
                         return True
                 else:
                     # Check exact IP match
-                    if client_ip == ipaddress.ip_address(entry.ip_address):
+                    if client_ip == ipaddress.ip_address(address):
                         return True
             except ValueError as e:
-                logger.warning(f"Invalid whitelist entry: {entry.ip_address}/{entry.cidr_notation}: {e}")
+                logger.warning(f"Invalid whitelist entry: {address}/{cidr}: {e}")
                 continue
 
         return False
