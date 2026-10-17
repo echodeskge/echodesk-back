@@ -14,6 +14,8 @@ DEFAULT_MAX_DAYS_ADVANCE = 60
 
 # Bookings in these states occupy their staff member's time.
 ACTIVE_BOOKING_STATUSES = ['pending', 'confirmed', 'in_progress']
+# Bookings in these states are over: they can't be cancelled, moved or paid.
+FINAL_BOOKING_STATUSES = ['completed', 'cancelled', 'no_show']
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +194,72 @@ def generate_available_slots(service, date, staff=None, language='en', booking_s
         })
 
     return grouped_slots
+
+
+def generate_admin_slots(service, date, staff=None, exclude_booking_id=None, not_before=None, step_minutes=None):
+    """Free start times for staff booking on the business's behalf.
+
+    Like generate_available_slots, but without the customer lead-time /
+    advance window: honours each staff member's weekly hours, the day's
+    exceptions, breaks, existing bookings and the service duration (+ buffer).
+
+    exclude_booking_id: treat this booking's own time as free (rescheduling).
+    not_before: naive datetime; start times before it are skipped (the past).
+    step_minutes: grid for duration-based services (default as on the public site).
+    """
+    if staff is not None:
+        staff_members = [staff]
+    else:
+        staff_members = list(
+            service.staff_members.filter(is_active_for_bookings=True).select_related('user').order_by('id')
+        )
+
+    total_minutes = service.total_duration_minutes
+    slots_by_time = {}
+
+    for staff_member in staff_members:
+        availability = get_staff_availability(staff_member, date)
+        if not availability:
+            continue
+
+        if service.booking_type == 'duration_based' and step_minutes:
+            start = time_to_minutes(availability['start_time'])
+            end = time_to_minutes(availability['end_time'])
+            candidates = [minutes_to_time(m) for m in range(start, end, step_minutes)]
+        else:
+            candidates = _candidate_start_times(service, availability)
+
+        for start_time in candidates:
+            if not _fits_working_hours(availability, start_time, total_minutes):
+                continue
+            if not_before is not None and datetime.combine(date, start_time) < not_before:
+                continue
+            if is_slot_booked(staff_member, date, start_time, total_minutes, exclude_booking_id=exclude_booking_id):
+                continue
+
+            key = start_time.strftime('%H:%M')
+            slot = slots_by_time.setdefault(key, {
+                'start_time': key,
+                'end_time': add_minutes_to_time(start_time, service.duration_minutes).strftime('%H:%M'),
+                'available_staff': [],
+            })
+            slot['available_staff'].append({
+                'staff_id': staff_member.id,
+                'staff_name': staff_member.user.get_full_name() or staff_member.user.email,
+            })
+
+    result = []
+    for key in sorted(slots_by_time.keys()):
+        slot = slots_by_time[key]
+        primary = slot['available_staff'][0]
+        result.append({
+            'start_time': slot['start_time'],
+            'end_time': slot['end_time'],
+            'staff_id': primary['staff_id'],
+            'staff_name': primary['staff_name'],
+            'available_staff': slot['available_staff'],
+        })
+    return result
 
 
 def get_staff_availability(staff, date):
@@ -439,7 +507,7 @@ def can_cancel_booking(booking, settings):
 
     Returns: (can_cancel: bool, reason: str)
     """
-    if booking.status in ['completed', 'cancelled']:
+    if booking.status in FINAL_BOOKING_STATUSES:
         return False, "Booking is already completed or cancelled"
 
     # Calculate time until booking

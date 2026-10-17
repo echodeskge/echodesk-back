@@ -289,6 +289,7 @@ class Booking(models.Model):
         ('in_progress', 'In Progress'),
         ('completed', 'Completed'),
         ('cancelled', 'Cancelled'),
+        ('no_show', 'No Show'),
     ]
 
     PAYMENT_STATUS_CHOICES = [
@@ -347,6 +348,12 @@ class Booking(models.Model):
     # Reminders
     reminder_sent = models.BooleanField(default=False, help_text="Whether reminder was sent")
     second_reminder_sent = models.BooleanField(default=False, help_text="Whether the second (closer) reminder was sent")
+    # "Your next client in N minutes" push to the assigned staff member
+    staff_reminder_sent = models.BooleanField(default=False, help_text="Whether the assigned staff member was reminded")
+
+    # Payments taken by staff (cash at the desk, card terminal, bank transfer):
+    # [{amount, method, note, recorded_by, recorded_by_name, recorded_at}]
+    manual_payments = models.JSONField(default=list, blank=True, help_text="Payments recorded by staff")
 
     # Cancellation
     cancelled_at = models.DateTimeField(blank=True, null=True)
@@ -402,6 +409,16 @@ class Booking(models.Model):
         self.status = 'completed'
         self.completed_at = timezone.now()
         self.save(update_fields=['status', 'completed_at', 'updated_at'])
+
+    def check_in(self):
+        """The client has arrived and the service is under way."""
+        self.status = 'in_progress'
+        self.save(update_fields=['status', 'updated_at'])
+
+    def mark_no_show(self):
+        """The client never came. Frees the staff member's time."""
+        self.status = 'no_show'
+        self.save(update_fields=['status', 'updated_at'])
 
     def cancel(self, cancelled_by, reason='', notify=True):
         """Cancel booking"""

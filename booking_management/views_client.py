@@ -244,8 +244,10 @@ def _cancel_booking(booking, reason):
     """
     with transaction.atomic():
         locked = Booking.objects.select_for_update().get(pk=booking.pk)
-        if locked.status in ('cancelled', 'completed'):
+        if locked.status in ('cancelled', 'completed', 'no_show'):
             return None
+        # notify_staff_of_booking below tells the assigned staff member too
+        locked._skip_staff_notification = True
         locked.cancel(cancelled_by='client', reason=reason or '')
     booking.refresh_from_db()
     if booking.paid_amount and booking.paid_amount > 0:
@@ -907,7 +909,8 @@ class ClientBookingViewSet(
             booking.end_time = end_dt.time()
             booking.reminder_sent = False
             booking.second_reminder_sent = False
-            booking.save(update_fields=['staff', 'date', 'start_time', 'end_time', 'reminder_sent', 'second_reminder_sent', 'updated_at'])
+            booking.staff_reminder_sent = False
+            booking.save(update_fields=['staff', 'date', 'start_time', 'end_time', 'reminder_sent', 'second_reminder_sent', 'staff_reminder_sent', 'updated_at'])
 
         _queue_booking_email(booking, 'rescheduled', _language(request))
         notify_staff_of_booking(booking, 'rescheduled')
