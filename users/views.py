@@ -772,7 +772,7 @@ def tenant_homepage(request):
 from rest_framework.views import APIView
 from rest_framework.decorators import api_view
 from rest_framework.parsers import MultiPartParser, FormParser
-from django.db.models import Q, Max, Prefetch
+from django.db.models import F, Q, Max, Prefetch
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
     OpenApiParameter, extend_schema, extend_schema_view, inline_serializer,
@@ -991,7 +991,11 @@ class TeamChatConversationViewSet(viewsets.ModelViewSet):
                     | Q(latest_message_time__isnull=True, updated_at__gte=today_start)
                 )
 
-        return queryset.order_by('-latest_message_time', '-updated_at')
+        # Empty conversations (created by opening a thread) have no message time;
+        # Postgres sorts NULLs first on DESC, so push them after real chats.
+        return queryset.order_by(
+            F('latest_message_time').desc(nulls_last=True), '-updated_at'
+        )
 
     def get_serializer_class(self):
         if self.action in ('retrieve', 'with_user'):

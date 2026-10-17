@@ -1199,7 +1199,7 @@ class TicketTimeLogViewSet(viewsets.ReadOnlyModelViewSet):
             Q(ticket__created_by=self.request.user) |
             Q(ticket__assigned_to=self.request.user) |
             Q(ticket__assigned_users=self.request.user)
-        ).select_related('ticket', 'column', 'user')
+        ).distinct().select_related('ticket', 'column', 'user')
 
     @extend_schema(
         parameters=[

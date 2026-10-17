@@ -97,16 +97,18 @@ class PublicHelpCategoryViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         # article_count is annotated DB-side; the list serializer never walks
         # `articles`, so there is nothing to prefetch here.
-        queryset = HelpCategory.objects.filter(is_active=True).annotate(
-            _article_count=Count('articles', filter=Q(articles__is_active=True))
-        )
-
-        # Filter by visibility (for_dashboard wins over for_public)
+        # Count only the articles this audience can actually see, so the badge
+        # matches the category screen.
         mode = get_visibility_mode(self.request)
+        article_filter = Q(articles__is_active=True)
+        queryset = HelpCategory.objects.filter(is_active=True)
         if mode == 'dashboard':
             queryset = queryset.filter(show_in_dashboard=True)
+            article_filter &= Q(articles__show_in_dashboard=True)
         elif mode == 'public':
             queryset = queryset.filter(show_on_public=True)
+            article_filter &= Q(articles__show_on_public=True)
+        queryset = queryset.annotate(_article_count=Count('articles', filter=article_filter))
 
         return queryset.order_by('position', 'created_at')
 

@@ -382,7 +382,9 @@ class TestHelpSchema(EchoDeskTenantTestCase):
         params = self._param_names(op)
         for name in ('q', 'lang', 'for_dashboard', 'for_public'):
             self.assertIn(name, params, name)
-        self.assertTrue(params['q']['required'])
+        # Optional on purpose: the TS generator emits required params after
+        # optional ones (invalid TS); the view returns [] without q.
+        self.assertFalse(params['q'].get('required', False))
         body = op['responses']['200']['content']['application/json']['schema']
         self.assertEqual(body['type'], 'array')
         self.assertEqual(body['items']['$ref'], '#/components/schemas/HelpArticleList')
