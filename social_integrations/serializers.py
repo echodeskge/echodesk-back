@@ -1705,7 +1705,14 @@ class UnifiedConversationSerializer(serializers.Serializer):
     assigned_user_name = serializers.CharField(allow_null=True, allow_blank=True, required=False)
     assignment_status = serializers.CharField(allow_null=True, allow_blank=True, required=False)
     session_started_at = serializers.DateTimeField(allow_null=True, required=False)
-    session_ended_at = serializers.DateTimeField(allow_null=True, required=False)
+    session_ended_at = serializers.DateTimeField(
+        allow_null=True, required=False,
+        help_text="Assignment session end; for widget chats the visitor/agent close time when set.",
+    )
+    session_ended_by = serializers.CharField(
+        allow_null=True, allow_blank=True, required=False,
+        help_text="Widget only: who closed the website chat ('visitor' | 'agent' | 'timeout'), null while open.",
+    )
     is_archived = serializers.BooleanField(required=False, default=False)
     archived_at = serializers.DateTimeField(allow_null=True, required=False)
     # AI companion mode: 'needs_human' | 'off' when escalated/paused,
