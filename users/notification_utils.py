@@ -552,12 +552,32 @@ def create_ai_handoff_notification(platform, conversation_id, account_id,
         )
 
 
+# Permissions User.has_permission grants by role to managers (not only admins).
+_MANAGER_ROLE_PERMISSIONS = {
+    'view_all_tickets', 'make_calls', 'edit_all_tickets', 'delete_tickets',
+    'assign_tickets', 'view_reports', 'export_data', 'manage_tags',
+    'manage_columns', 'view_boards', 'create_boards', 'edit_boards',
+    'view_social_messages', 'send_social_messages',
+}
+
+
 def social_admin_recipients(permission='manage_social_settings'):
     """Users who administer social settings/connections: active users with
     the social inbox who are staff, superuser, role admin, or hold
-    ``permission``."""
-    return [
-        user for user in users_with_feature('social_integrations')
-        if user.is_staff or user.is_superuser or user.role == 'admin'
-        or user.has_permission(permission)
-    ]
+    ``permission``.
+
+    Resolved in SQL (same rule as ``User.has_permission``: the individual
+    ``can_<permission>`` flag or the role), so the cost does not grow with
+    the number of users.
+    """
+    from django.contrib.auth import get_user_model
+    from django.db.models import Q
+
+    User = get_user_model()
+    q = Q(is_staff=True) | Q(is_superuser=True) | Q(role='admin')
+    if permission in _MANAGER_ROLE_PERMISSIONS:
+        q |= Q(role='manager')
+    flag = f'can_{permission}'
+    if any(f.name == flag for f in User._meta.get_fields()):
+        q |= Q(**{flag: True})
+    return list(users_with_feature('social_integrations').filter(q))

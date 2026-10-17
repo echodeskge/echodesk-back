@@ -13,7 +13,9 @@ import re
 import uuid
 from datetime import timedelta
 
+from django.db.models import Q
 from django.utils import timezone
+from django_filters.rest_framework import DjangoFilterBackend
 from django_ratelimit.decorators import ratelimit
 from drf_spectacular.utils import (
     OpenApiParameter, OpenApiResponse, OpenApiTypes, extend_schema, extend_schema_view,
@@ -26,8 +28,8 @@ from tenant_schemas.utils import schema_context
 
 from widget_registry.models import WidgetConnection
 from .models import ChatRating, ConversationArchive, WidgetMessage, WidgetSession
-from .permissions import CanManageSocialConnections, CanSendSocialMessages, CanViewSocialMessages
-from .pagination import SocialMessagePagination
+from .permissions import CanManageWidgetConnections, CanSendSocialMessages, CanViewSocialMessages
+from .pagination import WidgetTranscriptPagination
 from .widget_serializers import (
     WidgetAdminSendMessageSerializer,
     WidgetConnectionSerializer,
@@ -939,10 +941,11 @@ class WidgetConnectionViewSet(viewsets.ModelViewSet):
 
     Reads need the social_integrations feature; writes also need the admin
     role or manage_social_connections (same as the other social connections).
+    Tenant staff and superusers may always read and write.
     """
     queryset = WidgetConnection.objects.none()  # schema typing; get_queryset() is used
     serializer_class = WidgetConnectionSerializer
-    permission_classes = [IsAuthenticated, CanManageSocialConnections]
+    permission_classes = [IsAuthenticated, CanManageWidgetConnections]
 
     def get_queryset(self):
         schema = getattr(self.request.tenant, 'schema_name', None)
@@ -973,16 +976,25 @@ class WidgetConnectionViewSet(viewsets.ModelViewSet):
         summary='Website-chat transcript',
         tags=['Widget'],
         description=(
-            'Messages of one website chat (pass session_id). Default order is '
+            'Messages of one website chat: session_id, visitor_id or '
+            'conversation_id is required (400 otherwise). Default order is '
             'oldest first (dashboard). Pass ordering=-timestamp to page newest '
             'first: page=1 is the latest messages, page=2.. older ones. '
-            'page_size up to 500. hide_assigned_chats hides chats assigned to '
+            'page_size defaults to 20, up to 500. hide_assigned_chats hides chats assigned to '
             'other agents from non-staff users.'
         ),
         parameters=[
             OpenApiParameter(
                 'session_id', OpenApiTypes.STR,
                 description='Widget session id; the list id widget_<conn>_<session> is accepted too',
+            ),
+            OpenApiParameter(
+                'visitor_id', OpenApiTypes.STR,
+                description='Every chat of one visitor (alternative to session_id)',
+            ),
+            OpenApiParameter(
+                'conversation_id', OpenApiTypes.STR,
+                description='Inbox list id widget_<conn>_<session>, or a session / visitor id',
             ),
             OpenApiParameter(
                 'ordering', OpenApiTypes.STR, enum=['timestamp', '-timestamp', 'id', '-id'],
@@ -998,10 +1010,24 @@ class WidgetMessageViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = WidgetMessage.objects.none()  # schema typing; get_queryset() is used
     serializer_class = WidgetMessageSerializer
     permission_classes = [IsAuthenticated, CanViewSocialMessages]
-    pagination_class = SocialMessagePagination
-    filter_backends = [drf_filters.OrderingFilter]
+    pagination_class = WidgetTranscriptPagination
+    # Keep the project-wide default backends (filters + search) and the
+    # ordering switch the mobile app pages with.
+    filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
+    search_fields = ['message_text']
     ordering_fields = ['timestamp', 'id']
     ordering = ['timestamp', 'id']
+
+    def list(self, request, *args, **kwargs):
+        # A transcript is one chat: never dump every widget message of the
+        # tenant when the caller forgot to say which chat.
+        params = request.query_params
+        if not any((params.get(k) or '').strip() for k in ('session_id', 'visitor_id', 'conversation_id')):
+            return Response(
+                {'error': 'session_id, visitor_id or conversation_id is required'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().list(request, *args, **kwargs)
 
     def get_queryset(self):
         schema = getattr(self.request.tenant, 'schema_name', None)
@@ -1010,12 +1036,28 @@ class WidgetMessageViewSet(viewsets.ReadOnlyModelViewSet):
         # WidgetMessage lives in the tenant schema already — the tenant middleware
         # set the connection. Filter by session_id query param when provided.
         qs = WidgetMessage.objects.filter(is_deleted=False).select_related('session')
-        session_id = (self.request.query_params.get('session_id') or '').strip()
+        params = self.request.query_params
+        session_id = (params.get('session_id') or '').strip()
         if session_id:
-            match = re.match(r'^widget_\d+_(.+)$', session_id)
+            match = re.match(r'^widget_(\d+)_(.+)$', session_id)
             if match:
-                session_id = match.group(1)
+                qs = qs.filter(session__connection_id=int(match.group(1)))
+                session_id = match.group(2)
             qs = qs.filter(session__session_id=session_id)
+        visitor_id = (params.get('visitor_id') or '').strip()
+        if visitor_id:
+            qs = qs.filter(session__visitor_id=visitor_id)
+        conversation_id = (params.get('conversation_id') or '').strip()
+        if conversation_id:
+            # Inbox list id widget_<conn>_<session>, or a bare session /
+            # visitor id (whichever the client holds).
+            match = re.match(r'^widget_(\d+)_(.+)$', conversation_id)
+            if match:
+                qs = qs.filter(session__connection_id=int(match.group(1)),
+                               session__session_id=match.group(2))
+            else:
+                qs = qs.filter(Q(session__session_id=conversation_id)
+                               | Q(session__visitor_id=conversation_id))
 
         from .inbox_list import exclude_chats_assigned_to_others, hide_assigned_applies
         if hide_assigned_applies(self.request):

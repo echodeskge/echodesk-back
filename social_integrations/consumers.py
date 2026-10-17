@@ -13,6 +13,62 @@ from tenant_schemas.utils import schema_context
 from .models import FacebookMessage, FacebookPageConnection
 
 
+CHAT_ID_PREFIXES = {
+    'fb': 'facebook', 'ig': 'instagram', 'wa': 'whatsapp', 'tg': 'telegram',
+    'widget': 'widget', 'email': 'email', 'tiktok': 'tiktok',
+}
+ACTIVE_ASSIGNMENT_STATUSES = ('active', 'in_session')
+
+
+def split_chat_id(raw):
+    """``fb_<page>_<psid>``-style inbox ids → (platform, account_id, key).
+
+    Anything else is returned as (None, None, raw): an unprefixed customer
+    key whose platform/account the caller does not know.
+    """
+    raw = str(raw or '').strip()
+    prefix, sep, rest = raw.partition('_')
+    if sep and prefix in CHAT_ID_PREFIXES:
+        account, sep2, key = rest.partition('_')
+        if sep2 and account and key:
+            return CHAT_ID_PREFIXES[prefix], account, key
+    return None, None, raw
+
+
+def chat_holder_id(platform, conversation_id, account_id):
+    """User id of the active assignee of a chat, or None (sync, tenant schema).
+
+    ``platform`` / ``account_id`` may be unknown (None): the lookup then
+    matches the customer key on any platform / account, which errs on the
+    side of hiding. Widget ids are resolved through every key the chat may
+    be stored under (visitor id, session id, list id).
+    """
+    from .conversation_keys import assignment_lookup_ids
+    from .models import ChatAssignment
+
+    if not conversation_id:
+        return None
+    if platform is None:
+        parsed_platform, parsed_account, key = split_chat_id(conversation_id)
+        if parsed_platform:
+            platform, account_id, conversation_id = parsed_platform, parsed_account, key
+    if platform:
+        keys = assignment_lookup_ids(platform, conversation_id, account_id)
+    else:
+        raw = str(conversation_id).strip()
+        keys = sorted({raw, raw.lstrip('+')} - {''})
+    qs = ChatAssignment.objects.filter(
+        conversation_id__in=keys,
+        status__in=ACTIVE_ASSIGNMENT_STATUSES,
+        assigned_user__isnull=False,
+    )
+    if platform:
+        qs = qs.filter(platform=platform)
+    if account_id not in (None, ''):
+        qs = qs.filter(account_id=str(account_id))
+    return qs.order_by('-updated_at').values_list('assigned_user_id', flat=True).first()
+
+
 class MessagesConsumer(AsyncWebsocketConsumer):
     """
     WebSocket consumer for real-time message updates.
@@ -112,7 +168,16 @@ class MessagesConsumer(AsyncWebsocketConsumer):
             elif message_type == 'subscribe_conversation':
                 # Subscribe to specific conversation updates
                 conversation_id = data.get('conversation_id')
-                if conversation_id:
+                if conversation_id and await self._chat_hidden_for_me(
+                    data.get('platform'), conversation_id, data.get('account_id'),
+                ):
+                    await self.send(text_data=json.dumps({
+                        'type': 'error',
+                        'message': 'This chat is assigned to another agent',
+                        'code': 'FORBIDDEN',
+                        'conversation_id': conversation_id,
+                    }))
+                elif conversation_id:
                     self.conversation_group_name = f'conversation_{self.tenant_schema}_{conversation_id}'
                     await self.channel_layer.group_add(
                         self.conversation_group_name,
@@ -180,6 +245,45 @@ class MessagesConsumer(AsyncWebsocketConsumer):
             self._hide_assigned_cache = (value, time.monotonic())
         return value
 
+    HOLDER_TTL = 5  # seconds a chat's assignee is cached per connection
+
+    @database_sync_to_async
+    def _fetch_holder(self, platform, conversation_id, account_id):
+        with schema_context(self.tenant_schema):
+            return chat_holder_id(platform, conversation_id, account_id)
+
+    async def _chat_hidden_for_me(self, platform, conversation_id, account_id):
+        """Like _hidden_for_me for frames that carry only the chat key:
+        looks the assignee up (briefly cached) when hide_assigned applies."""
+        if not conversation_id or getattr(self, 'is_privileged', False):
+            return False
+        if not await self._hide_assigned_enabled():
+            return False
+        cache_key = (platform or None, str(conversation_id), str(account_id) if account_id not in (None, '') else None)
+        cache = getattr(self, '_holder_cache', None)
+        if cache is None:
+            cache = self._holder_cache = {}
+        hit = cache.get(cache_key)
+        now = time.monotonic()
+        if hit and now - hit[1] <= self.HOLDER_TTL:
+            holder = hit[0]
+        else:
+            try:
+                holder = await self._fetch_holder(*cache_key)
+            except Exception:  # noqa: BLE001 — fail closed would blank the inbox; keep last value
+                holder = hit[0] if hit else None
+            if len(cache) > 500:
+                cache.clear()
+            cache[cache_key] = (holder, now)
+        return holder is not None and holder != self.user.id
+
+    async def _frame_hidden(self, event):
+        """Hide-assigned check for chat-scoped frames (read/archive/AI state/
+        status/reaction): platform + conversation_id + account_id."""
+        return await self._chat_hidden_for_me(
+            event.get('platform'), event.get('conversation_id'), event.get('account_id'),
+        )
+
     async def _hidden_for_me(self, assigned_user_id):
         """True when hide_assigned_chats hides this chat from this agent:
         it is assigned to someone else and the agent is not staff."""
@@ -194,12 +298,34 @@ class MessagesConsumer(AsyncWebsocketConsumer):
             return False
         return await self._hide_assigned_enabled()
 
+    async def _assignment_hidden(self, event):
+        """An assignment frame is hidden when the chat is (now) held by
+        another agent, unless this agent made the change (e.g. transferred
+        their own chat away)."""
+        if event.get('status') not in ACTIVE_ASSIGNMENT_STATUSES:
+            return False  # unassigned / ended: the chat is visible again
+        by = event.get('by_user_id')
+        try:
+            if by not in (None, '') and int(by) == self.user.id:
+                return False
+        except (TypeError, ValueError):
+            pass
+        return await self._hidden_for_me(event.get('assigned_user_id'))
+
     # Handlers for messages sent from Django views/signals
     async def new_message(self, event):
         """Send new message to WebSocket (unless hide_assigned_chats hides
         the chat from this agent)."""
         if await self._hidden_for_me(event.get('assigned_user_id')):
             return
+        if 'assigned_user_id' not in event:
+            # Outbound / conversation-group frames don't say who holds the
+            # chat (inbound frames send None for "unassigned"): resolve it.
+            message = event.get('message') if isinstance(event.get('message'), dict) else {}
+            if await self._chat_hidden_for_me(
+                message.get('platform'), event.get('conversation_id'), None,
+            ):
+                return
         await self.send(text_data=json.dumps({
             'type': 'new_message',
             'message': event['message'],
@@ -216,6 +342,8 @@ class MessagesConsumer(AsyncWebsocketConsumer):
         the status pips on the matching bubbles. Falls back to a single
         `message_id` for any legacy caller.
         """
+        if await self._frame_hidden(event):
+            return
         message_ids = event.get('message_ids')
         if not message_ids and event.get('message_id') is not None:
             message_ids = [event['message_id']]
@@ -234,6 +362,8 @@ class MessagesConsumer(AsyncWebsocketConsumer):
 
         `reaction_emoji` is null/empty when a reaction was removed.
         """
+        if await self._frame_hidden(event):
+            return
         await self.send(text_data=json.dumps({
             'type': 'reaction_update',
             'platform': event.get('platform'),
@@ -284,6 +414,8 @@ class MessagesConsumer(AsyncWebsocketConsumer):
     # ------------------------------------------------------------------
     async def assignment_update(self, event):
         """Pushed by assign/unassign/transfer/start-session/end-session views."""
+        if await self._assignment_hidden(event):
+            return
         await self.send(text_data=json.dumps({
             'type': 'assignment_update',
             'platform': event.get('platform'),
@@ -300,6 +432,8 @@ class MessagesConsumer(AsyncWebsocketConsumer):
 
     async def read_state_update(self, event):
         """Pushed by mark-read/mark-unread/mark-all-read views."""
+        if await self._frame_hidden(event):
+            return
         await self.send(text_data=json.dumps({
             'type': 'read_state_update',
             'platform': event.get('platform'),
@@ -313,6 +447,8 @@ class MessagesConsumer(AsyncWebsocketConsumer):
 
     async def archive_update(self, event):
         """Pushed by archive/unarchive/archive-all views."""
+        if await self._frame_hidden(event):
+            return
         await self.send(text_data=json.dumps({
             'type': 'archive_update',
             'platform': event.get('platform'),
@@ -347,6 +483,8 @@ class MessagesConsumer(AsyncWebsocketConsumer):
     async def ai_state_update(self, event):
         """Pushed when a conversation's AI companion mode changes
         (handoff escalation, manual pause/resume)."""
+        if await self._frame_hidden(event):
+            return
         await self.send(text_data=json.dumps({
             'type': 'ai_state_update',
             'platform': event.get('platform'),
@@ -650,6 +788,18 @@ class TypingConsumer(AsyncWebsocketConsumer):
             await self.close(code=4001)
             return
 
+        # hide_assigned_chats: a non-staff agent gets no typing frames for a
+        # chat another agent holds (and cannot type into its room). The
+        # socket stays open so the dashboard does not reconnect-loop.
+        if await self._hidden_for_me():
+            await self.accept()
+            await self.send(text_data=json.dumps({
+                'type': 'connection',
+                'status': 'connected',
+                'conversation_id': self.conversation_id
+            }))
+            return
+
         # Join the typing group for this conversation
         self.typing_group_name = f'typing_{self.tenant_schema}_{self.conversation_id}'
 
@@ -669,6 +819,22 @@ class TypingConsumer(AsyncWebsocketConsumer):
             'conversation_id': self.conversation_id
         }))
     
+    @database_sync_to_async
+    def _hidden_for_me(self):
+        """True when hide_assigned_chats hides this chat from this agent."""
+        if self.user.is_staff or self.user.is_superuser:
+            return False
+        from .models import SocialIntegrationSettings
+        try:
+            with schema_context(self.tenant_schema):
+                settings_obj = SocialIntegrationSettings.objects.first()
+                if not (settings_obj and settings_obj.hide_assigned_chats):
+                    return False
+                holder = chat_holder_id(None, self.conversation_id, None)
+        except Exception:  # noqa: BLE001 — never break typing on a lookup hiccup
+            return False
+        return holder is not None and holder != self.user.id
+
     async def disconnect(self, close_code):
         # Leave the typing group and notify others that user stopped typing
         if hasattr(self, 'typing_group_name'):
@@ -699,6 +865,9 @@ class TypingConsumer(AsyncWebsocketConsumer):
                     'timestamp': data.get('timestamp')
                 }))
                 print('[TypingWebSocket] Pong sent')
+
+            elif message_type in ('typing_start', 'typing_stop') and not hasattr(self, 'typing_group_name'):
+                return  # not in the room (chat hidden by hide_assigned_chats)
 
             elif message_type == 'typing_start':
                 # Broadcast typing start to other users in conversation
