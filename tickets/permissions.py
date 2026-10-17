@@ -1,6 +1,8 @@
 """
-Permission helpers for the ticket admin endpoints (columns, tags, item lists,
-ticket forms).
+Permission helpers for the ticket admin endpoints (columns, item lists,
+ticket forms). Tags are not gated: every authenticated user may write them,
+as the web label dialog expects. ``CanManageTags`` is kept for callers that
+want the check.
 
 Reads stay open to every authenticated user (the kanban, ticket create sheet
 and ticket forms all need them). Writes need the matching tenant permission
