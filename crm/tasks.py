@@ -45,12 +45,27 @@ def rebuild_tenant_asterisk_state(tenant_schema: str) -> Dict[str, int]:
 
 
 @shared_task(name="crm.notify_missed_call")
-def notify_missed_call(call_log_id: int, tenant_schema: str) -> int:
+def notify_missed_call(call_log_id: int, tenant_schema: str, attempt: int = 0) -> int:
     """Send the ``call_missed`` notification for one call log (see
-    :mod:`crm.call_notifications`). Runs inside the tenant's schema."""
+    :mod:`crm.call_notifications`). Runs inside the tenant's schema.
+
+    While the queue attempt may still be ringing a colleague (a sequential
+    strategy such as rrmemory), the task re-queues itself, at most
+    ``MISSED_CALL_MAX_DEFERS`` times, and then decides."""
     from tenant_schemas.utils import schema_context
 
-    from crm.call_notifications import send_missed_call_notifications
+    from crm.call_notifications import (
+        MISSED_CALL_MAX_DEFERS,
+        missed_call_retry_seconds,
+        send_missed_call_notifications,
+    )
 
     with schema_context(tenant_schema):
+        if attempt < MISSED_CALL_MAX_DEFERS:
+            retry_in = missed_call_retry_seconds(call_log_id)
+            if retry_in is not None:
+                notify_missed_call.apply_async(
+                    args=[call_log_id, tenant_schema, attempt + 1], countdown=retry_in,
+                )
+                return 0
         return send_missed_call_notifications(call_log_id)

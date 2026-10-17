@@ -217,7 +217,7 @@ class TestCallLogWriteLimits(CrmTestCase):
         url = f'/api/call-logs/{self.call.id}/update_status/'
         resp = self.api_patch(url, {
             'status': 'answered', 'recording_url': 'http://169.254.169.254/latest/meta-data/',
-        }, user=self.agent)
+        }, user=self.other)
         self.assertEqual(resp.status_code, 400)
         self.call.refresh_from_db()
         self.assertEqual(self.call.recording_url, '')
@@ -232,7 +232,7 @@ class TestCallLogWriteLimits(CrmTestCase):
                     'https://pbx.tenant.test/rec/b.wav',
                     'https://pbx2.echodesk.cloud:8443/recordings/c.wav'):
             resp = self.api_patch(url, {'status': 'answered', 'recording_url': rec},
-                                  user=self.agent)
+                                  user=self.other)
             self.assertEqual(resp.status_code, 200, (rec, resp.data))
             self.call.refresh_from_db()
             self.assertEqual(self.call.recording_url, rec)
@@ -245,8 +245,10 @@ class TestCallLogWriteLimits(CrmTestCase):
         self.assertEqual(resp.status_code, 404)
         mock_get.assert_not_called()
 
-    @patch('requests.get')
-    def test_stream_allowed_host_does_not_follow_redirects(self, mock_get):
+    @patch('crm.recording_hosts.socket.getaddrinfo',
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 443))])
+    @patch('requests.Session.get')
+    def test_stream_allowed_host_does_not_follow_redirects(self, mock_get, _dns):
         CallLog.objects.filter(pk=self.call.pk).update(
             recording_url='https://pbx.tenant.test/rec/a.wav')
         upstream = mock_get.return_value

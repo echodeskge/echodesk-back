@@ -5,12 +5,15 @@ Each block is guarded by try/except ImportError so the app works even if a
 module is not installed.  Registered via UsersConfig.ready().
 """
 
+import logging
+
 from django.db.models.signals import post_save, pre_save
 from django.dispatch import receiver
 from django.contrib.auth import get_user_model
 from django.db.models import Q
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Invoices
@@ -428,12 +431,24 @@ try:
         Later saves of the same row (notes, recording url, ...) do not
         re-notify. Recipients and the ring-all "answered elsewhere" check
         live in :mod:`crm.call_notifications`."""
-        from crm.call_notifications import schedule_missed_call_notification
+        from crm.call_notifications import (
+            relabel_legs_answered_elsewhere,
+            schedule_missed_call_notification,
+        )
         from crm.call_status import MISSED_STATUSES
 
+        old_status = None if created else getattr(instance, '_old_status', None)
+        if (instance.direction == 'inbound' and instance.status == 'answered'
+                and old_status != 'answered' and instance.answered_at):
+            # A sequential queue (rrmemory) rang colleagues before this
+            # agent: their timed-out legs were answered elsewhere.
+            try:
+                relabel_legs_answered_elsewhere(instance)
+            except Exception:  # noqa: BLE001 - never break the status update
+                logger.exception('answered-elsewhere relabel failed for call %s', instance.pk)
+            return
         if instance.direction != 'inbound' or instance.status not in MISSED_STATUSES:
             return
-        old_status = None if created else getattr(instance, '_old_status', None)
         if old_status in MISSED_STATUSES:
             return
         schedule_missed_call_notification(instance.pk)

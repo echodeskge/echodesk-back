@@ -12,9 +12,11 @@ single definition used by the stats endpoints, the legacy
 * missed (inbound only): status missed/no_answer, or a legacy ``ended`` row
   that was never picked up (no ``answered_at``, zero/empty duration).
 
-A ring-all leg that rang here while a colleague answered the call is saved
-as ``cancelled`` (see :data:`ANSWERED_ELSEWHERE_STATUS`), which neither
-definition counts, so one handled call does not show up as N-1 missed ones.
+A queue leg that rang here while a colleague answered the call (ringall),
+or that timed out before the queue rang the colleague who answered
+(rrmemory and other sequential strategies), is saved as ``cancelled`` (see
+:data:`ANSWERED_ELSEWHERE_STATUS` and :mod:`crm.call_notifications`), which
+neither definition counts, so one handled call does not show up as missed.
 """
 
 from datetime import timedelta
