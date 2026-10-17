@@ -118,6 +118,10 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
     # and link moved to the second one).
     if metadata.get('conversation_id') is not None:
         recent_filter['metadata__conversation_id'] = metadata['conversation_id']
+    # Shop orders likewise batch per order: two orders inside the window are
+    # two notifications, each deep-linking to its own order.
+    if metadata.get('order_id') is not None:
+        recent_filter['metadata__order_id'] = metadata['order_id']
     recent = Notification.objects.filter(**recent_filter).first()
 
     if recent:
