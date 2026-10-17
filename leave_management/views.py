@@ -4,7 +4,8 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
-from django.db.models import Q, F
+from django.db import IntegrityError, transaction
+from django.db.models import F
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
     extend_schema, extend_schema_view, OpenApiParameter, OpenApiResponse, inline_serializer
@@ -12,10 +13,11 @@ from drf_spectacular.utils import (
 
 from .models import (
     LeaveSettings, LeaveType, LeaveBalance, LeaveRequest,
-    PublicHoliday, LeaveApprovalChain
+    PublicHoliday, LeaveApprovalChain, LeaveCarryForwardRun
 )
 from .serializers import (
     LeaveActionResponseSerializer, LeaveErrorResponseSerializer,
+    LeaveActionErrorResponseSerializer, LeaveForbiddenResponseSerializer,
     CarryForwardRequestSerializer, CarryForwardResponseSerializer,
     LeaveSettingsSerializer,
     LeaveTypeListSerializer, LeaveTypeDetailSerializer, LeaveTypeCreateUpdateSerializer,
@@ -53,6 +55,27 @@ LANG_PARAM = OpenApiParameter(
 )
 STR_ID = {'id': OpenApiTypes.STR}
 ERROR_RESPONSE = OpenApiResponse(LeaveErrorResponseSerializer, description='{error}')
+ACTION_ERROR_RESPONSE = OpenApiResponse(
+    LeaveActionErrorResponseSerializer,
+    description='{error} when the request is not in a state that allows the '
+                'action, or DRF field errors such as {action: [...]} / '
+                '{comments: [...]} when the body is invalid'
+)
+FORBIDDEN_RESPONSE = OpenApiResponse(
+    LeaveForbiddenResponseSerializer,
+    description='{detail} when the user may not act on this request (not '
+                'admin/HR, not the approver, or their own request)'
+)
+
+
+def lock_leave_request(leave_request):
+    """
+    Re-read ``leave_request`` with a row lock (call inside
+    transaction.atomic). Callers re-check its status on the returned row,
+    so two concurrent decisions on the same request are serialised and the
+    second one sees the first one's result (no double-counted days).
+    """
+    return LeaveRequest.objects.select_for_update().get(pk=leave_request.pk)
 
 
 def _is_schema_view(view):
@@ -236,7 +259,6 @@ class AdminLeaveBalanceViewSet(viewsets.ModelViewSet):
         return context
 
     def perform_create(self, serializer):
-        from django.db import IntegrityError, transaction
         try:
             with transaction.atomic():
                 serializer.save(tenant=self.request.tenant)
@@ -307,6 +329,10 @@ class AdminLeaveBalanceViewSet(viewsets.ModelViewSet):
             200: CarryForwardResponseSerializer,
             400: OpenApiResponse(description='{error} when a year is missing, else field errors ({to_year: [...]})'),
             403: ERROR_RESPONSE,
+            409: OpenApiResponse(
+                LeaveErrorResponseSerializer,
+                description='{error} when a concurrent first run collided and its result is not visible yet'
+            ),
         }
     )
     @action(detail=False, methods=['post'])
@@ -334,8 +360,21 @@ class AdminLeaveBalanceViewSet(viewsets.ModelViewSet):
             run, count = carry_forward_balances(
                 request.tenant, from_year, to_year, user=request.user, force=force
             )
-        except CarryForwardAlreadyRun as exc:
-            run = exc.run
+        except (CarryForwardAlreadyRun, IntegrityError) as exc:
+            if isinstance(exc, CarryForwardAlreadyRun):
+                run = exc.run
+            else:
+                # Lost the race with a concurrent first run: its row now
+                # exists (unique per tenant and from_year) and our writes
+                # were rolled back with the failed transaction.
+                run = LeaveCarryForwardRun.objects.filter(
+                    tenant=request.tenant, from_year=from_year
+                ).first()
+                if run is None:
+                    return Response(
+                        {'error': 'A carry forward for this year is already in progress; try again'},
+                        status=status.HTTP_409_CONFLICT
+                    )
             return Response({
                 'success': True,
                 'message': f'Balances from {run.from_year} were already carried forward to {run.to_year}; nothing changed',
@@ -486,13 +525,11 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
             '`action` must be "approve".'
         ),
         request=LeaveApprovalSerializer,
-        responses={200: LeaveActionResponseSerializer, 400: ERROR_RESPONSE},
+        responses={200: LeaveActionResponseSerializer, 400: ACTION_ERROR_RESPONSE, 403: FORBIDDEN_RESPONSE},
     )
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, HasLeaveManagementFeature, CanManageLeaveBalances, CanApproveLeave])
     def approve(self, request, pk=None):
         """Approve a leave request"""
-        from django.db import transaction
-
         leave_request = self.get_object()
 
         if leave_request.status not in OPEN_APPROVAL_STATUSES:
@@ -511,6 +548,13 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
         comments = serializer.validated_data.get('comments', '')
 
         with transaction.atomic():
+            leave_request = lock_leave_request(leave_request)
+            if leave_request.status not in OPEN_APPROVAL_STATUSES:
+                # Decided by a concurrent request while we waited for the lock
+                return Response(
+                    {'error': 'Only pending or partially approved requests can be approved'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             apply_approval_step(leave_request, request.user, comments)
             leave_request._leave_actor = request.user
             leave_request.save()
@@ -531,7 +575,7 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
         summary='Reject leave request',
         description='`action` must be "reject" and `comments` (the reason) are required.',
         request=LeaveApprovalSerializer,
-        responses={200: LeaveActionResponseSerializer, 400: ERROR_RESPONSE},
+        responses={200: LeaveActionResponseSerializer, 400: ACTION_ERROR_RESPONSE, 403: FORBIDDEN_RESPONSE},
     )
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, HasLeaveManagementFeature, CanManageLeaveBalances, CanApproveLeave])
     def reject(self, request, pk=None):
@@ -552,8 +596,13 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        from django.db import transaction
         with transaction.atomic():
+            leave_request = lock_leave_request(leave_request)
+            if leave_request.status not in OPEN_APPROVAL_STATUSES:
+                return Response(
+                    {'error': 'Only pending or partially approved requests can be rejected'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             leave_request.status = 'rejected'
             leave_request.rejected_by = request.user
             leave_request.rejected_at = timezone.now()
@@ -577,7 +626,7 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
                     '(approved days go back to the balance). Rejected or '
                     'cancelled requests cannot be cancelled.',
         request=LeaveCancellationSerializer,
-        responses={200: LeaveActionResponseSerializer, 400: ERROR_RESPONSE},
+        responses={200: LeaveActionResponseSerializer, 400: ACTION_ERROR_RESPONSE, 403: FORBIDDEN_RESPONSE},
     )
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, HasLeaveManagementFeature, CanManageLeaveBalances, CanCancelLeave])
     def cancel(self, request, pk=None):
@@ -600,10 +649,15 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
         serializer = LeaveCancellationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        was_approved = leave_request.status == 'approved'
-
-        from django.db import transaction
         with transaction.atomic():
+            leave_request = lock_leave_request(leave_request)
+            if leave_request.status in ('cancelled', 'rejected'):
+                return Response(
+                    {'error': f'Leave request is already {leave_request.status}'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            was_approved = leave_request.status == 'approved'
+
             leave_request.status = 'cancelled'
             leave_request.cancelled_at = timezone.now()
             leave_request.cancellation_reason = serializer.validated_data.get('reason', '')
@@ -628,15 +682,20 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
 
-        # Give the days back before deleting: approved requests hold used
-        # days (this used to release pending days instead), open ones hold
+        # Give the days back and delete in one transaction, on the locked
+        # row, so the balance never changes without the delete (or twice
+        # for two concurrent deletes). Approved requests hold used days
+        # (this used to release pending days instead), open ones hold
         # pending days; rejected / cancelled ones hold nothing.
-        if instance.status == 'approved':
-            update_leave_balance(instance, action='cancel_approved')
-        elif instance.status in OPEN_APPROVAL_STATUSES:
-            update_leave_balance(instance, action='cancel')
+        with transaction.atomic():
+            instance = lock_leave_request(instance)
+            if instance.status == 'approved':
+                update_leave_balance(instance, action='cancel_approved')
+            elif instance.status in OPEN_APPROVAL_STATUSES:
+                update_leave_balance(instance, action='cancel')
+            self.perform_destroy(instance)
 
-        return super().destroy(request, *args, **kwargs)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class PublicHolidayViewSet(viewsets.ModelViewSet):

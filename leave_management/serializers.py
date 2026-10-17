@@ -507,6 +507,29 @@ class LeaveErrorResponseSerializer(serializers.Serializer):
     error = serializers.CharField()
 
 
+class LeaveActionErrorResponseSerializer(serializers.Serializer):
+    """
+    400 body of the approve / reject / cancel actions: either a state error
+    {error} (request not open, wrong action) or DRF field errors
+    ({action: [...]}, {comments: [...]}, ...).
+    """
+    error = serializers.CharField(required=False)
+    action = serializers.ListField(child=serializers.CharField(), required=False)
+    comments = serializers.ListField(child=serializers.CharField(), required=False)
+    reason = serializers.ListField(child=serializers.CharField(), required=False)
+    non_field_errors = serializers.ListField(child=serializers.CharField(), required=False)
+
+
+class LeaveForbiddenResponseSerializer(serializers.Serializer):
+    """
+    403 body of the leave decision actions: {detail} from a permission check
+    (not admin/HR, not the employee's manager, own request) or {error} when
+    the request awaits a different approver role.
+    """
+    detail = serializers.CharField(required=False)
+    error = serializers.CharField(required=False)
+
+
 class CarryForwardRequestSerializer(serializers.Serializer):
     """Input of the carry forward action"""
     from_year = serializers.IntegerField(min_value=2000, max_value=2100)
