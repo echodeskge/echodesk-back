@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import api_view, permission_classes, action
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.response import Response
 from django.db import transaction
 from django.utils import timezone
@@ -22,7 +23,8 @@ from .serializers import (
     BookingListSerializer, BookingDetailSerializer, BookingRowSerializer, AdminBookingUpdateSerializer,
     RecurringBookingSerializer, AdminRecurringBookingCreateSerializer, StaffAvailabilitySerializer,
     StaffExceptionSerializer, BookingSettingsSerializer,
-    BookingConfirmRequestSerializer, BookingCancelRequestSerializer, BookingAssignStaffRequestSerializer,
+    BookingConfirmRequestSerializer, BookingCancelRequestSerializer, BookingCancelResponseSerializer,
+    BookingAssignStaffRequestSerializer,
     BookingRescheduleRequestSerializer, BookingRecordPaymentRequestSerializer, BookingErrorSerializer,
     AdminSlotsResponseSerializer, BookingDashboardSerializer, StaffScheduleSerializer,
     AvailableUserSerializer, BookingClientStatsSerializer,
@@ -31,11 +33,16 @@ from .permissions import (
     HasBookingManagementFeature, IsBookingAdmin, IsBookingAdminForDestroy, IsBookingAdminForWrites,
 )
 from .staff_notifications import notify_assigned_staff
-from .utils import generate_available_slots, can_cancel_booking, get_booking_settings, tenant_now
+from .utils import (
+    generate_available_slots, can_cancel_booking, flag_manual_refund, get_booking_settings,
+    get_or_create_booking_settings, tenant_now,
+)
 from .payment_service import get_booking_payment_service
 import logging
 
 logger = logging.getLogger(__name__)
+
+STAFF_INACTIVE_ERROR = 'Staff member is not active for bookings'
 
 BOOKING_ERROR = OpenApiResponse(BookingErrorSerializer, description='{"error": "..."}')
 
@@ -68,6 +75,16 @@ def _row_booking_qs(qs=None):
     if qs is None:
         qs = Booking.objects.all()
     return qs.select_related('client', 'service', 'staff', 'staff__user')
+
+
+def _forced(request):
+    return str(request.data.get('force', False)).lower() in ('1', 'true', 'yes')
+
+
+def _awaiting_online_payment(booking):
+    """The customer chose to pay online by card and hasn't paid yet.
+    Pay-at-venue bookings (and ones staff created) don't wait for payment."""
+    return booking.payment_method == 'card' and booking.payment_status not in ['deposit_paid', 'fully_paid']
 
 
 def _wants_lite(request):
@@ -272,6 +289,8 @@ def admin_slots(request):
         staff = BookingStaff.objects.select_related('user').filter(id=staff_id).first()
         if staff is None:
             return Response({'error': 'Staff not found'}, status=status.HTTP_400_BAD_REQUEST)
+        if not staff.is_active_for_bookings:
+            return Response({'error': STAFF_INACTIVE_ERROR}, status=status.HTTP_400_BAD_REQUEST)
         if not staff_can_perform(service, staff):
             return Response({'error': 'This staff member does not provide this service'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -691,21 +710,16 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
         base = _row_booking_qs() if self._lite() else _optimized_booking_qs()
         queryset = base.order_by('-date', '-start_time')
 
-        # Date range filter
-        date_from = self.request.query_params.get('date_from')
-        date_to = self.request.query_params.get('date_to')
-
-        if date_from:
-            try:
-                queryset = queryset.filter(date__gte=_parse_date(date_from))
-            except ValueError:
-                pass
-
-        if date_to:
-            try:
-                queryset = queryset.filter(date__lte=_parse_date(date_to))
-            except ValueError:
-                pass
+        # A bad date is a 400 (like staff/{id}/bookings), not a silently dropped filter.
+        if self.action in ('list', 'rows'):
+            for name, lookup in (('date_from', 'date__gte'), ('date_to', 'date__lte')):
+                value = self.request.query_params.get(name)
+                if not value:
+                    continue
+                try:
+                    queryset = queryset.filter(**{lookup: _parse_date(value)})
+                except ValueError:
+                    raise DRFValidationError({'error': f'Invalid {name}. Use YYYY-MM-DD'})
 
         if str(self.request.query_params.get('mine', '')).lower() in ('1', 'true', 'yes'):
             queryset = queryset.filter(staff__user=self.request.user)
@@ -745,7 +759,7 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
             BookingStaff.objects.select_for_update().filter(pk=data['staff'].pk).exists()
             if is_slot_booked(data['staff'], data['date'], data['start_time'], data['service'].total_duration_minutes):
                 return Response({'start_time': 'This time slot was just booked'}, status=status.HTTP_400_BAD_REQUEST)
-            booking = serializer.save()
+            booking = serializer.save(created_by=request.user if request.user.is_authenticated else None)
         if data.get('notify_client') and booking.status == 'confirmed':
             booking._notify_client('confirmed')
         # A colleague booked one of this staff member's clients
@@ -794,9 +808,7 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
         # Check payment unless admin forces confirmation
         # Only bookings the customer chose to pay online must be paid first;
         # pay-at-venue bookings (and ones staff created) are confirmed as-is.
-        force = str(request.data.get('force', False)).lower() in ('1', 'true', 'yes')
-        awaiting_online_payment = booking.payment_method == 'card'
-        if not force and awaiting_online_payment and booking.payment_status not in ['deposit_paid', 'fully_paid']:
+        if not _forced(request) and _awaiting_online_payment(booking):
             return Response(
                 {'error': 'Cannot confirm booking without payment. Use force=true to override.'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -808,8 +820,11 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         tags=['Booking Admin - Bookings'],
-        description='The client has arrived: pending/confirmed → in_progress.',
-        request=None, responses={200: BookingDetailSerializer, 400: BOOKING_ERROR},
+        description=(
+            'The client has arrived: pending/confirmed → in_progress. Like confirm, a pending '
+            'unpaid online-card booking needs force=true.'
+        ),
+        request=BookingConfirmRequestSerializer, responses={200: BookingDetailSerializer, 400: BOOKING_ERROR},
     )
     @action(detail=True, methods=['post'])
     def check_in(self, request, pk=None):
@@ -817,6 +832,12 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
         if booking.status not in ['pending', 'confirmed']:
             return Response(
                 {'error': f'Cannot check in booking with status: {booking.status}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        # Checking in a pending booking skips confirm, so the same payment rule applies.
+        if booking.status == 'pending' and not _forced(request) and _awaiting_online_payment(booking):
+            return Response(
+                {'error': 'Cannot check in booking without payment. Use force=true to override.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         booking.check_in()
@@ -863,7 +884,7 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
             'Cancel (any status except completed/cancelled/no_show). Refunds what was paid '
             'online unless refund=false.'
         ),
-        request=BookingCancelRequestSerializer, responses={200: BookingDetailSerializer, 400: BOOKING_ERROR},
+        request=BookingCancelRequestSerializer, responses={200: BookingCancelResponseSerializer, 400: BOOKING_ERROR},
     )
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
@@ -890,17 +911,30 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
             booking._notification_actor = request.user
             booking.cancel(cancelled_by='admin', reason=cancellation_reason)
 
-        # Initiate refund if applicable
+        # Initiate refund if applicable. Only the online part goes back through
+        # BOG; cash/terminal payments staff recorded stay on the booking and
+        # are flagged for returning by hand.
+        refund_result = {'status': 'no_refund', 'amount': Decimal('0')}
+        manual_due = Decimal('0')
         if booking.paid_amount > 0:
             refund_requested = str(request.data.get('refund', True)).lower() not in ('0', 'false', 'no')
             if refund_requested:
                 try:
                     payment_service = get_booking_payment_service()
-                    payment_service.initiate_refund(booking)
+                    refund_result = payment_service.initiate_refund(booking)
                 except Exception as e:
+                    refund_result = {'status': 'error', 'amount': Decimal('0')}
                     logger.error(f"Failed to initiate refund for {booking.booking_number}: {str(e)}")
+                try:
+                    booking.refresh_from_db()
+                    manual_due = flag_manual_refund(booking, get_or_create_booking_settings())
+                except Exception:
+                    logger.exception('Could not flag the manual refund for %s', booking.booking_number)
 
-        return Response(self._detail(booking))
+        data = self._detail(booking)
+        data['refund'] = {'status': refund_result.get('status'), 'amount': str(refund_result.get('amount') or Decimal('0'))}
+        data['manual_refund_due'] = str(manual_due.quantize(Decimal('0.01')))
+        return Response(data)
 
     @extend_schema(
         tags=['Booking Admin - Bookings'],
@@ -939,6 +973,12 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
 
         if staff.pk == booking.staff_id:
             return Response(self._detail(booking))
+
+        if not staff.is_active_for_bookings:
+            return Response(
+                {'error': STAFF_INACTIVE_ERROR},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         # Check if staff is available for this service
         if not staff.services.filter(id=booking.service.id).exists():

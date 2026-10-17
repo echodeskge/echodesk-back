@@ -553,7 +553,10 @@ class AdminBookingUpdateSerializer(serializers.ModelSerializer):
     check_in, complete, no_show, cancel, reschedule, assign_staff,
     record_payment), which apply their rules and notifications.
     """
-    total_amount = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=0, required=False)
+    total_amount = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=0, required=False,
+        help_text='Not below what was already paid (paid_amount)',
+    )
 
     class Meta:
         model = Booking
@@ -562,6 +565,28 @@ class AdminBookingUpdateSerializer(serializers.ModelSerializer):
             'staff_notes': {'required': False},
             'client_notes': {'required': False},
         }
+
+    def validate_total_amount(self, value):
+        paid = (self.instance.paid_amount if self.instance is not None else None) or Decimal('0')
+        if value is not None and value < paid:
+            raise serializers.ValidationError(
+                f'The total can\'t be less than what was already paid ({paid})'
+            )
+        return value
+
+    def update(self, instance, validated_data):
+        booking = super().update(instance, validated_data)
+        if 'total_amount' in validated_data:
+            # Keep payment_status in line with the new price: paying the old
+            # total may now cover it in full, or a raised price leaves
+            # something owed. Refunded/failed bookings are left alone.
+            paid = booking.paid_amount or Decimal('0')
+            if paid > 0 and booking.payment_status in ('pending', 'deposit_paid', 'fully_paid'):
+                new_status = 'fully_paid' if paid >= booking.total_amount else 'deposit_paid'
+                if new_status != booking.payment_status:
+                    booking.payment_status = new_status
+                    booking.save(update_fields=['payment_status', 'updated_at'])
+        return booking
 
 
 # ----------------------------------------------------------------------------
@@ -581,6 +606,27 @@ class BookingCancelRequestSerializer(serializers.Serializer):
         required=False, default=True,
         help_text='Refund the online payment (only when something was paid online)',
     )
+
+
+class BookingRefundResultSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(
+        choices=['no_refund', 'refunded', 'manual_required', 'error'],
+        help_text='Outcome of the online (BOG) refund',
+    )
+    amount = serializers.CharField(help_text='Decimal string refunded (or to refund) online')
+
+
+class BookingCancelResponseSerializer(BookingDetailSerializer):
+    """Cancel response: BookingDetail plus what happened to the money."""
+    refund = BookingRefundResultSerializer(read_only=True)
+    manual_refund_due = serializers.CharField(
+        read_only=True,
+        help_text='Decimal string: money staff recorded by hand (cash/terminal/transfer) that must be '
+                  'returned by hand. "0.00" when nothing is due.',
+    )
+
+    class Meta(BookingDetailSerializer.Meta):
+        fields = BookingDetailSerializer.Meta.fields + ['refund', 'manual_refund_due']
 
 
 class BookingAssignStaffRequestSerializer(serializers.Serializer):
@@ -1246,6 +1292,8 @@ class AdminBookingCreateSerializer(serializers.Serializer):
             staff = BookingStaff.objects.select_related('user').get(id=attrs['staff_id'])
         except BookingStaff.DoesNotExist:
             raise serializers.ValidationError({'staff_id': 'Staff not found'})
+        if not staff.is_active_for_bookings:
+            raise serializers.ValidationError({'staff_id': 'Staff member is not active for bookings'})
         if not staff_can_perform(service, staff):
             raise serializers.ValidationError({'staff_id': 'This staff member does not provide this service'})
 
@@ -1304,6 +1352,7 @@ class AdminBookingCreateSerializer(serializers.Serializer):
             client_notes=validated_data.get('client_notes', ''),
             contact_email=client.email or '',
             contact_language=_business_language(),
+            created_by=validated_data.get('created_by'),
         )
         return booking
 

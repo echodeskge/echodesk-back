@@ -256,6 +256,13 @@ def _cancel_booking(booking, reason):
         except Exception:
             logger.exception('Refund failed for booking %s', booking.booking_number)
         booking.refresh_from_db()
+        # Cash recorded at the desk can't go back through BOG: leave a note
+        # for staff to return it by hand.
+        try:
+            from .utils import flag_manual_refund, get_or_create_booking_settings
+            flag_manual_refund(booking, get_or_create_booking_settings())
+        except Exception:
+            logger.exception('Could not flag the manual refund for %s', booking.booking_number)
     notify_staff_of_booking(booking, 'cancelled')
     return booking
 
