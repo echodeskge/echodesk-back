@@ -116,6 +116,7 @@ def _disable_account(account_id, reason, error_text):
     try:
         from django.contrib.auth import get_user_model
 
+        from users.notification_texts import T
         from users.notification_utils import create_notification
 
         User = get_user_model()
@@ -124,11 +125,8 @@ def _disable_account(account_id, reason, error_text):
             create_notification(
                 user=admin,
                 notification_type='system',
-                title='Telegram account disconnected',
-                message=(
-                    f'The Telegram account {label} was disconnected '
-                    f'({reason}). Reconnect it from Settings → Social → Telegram.'
-                ),
+                title=T('telegram.disconnected.title'),
+                message=T('telegram.disconnected.message', label=label, reason=reason),
                 metadata={
                     'platform_key': 'telegram',
                     'telegram_account_id': str(account.telegram_user_id),

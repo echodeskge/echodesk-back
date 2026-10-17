@@ -15,6 +15,12 @@ from django.db.models import Q
 User = get_user_model()
 logger = logging.getLogger(__name__)
 
+
+def _texts():
+    """users.notification_texts.T / LazyText / render (lazy import)."""
+    from users.notification_texts import LazyText, T, render
+    return T, LazyText, render
+
 # ---------------------------------------------------------------------------
 # Invoices
 # ---------------------------------------------------------------------------
@@ -36,6 +42,7 @@ try:
     @receiver(post_save, sender=Invoice)
     def notify_invoice_events(sender, instance, created, **kwargs):
         from users.notification_utils import create_notification
+        T, _, _ = _texts()
 
         if created:
             # Notify all active users about a new invoice
@@ -44,8 +51,12 @@ try:
                 create_notification(
                     user=user,
                     notification_type='invoice_created',
-                    title=f'Invoice {instance.invoice_number} created',
-                    message=f'New invoice for {instance.client_name or "a client"} totalling {instance.total} {instance.currency}',
+                    title=T('invoice.created.title', number=instance.invoice_number),
+                    message=T(
+                        'invoice.created.message',
+                        client=instance.client_name or T('invoice.a_client'),
+                        total=instance.total, currency=instance.currency,
+                    ),
                     metadata={
                         'invoice_id': instance.id,
                         'invoice_number': instance.invoice_number,
@@ -63,8 +74,12 @@ try:
                 create_notification(
                     user=instance.created_by,
                     notification_type='invoice_paid',
-                    title=f'Invoice {instance.invoice_number} paid',
-                    message=f'{instance.client_name or "Client"} has paid invoice {instance.invoice_number}',
+                    title=T('invoice.paid.title', number=instance.invoice_number),
+                    message=T(
+                        'invoice.paid.message',
+                        client=instance.client_name or T('invoice.client'),
+                        number=instance.invoice_number,
+                    ),
                     metadata={
                         'invoice_id': instance.id,
                         'invoice_number': instance.invoice_number,
@@ -78,8 +93,8 @@ try:
                 create_notification(
                     user=instance.created_by,
                     notification_type='invoice_overdue',
-                    title=f'Invoice {instance.invoice_number} overdue',
-                    message=f'Invoice for {instance.client_name or "a client"} is now overdue',
+                    title=T('invoice.overdue.title', number=instance.invoice_number),
+                    message=T('invoice.overdue.message', client=instance.client_name or T('invoice.a_client')),
                     metadata={
                         'invoice_id': instance.id,
                         'invoice_number': instance.invoice_number,
@@ -108,9 +123,18 @@ try:
         else:
             instance._old_status = None
 
+    def _leave_type_text(instance):
+        """The leave type's name in the recipient's language ({en, ka} names)."""
+        _, LazyText, render = _texts()
+        name = getattr(instance.leave_type, 'name', None)
+        if isinstance(name, dict):
+            return LazyText(lambda language: render(name, language) or str(instance.leave_type))
+        return str(instance.leave_type)
+
     @receiver(post_save, sender=LeaveRequest)
     def notify_leave_events(sender, instance, created, **kwargs):
         from users.notification_utils import create_notification
+        T, _, _ = _texts()
 
         if created:
             from leave_management.utils import get_next_approver_role
@@ -140,8 +164,11 @@ try:
                 create_notification(
                     user=manager,
                     notification_type='leave_request_submitted',
-                    title='New leave request',
-                    message=f'{employee_name} submitted a leave request ({instance.leave_type})',
+                    title=T('leave.submitted.title'),
+                    message=T(
+                        'leave.submitted.message',
+                        employee=employee_name, leave_type=_leave_type_text(instance),
+                    ),
                     metadata={
                         'leave_request_id': instance.id,
                         'employee_name': employee_name,
@@ -169,18 +196,17 @@ try:
         if instance.status in ('manager_approved', 'hr_approved'):
             from leave_management.utils import get_next_approver_role
 
-            stage = 'manager' if instance.status == 'manager_approved' else 'HR'
+            stage = T('leave.stage.manager' if instance.status == 'manager_approved' else 'leave.stage.hr')
             next_role = get_next_approver_role(instance)
-            next_label = {'manager': 'manager', 'hr': 'HR', 'admin': 'admin'}.get(next_role, 'final')
+            next_label = T(
+                f'leave.next.{next_role}' if next_role in ('manager', 'hr', 'admin') else 'leave.next.final'
+            )
             if instance.employee_id != actor_id:
                 create_notification(
                     user=instance.employee,
                     notification_type='leave_request_progress',
-                    title='Leave request partially approved',
-                    message=(
-                        f'Your leave request for {period} was approved by {stage}; '
-                        f'it now awaits {next_label} approval'
-                    ),
+                    title=T('leave.progress.title'),
+                    message=T('leave.progress.message', period=period, stage=stage, next=next_label),
                     metadata={
                         'leave_request_id': instance.id,
                         'status': instance.status,
@@ -194,8 +220,11 @@ try:
                     create_notification(
                         user=approver,
                         notification_type='leave_request_awaiting_approval',
-                        title=f'Leave request awaiting {next_label} approval',
-                        message=f'{employee_name} has a leave request ({instance.leave_type}) for {period} waiting for your approval',
+                        title=T('leave.awaiting.title', next=next_label),
+                        message=T(
+                            'leave.awaiting.message', employee=employee_name,
+                            leave_type=_leave_type_text(instance), period=period,
+                        ),
                         metadata={
                             'leave_request_id': instance.id,
                             'employee_name': employee_name,
@@ -213,8 +242,8 @@ try:
             create_notification(
                 user=instance.employee,
                 notification_type='leave_request_approved',
-                title='Leave request approved',
-                message=f'Your leave request for {period} has been approved',
+                title=T('leave.approved.title'),
+                message=T('leave.approved.message', period=period),
                 metadata={
                     'leave_request_id': instance.id,
                     'status': instance.status,
@@ -227,8 +256,8 @@ try:
             create_notification(
                 user=instance.employee,
                 notification_type='leave_request_rejected',
-                title='Leave request rejected',
-                message=f'Your leave request for {period} has been rejected',
+                title=T('leave.rejected.title'),
+                message=T('leave.rejected.message', period=period),
                 metadata={
                     'leave_request_id': instance.id,
                     'rejection_reason': instance.rejection_reason or '',
@@ -248,8 +277,8 @@ try:
                 create_notification(
                     user=instance.employee,
                     notification_type='leave_request_cancelled',
-                    title='Leave request cancelled',
-                    message=f'Your leave request for {period} has been cancelled',
+                    title=T('leave.cancelled.title'),
+                    message=T('leave.cancelled.message', period=period),
                     metadata=metadata,
                     link_url=f'/leave/my-requests?id={instance.id}',
                 )
@@ -267,8 +296,8 @@ try:
                 create_notification(
                     user=approver,
                     notification_type='leave_request_cancelled',
-                    title='Leave request cancelled',
-                    message=f"{employee_name}'s leave request for {period} has been cancelled",
+                    title=T('leave.cancelled.title'),
+                    message=T('leave.cancelled.message_approver', employee=employee_name, period=period),
                     metadata={**metadata, 'employee_name': employee_name},
                     link_url=_leave_approver_link(approver, instance.id),
                 )

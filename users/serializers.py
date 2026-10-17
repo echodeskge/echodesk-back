@@ -309,7 +309,7 @@ class UserSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'email', 'first_name', 'last_name', 'full_name',
             'role', 'status', 'phone_number', 'job_title', 'department', 'department_id',
-            'manager', 'manager_name',
+            'manager', 'manager_name', 'preferred_language',
             'is_active', 'is_staff', 'is_booking_staff', 'date_joined', 'last_login',
             'permissions', 'group_permissions', 'all_permissions', 'feature_keys',
             'group_ids', 'tenant_groups', 'tenant_group_ids', 'user_permission_ids'
@@ -535,6 +535,7 @@ class UserUpdateSerializer(ManagerIdMixin, EmailUniquenessMixin, serializers.Mod
         fields = [
             'email', 'first_name', 'last_name', 'role', 'status',
             'phone_number', 'job_title', 'is_active', 'department_id', 'manager_id',
+            'preferred_language',
             'group_ids', 'tenant_group_ids', 'user_permission_ids'
         ]
         extra_kwargs = {

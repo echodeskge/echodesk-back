@@ -11,8 +11,9 @@ Two audiences:
   assigned staff member only, never to the person who made the change.
 
 Every notification carries link_url '/bookings/bookings/<id>' and metadata
-{booking_id, booking_number, ...}. Texts follow the tenant's preferred
-language (en / ka).
+{booking_id, booking_number, ...}. Texts follow each recipient's language
+(users.notification_texts.user_language: their own preferred_language, else
+the tenant's, else Georgian), rendered per recipient.
 
 Never raises: a notification problem must not fail a booking.
 """
@@ -72,16 +73,6 @@ STAFF_NOTIFICATION_TYPES = {
 }
 
 
-def _tenant_language():
-    try:
-        from django.db import connection
-        from tenants.models import Tenant
-        language = Tenant.objects.get(schema_name=connection.schema_name).preferred_language
-    except Exception:
-        language = 'en'
-    return language if language in ('en', 'ka') else 'en'
-
-
 def _hhmm(value):
     """'HH:MM' from a time (or the 'HH:MM[:SS]' string a freshly built row may still hold)."""
     return value.strftime('%H:%M') if hasattr(value, 'strftime') else str(value)[:5]
@@ -121,10 +112,15 @@ def notify_staff_of_booking(booking, kind, client_label=''):
         from users.models import User
         from users.notification_utils import create_notification
 
-        language = _tenant_language()
-        texts = TEXTS.get(language) or TEXTS['en']
-        title, template = texts[kind]
-        message = _format(booking, template, language, client_label=client_label)
+        from users.notification_texts import LazyText
+
+        def _texts(language):
+            return (TEXTS.get(language) or TEXTS['en'])[kind]
+
+        title = LazyText(lambda language: _texts(language)[0])
+        message = LazyText(
+            lambda language: _format(booking, _texts(language)[1], language, client_label=client_label)
+        )
 
         # The assigned staff member, plus everyone who runs the business.
         recipients = Q(is_staff=True) | Q(is_superuser=True)
@@ -164,11 +160,15 @@ def notify_assigned_staff(booking, kind, actor=None, staff=None, **extra):
         if actor_id is not None and actor_id == user.pk:
             return False
 
-        language = _tenant_language()
-        texts = STAFF_TEXTS.get(language) or STAFF_TEXTS['en']
-        title_template, message_template = texts[kind]
-        title = title_template.format(**extra) if extra else title_template
-        message = _format(booking, message_template, language, **extra)
+        from users.notification_texts import LazyText
+
+        def _texts(language):
+            return (STAFF_TEXTS.get(language) or STAFF_TEXTS['en'])[kind]
+
+        title = LazyText(
+            lambda language: _texts(language)[0].format(**extra) if extra else _texts(language)[0]
+        )
+        message = LazyText(lambda language: _format(booking, _texts(language)[1], language, **extra))
 
         metadata = _metadata(booking, kind=kind)
         if booking.cancelled_by and kind == 'cancelled':

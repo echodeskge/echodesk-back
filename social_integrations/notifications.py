@@ -21,12 +21,13 @@ def notify_widget_visitor_message(session, message, assigned_user_id=None):
     conversation_id is the session id (what mark-read clears by).
     """
     try:
+        from users.notification_texts import T
         from users.notification_utils import create_social_message_notification
 
-        text = message.message_text or ('Sent an attachment' if message.attachments else '')
+        text = message.message_text or (T('social.widget.attachment') if message.attachments else '')
         create_social_message_notification(
             platform='Widget',
-            sender_name=session.visitor_name or f"Website visitor {session.visitor_id[:6]}",
+            sender_name=session.visitor_name or T('social.widget.visitor', visitor=session.visitor_id[:6]),
             message_text=text,
             conversation_id=session.session_id,
             sender_id=session.visitor_id,
@@ -49,17 +50,20 @@ def notify_auto_post(post, kind):
     Link: /settings/social/auto-posting?post=<id>; metadata.auto_post_id.
     """
     try:
+        from users.notification_texts import T
         from users.notification_utils import create_notification, social_admin_recipients
 
+        # The post preview and the publisher's error are content and stay as
+        # written; only the fallbacks are localized.
         if kind == 'draft':
             notification_type = 'auto_post_draft'
-            title = 'New AI post waiting for approval'
+            title = T('auto_post.draft.title')
             preview = (post.facebook_text or post.instagram_text or '')[:120]
-            message = preview or 'An auto-generated post needs your review.'
+            message = preview or T('auto_post.draft.default')
         else:
             notification_type = 'auto_post_failed'
-            title = 'Auto-post failed to publish'
-            message = (post.error_message or 'Publishing failed.')[:200]
+            title = T('auto_post.failed.title')
+            message = (post.error_message or '')[:200] or T('auto_post.failed.default')
         metadata = {
             'auto_post_id': post.id,
             'status': post.status,
@@ -86,6 +90,7 @@ def notify_whatsapp_template_status(template, previous_status, reason=''):
     status, previous_status, reason, waba_id}.
     """
     try:
+        from users.notification_texts import CATALOG, T, truncate
         from users.notification_utils import create_notification, social_admin_recipients
 
         recipients = {u.id: u for u in social_admin_recipients('manage_social_connections')}
@@ -93,9 +98,19 @@ def notify_whatsapp_template_status(template, previous_status, reason=''):
         if creator is not None and creator.is_active:
             recipients.setdefault(creator.id, creator)
         status_label = (template.status or '').lower().replace('_', ' ')
-        message = f'Template "{template.name}" ({template.language}) is now {status_label}.'
+        status_key = f'whatsapp.status.{status_label}'
+        status_text = T(status_key) if status_key in CATALOG else status_label
+        # Meta's rejection reason is a code / free text and stays as sent.
         if reason and reason.upper() != 'NONE':
-            message += f' Reason: {reason}'
+            message = T(
+                'whatsapp.template.message_reason', name=template.name,
+                language=template.language, status=status_text, reason=reason,
+            )
+        else:
+            message = T(
+                'whatsapp.template.message', name=template.name,
+                language=template.language, status=status_text,
+            )
         metadata = {
             'template_id': template.id,
             'name': template.name,
@@ -109,8 +124,8 @@ def notify_whatsapp_template_status(template, previous_status, reason=''):
             create_notification(
                 user=user,
                 notification_type='whatsapp_template_status',
-                title='WhatsApp template reviewed',
-                message=message[:500],
+                title=T('whatsapp.template.title'),
+                message=truncate(message, 500),
                 metadata=dict(metadata),
                 link_url=f'/social/templates?id={template.id}',
             )

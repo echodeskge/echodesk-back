@@ -1090,6 +1090,7 @@ def _auto_disable_email_connection(connection, error_message: str) -> None:
     # Notify tenant admins so the outage surfaces in-app.
     try:
         from django.contrib.auth import get_user_model
+        from users.notification_texts import T
         from users.notification_utils import create_notification
         User = get_user_model()
         admins = User.objects.filter(is_active=True).filter(
@@ -1100,11 +1101,11 @@ def _auto_disable_email_connection(connection, error_message: str) -> None:
             create_notification(
                 user=admin,
                 notification_type='email_sync_disabled',
-                title=f'Email sync disabled: {connection.email_address}',
-                message=(
-                    f'Automatic IMAP sync for {connection.email_address} was '
-                    f'disabled after an error. Go to email settings to fix '
-                    f'credentials and reactivate. Error: {error_message[:200]}'
+                title=T('email_sync.disabled.title', email=connection.email_address),
+                # The server's error text stays as reported.
+                message=T(
+                    'email_sync.disabled.message',
+                    email=connection.email_address, error=error_message[:200],
                 ),
                 metadata={
                     'connection_id': connection.id,
