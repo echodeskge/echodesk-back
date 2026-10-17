@@ -348,6 +348,12 @@ SPECTACULAR_SETTINGS = {
         'UnifiedConversationPlatformEnum': ['facebook', 'instagram', 'whatsapp', 'email', 'widget', 'telegram'],
         'ModeEnum': ['ai', 'off'],
         'DeactivationReasonEnum': 'social_integrations.models.TelegramAccount.DEACTIVATION_REASONS',
+        # web/ios/android: TenantLoginRequest.platform and AuthDevice.platform.
+        'TenantLoginPlatformEnum': ['web', 'ios', 'android'],
+        # CallEvent.event_type kept its name when SecurityLog.event_type arrived.
+        'EventTypeEnum': 'crm.models.CallEvent.EVENT_TYPES',
+        'SecurityLogEventTypeEnum': 'tenants.models.SecurityLog.EVENT_TYPES',
+        'IPWhitelistLockoutCodeEnum': 'tenants.security_views.IP_WHITELIST_LOCKOUT_CODES',
     },
 }
 

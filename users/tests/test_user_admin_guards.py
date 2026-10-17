@@ -93,7 +93,13 @@ class TestRoleEscalation(GuardTestCase):
         self.assertEqual(self.agent.role, 'admin')
 
     def test_non_admin_role_changes_still_allowed(self):
-        resp = self.api_patch(detail_url(self.agent.id), {'role': 'manager'}, user=self.user_manager)
+        # Up to the caller's own role (an agent-role user manager may not
+        # hand out manager; see test_fxusers_security.TestRoleChangeTakeover).
+        resp = self.api_patch(detail_url(self.agent.id), {'role': 'viewer'}, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.agent.refresh_from_db()
+        self.assertEqual(self.agent.role, 'viewer')
+        resp = self.api_patch(detail_url(self.agent.id), {'role': 'manager'}, user=self.admin)
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.agent.refresh_from_db()
         self.assertEqual(self.agent.role, 'manager')

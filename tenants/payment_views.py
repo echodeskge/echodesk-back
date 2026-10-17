@@ -4,7 +4,7 @@ Payment views for subscription management
 
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import IsAuthenticated, AllowAny, BasePermission
 from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, OpenApiResponse, inline_serializer
 from rest_framework import serializers
@@ -43,6 +43,22 @@ Package = _DeprecatedPackage
 User = get_user_model()
 
 logger = logging.getLogger(__name__)
+
+
+class IsBillingAdmin(BasePermission):
+    """
+    Endpoints that charge the tenant's card, save or replace a card, or
+    cancel the subscription: staff, superusers and role=admin users only
+    (the dashboard shows the billing pages to staff only).
+    """
+    message = 'Only staff or administrators can manage billing and payments.'
+
+    def has_permission(self, request, view):
+        user = request.user
+        return bool(
+            user and user.is_authenticated
+            and (user.is_staff or user.is_superuser or getattr(user, 'role', None) == 'admin')
+        )
 
 
 def get_next_billing_date():
@@ -126,13 +142,14 @@ def trigger_tenant_processing(schema_name):
             }
         ),
         400: OpenApiResponse(description='Invalid request'),
+        403: OpenApiResponse(description='Not staff / superuser / admin role'),
         404: OpenApiResponse(description='Package not found'),
         500: OpenApiResponse(description='Payment gateway error')
     },
     tags=['Payments']
 )
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsBillingAdmin])
 def create_subscription_payment(request):
     """
     Create a payment session for subscription
@@ -1420,12 +1437,13 @@ def bog_webhook(request):
     description='Cancel the current subscription',
     responses={
         200: OpenApiResponse(description='Subscription cancelled'),
+        403: OpenApiResponse(description='Not staff / superuser / admin role'),
         404: OpenApiResponse(description='No active subscription found')
     },
     tags=['Payments']
 )
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsBillingAdmin])
 def cancel_subscription(request):
     """
     Cancel the current subscription
@@ -1611,12 +1629,13 @@ def delete_saved_card(request):
                 }
             }
         ),
+        403: OpenApiResponse(description='Not staff / superuser / admin role'),
         404: OpenApiResponse(description='No active subscription found')
     },
     tags=['Payments']
 )
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsBillingAdmin])
 def manual_payment(request):
     """
     Create a manual payment for subscription renewal
@@ -1713,12 +1732,13 @@ def manual_payment(request):
                 }
             }
         ),
+        403: OpenApiResponse(description='Not staff / superuser / admin role'),
         404: OpenApiResponse(description='No subscription found')
     },
     tags=['Payments']
 )
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsBillingAdmin])
 def reactivate_subscription_payment(request):
     """
     Create a payment to reactivate an inactive subscription
@@ -1893,12 +1913,13 @@ def get_saved_card(request):
     ),
     responses={
         200: OpenApiResponse(description='Card removed successfully'),
+        403: OpenApiResponse(description='Not staff / superuser / admin role'),
         404: OpenApiResponse(description='Card not found')
     },
     tags=['Payments']
 )
 @api_view(['DELETE'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsBillingAdmin])
 def remove_saved_card(request):
     """
     Remove a specific saved payment card
@@ -1978,12 +1999,13 @@ def remove_saved_card(request):
     ),
     responses={
         200: OpenApiResponse(description='Default card updated successfully'),
+        403: OpenApiResponse(description='Not staff / superuser / admin role'),
         404: OpenApiResponse(description='Card not found')
     },
     tags=['Payments']
 )
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsBillingAdmin])
 def set_default_card(request):
     """
     Set a specific card as the default payment method
@@ -2076,13 +2098,13 @@ def set_default_card(request):
                 }
             )
         ),
-        403: OpenApiResponse(description='Not accessible from this domain'),
+        403: OpenApiResponse(description='Not accessible from this domain, or not staff / superuser / admin role'),
         503: OpenApiResponse(description='Payment gateway not configured')
     },
     tags=['Payments']
 )
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsBillingAdmin])
 def add_new_card(request):
     """
     Create a 0 GEL payment to add and save a new payment card
@@ -2206,13 +2228,13 @@ def add_new_card(request):
                 }
             )
         ),
-        403: OpenApiResponse(description='Not accessible from this domain'),
+        403: OpenApiResponse(description='Not accessible from this domain, or not staff / superuser / admin role'),
         503: OpenApiResponse(description='Payment gateway not configured')
     },
     tags=['Payments']
 )
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsBillingAdmin])
 def add_ecommerce_card(request):
     """
     Create a 0 GEL payment to add and save an ecommerce payment card

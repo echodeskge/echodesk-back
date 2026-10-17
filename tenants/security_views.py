@@ -66,11 +66,15 @@ IP_WHITELIST_STATE = inline_serializer(
     },
 )
 
+# Codes of the 400 a whitelist change can be refused with (the component is
+# pinned to ``IPWhitelistLockoutCodeEnum`` in ENUM_NAME_OVERRIDES).
+IP_WHITELIST_LOCKOUT_CODES = ['no_active_entries', 'would_lock_out', 'would_lock_out_superusers']
+
 IP_WHITELIST_LOCKOUT = inline_serializer(
     name='IPWhitelistLockoutError',
     fields={
         'error': serializers.CharField(),
-        'code': serializers.ChoiceField(choices=['no_active_entries', 'would_lock_out']),
+        'code': serializers.ChoiceField(choices=IP_WHITELIST_LOCKOUT_CODES),
         'ip_address': serializers.CharField(required=False),
     },
 )
@@ -88,6 +92,65 @@ def _would_lock_out(request, tenant, enabled, bypass, exclude_entry_id=None, ent
     client_ip = SecurityService.get_client_ip(request)
     return not SecurityService.ip_matches_whitelist(
         tenant, client_ip, exclude_entry_id=exclude_entry_id, entry_overrides=entry_overrides,
+    )
+
+
+def _covered_superuser_count(tenant, enabled, bypass, exclude_entry_id=None, entry_overrides=None):
+    """
+    How many active superusers of the tenant could still sign in with the
+    given whitelist state. With the whitelist off or the bypass on, all of
+    them; otherwise those whose latest successful sign-in IP matches an
+    active entry (a superuser who never signed in has no known IP and is
+    not counted as covered).
+    """
+    from django.contrib.auth import get_user_model
+    from .models import SecurityLog
+
+    superuser_ids = list(
+        get_user_model().objects.filter(is_superuser=True, is_active=True).values_list('id', flat=True)
+    )
+    if not enabled or bypass:
+        return len(superuser_ids)
+    covered = 0
+    for user_id in superuser_ids:
+        last_ip = (
+            SecurityLog.objects.filter(tenant=tenant, user_id=user_id, event_type='login_success')
+            .order_by('-created_at').values_list('ip_address', flat=True).first()
+        )
+        if last_ip and SecurityService.ip_matches_whitelist(
+            tenant, last_ip, exclude_entry_id=exclude_entry_id, entry_overrides=entry_overrides,
+        ):
+            covered += 1
+    return covered
+
+
+def _would_lock_out_superusers(request, tenant, enabled, bypass, exclude_entry_id=None, entry_overrides=None):
+    """
+    True when a caller who is not a superuser makes a change after which no
+    active superuser can get in any more (while at least one could before).
+    Superusers are only protected by their own-IP check, which already
+    covers them.
+    """
+    if request.user.is_superuser:
+        return False
+    if _covered_superuser_count(tenant, tenant.ip_whitelist_enabled, tenant.superadmin_bypass_whitelist) == 0:
+        return False
+    return _covered_superuser_count(
+        tenant, enabled, bypass, exclude_entry_id=exclude_entry_id, entry_overrides=entry_overrides,
+    ) == 0
+
+
+def _superuser_lockout_response():
+    return Response(
+        {
+            'error': (
+                'This change would lock every superuser out: none of their last sign-in IP '
+                'addresses would be in the active whitelist and the superadmin bypass is off. '
+                'Add a superuser\'s IP first, or ask a superuser to turn the bypass on.'
+            ),
+            'code': 'would_lock_out_superusers',
+        },
+        status=status.HTTP_400_BAD_REQUEST,
     )
 
 
@@ -455,7 +518,10 @@ def create_ip_whitelist(request):
         'Update or delete an IP whitelist entry. Staff or superuser only. While the whitelist '
         "is enabled, a change that would stop letting the caller's current IP through "
         '(deleting, deactivating or re-addressing the entry that covers it) is refused with '
-        '400 `code: would_lock_out`, unless the caller is a superuser and the bypass is on.'
+        '400 `code: would_lock_out`, unless the caller is a superuser and the bypass is on. '
+        'A caller who is not a superuser also cannot, with the bypass off, make a change after '
+        'which no active superuser\'s last sign-in IP is covered (400 '
+        '`code: would_lock_out_superusers`).'
     ),
     request=TenantIPWhitelistSerializer,
     responses={
@@ -490,6 +556,9 @@ def manage_ip_whitelist(request, pk):
         if _would_lock_out(request, tenant, tenant.ip_whitelist_enabled,
                            tenant.superadmin_bypass_whitelist, exclude_entry_id=entry.pk):
             return _lockout_response(request)
+        if _would_lock_out_superusers(request, tenant, tenant.ip_whitelist_enabled,
+                                      tenant.superadmin_bypass_whitelist, exclude_entry_id=entry.pk):
+            return _superuser_lockout_response()
         ip_info = f"{entry.ip_address}/{entry.cidr_notation}" if entry.cidr_notation else entry.ip_address
         entry.delete()
         logger.info(f"IP whitelist entry deleted by {request.user.email}: {ip_info}")
@@ -502,6 +571,10 @@ def manage_ip_whitelist(request, pk):
                            tenant.superadmin_bypass_whitelist,
                            entry_overrides={entry.pk: serializer.validated_data}):
             return _lockout_response(request)
+        if _would_lock_out_superusers(request, tenant, tenant.ip_whitelist_enabled,
+                                      tenant.superadmin_bypass_whitelist,
+                                      entry_overrides={entry.pk: serializer.validated_data}):
+            return _superuser_lockout_response()
         serializer.save()
         return Response(serializer.data)
 
@@ -518,6 +591,8 @@ def manage_ip_whitelist(request, pk):
         "the whitelist on without letting the caller's current IP through is refused with "
         '400 `code: would_lock_out` (the bypass only counts for superusers). Only a '
         'superuser can change `superadmin_bypass` (403 `code: bypass_superuser_only`). '
+        'A caller who is not a superuser cannot enable the whitelist (bypass off) so that no '
+        'active superuser\'s last sign-in IP is covered (400 `code: would_lock_out_superusers`). '
         'Values that are not booleans (form strings true/false/1/0 are accepted) return '
         '400 `code: invalid`. The caller IP is the first X-Forwarded-For entry.'
     ),
@@ -588,6 +663,8 @@ def toggle_ip_whitelist(request):
     final_bypass = tenant.superadmin_bypass_whitelist if superadmin_bypass is None else superadmin_bypass
     if _would_lock_out(request, tenant, final_enabled, final_bypass):
         return _lockout_response(request)
+    if _would_lock_out_superusers(request, tenant, final_enabled, final_bypass):
+        return _superuser_lockout_response()
 
     # Update settings
     if enabled is not None:
