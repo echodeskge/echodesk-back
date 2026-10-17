@@ -410,9 +410,12 @@ class TestCallSignals(EchoDeskTenantTestCase):
 
     @_ws_patch
     @_push_patch
-    def test_missed_inbound_without_handler_notifies_active_users(self, mock_incr, mock_async):
+    def test_missed_inbound_without_handler_notifies_staff(self, mock_incr, mock_async):
+        """No handler and no InboundRoute for the DID: PBX admins (staff)
+        are notified, not arbitrary agents."""
         from crm.models import CallLog
 
+        staff = self.create_admin(email='call-sig-staff@test.com')
         call = CallLog.objects.create(
             caller_number='+995555111111',
             recipient_number='+995555222222',
@@ -422,7 +425,9 @@ class TestCallSignals(EchoDeskTenantTestCase):
         )
 
         notifs = Notification.objects.filter(notification_type='call_missed')
-        self.assertTrue(notifs.exists())
+        self.assertTrue(notifs.filter(user=staff).exists())
+        self.assertFalse(notifs.filter(user=self.agent).exists())
+        self.assertEqual(notifs.filter(user=staff).first().link_url, f'/calls?id={call.id}')
 
     @_ws_patch
     @_push_patch
