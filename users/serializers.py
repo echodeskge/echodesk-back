@@ -534,20 +534,13 @@ class UserUpdateSerializer(ManagerIdMixin, EmailUniquenessMixin, serializers.Mod
         model = User
         fields = [
             'email', 'first_name', 'last_name', 'role', 'status',
-            'phone_number', 'job_title', 'is_active', 'is_staff', 'department_id', 'manager_id',
+            'phone_number', 'job_title', 'is_active', 'department_id', 'manager_id',
             'group_ids', 'tenant_group_ids', 'user_permission_ids'
         ]
         extra_kwargs = {
             # PATCH is the only update path used by the UI; keep email optional
             # so other-field updates don't have to resend it.
             'email': {'required': False},
-            'is_staff': {
-                'required': False,
-                'help_text': (
-                    'Staff flag (billing, security and user admin). Only a superuser '
-                    'can change it; the value is ignored for everyone else.'
-                ),
-            },
         }
 
     def validate_department_id(self, value):

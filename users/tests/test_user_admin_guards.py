@@ -1,7 +1,8 @@
 """
 P6 users/security: privilege-escalation guards on /api/users/, session
 revocation when a user loses access, the new bulk actions, writable
-is_staff / department_id / job_title, and the user list's query count.
+department_id / job_title, is_staff only via set-staff, account-takeover
+guards, and the user list / group members query counts.
 """
 from unittest.mock import patch
 
@@ -30,6 +31,15 @@ def send_password_url(user_id):
 
 def change_password_url(user_id):
     return f'{USERS_URL}{user_id}/change_password/'
+
+
+def set_staff_url(user_id):
+    return f'{USERS_URL}{user_id}/set-staff/'
+
+
+NEW_PASSWORD = {
+    'new_password': 'N3w-pass-word!', 'new_password_confirm': 'N3w-pass-word!',
+}
 
 
 class GuardTestCase(EchoDeskTenantTestCase):
@@ -158,26 +168,138 @@ class TestSuperuserProtection(GuardTestCase):
         for payload in ({'is_active': False}, {'status': 'suspended'}, {'status': 'inactive'}):
             resp = self.api_patch(detail_url(self.admin.id), payload, user=self.admin)
             self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST, payload)
+            # The web shows ``detail``; ``error`` stays for older clients.
+            self.assertEqual(resp.data['detail'], 'You cannot deactivate or suspend your own account.')
+            self.assertEqual(resp.data['error'], resp.data['detail'])
         self.admin.refresh_from_db()
         self.assertTrue(self.admin.is_active)
         self.assertEqual(self.admin.status, 'active')
 
 
+class TestAccountTakeover(GuardTestCase):
+    """Credential changes need at least the target's privileges."""
+
+    def setUp(self):
+        super().setUp()
+        self.staff_only = self.create_user(email='staffonly@test.com', is_staff=True)
+        self.role_admin = self.create_user(
+            email='roleadmin@test.com', role='admin', can_manage_users=True,
+        )
+
+    def _set_password(self, target, actor):
+        return self.api_post(change_password_url(target.id), {
+            'old_password': 'testpass123', **NEW_PASSWORD,
+        }, user=actor)
+
+    def test_role_admin_cannot_take_over_staff(self):
+        old_hash = self.staff_only.password
+        resp = self._set_password(self.staff_only, self.role_admin)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.staff_only.refresh_from_db()
+        self.assertEqual(self.staff_only.password, old_hash)
+
+    def test_user_manager_cannot_take_over_admin_or_staff(self):
+        for target in (self.admin, self.role_admin, self.staff_only):
+            resp = self._set_password(target, self.user_manager)
+            self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN, target.email)
+
+    def test_staff_without_admin_role_cannot_take_over_role_admin(self):
+        resp = self._set_password(self.role_admin, self.staff_only)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    @patch('users.views.send_new_password_email_task')
+    def test_email_change_on_privileged_target_refused(self, mock_email):
+        resp = self.api_patch(
+            detail_url(self.staff_only.id), {'email': 'attacker@evil.com'}, user=self.role_admin,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.staff_only.refresh_from_db()
+        self.assertEqual(self.staff_only.email, 'staffonly@test.com')
+        mock_email.delay.assert_not_called()
+
+    @patch('users.views.send_new_password_email_task')
+    def test_unchanged_email_in_payload_is_fine(self, _mock):
+        resp = self.api_patch(
+            detail_url(self.staff_only.id),
+            {'email': 'staffonly@test.com', 'job_title': 'Ops'}, user=self.role_admin,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    @patch('users.views.send_new_password_email_task')
+    def test_send_new_password_on_privileged_target_refused(self, mock_email):
+        resp = self.api_post(send_password_url(self.admin.id), {}, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        mock_email.delay.assert_not_called()
+
+    @patch('users.views.send_new_password_email_task')
+    def test_bulk_reset_skips_privileged_targets(self, mock_email):
+        resp = self.api_post(BULK_URL, {
+            'action': 'reset_password',
+            'user_ids': [self.agent.id, self.admin.id, self.staff_only.id],
+        }, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['affected'], 1)
+        self.assertEqual(sorted(resp.data['skipped_user_ids']), sorted([self.admin.id, self.staff_only.id]))
+        self.assertEqual(mock_email.delay.call_count, 1)
+
+    def test_equal_privilege_may_change_credentials(self):
+        # self.admin is staff + admin role: holds every privilege of both.
+        for target in (self.staff_only, self.role_admin, self.agent):
+            resp = self._set_password(target, self.admin)
+            self.assertEqual(resp.status_code, status.HTTP_200_OK, target.email)
+
+    def test_superuser_may_change_anyone(self):
+        resp = self._set_password(self.admin, self.superuser)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_own_password_always_allowed(self):
+        resp = self._set_password(self.user_manager, self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_plain_agent_targets_still_managed_by_user_manager(self):
+        resp = self._set_password(self.agent, self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+
 class TestIsStaffAndDepartment(GuardTestCase):
 
-    def test_superuser_can_set_is_staff(self):
-        resp = self.api_patch(detail_url(self.agent.id), {'is_staff': True}, user=self.superuser)
+    def test_patch_is_staff_is_ignored_even_for_superuser(self):
+        # The dashboard's booking-staff checkbox PATCHes is_staff. A tenant
+        # owner (superuser) ticking it must not grant staff, nor un-ticking
+        # it strip a real staff admin.
+        for actor in (self.superuser, self.admin):
+            resp = self.api_patch(detail_url(self.agent.id), {'is_staff': True}, user=actor)
+            self.assertEqual(resp.status_code, status.HTTP_200_OK)
+            self.agent.refresh_from_db()
+            self.assertFalse(self.agent.is_staff)
+        resp = self.api_patch(detail_url(self.admin.id), {'is_staff': False}, user=self.superuser)
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.admin.refresh_from_db()
+        self.assertTrue(self.admin.is_staff)
+
+    def test_superuser_sets_staff_via_explicit_endpoint(self):
+        resp = self.api_post(set_staff_url(self.agent.id), {'is_staff': True}, user=self.superuser)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data, {'id': self.agent.id, 'is_staff': True})
         self.agent.refresh_from_db()
         self.assertTrue(self.agent.is_staff)
-
-    def test_non_superuser_is_staff_is_ignored(self):
-        # The dashboard's booking-staff toggle sends is_staff; it must keep
-        # succeeding without granting anything.
-        resp = self.api_patch(detail_url(self.agent.id), {'is_staff': True}, user=self.admin)
+        resp = self.api_post(set_staff_url(self.agent.id), {'is_staff': False}, user=self.superuser)
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.agent.refresh_from_db()
         self.assertFalse(self.agent.is_staff)
+
+    def test_set_staff_refused_for_non_superusers_and_self(self):
+        for actor in (self.admin, self.user_manager, self.agent):
+            resp = self.api_post(set_staff_url(self.agent.id), {'is_staff': True}, user=actor)
+            self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN, actor.email)
+        self.agent.refresh_from_db()
+        self.assertFalse(self.agent.is_staff)
+        resp = self.api_post(set_staff_url(self.superuser.id), {'is_staff': False}, user=self.superuser)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_set_staff_needs_boolean(self):
+        resp = self.api_post(set_staff_url(self.agent.id), {}, user=self.superuser)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_department_can_be_changed_and_cleared(self):
         dept = Department.objects.create(name='Support P6')
@@ -354,6 +476,15 @@ class TestBulkActionGuards(GuardTestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(list(group.members.values_list('id', flat=True)), [self.admin.id])
 
+    def test_bulk_group_actions_need_manage_groups(self):
+        group = self.create_tenant_group(name='Bulk P6 gated group')
+        for action in ('add_to_group', 'remove_from_group'):
+            resp = self.api_post(BULK_URL, {
+                'action': action, 'group_id': group.id, 'user_ids': [self.agent.id],
+            }, user=self.user_manager)
+            self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN, action)
+        self.assertFalse(group.members.exists())
+
     def test_bulk_group_action_needs_valid_group(self):
         resp = self.api_post(BULK_URL, {
             'action': 'add_to_group', 'user_ids': [self.agent.id],
@@ -394,3 +525,32 @@ class TestUserListQueryCount(EchoDeskTenantTestCase):
         large, resp = self._count()
         self.assertGreaterEqual(resp.data['count'], 10)
         self.assertEqual(small, large, getattr(self, '_last_sql', ''))
+
+
+class TestGroupMembersQueryCount(EchoDeskTenantTestCase):
+    """GET /api/tenant-groups/{id}/members/ (full rows) is constant in queries."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='gmadmin@test.com')
+        self.group = self.create_tenant_group(name='GM group')
+        self.dept = Department.objects.create(name='GM dept')
+
+    def _add(self, n, start):
+        for i in range(start, start + n):
+            self.create_user(email=f'gm{i}@test.com', department=self.dept).tenant_groups.add(self.group)
+
+    def _count(self):
+        with CaptureQueriesContext(connection) as ctx:
+            resp = self.api_get(f'/api/tenant-groups/{self.group.id}/members/', user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        return len(ctx.captured_queries), resp
+
+    def test_members_query_count_does_not_grow(self):
+        self._add(2, 0)
+        small, _ = self._count()
+        self._add(6, 100)
+        large, resp = self._count()
+        self.assertEqual(resp.data['count'], 8)
+        self.assertEqual(resp.data['members'][0]['department']['employee_count'], 8)
+        self.assertEqual(small, large)

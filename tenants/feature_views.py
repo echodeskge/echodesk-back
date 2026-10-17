@@ -175,7 +175,7 @@ _FEATURE_REF = inline_serializer(
 
 
 @extend_schema(
-    operation_id='add_feature_to_subscription',
+    operation_id='subscription_features_add_create',
     summary='Add a feature to the subscription',
     description=(
         'Staff or superuser only. When a prorated charge is due (and `charge_immediately` '
@@ -402,7 +402,7 @@ def add_feature_to_subscription(request):
 
 
 @extend_schema(
-    operation_id='remove_feature_from_subscription',
+    operation_id='subscription_features_remove_create',
     summary='Remove a feature from the subscription',
     description='Staff or superuser only. Core features cannot be removed.',
     request=inline_serializer(
@@ -506,7 +506,7 @@ def remove_feature_from_subscription(request):
 
 
 @extend_schema(
-    operation_id='update_agent_count',
+    operation_id='subscription_agent_count_update',
     summary='Change the subscription agent count',
     description='Staff or superuser only.',
     request=inline_serializer(
@@ -603,7 +603,7 @@ def update_agent_count(request):
 
 
 @extend_schema(
-    operation_id='get_available_features',
+    operation_id='subscription_features_available_retrieve',
     summary='Features available to add to the subscription',
     description=(
         'Staff or superuser only. `features_by_category` maps a category display name '

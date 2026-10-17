@@ -122,8 +122,47 @@ class TestIPWhitelistLockoutGuard(SecurityTestMixin, EchoDeskTenantTestCase):
 
     def test_bypass_does_not_help_staff(self):
         self._make_whitelist(ip='10.0.0.1')
+        self.set_tenant(enabled=False, bypass=True)
         resp = self.api_post(IP_TOGGLE_URL, {'enabled': True, 'superadmin_bypass': True}, user=self.staff)
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp.data['code'], 'would_lock_out')
+
+    def test_only_superuser_changes_bypass(self):
+        self._make_whitelist(ip=CALLER_IP)
+        self.set_tenant(enabled=True, bypass=True)
+        resp = self.api_post(IP_TOGGLE_URL, {'superadmin_bypass': False}, user=self.staff)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(resp.data['code'], 'bypass_superuser_only')
+        self.tenant.refresh_from_db()
+        self.assertTrue(self.tenant.superadmin_bypass_whitelist)
+        # Resending the current value is not a change.
+        resp = self.api_post(IP_TOGGLE_URL, {'enabled': True, 'superadmin_bypass': True}, user=self.staff)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        resp = self.api_post(IP_TOGGLE_URL, {'superadmin_bypass': False}, user=self.superuser)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertFalse(resp.data['superadmin_bypass_whitelist'])
+
+    def test_form_string_false_disables(self):
+        self._make_whitelist(ip='10.0.0.1')
+        self.set_tenant(enabled=True, bypass=True)
+        resp = self.authenticated_client(self.staff).post(
+            IP_TOGGLE_URL, {'enabled': 'false'}, format='multipart', HTTP_HOST='tenant.test.com',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, getattr(resp, 'data', None))
+        self.tenant.refresh_from_db()
+        self.assertFalse(self.tenant.ip_whitelist_enabled)
+
+    def test_form_string_true_still_checks_entries(self):
+        resp = self.authenticated_client(self.staff).post(
+            IP_TOGGLE_URL, {'enabled': 'true'}, format='multipart', HTTP_HOST='tenant.test.com',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp.data['code'], 'no_active_entries')
+
+    def test_non_boolean_rejected(self):
+        resp = self.api_post(IP_TOGGLE_URL, {'enabled': 'maybe'}, user=self.staff)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp.data['code'], 'invalid')
 
     def test_superuser_without_bypass_refused(self):
         self._make_whitelist(ip='10.0.0.1')

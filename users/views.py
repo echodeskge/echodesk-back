@@ -1,6 +1,6 @@
 from rest_framework import viewsets, status, permissions, serializers as drf_serializers
 from rest_framework.decorators import action, api_view, permission_classes as drf_permission_classes
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
 from rest_framework.response import Response
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
@@ -84,6 +84,47 @@ def _guard_target(actor, target):
         raise PermissionDenied('Only a superuser can change a superuser account.')
 
 
+def _outranks_or_equals(actor, target):
+    """
+    True when ``actor`` holds every privilege ``target`` has: superusers hold
+    them all; otherwise a staff target needs a staff actor and an admin-role
+    target needs an admin-role actor.
+    """
+    if actor.is_superuser:
+        return True
+    if target.is_superuser:
+        return False
+    if target.is_staff and not actor.is_staff:
+        return False
+    if target.role == 'admin' and actor.role != 'admin':
+        return False
+    return True
+
+
+def _guard_credentials(actor, target):
+    """
+    Setting, resetting or re-addressing (email) another user's credentials is
+    an account takeover, so it needs at least the target's privileges. Without
+    this, anyone with ``manage_users`` could take over a staff or admin
+    account and gain what only a superuser may grant.
+    """
+    if actor.pk == target.pk:
+        return
+    if not _outranks_or_equals(actor, target):
+        raise PermissionDenied(
+            "You cannot change the password or email of a user with more privileges than you."
+        )
+
+
+class SelfLockoutError(APIException):
+    """400 with both ``detail`` (what the web reads) and ``error``."""
+    status_code = status.HTTP_400_BAD_REQUEST
+    default_code = 'self_lockout'
+
+    def __init__(self, message):
+        super().__init__({'detail': message, 'error': message, 'code': 'self_lockout'})
+
+
 def _guard_role_change(actor, current_role, new_role):
     """Granting or removing the admin role is reserved to superusers."""
     if not new_role or new_role == current_role:
@@ -99,6 +140,20 @@ def _revoke_tokens_for(user_ids):
         return
     Token.objects.filter(user_id__in=user_ids).delete()
     AuthDeviceToken.objects.filter(user_id__in=user_ids).delete()
+
+
+class SetStaffSerializer(drf_serializers.Serializer):
+    is_staff = drf_serializers.BooleanField()
+
+
+SET_STAFF_REQUEST = inline_serializer(
+    name='SetUserStaff',
+    fields={'is_staff': drf_serializers.BooleanField()},
+)
+SET_STAFF_RESPONSE = inline_serializer(
+    name='SetUserStaffResponse',
+    fields={'id': drf_serializers.IntegerField(), 'is_staff': drf_serializers.BooleanField()},
+)
 
 
 ERROR_RESPONSE = inline_serializer(
@@ -429,15 +484,15 @@ class UserViewSet(viewsets.ModelViewSet):
             _guard_target(actor, user_being_updated)
             if 'role' in data:
                 _guard_role_change(actor, user_being_updated.role, data['role'])
-            # is_staff unlocks billing, security and user admin: superusers
-            # only. Anyone else's value is dropped (the dashboard's booking-staff
-            # toggle sends it), as it always was.
-            if 'is_staff' in data and not actor.is_superuser:
-                data.pop('is_staff')
+            # Changing the email re-addresses the login and mails a fresh
+            # password to the new address: a takeover unless the caller holds
+            # the target's privileges.
+            if 'email' in data and data['email'] and data['email'] != user_being_updated.email:
+                _guard_credentials(actor, user_being_updated)
             if user_being_updated == actor and (
                 data.get('is_active') is False or data.get('status') in REVOKING_STATUSES
             ):
-                raise ValidationError({'error': 'You cannot deactivate or suspend your own account.'})
+                raise SelfLockoutError('You cannot deactivate or suspend your own account.')
 
         old_email = user_being_updated.email
         old_status = user_being_updated.status
@@ -479,6 +534,8 @@ class UserViewSet(viewsets.ModelViewSet):
             'bulk action, and non-superusers cannot touch superusers; such ids come back '
             'in `skipped_user_ids`. Granting the admin role (or changing an admin\'s role) '
             'needs a superuser: granting returns 403, admins in a role change are skipped. '
+            '`reset_password` also skips users with privileges you lack (staff / admin role). '
+            '`add_to_group` / `remove_from_group` additionally need `manage_groups` or staff. '
             'Deactivating signs the users out of every session.'
         ),
         request=BulkUserActionSerializer,
@@ -520,6 +577,14 @@ class UserViewSet(viewsets.ModelViewSet):
         if action_type in ('deactivate', 'delete', 'reset_password'):
             if actor.id in user_ids:
                 skipped.add(actor.id)
+        if action_type == 'reset_password':
+            # Same rule as send_new_password: no resets above your privileges.
+            skipped.update(u.id for u in users if not _outranks_or_equals(actor, u))
+        if action_type in ('add_to_group', 'remove_from_group'):
+            # Groups grant feature keys: same permission as the group's own
+            # add_users / remove_users.
+            if not actor.has_permission('manage_groups') and not actor.is_staff:
+                raise PermissionDenied("You don't have permission to manage groups")
         targets = users.exclude(id__in=skipped)
         target_ids = list(targets.values_list('id', flat=True))
         count = len(target_ids)
@@ -568,7 +633,8 @@ class UserViewSet(viewsets.ModelViewSet):
         summary="Change a user's password",
         description=(
             'Set a new password. Your own, or another user\'s with `manage_users`/staff '
-            '(superuser accounts only by a superuser). `old_password` is always YOUR '
+            '(superuser accounts only by a superuser; staff or admin-role accounts only '
+            'by a caller who is also staff / admin, or a superuser). `old_password` is always YOUR '
             'current password (re-authentication). Changing someone else\'s password '
             'signs them out of every session.'
         ),
@@ -589,6 +655,7 @@ class UserViewSet(viewsets.ModelViewSet):
             if not _can_manage_users(request.user):
                 raise PermissionDenied('You can only change your own password')
             _guard_target(request.user, user)
+            _guard_credentials(request.user, user)
 
         serializer = PasswordChangeSerializer(data=request.data, context={'request': request})
         if serializer.is_valid():
@@ -605,7 +672,8 @@ class UserViewSet(viewsets.ModelViewSet):
         description=(
             'Generate a temporary password, require a change at next sign-in, email it '
             'to the user and sign them out of every session (web and devices). Needs '
-            '`manage_users`/staff; superuser accounts only by a superuser.'
+            '`manage_users`/staff; superuser accounts only by a superuser; staff or '
+            'admin-role accounts only by a caller who is also staff / admin, or a superuser.'
         ),
         request=None,
         responses={
@@ -623,6 +691,7 @@ class UserViewSet(viewsets.ModelViewSet):
 
         user = self.get_object()
         _guard_target(request.user, user)
+        _guard_credentials(request.user, user)
         email_sent = self._reset_password_and_notify(user)
         # The password changed either way, so the old sessions must go.
         user.revoke_auth_tokens()
@@ -634,6 +703,34 @@ class UserViewSet(viewsets.ModelViewSet):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
+
+    @extend_schema(
+        summary="Grant or remove a user's staff flag",
+        description=(
+            'Set `is_staff` (billing, security, IP whitelist and user admin). Superusers '
+            'only; you cannot change your own flag. This is deliberately separate from '
+            '`PATCH /api/users/{id}/`, which ignores `is_staff` (the dashboard\'s '
+            'booking-staff checkbox still sends it there).'
+        ),
+        request=SET_STAFF_REQUEST,
+        responses={
+            200: SET_STAFF_RESPONSE,
+            400: OpenApiResponse(description='Validation error'),
+            403: OpenApiResponse(description='Not a superuser, or your own account'),
+        },
+    )
+    @action(detail=True, methods=['post'], url_path='set-staff')
+    def set_staff(self, request, pk=None):
+        if not request.user.is_superuser:
+            raise PermissionDenied('Only a superuser can grant or remove staff access.')
+        user = self.get_object()
+        if user.pk == request.user.pk:
+            raise PermissionDenied('You cannot change your own staff access.')
+        serializer = SetStaffSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user.is_staff = serializer.validated_data['is_staff']
+        user.save(update_fields=['is_staff'])
+        return Response({'id': user.pk, 'is_staff': user.is_staff})
 
 TENANT_GROUP_MEMBERS_RESPONSE = inline_serializer(
     name='TenantGroupMembersResponse',
@@ -806,7 +903,7 @@ class TenantGroupViewSet(viewsets.ModelViewSet):
             serializer = UserDirectorySerializer(members, many=True)
         else:
             members = _full_user_queryset().filter(tenant_groups=tenant_group)
-            serializer = UserSerializer(members, many=True)
+            serializer = UserSerializer(members, many=True, context=self.get_serializer_context())
 
         return Response({
             'count': len(members),

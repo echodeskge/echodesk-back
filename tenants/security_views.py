@@ -91,6 +91,31 @@ def _would_lock_out(request, tenant, enabled, bypass, exclude_entry_id=None, ent
     )
 
 
+_TRUE_STRINGS = ('true', '1', 'yes', 'on')
+_FALSE_STRINGS = ('false', '0', 'no', 'off')
+
+
+def _parse_optional_bool(value):
+    """
+    Request booleans from JSON or form bodies: ``None`` stays ``None``;
+    real booleans pass; the usual strings map to True/False. Anything else
+    raises ``ValueError`` (so ``'false'`` never counts as truthy).
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        value = value[0]
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUE_STRINGS:
+            return True
+        if lowered in _FALSE_STRINGS:
+            return False
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise ValueError(value)
+
+
 def _lockout_response(request):
     client_ip = SecurityService.get_client_ip(request)
     return Response(
@@ -491,7 +516,10 @@ def manage_ip_whitelist(request, pk):
         'only. Both fields are optional; omitted ones keep their value. Enabling needs at '
         'least one active entry (400 `code: no_active_entries`). A change that would leave '
         "the whitelist on without letting the caller's current IP through is refused with "
-        '400 `code: would_lock_out` (the bypass only counts for superusers).'
+        '400 `code: would_lock_out` (the bypass only counts for superusers). Only a '
+        'superuser can change `superadmin_bypass` (403 `code: bypass_superuser_only`). '
+        'Values that are not booleans (form strings true/false/1/0 are accepted) return '
+        '400 `code: invalid`. The caller IP is the first X-Forwarded-For entry.'
     ),
     request=inline_serializer(
         name='ToggleIPWhitelist',
@@ -504,7 +532,10 @@ def manage_ip_whitelist(request, pk):
     responses={
         200: IP_WHITELIST_STATE,
         400: IP_WHITELIST_LOCKOUT,
-        403: OpenApiResponse(description='Not staff/superuser or not from tenant domain')
+        403: OpenApiResponse(description=(
+            'Not staff/superuser, not from tenant domain, or a non-superuser changing '
+            'superadmin_bypass'
+        ))
     },
     tags=['Security']
 )
@@ -519,8 +550,25 @@ def toggle_ip_whitelist(request):
         )
 
     tenant = request.tenant
-    enabled = request.data.get('enabled')
-    superadmin_bypass = request.data.get('superadmin_bypass')
+    try:
+        enabled = _parse_optional_bool(request.data.get('enabled'))
+        superadmin_bypass = _parse_optional_bool(request.data.get('superadmin_bypass'))
+    except ValueError:
+        return Response(
+            {'error': '`enabled` and `superadmin_bypass` must be booleans.', 'code': 'invalid'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # The bypass protects superusers; a staff user who is not one must not be
+    # able to take it away from them.
+    if (superadmin_bypass is not None
+            and superadmin_bypass != tenant.superadmin_bypass_whitelist
+            and not request.user.is_superuser):
+        return Response(
+            {'error': 'Only a superuser can change the superadmin bypass.',
+             'code': 'bypass_superuser_only'},
+            status=status.HTTP_403_FORBIDDEN
+        )
 
     # If enabling whitelist, ensure there's at least one entry
     if enabled is True:
@@ -536,8 +584,8 @@ def toggle_ip_whitelist(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-    final_enabled = tenant.ip_whitelist_enabled if enabled is None else bool(enabled)
-    final_bypass = tenant.superadmin_bypass_whitelist if superadmin_bypass is None else bool(superadmin_bypass)
+    final_enabled = tenant.ip_whitelist_enabled if enabled is None else enabled
+    final_bypass = tenant.superadmin_bypass_whitelist if superadmin_bypass is None else superadmin_bypass
     if _would_lock_out(request, tenant, final_enabled, final_bypass):
         return _lockout_response(request)
 
