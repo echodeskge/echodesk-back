@@ -347,6 +347,7 @@ SPECTACULAR_SETTINGS = {
     'ENUM_NAME_OVERRIDES': {
         'UnifiedConversationPlatformEnum': ['facebook', 'instagram', 'whatsapp', 'email', 'widget', 'telegram'],
         'ModeEnum': ['ai', 'off'],
+        'DeactivationReasonEnum': 'social_integrations.models.TelegramAccount.DEACTIVATION_REASONS',
     },
 }
 
