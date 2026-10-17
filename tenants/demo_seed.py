@@ -9,8 +9,11 @@ seeding).
 
 Idempotency: every module seeder first checks for its own marker rows and
 skips itself when they already exist, so re-running the command never
-duplicates data. ``--reset`` (handled by the command) drops the schema for a
-clean slate.
+duplicates data. Each module runs inside its own savepoint
+(``transaction.atomic``): a module that fails half-way is rolled back as a
+whole, marker rows included, so the next run seeds it again instead of
+skipping a half-filled module. ``--reset`` (handled by the command) drops the
+schema for a clean slate.
 """
 from __future__ import annotations
 
@@ -23,7 +26,8 @@ from decimal import Decimal
 from unittest import mock
 
 from django.contrib.auth.hashers import make_password
-from django.db import connection
+from django.db import connection, transaction
+from django.test.utils import override_settings
 from django.utils import timezone
 from tenant_schemas.utils import get_public_schema_name, schema_context
 
@@ -45,6 +49,24 @@ EXTRA_STAFF = [
     ('staff5', 'Irakli', 'Chkheidze', 'manager'),
     ('staff6', 'Tamar', 'Kvaratskhelia', 'viewer'),
 ]
+# staff6 ("viewer") is NOT in "All features": it only gets these feature keys,
+# so feature/role gating can be exercised with a real account.
+VIEWER_GROUP_NAME = 'Viewer (tickets + leave)'
+VIEWER_FEATURE_KEYS = ('ticket_management', 'leave_management')
+
+# Every seeded login (password DEMO_PASSWORD), shown by the command help/output.
+DEMO_LOGINS = [
+    ('admin@demo.ge', 'superuser + staff, role admin; every feature'),
+    ('manager@demo.ge', 'role manager; leave manager of agent + staff1-4; queue "Support line" member'),
+    ('agent@demo.ge', 'role agent; booking staff; queue "Support line" member'),
+    ('staff1@demo.ge .. staff4@demo.ge', 'role agent; every feature'),
+    ('staff5@demo.ge', 'role manager; every feature'),
+    ('staff6@demo.ge', 'role viewer; ONLY tickets + leave (group "%s")' % VIEWER_GROUP_NAME),
+]
+
+DEMO_DID = '+995322000111'
+DEMO_VIDEO_URL = 'https://www.youtube.com/watch?v=aqz-KE-bpKQ'  # Big Buck Bunny (Blender Foundation)
+_OLD_DEMO_VIDEO_URL = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
 
 CUSTOMER_NAMES = [
     ('Levan', 'Maisuradze'), ('Ketevan', 'Gogoladze'), ('Zurab', 'Japaridze'),
@@ -84,6 +106,44 @@ def muted_push():
         yield
 
 
+@contextlib.contextmanager
+def muted_asterisk_sync():
+    """Seeding must never write to an Asterisk realtime DB.
+
+    Belt and braces: the global kill switch is turned off *and* the crm signal
+    handlers' tenant lookup returns None, so every PBX signal (trunk, queue,
+    extension, group membership) is a no-op while seeding.
+    """
+    with override_settings(ASTERISK_SYNC_ENABLED=False), \
+            mock.patch('crm.signals._sync_for_current_tenant', lambda: None):
+        yield
+
+
+def leave_plan_base(today, min_offset, max_end_offset):
+    """Monday the leave plan's day offsets are counted from.
+
+    Normally this week's Monday. When the plan would spill into another year
+    (early January / late December) the whole plan is shifted, keeping the
+    relative offsets, so every request stays in ``today.year`` and requests of
+    one employee never overlap (clamping each date separately collapsed
+    several requests onto the same day).
+    """
+    year = today.year
+    first, last = date(year, 1, 1), date(year, 12, 31)
+    base = today - timedelta(days=today.weekday())
+    if base + timedelta(days=min_offset) < first:
+        earliest = first - timedelta(days=min_offset)
+        base = earliest + timedelta(days=(7 - earliest.weekday()) % 7)  # first Monday >= earliest
+    elif base + timedelta(days=max_end_offset) > last:
+        latest = last - timedelta(days=max_end_offset)
+        base = latest - timedelta(days=latest.weekday())  # last Monday <= latest
+    return base
+
+
+class DemoSeedError(Exception):
+    """One or more modules failed; they were rolled back and are retried on the next run."""
+
+
 class DemoSeeder:
     """Seeds one tenant schema. Call :meth:`run` inside ``schema_context``."""
 
@@ -95,7 +155,8 @@ class DemoSeeder:
         self.now = timezone.now()
         self.today = timezone.localdate()
         self.password_hash = make_password(DEMO_PASSWORD)
-        self.report = []  # [(module, 'created' | 'skipped')]
+        self.report = []  # [(module, 'created' | 'skipped' | 'failed')]
+        self.failures = []  # [(module, exception)]
 
     # ------------------------------------------------------------------ utils
     def log(self, msg):
@@ -107,14 +168,23 @@ class DemoSeeder:
             self.report.append((name, 'skipped'))
             self.log(f'  - {name}: already seeded, skipping')
             return
-        fn()
+        try:
+            # Savepoint per module: the marker rows the skip check looks for
+            # only become visible together with the rest of the module.
+            with transaction.atomic():
+                fn()
+        except Exception as exc:  # noqa: BLE001 - reported, rolled back, retried next run
+            self.report.append((name, 'failed'))
+            self.failures.append((name, exc))
+            self.log(f'  ! {name}: FAILED ({type(exc).__name__}: {exc}); rolled back, will retry next run')
+            return
         self.report.append((name, 'created'))
         self.log(f'  + {name}: seeded')
 
     def run(self):
         assert connection.schema_name == self.schema, 'run() must be called inside the tenant schema'
         from booking_management.models import Service
-        from crm.models import CallLog
+        from crm.models import CallLog, InboundRoute
         from ecommerce_crm.models import Product
         from invoices.models import Invoice
         from leave_management.models import LeaveType
@@ -122,8 +192,9 @@ class DemoSeeder:
         from tickets.models import Board
         from users.models import Notification, TeamChatConversation
 
-        with muted_push():
-            self.seed_users()  # always: get_or_create, cheap, needed by everything
+        with muted_push(), muted_asterisk_sync():
+            with transaction.atomic():
+                self.seed_users()  # always: get_or_create, cheap, needed by everything
             self._module('tickets', Board.objects.filter(name='Customer Support').exists(), self.seed_tickets)
             self._module('leave', LeaveType.objects.filter(tenant=self.tenant, code='VAC').exists(), self.seed_leave)
             self._module('ecommerce', Product.objects.filter(sku='DEMO-001').exists(), self.seed_ecommerce)
@@ -131,11 +202,16 @@ class DemoSeeder:
             self._module('bookings', Service.objects.filter(name__en='Classic haircut').exists(), self.seed_bookings)
             self._module('social', FacebookPageConnection.objects.filter(page_id=self._ext('fb-page')).exists(), self.seed_social)
             self._module('calls', CallLog.objects.filter(notes__startswith='[demo]').exists(), self.seed_calls)
+            self._module('pbx', InboundRoute.objects.filter(did=DEMO_DID).exists(), self.seed_pbx)
             self._module('team_chat', TeamChatConversation.objects.filter(participants=self.admin).exists(), self.seed_team_chat)
             self._module('notifications', Notification.objects.filter(metadata__demo_seed=True).exists(), self.seed_notifications)
         with schema_context(get_public_schema_name()):
             from help_center.models import HelpCategory
             self._module('help_center', HelpCategory.objects.exists(), self.seed_help_center)
+            self._replace_old_demo_video()
+        if self.failures:
+            names = ', '.join(name for name, _ in self.failures)
+            raise DemoSeedError(f'demo seed failed for: {names} (rolled back; re-run to retry)')
         return self.report
 
     def _ext(self, suffix):
@@ -165,7 +241,13 @@ class DemoSeeder:
         support_group, _ = TenantGroup.objects.get_or_create(
             name='Support team', defaults={'description': 'First-line support'},
         )
-        self.groups = {'everyone': everyone, 'booking': booking_group, 'support': support_group}
+        viewer_group, _ = TenantGroup.objects.get_or_create(
+            name=VIEWER_GROUP_NAME,
+            defaults={'description': 'Read-mostly demo role: tickets and leave only'},
+        )
+        viewer_group.features.set(Feature.objects.filter(is_active=True, key__in=VIEWER_FEATURE_KEYS))
+        self.groups = {'everyone': everyone, 'booking': booking_group, 'support': support_group,
+                       'viewer': viewer_group}
 
         users = {}
         specs = [(l, f, la, r, x) for (l, f, la, r, x) in CORE_USERS]
@@ -209,8 +291,16 @@ class DemoSeeder:
             self.manager.manager = self.admin
             self.manager.save(update_fields=['manager'])
 
+        viewer = users['staff6']
         for u in self.all_users:
-            u.tenant_groups.add(everyone)
+            if u.id != viewer.id:
+                u.tenant_groups.add(everyone)
+        # Older seeds put the viewer in "All features"; keep it restricted.
+        viewer.tenant_groups.remove(everyone)
+        viewer.tenant_groups.add(viewer_group)
+        if viewer.primary_group_id != viewer_group.id:
+            viewer.primary_group = viewer_group
+            viewer.save(update_fields=['primary_group'])
         for u in (self.agent, users['staff1'], users['staff2']):
             u.tenant_groups.add(booking_group)
         for u in (self.agent, users['staff1'], users['staff3'], self.manager):
@@ -421,7 +511,6 @@ class DemoSeeder:
 
         employees = [self.agent, self.manager] + self.staff[:4]
         # Ten requests across every status; dates never overlap per employee.
-        base = self.today - timedelta(days=self.today.weekday())  # this Monday
         plan = [
             # (employee, type, start offset days, length days, status)
             (self.agent, 'VAC', 14, 5, 'pending'),
@@ -435,14 +524,13 @@ class DemoSeeder:
             (self.users['staff4'], 'VAC', 28, 3, 'pending'),
             (self.manager, 'VAC', 49, 5, 'pending'),
         ]
+        # Keep every request (and so the balances) inside this year.
+        base = leave_plan_base(self.today, min(p[2] for p in plan), max(p[2] + p[3] - 1 for p in plan))
         used = {}
         pending = {}
         for emp, code, offset, length, status in plan:
             start = base + timedelta(days=offset)
             end = start + timedelta(days=length - 1)
-            if start.year != year:  # keep balances in one year for a clean demo
-                start = date(year, 1, 12) if start.year < year else date(year, 12, 1)
-                end = start + timedelta(days=length - 1)
             days = calculate_working_days(start, end, tenant) or Decimal('1')
             req = LeaveRequest(tenant=tenant, employee=emp, leave_type=types[code], start_date=start,
                                end_date=end, total_days=days, status=status,
@@ -1056,6 +1144,63 @@ class DemoSeeder:
                 CallEvent.objects.create(call_log=log, event_type='failed' if status == 'failed' else 'ended',
                                          metadata={'reason': status})
 
+    # -------------------------------------------------------------------- pbx
+    def seed_pbx(self):
+        """PBX management entities: trunk, queue (+ derived members), inbound
+        routes and working-hours settings. Runs with Asterisk sync muted, so
+        nothing is written to an Asterisk realtime DB."""
+        from crm.models import (
+            InboundRoute, PbxSettings, Queue, QueueMember, SipConfiguration, Trunk, UserPhoneAssignment,
+        )
+        from tenants.feature_models import Feature
+        from users.models import TenantGroup
+
+        sip = SipConfiguration.objects.filter(name='Demo PBX').first()
+        if sip is None:
+            raise RuntimeError('the calls module (SipConfiguration "Demo PBX") must be seeded first')
+
+        hours = list(range(9, 18))
+        pbx_settings, _ = PbxSettings.objects.get_or_create(sip_configuration=sip, defaults={
+            'working_hours_enabled': True,
+            'working_hours_schedule': {day: hours for day in
+                                       ('monday', 'tuesday', 'wednesday', 'thursday', 'friday')},
+            'timezone': 'Asia/Tbilisi',
+            'holidays': [{'date': f'{self.today.year}-01-01', 'name': "New Year's Day"},
+                         {'date': f'{self.today.year}-05-26', 'name': 'Independence Day'}],
+            'after_hours_action': 'voicemail',
+            'voicemail_enabled': True,
+        })
+
+        trunk = Trunk(
+            name='Demo Magti', provider='Magti', sip_server='sip.demo.invalid', sip_port=5060,
+            username=self._ext('trunk'), password='demo-fake-password', realm='sip.demo.invalid',
+            register=False, codecs=['g722', 'alaw', 'ulaw'], caller_id_number=DEMO_DID,
+            phone_numbers=[DEMO_DID, '+995322000112'], is_default=True)
+        _clean_save(trunk)
+
+        call_center, _ = TenantGroup.objects.get_or_create(
+            name='Call center', defaults={'description': 'Agents answering the support line'})
+        call_center.features.set(Feature.objects.filter(is_active=True, key='ip_calling'))
+        call_center.members.add(self.agent, self.manager)
+        self.groups['call_center'] = call_center
+
+        queue = Queue(name='Support line', slug='support', strategy='rrmemory', group=call_center,
+                      timeout_seconds=20, max_wait_seconds=300, wrapup_time=10, is_default=True)
+        _clean_save(queue)
+        # QueueMember rows are normally materialised by the (muted) sync layer.
+        assignments = UserPhoneAssignment.objects.filter(
+            user__in=[self.agent, self.manager], is_active=True).order_by('extension')
+        for penalty, assignment in enumerate(assignments):
+            QueueMember.objects.create(queue=queue, user_phone_assignment=assignment, penalty=penalty)
+
+        agent_ext = UserPhoneAssignment.objects.filter(user=self.agent).first()
+        if agent_ext is not None:
+            _clean_save(InboundRoute(did='+995322000112', trunk=trunk, destination_type='extension',
+                                     destination_extension=agent_ext, priority=20))
+        # Marker row for this module: created last.
+        _clean_save(InboundRoute(did=DEMO_DID, trunk=trunk, destination_type='queue',
+                                 destination_queue=queue, working_hours_override=pbx_settings, priority=10))
+
     # -------------------------------------------------------------- team chat
     def seed_team_chat(self):
         from users.models import TeamChatConversation, TeamChatMessage
@@ -1154,8 +1299,8 @@ class DemoSeeder:
                     category=cat, slug=aslug, title={'en': aen, 'ka': aka}, content_type=ctype,
                     summary={'en': f'{aen} in a few minutes.', 'ka': aka},
                     content={'en': f'<p>{aen}: step-by-step instructions.</p>', 'ka': f'<p>{aka}</p>'},
-                    video_url='https://www.youtube.com/watch?v=dQw4w9WgXcQ' if ctype == 'video' else '',
-                    video_duration='3:20' if ctype == 'video' else '',
+                    video_url=DEMO_VIDEO_URL if ctype == 'video' else '',
+                    video_duration='10:34' if ctype == 'video' else '',
                     guide_steps=[{'title': {'en': 'Open settings'}, 'content': {'en': 'Go to Settings.'}},
                                  {'title': {'en': 'Save'}, 'content': {'en': 'Click Save.'}}]
                     if ctype == 'guide' else [],
@@ -1163,11 +1308,19 @@ class DemoSeeder:
                     if ctype == 'faq' else [],
                     position=apos, is_featured=featured, published_at=self.now)
 
+    def _replace_old_demo_video(self):
+        """Earlier seeds stored a joke video URL in the shared help center."""
+        from help_center.models import HelpArticle
+        HelpArticle.objects.filter(video_url=_OLD_DEMO_VIDEO_URL).update(
+            video_url=DEMO_VIDEO_URL, video_duration='10:34')
+
 
 def demo_counts(tenant):
     """Row counts per module for the seeded tenant (inside its schema)."""
     from booking_management.models import Booking, BookingStaff, Service, ServiceCategory, StaffAvailability
-    from crm.models import CallLog, CallRecording, UserPhoneAssignment
+    from crm.models import (
+        CallLog, CallRecording, InboundRoute, PbxSettings, Queue, QueueMember, Trunk, UserPhoneAssignment,
+    )
     from ecommerce_crm.models import (
         EcommerceClient, Language, Order, Product, ProductReview, ProductVariant, PromoCode, ShippingMethod,
     )
@@ -1224,6 +1377,11 @@ def demo_counts(tenant):
         'phone_assignments': UserPhoneAssignment.objects.count(),
         'call_logs': CallLog.objects.count(),
         'call_recordings': CallRecording.objects.count(),
+        'trunks': Trunk.objects.count(),
+        'queues': Queue.objects.count(),
+        'queue_members': QueueMember.objects.count(),
+        'inbound_routes': InboundRoute.objects.count(),
+        'pbx_settings': PbxSettings.objects.count(),
         'team_chat_conversations': TeamChatConversation.objects.count(),
         'team_chat_messages': TeamChatMessage.objects.count(),
         'notifications': Notification.objects.count(),

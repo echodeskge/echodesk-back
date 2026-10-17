@@ -100,19 +100,24 @@ python manage.py seed_demo_tenant --reset    # drop the demo schema and seed it 
 Creates tenant schema `demo` on `demo.api.lvh.me` (set `API_DOMAIN=api.lvh.me`,
 `MAIN_DOMAIN=lvh.me`) with every feature enabled and sample data in tickets,
 leave, invoices, bookings, e-commerce, social inbox (Facebook / Instagram /
-WhatsApp / Telegram / website widget), calls, team chat and notifications.
-Social, e-mail and PBX connections are DB rows with fake tokens; nothing calls
-an external service.
+WhatsApp / Telegram / website widget), calls, PBX management (trunk, queue,
+inbound routes, working hours), team chat and notifications. Social, e-mail
+and PBX connections are DB rows with fake tokens; nothing calls an external
+service and Asterisk realtime sync is switched off while seeding.
 
 | Login | Role |
 |---|---|
-| `admin@demo.ge` | superuser + staff, admin |
-| `manager@demo.ge` | manager (leave manager of agent) |
-| `agent@demo.ge` | agent |
-| `staff1@demo.ge` … `staff6@demo.ge` | extra team members |
+| `admin@demo.ge` | superuser + staff, admin; every feature |
+| `manager@demo.ge` | manager; leave manager of agent + staff1-4; "Support line" queue |
+| `agent@demo.ge` | agent; booking staff; "Support line" queue |
+| `staff1@demo.ge` … `staff4@demo.ge` | agent; every feature |
+| `staff5@demo.ge` | manager; every feature |
+| `staff6@demo.ge` | viewer; **only tickets + leave** (for testing feature gating) |
 
 Password for every demo user: **`Demo12345!`**. The command refuses to touch a
-tenant it did not create.
+tenant it did not create, and refuses to run at all unless `DEBUG=True` (or
+`--allow-production` is passed, which prints a loud warning). A module that
+fails is rolled back and retried on the next run.
 
 ### **Frontend Setup**
 

@@ -10,6 +10,7 @@ from unittest import mock
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
+from django.test.utils import override_settings
 from tenant_schemas.utils import get_public_schema_name, schema_context, schema_exists
 
 from tenants.demo_seed import DEMO_PASSWORD
@@ -21,7 +22,8 @@ from users.tests.conftest import EchoDeskTenantTestCase
 
 def _seed(*args):
     out = StringIO()
-    call_command('seed_demo_tenant', *args, stdout=out)
+    with override_settings(DEBUG=True):  # the command refuses to run with DEBUG=False
+        call_command('seed_demo_tenant', *args, stdout=out, stderr=StringIO())
     return out.getvalue()
 
 
@@ -34,8 +36,9 @@ class SeedDemoTenantTests(EchoDeskTenantTestCase):
             return demo_counts(tenant)
 
     def test_seed_twice_is_idempotent_and_fills_every_module(self):
-        # Push delivery must never be reached while seeding.
-        with mock.patch('notifications.tasks.deliver_push_notification_task.delay') as push:
+        # Push delivery must never be reached while seeding (the spy would be
+        # hit by every notification if muted_push() were missing).
+        with mock.patch('users.notification_utils._dispatch_push') as push:
             first_out = _seed()
             first = self._counts()
             second_out = _seed()
@@ -112,9 +115,11 @@ class SeedDemoTenantTests(EchoDeskTenantTestCase):
             self.assertEqual(agent.manager_id, manager.id)
             for u in User.objects.all():
                 self.assertTrue(u.check_password(DEMO_PASSWORD), u.email)
-            # Non-superusers get every feature through their group.
+            # Non-superusers (except the restricted viewer) get every feature through their group.
             self.assertTrue(agent.get_feature_keys())
             self.assertEqual(set(agent.get_feature_keys()), set(admin.get_feature_keys()))
+            viewer = User.objects.get(email='staff6@demo.ge')
+            self.assertEqual(set(viewer.get_feature_keys()), {'ticket_management', 'leave_management'})
 
             self.assertTrue(TicketColumn.objects.filter(track_time=True).exists())
             self.assertEqual(
@@ -170,15 +175,15 @@ class SeedDemoTenantTests(EchoDeskTenantTestCase):
     def test_refuses_to_seed_a_tenant_it_did_not_create(self):
         # The shared test tenant ("test") belongs to someone else.
         with self.assertRaises(CommandError):
-            call_command('seed_demo_tenant', '--schema', 'test', stdout=StringIO())
+            _seed('--schema', 'test')
         with self.assertRaises(CommandError):
-            call_command('seed_demo_tenant', '--schema', 'test', '--reset', stdout=StringIO())
+            _seed('--schema', 'test', '--reset')
         self.assertTrue(schema_exists('test'))
 
     def test_rejects_public_and_invalid_schema(self):
-        for bad in (get_public_schema_name(), 'drop table;'):
+        for bad in (get_public_schema_name(), 'drop table;', 'information_schema', 'pg_catalog', 'x' * 64):
             with self.assertRaises(CommandError):
-                call_command('seed_demo_tenant', '--schema', bad, stdout=StringIO())
+                _seed('--schema', bad)
 
     def test_help_documents_the_password(self):
         self.assertIn(DEMO_PASSWORD, SeedCommand.help)

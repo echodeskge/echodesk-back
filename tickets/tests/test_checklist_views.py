@@ -130,3 +130,44 @@ class TestChecklistPermissions(TicketTestCase):
         # user1 only sees items on tickets they created
         texts = [i['text'] for i in self.get_results(resp)]
         self.assertIn('Mine', texts)
+
+
+class TestChecklistMultiAssigneeDistinct(TicketTestCase):
+    """Bug: a non-staff manager reaching an item through several relations got
+    MultipleObjectsReturned on /api/checklist-items/<id>/ (missing distinct())."""
+
+    def _multi_assignee_item(self):
+        admin = self.create_admin()
+        manager = self.create_manager(email='chk-mgr@test.com')
+        agent = self.create_user(email='chk-agent@test.com')
+        other = self.create_user(email='chk-other@test.com')
+        board, col1, _, _ = self.setup_board_with_columns(admin=admin)
+        ticket = self.create_ticket(title='Shared', column=col1, created_by=manager, assigned_to=manager)
+        for u in (manager, agent, other):
+            self.create_assignment(ticket, u, assigned_by=manager)
+        item = self.create_checklist_item(ticket, 'Check me', created_by=manager)
+        return manager, item
+
+    def test_detail_for_manager_with_multiple_relations(self):
+        manager, item = self._multi_assignee_item()
+        resp = self.api_get(f'/api/checklist-items/{item.id}/', user=manager)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['id'], item.id)
+
+    def test_toggle_for_manager_with_multiple_relations(self):
+        manager, item = self._multi_assignee_item()
+        resp = self.api_patch(f'/api/checklist-items/{item.id}/toggle_check/', user=manager)
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data['is_checked'])
+
+    def test_list_has_no_duplicates(self):
+        manager, item = self._multi_assignee_item()
+        resp = self.api_get('/api/checklist-items/', user=manager)
+        ids = [i['id'] for i in self.get_results(resp)]
+        self.assertEqual(ids, [item.id])
+
+    def test_unrelated_user_still_denied(self):
+        manager, item = self._multi_assignee_item()
+        stranger = self.create_user(email='chk-stranger@test.com')
+        resp = self.api_get(f'/api/checklist-items/{item.id}/', user=stranger)
+        self.assertEqual(resp.status_code, 404)

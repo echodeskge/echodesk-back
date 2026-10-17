@@ -983,13 +983,16 @@ class ChecklistItemViewSet(viewsets.ModelViewSet):
                 'ticket', 'created_by'
             )
 
-        # Non-staff users can only see checklist items for tickets they have access to
+        # Non-staff users can only see checklist items for tickets they have access to.
+        # The assigned_users join yields one row per assignment, so without
+        # distinct() an item on a multi-assignee ticket appears several times
+        # (duplicates in the list, MultipleObjectsReturned on the detail routes).
         return ChecklistItem.objects.filter(
             Q(ticket__created_by=self.request.user) |
             Q(ticket__assigned_to=self.request.user) |
             Q(ticket__assigned_users=self.request.user) |
             Q(created_by=self.request.user)
-        ).select_related('ticket', 'created_by')
+        ).select_related('ticket', 'created_by').distinct()
 
     @action(detail=True, methods=['patch'])
     def toggle_check(self, request, pk=None):
