@@ -3,7 +3,10 @@ Review fixes on the leave admin package (parity-fix/leave):
 1. decisions re-check the status on a locked row (no double-counted days)
 2. carry forward survives the first-run unique-constraint race
 3. nobody but a superuser approves / rejects their own request
-4. chain steps are walked in level order, not by role rank
+4. chain steps are walked in level order, not by role rank; a step is
+   done when its approver signed (a role repeated around another role
+   does not skip it)
+6. employee cancel / delete / edit lock the row and re-check the status
 5. schema documents the real action bodies, 403s and 400 field errors
 """
 from datetime import date
@@ -16,10 +19,11 @@ from rest_framework import status
 from amanati_crm.schema import TenantAwareSchemaGenerator
 from leave_management.models import LeaveBalance, LeaveCarryForwardRun, LeaveRequest
 from leave_management.tests.test_admin_fixes import (
-    AdminFixesBase, BALANCE_URL, MANAGER_URL, REQUEST_URL, _patch_feature,
+    AdminFixesBase, BALANCE_URL, EMPLOYEE_URL, MANAGER_URL, REQUEST_URL, _patch_feature,
 )
 from leave_management.utils import get_next_approver_role
 from leave_management.views import AdminLeaveRequestViewSet
+from leave_management.views_employee import EmployeeLeaveRequestViewSet
 from leave_management.views_manager import ManagerLeaveRequestViewSet
 
 
@@ -151,6 +155,74 @@ class TestDecisionLocking(AdminFixesBase):
             'success': True, 'message': 'Leave request rejected', 'status': 'rejected',
         })
         self.assertEqual(self.reload_balance().pending_days, Decimal('0'))
+
+
+class TestEmployeeRouteLocking(AdminFixesBase):
+    """Employee cancel / delete / edit re-check the status on a locked row."""
+
+    @_patch_feature
+    def test_employee_cancel_with_stale_pending_copy_returns_used_days(self):
+        lr = self.make_request()
+        stale = _stale(lr)
+        self.assertEqual(self.approve(lr, self.admin).data['status'], 'approved')
+        self.assertEqual(self.reload_balance().used_days, Decimal('3'))
+
+        with patch.object(EmployeeLeaveRequestViewSet, 'get_object', return_value=stale):
+            resp = self.api_post(f'{EMPLOYEE_URL}{lr.pk}/cancel/', {'reason': 'x'}, user=self.employee)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        balance = self.reload_balance()
+        self.assertEqual(balance.used_days, Decimal('0'))     # not left counted
+        self.assertEqual(balance.pending_days, Decimal('0'))  # not released twice
+
+    @_patch_feature
+    def test_employee_cancel_with_stale_copy_after_reject_is_refused(self):
+        lr = self.make_request()
+        stale = _stale(lr)
+        self.api_post(
+            f'{REQUEST_URL}{lr.pk}/reject/', {'action': 'reject', 'comments': 'no'}, user=self.admin,
+        )
+        with patch.object(EmployeeLeaveRequestViewSet, 'get_object', return_value=stale):
+            resp = self.api_post(f'{EMPLOYEE_URL}{lr.pk}/cancel/', {'reason': 'x'}, user=self.employee)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        lr.refresh_from_db()
+        self.assertEqual(lr.status, 'rejected')
+        self.assertEqual(self.reload_balance().pending_days, Decimal('0'))
+
+    @_patch_feature
+    def test_employee_delete_with_stale_pending_copy_is_refused(self):
+        lr = self.make_request()
+        stale = _stale(lr)
+        self.approve(lr, self.admin)
+
+        with patch.object(EmployeeLeaveRequestViewSet, 'get_object', return_value=stale):
+            resp = self.api_delete(f'{EMPLOYEE_URL}{lr.pk}/', user=self.employee)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Only pending', str(resp.data))
+        self.assertTrue(LeaveRequest.objects.filter(pk=lr.pk).exists())
+        balance = self.reload_balance()
+        self.assertEqual(balance.used_days, Decimal('3'))
+        self.assertEqual(balance.pending_days, Decimal('0'))
+
+    @_patch_feature
+    def test_employee_delete_pending_releases_days(self):
+        lr = self.make_request()
+        resp = self.api_delete(f'{EMPLOYEE_URL}{lr.pk}/', user=self.employee)
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(LeaveRequest.objects.filter(pk=lr.pk).exists())
+        self.assertEqual(self.reload_balance().pending_days, Decimal('0'))
+
+    @_patch_feature
+    def test_employee_edit_with_stale_copy_does_not_revert_approval(self):
+        lr = self.make_request()
+        stale = _stale(lr)
+        self.approve(lr, self.admin)
+
+        with patch.object(EmployeeLeaveRequestViewSet, 'get_object', return_value=stale):
+            resp = self.api_patch(f'{EMPLOYEE_URL}{lr.pk}/', {'reason': 'edited'}, user=self.employee)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Only pending', str(resp.data))
+        lr.refresh_from_db()
+        self.assertEqual(lr.status, 'approved')
 
 
 # ═══════════════════════════════════════════════════════════
@@ -293,9 +365,66 @@ class TestChainLevelOrder(AdminFixesBase):
         lr = self.make_request()
         self.assertEqual(get_next_approver_role(lr), 'hr')
         lr.status = 'hr_approved'
+        lr.hr_approver = self.hr
         self.assertEqual(get_next_approver_role(lr), 'manager')
         lr.status = 'manager_approved'
+        lr.manager_approver = self.manager
         self.assertIsNone(get_next_approver_role(lr))
+
+    def test_role_repeated_around_another_role_does_not_skip_it(self):
+        """manager@1, hr@2, manager@3: HR must sign after the first manager step."""
+        lt = self.create_leave_type(code='MHM', created_by=self.admin, updated_by=self.admin)
+        self.create_approval_chain(leave_type=lt, level=1, approver_role='manager')
+        self.create_approval_chain(leave_type=lt, level=2, approver_role='hr')
+        self.create_approval_chain(leave_type=lt, level=3, approver_role='manager')
+        lr = self.create_leave_request(self.employee, lt)
+        self.assertEqual(get_next_approver_role(lr), 'manager')
+        lr.status = 'manager_approved'
+        lr.manager_approver = self.manager
+        self.assertEqual(get_next_approver_role(lr), 'hr')  # used to be None
+        lr.status = 'hr_approved'
+        lr.hr_approver = self.hr
+        # The repeated manager role needs only one sign-off
+        self.assertIsNone(get_next_approver_role(lr))
+
+    @_patch_feature
+    def test_role_repeated_around_another_role_end_to_end(self):
+        lt = self.create_leave_type(code='MHX', created_by=self.admin, updated_by=self.admin)
+        self.create_approval_chain(leave_type=lt, level=1, approver_role='manager')
+        self.create_approval_chain(leave_type=lt, level=2, approver_role='hr')
+        self.create_approval_chain(leave_type=lt, level=3, approver_role='manager')
+        balance = self.create_leave_balance(self.employee, lt, pending_days=Decimal('3'))
+        lr = self.create_leave_request(self.employee, lt, total_days=Decimal('3'))
+
+        resp = self.api_post(f'{MANAGER_URL}{lr.pk}/approve/', {'action': 'approve'}, user=self.manager)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(resp.data['status'], 'manager_approved')  # NOT approved
+        balance.refresh_from_db()
+        self.assertEqual(balance.used_days, Decimal('0'))
+
+        resp = self.approve(lr, self.hr)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(resp.data['status'], 'approved')
+        lr.refresh_from_db()
+        self.assertEqual(lr.manager_approver, self.manager)
+        self.assertEqual(lr.hr_approver, self.hr)
+        balance.refresh_from_db()
+        self.assertEqual(balance.used_days, Decimal('3'))
+        self.assertEqual(balance.pending_days, Decimal('0'))
+
+    def test_chain_edited_in_flight_resumes_at_first_unsigned_step(self):
+        """Signed manager@1 under manager, hr; chain then becomes hr@1, manager@2."""
+        lr = self.make_request(status='manager_approved', manager_approver=self.manager)
+        self.assertEqual(get_next_approver_role(lr), 'hr')  # used to be None
+
+    @_patch_feature
+    def test_submitted_notification_goes_to_first_step_approvers(self):
+        """With HR first, the manager is not told to act on a new request."""
+        lr = self.make_request()
+        self.assertFalse(self.notifs(self.manager, 'leave_request_submitted').exists())
+        hr_notif = self.notifs(self.hr, 'leave_request_submitted').first()
+        self.assertIsNotNone(hr_notif)
+        self.assertIn(str(lr.pk), hr_notif.link_url)
 
     @_patch_feature
     def test_hr_then_manager_both_required(self):
@@ -340,14 +469,16 @@ class TestChainLevelOrder(AdminFixesBase):
         lr = self.create_leave_request(self.employee, lt)
         self.assertEqual(get_next_approver_role(lr), 'manager')
         lr.status = 'manager_approved'
+        lr.manager_approver = self.manager
         self.assertEqual(get_next_approver_role(lr), 'hr')
         lr.status = 'hr_approved'
+        lr.hr_approver = self.hr
         self.assertEqual(get_next_approver_role(lr), 'admin')
         for closed in ('approved', 'rejected', 'cancelled'):
             lr.status = closed
             self.assertIsNone(get_next_approver_role(lr))
 
-    def test_status_role_missing_from_edited_chain_falls_back_to_rank(self):
+    def test_status_role_missing_from_edited_chain_resumes_at_first_unsigned(self):
         lt = self.create_leave_type(code='EDT', created_by=self.admin, updated_by=self.admin)
         self.create_approval_chain(leave_type=lt, level=1, approver_role='hr')
         self.create_approval_chain(leave_type=lt, level=2, approver_role='admin')

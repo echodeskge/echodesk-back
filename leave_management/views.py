@@ -331,7 +331,7 @@ class AdminLeaveBalanceViewSet(viewsets.ModelViewSet):
             403: ERROR_RESPONSE,
             409: OpenApiResponse(
                 LeaveErrorResponseSerializer,
-                description='{error} when a concurrent first run collided and its result is not visible yet'
+                description='{error} when a concurrent write (another first run, or a balance created at the same moment) collided; nothing was changed, retry'
             ),
         }
     )
@@ -364,15 +364,16 @@ class AdminLeaveBalanceViewSet(viewsets.ModelViewSet):
             if isinstance(exc, CarryForwardAlreadyRun):
                 run = exc.run
             else:
-                # Lost the race with a concurrent first run: its row now
-                # exists (unique per tenant and from_year) and our writes
-                # were rolled back with the failed transaction.
+                # Lost a race: usually with a concurrent first run (its row
+                # now exists, unique per tenant and from_year), but it can
+                # also be a target balance created at the same moment. Our
+                # writes were rolled back with the failed transaction.
                 run = LeaveCarryForwardRun.objects.filter(
                     tenant=request.tenant, from_year=from_year
                 ).first()
                 if run is None:
                     return Response(
-                        {'error': 'A carry forward for this year is already in progress; try again'},
+                        {'error': 'A concurrent change (another carry forward or a new balance) collided with this carry forward; nothing was changed, try again'},
                         status=status.HTTP_409_CONFLICT
                     )
             return Response({

@@ -169,7 +169,7 @@ class ManagerLeaveRequestViewSet(viewsets.ReadOnlyModelViewSet):
 
         if not self._manager_can_reject(leave_request):
             return Response(
-                {'error': 'Only pending requests can be rejected by managers'},
+                {'error': 'Managers can only reject a request that is pending or awaiting the manager step'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -180,7 +180,7 @@ class ManagerLeaveRequestViewSet(viewsets.ReadOnlyModelViewSet):
             leave_request = lock_leave_request(leave_request)
             if not self._manager_can_reject(leave_request):
                 return Response(
-                    {'error': 'Only pending requests can be rejected by managers'},
+                    {'error': 'Managers can only reject a request that is pending or awaiting the manager step'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
             leave_request.status = 'rejected'

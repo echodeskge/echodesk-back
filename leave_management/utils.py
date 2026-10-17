@@ -533,11 +533,6 @@ APPROVAL_STATUS_RANK = {
     'manager_approved': 1,
     'hr_approved': 2,
 }
-APPROVER_ROLE_RANK = {
-    'manager': 1,
-    'hr': 2,
-    'admin': 3,
-}
 # Status a request gets once a step of the given role signs off. 'admin' is
 # always the last possible step, so it ends the chain.
 ROLE_APPROVED_STATUS = {
@@ -545,11 +540,30 @@ ROLE_APPROVED_STATUS = {
     'hr': 'hr_approved',
     'admin': 'approved',
 }
-STATUS_APPROVED_ROLE = {
-    'manager_approved': 'manager',
-    'hr_approved': 'hr',
-}
 OPEN_APPROVAL_STATUSES = tuple(APPROVAL_STATUS_RANK)
+
+
+def _step_signed(leave_request, role):
+    """
+    True when the chain step(s) for ``role`` were already signed off on
+    ``leave_request``. A step counts as signed when its approver field (or
+    its timestamp, which survives the approver being deleted) is set, or
+    when the status names that role as the last sign-off. An 'admin' step
+    is never "signed" in this sense: it always finalises the request.
+    """
+    if role == 'manager':
+        return bool(
+            leave_request.manager_approver_id
+            or leave_request.manager_approved_at
+            or leave_request.status == 'manager_approved'
+        )
+    if role == 'hr':
+        return bool(
+            leave_request.hr_approver_id
+            or leave_request.hr_approved_at
+            or leave_request.status == 'hr_approved'
+        )
+    return False
 
 
 def get_next_approver_role(leave_request):
@@ -564,8 +578,7 @@ def get_next_approver_role(leave_request):
         fully approved, closed (approved/rejected/cancelled) or no approval
         is required.
     """
-    current_rank = APPROVAL_STATUS_RANK.get(leave_request.status)
-    if current_rank is None:
+    if leave_request.status not in APPROVAL_STATUS_RANK:
         # approved / rejected / cancelled: nothing left to approve. (This
         # used to fall back to rank 0 and report 'manager' for an approved
         # request, so the final approval never moved the balance.)
@@ -576,26 +589,35 @@ def get_next_approver_role(leave_request):
     if not chain:
         return None
 
+    # Walk the steps in level order and return the first one that has not
+    # been signed off yet. A step is done when its approver field is set,
+    # so:
+    #   - hr@1, manager@2 requires HR first, then the manager;
+    #   - manager@1, hr@2, manager@3 still requires HR after the first
+    #     manager sign-off (jumping to the role's last position used to
+    #     skip HR there);
+    #   - a role listed twice needs only one sign-off (the request has one
+    #     approver field per role);
+    #   - a chain edited while a request is in flight resumes at the first
+    #     step of the new chain that nobody signed.
     roles = [approval['role'] for approval in chain]
 
-    if leave_request.status == 'pending':
-        return roles[0]
+    has_signoff_fields = bool(
+        leave_request.manager_approver_id or leave_request.manager_approved_at
+        or leave_request.hr_approver_id or leave_request.hr_approved_at
+    )
+    first_open = 0
+    if leave_request.status != 'pending' and not has_signoff_fields:
+        # A request whose status says a step signed but which carries no
+        # approver fields (legacy rows, direct status edits): trust the
+        # status and treat every step before the signed role's FIRST
+        # position as done too.
+        signed_role = leave_request.status[:-len('_approved')]
+        if signed_role in roles:
+            first_open = roles.index(signed_role)
 
-    # The status names the role of the last step signed off; every step up
-    # to (and including) that role's LAST position in level order is done.
-    # Taking the last position means a role listed twice is not asked twice
-    # (the status cannot tell the two sign-offs apart).
-    signed_role = STATUS_APPROVED_ROLE[leave_request.status]
-    if signed_role in roles:
-        position = len(roles) - 1 - roles[::-1].index(signed_role)
-        remaining = roles[position + 1:]
-        return remaining[0] if remaining else None
-
-    # The chain was edited after this step was signed and no longer holds
-    # the signed role: fall back to the next step ranked above it.
-    for role in roles:
-        role_rank = APPROVER_ROLE_RANK.get(role, APPROVER_ROLE_RANK['admin'])
-        if role_rank > current_rank:
+    for role in roles[first_open:]:
+        if not _step_signed(leave_request, role):
             return role
 
     return None  # All approvals completed
