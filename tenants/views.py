@@ -1699,6 +1699,14 @@ def forced_password_change(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Disabled and suspended accounts cannot sign in through this door
+        # either (same message as the login endpoint).
+        if not user.is_active or user.status == 'suspended':
+            return Response(
+                {'error': 'User account is disabled'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         # Check if password change is required
         if not user.password_change_required:
             return Response(

@@ -31,9 +31,12 @@ class MultiTokenAuthentication(TokenAuthentication):
 
     def authenticate_credentials(self, key):
         try:
-            return super().authenticate_credentials(key)
+            user, token = super().authenticate_credentials(key)
         except exceptions.AuthenticationFailed:
             pass
+        else:
+            self._check_not_suspended(user)
+            return (user, token)
 
         try:
             token = AuthDeviceToken.objects.select_related('user').get(key=key)
@@ -42,12 +45,22 @@ class MultiTokenAuthentication(TokenAuthentication):
 
         if not token.user.is_active:
             raise exceptions.AuthenticationFailed(_('User inactive or deleted.'))
+        self._check_not_suspended(token.user)
 
         if token.is_expired:
             raise exceptions.AuthenticationFailed(_('Token has expired.'))
 
         self._touch(token)
         return (token.user, token)
+
+    @staticmethod
+    def _check_not_suspended(user):
+        """
+        Suspension keeps ``is_active`` true, so a token minted before it (or
+        one that survived it) must still be refused.
+        """
+        if getattr(user, 'status', None) == 'suspended':
+            raise exceptions.AuthenticationFailed(_('User account is suspended.'))
 
     @staticmethod
     def _touch(token):
