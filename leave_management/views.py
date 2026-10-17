@@ -4,14 +4,19 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
-from django.db.models import Q
-from drf_spectacular.utils import extend_schema, OpenApiParameter, inline_serializer
+from django.db.models import Q, F
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import (
+    extend_schema, extend_schema_view, OpenApiParameter, OpenApiResponse, inline_serializer
+)
 
 from .models import (
     LeaveSettings, LeaveType, LeaveBalance, LeaveRequest,
     PublicHoliday, LeaveApprovalChain
 )
 from .serializers import (
+    LeaveActionResponseSerializer, LeaveErrorResponseSerializer,
+    CarryForwardRequestSerializer, CarryForwardResponseSerializer,
     LeaveSettingsSerializer,
     LeaveTypeListSerializer, LeaveTypeDetailSerializer, LeaveTypeCreateUpdateSerializer,
     LeaveBalanceListSerializer, LeaveBalanceDetailSerializer, LeaveBalanceUpdateSerializer,
@@ -27,8 +32,31 @@ from .permissions import (
     CanCancelLeave
 )
 from .utils import (
-    update_leave_balance, carry_forward_balances, initialize_leave_balances_for_user
+    update_leave_balance, carry_forward_balances, initialize_leave_balances_for_user,
+    CarryForwardAlreadyRun, apply_approval_step, filter_by_status_in,
+    OPEN_APPROVAL_STATUSES,
 )
+
+
+# ============================================================================
+# SCHEMA HELPERS
+# ============================================================================
+# The admin viewsets build their querysets from request.tenant, which does
+# not exist during schema generation; they return .none() for the fake view
+# so drf-spectacular can document their django-filter params. Their {id}
+# path params stay strings (that is what the dashboard's client was
+# generated with).
+
+LANG_PARAM = OpenApiParameter(
+    name='lang', type=str, location=OpenApiParameter.QUERY, enum=['en', 'ka'],
+    description='Language of the *_display / *_name fields (default en)'
+)
+STR_ID = {'id': OpenApiTypes.STR}
+ERROR_RESPONSE = OpenApiResponse(LeaveErrorResponseSerializer, description='{error}')
+
+
+def _is_schema_view(view):
+    return getattr(view, 'swagger_fake_view', False)
 
 
 # ============================================================================
@@ -43,7 +71,11 @@ class LeaveSettingsViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, HasLeaveManagementFeature, CanManageLeaveSettings]
     http_method_names = ['get', 'post', 'patch', 'put']
 
+    schema_path_param_types = STR_ID
+
     def get_queryset(self):
+        if _is_schema_view(self):
+            return LeaveSettings.objects.none()
         return LeaveSettings.objects.filter(tenant=self.request.tenant)
 
     def perform_create(self, serializer):
@@ -77,7 +109,11 @@ class LeaveTypeViewSet(viewsets.ModelViewSet):
     ordering_fields = ['sort_order', 'code', 'created_at']
     ordering = ['sort_order', 'id']
 
+    schema_path_param_types = STR_ID
+
     def get_queryset(self):
+        if _is_schema_view(self):
+            return LeaveType.objects.none()
         return LeaveType.objects.filter(tenant=self.request.tenant).select_related('created_by', 'updated_by')
 
     def get_serializer_class(self):
@@ -102,11 +138,11 @@ class LeaveTypeViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         serializer.save(updated_by=self.request.user)
 
-    @extend_schema(tags=['Leave Management - Admin'], summary='List leave types')
+    @extend_schema(tags=['Leave Management - Admin'], summary='List leave types', parameters=[LANG_PARAM])
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
 
-    @extend_schema(tags=['Leave Management - Admin'], summary='Get leave type details')
+    @extend_schema(tags=['Leave Management - Admin'], summary='Get leave type details', parameters=[LANG_PARAM])
     def retrieve(self, request, *args, **kwargs):
         return super().retrieve(request, *args, **kwargs)
 
@@ -118,7 +154,18 @@ class LeaveTypeViewSet(viewsets.ModelViewSet):
     def update(self, request, *args, **kwargs):
         return super().update(request, *args, **kwargs)
 
-    @extend_schema(tags=['Leave Management - Admin'], summary='Delete leave type')
+    @extend_schema(
+        tags=['Leave Management - Admin'], summary='Partially update leave type',
+        description='Omitted fields keep their stored values, so e.g. '
+                    '`{"is_active": false}` deactivates a type.'
+    )
+    def partial_update(self, request, *args, **kwargs):
+        return super().partial_update(request, *args, **kwargs)
+
+    @extend_schema(
+        tags=['Leave Management - Admin'], summary='Delete leave type',
+        responses={204: None, 400: ERROR_RESPONSE},
+    )
     def destroy(self, request, *args, **kwargs):
         from django.db.models import ProtectedError
         try:
@@ -131,21 +178,49 @@ class LeaveTypeViewSet(viewsets.ModelViewSet):
             )
 
 
+class BalanceOrderingFilter(filters.OrderingFilter):
+    """
+    OrderingFilter that can sort by the computed ``available_days``
+    (a model property, so it is annotated as ``available_days_value``).
+    """
+    ALIASES = {'available_days': 'available_days_value'}
+
+    def get_ordering(self, request, queryset, view):
+        ordering = super().get_ordering(request, queryset, view)
+        if not ordering:
+            return ordering
+        mapped = []
+        for field in ordering:
+            desc = field.startswith('-')
+            name = field.lstrip('-')
+            name = self.ALIASES.get(name, name)
+            mapped.append(f'-{name}' if desc else name)
+        return mapped
+
+
 class AdminLeaveBalanceViewSet(viewsets.ModelViewSet):
     """
     Admin ViewSet for managing all leave balances
     """
     permission_classes = [IsAuthenticated, HasLeaveManagementFeature, CanManageLeaveBalances]
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, BalanceOrderingFilter]
     filterset_fields = ['user', 'leave_type', 'year']
     search_fields = ['user__email', 'user__first_name', 'user__last_name']
     ordering_fields = ['year', 'allocated_days', 'used_days', 'available_days']
     ordering = ['-year', 'user__last_name']
     http_method_names = ['get', 'post', 'patch', 'delete']
+    schema_path_param_types = STR_ID
 
     def get_queryset(self):
+        if _is_schema_view(self):
+            return LeaveBalance.objects.none()
         return LeaveBalance.objects.filter(tenant=self.request.tenant).select_related(
             'user', 'leave_type'
+        ).annotate(
+            available_days_value=(
+                F('allocated_days') + F('carried_forward_days')
+                - F('used_days') - F('pending_days')
+            )
         )
 
     def get_serializer_class(self):
@@ -161,7 +236,14 @@ class AdminLeaveBalanceViewSet(viewsets.ModelViewSet):
         return context
 
     def perform_create(self, serializer):
-        serializer.save(tenant=self.request.tenant)
+        from django.db import IntegrityError, transaction
+        try:
+            with transaction.atomic():
+                serializer.save(tenant=self.request.tenant)
+        except IntegrityError:
+            raise serializers.ValidationError(
+                {'non_field_errors': ['A balance for this user, leave type and year already exists']}
+            )
 
     @extend_schema(
         tags=['Leave Management - Admin'],
@@ -173,7 +255,11 @@ class AdminLeaveBalanceViewSet(viewsets.ModelViewSet):
                 'year': serializers.IntegerField(required=False, help_text='Year (optional, defaults to current year)'),
             }
         ),
-        responses={200: LeaveBalanceDetailSerializer}
+        responses={
+            200: LeaveActionResponseSerializer,
+            400: ERROR_RESPONSE,
+            404: ERROR_RESPONSE,
+        }
     )
     @action(detail=False, methods=['post'])
     def initialize_user(self, request):
@@ -192,7 +278,7 @@ class AdminLeaveBalanceViewSet(viewsets.ModelViewSet):
 
         try:
             user = User.objects.get(id=user_id)
-        except User.DoesNotExist:
+        except (User.DoesNotExist, ValueError, TypeError):
             return Response(
                 {'error': 'User not found'},
                 status=status.HTTP_404_NOT_FOUND
@@ -208,45 +294,78 @@ class AdminLeaveBalanceViewSet(viewsets.ModelViewSet):
     @extend_schema(
         tags=['Leave Management - Admin'],
         summary='Carry forward balances',
-        request=inline_serializer(
-            name='CarryForwardRequest',
-            fields={
-                'from_year': serializers.IntegerField(required=True, help_text='Year to carry forward from'),
-                'to_year': serializers.IntegerField(required=True, help_text='Year to carry forward to'),
-            }
+        description=(
+            'Moves what is left of each from_year balance (allocated + carried in '
+            '- used; pending days are not subtracted), capped at the leave '
+            "type's max_carry_forward_days, into the to_year balance's "
+            'carried_forward_days (set, not added). Runs once per year: a '
+            'repeat call is a no-op that returns already_run=true. A superuser '
+            'can pass force=true to recompute (overwrites the carried days).'
         ),
-        responses={200: inline_serializer(
-            name='CarryForwardResponse',
-            fields={
-                'success': serializers.BooleanField(),
-                'message': serializers.CharField(),
-            }
-        )}
+        request=CarryForwardRequestSerializer,
+        responses={
+            200: CarryForwardResponseSerializer,
+            400: OpenApiResponse(description='{error} when a year is missing, else field errors ({to_year: [...]})'),
+            403: ERROR_RESPONSE,
+        }
     )
     @action(detail=False, methods=['post'])
     def carry_forward(self, request):
         """Carry forward unused balances from one year to next"""
-        from_year = request.data.get('from_year')
-        to_year = request.data.get('to_year')
-
-        if not from_year or not to_year:
+        if not request.data.get('from_year') or not request.data.get('to_year'):
             return Response(
                 {'error': 'from_year and to_year are required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        count = carry_forward_balances(request.tenant, from_year, to_year)
+        serializer = CarryForwardRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        from_year = serializer.validated_data['from_year']
+        to_year = serializer.validated_data['to_year']
+        force = serializer.validated_data.get('force', False)
+
+        if force and not request.user.is_superuser:
+            return Response(
+                {'error': 'Only a superuser can force a repeated carry forward'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            run, count = carry_forward_balances(
+                request.tenant, from_year, to_year, user=request.user, force=force
+            )
+        except CarryForwardAlreadyRun as exc:
+            run = exc.run
+            return Response({
+                'success': True,
+                'message': f'Balances from {run.from_year} were already carried forward to {run.to_year}; nothing changed',
+                'already_run': True,
+                'carried_forward': 0,
+                'from_year': run.from_year,
+                'to_year': run.to_year,
+                'run_at': run.updated_at,
+                'total_days': run.total_days,
+            })
 
         return Response({
             'success': True,
-            'message': f'Carried forward {count} balance(s) from {from_year} to {to_year}'
+            'message': f'Carried forward {count} balance(s) from {from_year} to {to_year}',
+            'already_run': False,
+            'carried_forward': count,
+            'from_year': from_year,
+            'to_year': to_year,
+            'run_at': run.updated_at,
+            'total_days': run.total_days,
         })
 
-    @extend_schema(tags=['Leave Management - Admin'], summary='List all leave balances')
+    @extend_schema(
+        tags=['Leave Management - Admin'], summary='List all leave balances',
+        parameters=[LANG_PARAM],
+    )
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
 
-    @extend_schema(tags=['Leave Management - Admin'], summary='Get balance details')
+    @extend_schema(tags=['Leave Management - Admin'], summary='Get balance details', parameters=[LANG_PARAM])
     def retrieve(self, request, *args, **kwargs):
         return super().retrieve(request, *args, **kwargs)
 
@@ -255,31 +374,81 @@ class AdminLeaveBalanceViewSet(viewsets.ModelViewSet):
         return super().partial_update(request, *args, **kwargs)
 
 
+@extend_schema_view(
+    list=extend_schema(
+        tags=['Leave Management - Admin'],
+        summary='List all leave requests',
+        parameters=[
+            OpenApiParameter(
+                name='status__in', type=str, location=OpenApiParameter.QUERY,
+                description='Comma-separated statuses, e.g. `manager_approved,hr_approved` '
+                            '(the HR inbox). Use `status` for a single value.'
+            ),
+            OpenApiParameter(
+                name='department', type=int, location=OpenApiParameter.QUERY,
+                description="Employee's department id"
+            ),
+            OpenApiParameter(
+                name='start_date', type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                description='Window start (YYYY-MM-DD): requests whose end_date is on or after this day'
+            ),
+            OpenApiParameter(
+                name='end_date', type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                description='Window end (YYYY-MM-DD): requests whose start_date is on or before this day'
+            ),
+            LANG_PARAM,
+        ],
+    ),
+    retrieve=extend_schema(
+        tags=['Leave Management - Admin'], summary='Get leave request details',
+        parameters=[LANG_PARAM],
+    ),
+    create=extend_schema(tags=['Leave Management - Admin'], summary='Create leave request'),
+    update=extend_schema(tags=['Leave Management - Admin'], summary='Update leave request'),
+    partial_update=extend_schema(tags=['Leave Management - Admin'], summary='Partially update leave request'),
+)
 class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
     """
     Admin ViewSet for managing all leave requests
     """
-    # Everyone's leave requests: administrators / HR only.
+    # Everyone's leave requests: administrators / HR only. The decision
+    # actions keep this gate too (they used to drop it, letting a team
+    # manager act through the admin route).
     permission_classes = [IsAuthenticated, HasLeaveManagementFeature, CanManageLeaveBalances]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['employee', 'leave_type', 'status']
     search_fields = ['employee__email', 'employee__first_name', 'employee__last_name', 'reason']
     ordering_fields = ['start_date', 'end_date', 'total_days', 'created_at', 'status']
     ordering = ['-created_at']
+    schema_path_param_types = STR_ID
 
     def get_queryset(self):
+        if _is_schema_view(self):
+            return LeaveRequest.objects.none()
         queryset = LeaveRequest.objects.filter(tenant=self.request.tenant).select_related(
             'employee', 'leave_type', 'manager_approver', 'hr_approver', 'final_approver', 'rejected_by'
         )
 
-        # Filter by date range
-        start_date = self.request.query_params.get('start_date')
-        end_date = self.request.query_params.get('end_date')
+        params = self.request.query_params
+
+        # Date window: a request is included when it overlaps the window
+        # (same rule as the manager list), so leave straddling an edge shows.
+        start_date = params.get('start_date')
+        end_date = params.get('end_date')
 
         if start_date:
-            queryset = queryset.filter(start_date__gte=start_date)
+            queryset = queryset.filter(end_date__gte=start_date)
         if end_date:
-            queryset = queryset.filter(end_date__lte=end_date)
+            queryset = queryset.filter(start_date__lte=end_date)
+
+        queryset = filter_by_status_in(queryset, params.get('status__in'))
+
+        department = params.get('department')
+        if department:
+            try:
+                queryset = queryset.filter(employee__department_id=int(department))
+            except (TypeError, ValueError):
+                raise serializers.ValidationError({'department': 'Must be an integer id'})
 
         return queryset
 
@@ -309,17 +478,24 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
     @extend_schema(
         tags=['Leave Management - Admin'],
         summary='Approve leave request',
-        request=LeaveApprovalSerializer
+        description=(
+            'Signs off the next open step of the approval chain '
+            '(pending -> manager_approved -> hr_approved -> approved; steps '
+            'not in the chain are skipped). When no step is left the request '
+            'becomes approved and its days move from pending to used. '
+            '`action` must be "approve".'
+        ),
+        request=LeaveApprovalSerializer,
+        responses={200: LeaveActionResponseSerializer, 400: ERROR_RESPONSE},
     )
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, HasLeaveManagementFeature, CanApproveLeave])
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, HasLeaveManagementFeature, CanManageLeaveBalances, CanApproveLeave])
     def approve(self, request, pk=None):
         """Approve a leave request"""
-        from .utils import get_next_approver_role
         from django.db import transaction
 
         leave_request = self.get_object()
 
-        if leave_request.status not in ['pending', 'manager_approved', 'hr_approved']:
+        if leave_request.status not in OPEN_APPROVAL_STATUSES:
             return Response(
                 {'error': 'Only pending or partially approved requests can be approved'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -327,58 +503,42 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
 
         serializer = LeaveApprovalSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        if serializer.validated_data['action'] != 'approve':
+            return Response(
+                {'error': 'action must be "approve" on this endpoint (use reject/ to reject)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         comments = serializer.validated_data.get('comments', '')
 
-        # Determine next required role BEFORE changing status
-        next_role = get_next_approver_role(leave_request)
-
         with transaction.atomic():
-            # Apply approval based on current status
-            if leave_request.status == 'pending':
-                leave_request.manager_approver = request.user
-                leave_request.manager_approved_at = timezone.now()
-                leave_request.manager_comments = comments
-                leave_request.status = 'manager_approved'
-            elif leave_request.status == 'manager_approved':
-                leave_request.hr_approver = request.user
-                leave_request.hr_approved_at = timezone.now()
-                leave_request.hr_comments = comments
-                leave_request.status = 'hr_approved'
-            elif leave_request.status == 'hr_approved':
-                leave_request.final_approver = request.user
-                leave_request.final_approved_at = timezone.now()
-                leave_request.status = 'approved'
-
-            # Check if there are more approval steps needed
-            next_role_after = get_next_approver_role(leave_request)
-
-            if not next_role_after:
-                # Final approval — set status to approved and update balance
-                leave_request.status = 'approved'
-                if not leave_request.final_approver:
-                    leave_request.final_approver = request.user
-                    leave_request.final_approved_at = timezone.now()
-                update_leave_balance(leave_request, action='approve')
-
+            apply_approval_step(leave_request, request.user, comments)
+            leave_request._leave_actor = request.user
             leave_request.save()
 
+        message = (
+            'Leave request approved successfully'
+            if leave_request.status == 'approved'
+            else 'Approval recorded; the request awaits the next approver'
+        )
         return Response({
             'success': True,
-            'message': 'Leave request approved successfully',
+            'message': message,
             'status': leave_request.status
         })
 
     @extend_schema(
         tags=['Leave Management - Admin'],
         summary='Reject leave request',
-        request=LeaveApprovalSerializer
+        description='`action` must be "reject" and `comments` (the reason) are required.',
+        request=LeaveApprovalSerializer,
+        responses={200: LeaveActionResponseSerializer, 400: ERROR_RESPONSE},
     )
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, HasLeaveManagementFeature, CanApproveLeave])
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, HasLeaveManagementFeature, CanManageLeaveBalances, CanApproveLeave])
     def reject(self, request, pk=None):
         """Reject a leave request"""
         leave_request = self.get_object()
 
-        if leave_request.status not in ['pending', 'manager_approved', 'hr_approved']:
+        if leave_request.status not in OPEN_APPROVAL_STATUSES:
             return Response(
                 {'error': 'Only pending or partially approved requests can be rejected'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -386,6 +546,11 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
 
         serializer = LeaveApprovalSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        if serializer.validated_data['action'] != 'reject':
+            return Response(
+                {'error': 'action must be "reject" on this endpoint (use approve/ to approve)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         from django.db import transaction
         with transaction.atomic():
@@ -393,6 +558,7 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
             leave_request.rejected_by = request.user
             leave_request.rejected_at = timezone.now()
             leave_request.rejection_reason = serializer.validated_data.get('comments', '')
+            leave_request._leave_actor = request.user
             leave_request.save()
 
             # Remove from pending balance
@@ -400,15 +566,20 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
 
         return Response({
             'success': True,
-            'message': 'Leave request rejected'
+            'message': 'Leave request rejected',
+            'status': leave_request.status,
         })
 
     @extend_schema(
         tags=['Leave Management - Admin'],
         summary='Cancel leave request',
-        request=LeaveCancellationSerializer
+        description='Cancels a pending, partially approved or approved request '
+                    '(approved days go back to the balance). Rejected or '
+                    'cancelled requests cannot be cancelled.',
+        request=LeaveCancellationSerializer,
+        responses={200: LeaveActionResponseSerializer, 400: ERROR_RESPONSE},
     )
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, HasLeaveManagementFeature, CanCancelLeave])
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, HasLeaveManagementFeature, CanManageLeaveBalances, CanCancelLeave])
     def cancel(self, request, pk=None):
         """Cancel a leave request"""
         leave_request = self.get_object()
@@ -416,6 +587,13 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
         if leave_request.status == 'cancelled':
             return Response(
                 {'error': 'Leave request is already cancelled'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if leave_request.status == 'rejected':
+            # Its pending days were already released on rejection; releasing
+            # them again ate into the employee's other open requests.
+            return Response(
+                {'error': 'Cannot cancel a rejected leave request'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -429,6 +607,7 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
             leave_request.status = 'cancelled'
             leave_request.cancelled_at = timezone.now()
             leave_request.cancellation_reason = serializer.validated_data.get('reason', '')
+            leave_request._leave_actor = request.user
             leave_request.save()
 
             # Update balance based on previous status
@@ -441,29 +620,20 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
 
         return Response({
             'success': True,
-            'message': 'Leave request cancelled successfully'
+            'message': 'Leave request cancelled successfully',
+            'status': leave_request.status,
         })
-
-    @extend_schema(tags=['Leave Management - Admin'], summary='List all leave requests')
-    def list(self, request, *args, **kwargs):
-        return super().list(request, *args, **kwargs)
-
-    @extend_schema(tags=['Leave Management - Admin'], summary='Get leave request details')
-    def retrieve(self, request, *args, **kwargs):
-        return super().retrieve(request, *args, **kwargs)
-
-    @extend_schema(tags=['Leave Management - Admin'], summary='Create leave request')
-    def create(self, request, *args, **kwargs):
-        return super().create(request, *args, **kwargs)
 
     @extend_schema(tags=['Leave Management - Admin'], summary='Delete leave request')
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
 
-        # Update balance before deleting
+        # Give the days back before deleting: approved requests hold used
+        # days (this used to release pending days instead), open ones hold
+        # pending days; rejected / cancelled ones hold nothing.
         if instance.status == 'approved':
-            update_leave_balance(instance, action='cancel')
-        elif instance.status in ['pending', 'manager_approved', 'hr_approved']:
+            update_leave_balance(instance, action='cancel_approved')
+        elif instance.status in OPEN_APPROVAL_STATUSES:
             update_leave_balance(instance, action='cancel')
 
         return super().destroy(request, *args, **kwargs)
@@ -478,8 +648,11 @@ class PublicHolidayViewSet(viewsets.ModelViewSet):
     filterset_fields = ['is_recurring', 'applies_to_all']
     ordering_fields = ['date']
     ordering = ['date']
+    schema_path_param_types = STR_ID
 
     def get_queryset(self):
+        if _is_schema_view(self):
+            return PublicHoliday.objects.none()
         queryset = PublicHoliday.objects.filter(tenant=self.request.tenant).select_related('created_by')
 
         # Filter by year
@@ -511,11 +684,20 @@ class PublicHolidayViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         serializer.save(updated_by=self.request.user)
 
-    @extend_schema(tags=['Leave Management - Admin'], summary='List public holidays')
+    @extend_schema(
+        tags=['Leave Management - Admin'], summary='List public holidays',
+        parameters=[
+            OpenApiParameter(
+                name='year', type=int, location=OpenApiParameter.QUERY,
+                description='Only holidays dated in this year'
+            ),
+            LANG_PARAM,
+        ],
+    )
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
 
-    @extend_schema(tags=['Leave Management - Admin'], summary='Get holiday details')
+    @extend_schema(tags=['Leave Management - Admin'], summary='Get holiday details', parameters=[LANG_PARAM])
     def retrieve(self, request, *args, **kwargs):
         return super().retrieve(request, *args, **kwargs)
 
@@ -542,8 +724,11 @@ class LeaveApprovalChainViewSet(viewsets.ModelViewSet):
     filterset_fields = ['leave_type', 'approver_role', 'is_required']
     ordering_fields = ['level']
     ordering = ['level']
+    schema_path_param_types = STR_ID
 
     def get_queryset(self):
+        if _is_schema_view(self):
+            return LeaveApprovalChain.objects.none()
         return LeaveApprovalChain.objects.filter(tenant=self.request.tenant).select_related('leave_type')
 
     def get_serializer_context(self):
@@ -554,11 +739,11 @@ class LeaveApprovalChainViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(tenant=self.request.tenant)
 
-    @extend_schema(tags=['Leave Management - Admin'], summary='List approval chains')
+    @extend_schema(tags=['Leave Management - Admin'], summary='List approval chains', parameters=[LANG_PARAM])
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
 
-    @extend_schema(tags=['Leave Management - Admin'], summary='Get approval chain details')
+    @extend_schema(tags=['Leave Management - Admin'], summary='Get approval chain details', parameters=[LANG_PARAM])
     def retrieve(self, request, *args, **kwargs):
         return super().retrieve(request, *args, **kwargs)
 
@@ -569,6 +754,13 @@ class LeaveApprovalChainViewSet(viewsets.ModelViewSet):
     @extend_schema(tags=['Leave Management - Admin'], summary='Update approval chain')
     def update(self, request, *args, **kwargs):
         return super().update(request, *args, **kwargs)
+
+    @extend_schema(
+        tags=['Leave Management - Admin'], summary='Partially update approval chain',
+        description='Omitted fields (level, leave_type) keep their stored values.'
+    )
+    def partial_update(self, request, *args, **kwargs):
+        return super().partial_update(request, *args, **kwargs)
 
     @extend_schema(tags=['Leave Management - Admin'], summary='Delete approval chain')
     def destroy(self, request, *args, **kwargs):

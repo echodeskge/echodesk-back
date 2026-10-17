@@ -551,6 +551,9 @@ class Notification(models.Model):
         ('leave_request_submitted', 'Leave Request Submitted'),
         ('leave_request_approved', 'Leave Request Approved'),
         ('leave_request_rejected', 'Leave Request Rejected'),
+        ('leave_request_progress', 'Leave Request Partially Approved'),
+        ('leave_request_awaiting_approval', 'Leave Request Awaiting Your Approval'),
+        ('leave_request_cancelled', 'Leave Request Cancelled'),
         # Bookings
         ('booking_confirmed', 'Booking Confirmed'),
         ('booking_cancelled', 'Booking Cancelled'),

@@ -137,6 +137,7 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
         leave_request.status = 'cancelled'
         leave_request.cancelled_at = timezone.now()
         leave_request.cancellation_reason = serializer.validated_data.get('reason', '')
+        leave_request._leave_actor = request.user
         leave_request.save()
 
         # Update balance

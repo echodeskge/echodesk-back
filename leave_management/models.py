@@ -343,6 +343,11 @@ class LeaveRequest(models.Model):
         related_name='final_approved_leaves'
     )
     final_approved_at = models.DateTimeField(null=True, blank=True)
+    final_comments = models.TextField(
+        blank=True,
+        default='',
+        help_text="Comments left by the final (admin) approver"
+    )
 
     # Rejection
     rejected_by = models.ForeignKey(
@@ -530,3 +535,48 @@ class LeaveApprovalChain(models.Model):
     def __str__(self):
         type_name = f"{self.leave_type}" if self.leave_type else "All Leave Types"
         return f"{type_name} - Level {self.level} ({self.approver_role})"
+
+
+class LeaveCarryForwardRun(models.Model):
+    """
+    Marker that a year's balances were carried forward, so the action is a
+    no-op when it is triggered again (one row per tenant and source year).
+    """
+    tenant = models.ForeignKey(
+        'tenants.Tenant',
+        on_delete=models.CASCADE,
+        related_name='leave_carry_forward_runs'
+    )
+    from_year = models.IntegerField(help_text="Year the unused days came from")
+    to_year = models.IntegerField(help_text="Year the days were carried into")
+    run_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='leave_carry_forward_runs'
+    )
+    balances_count = models.IntegerField(
+        default=0,
+        help_text="Balances that received carried forward days"
+    )
+    total_days = models.DecimalField(
+        max_digits=8,
+        decimal_places=1,
+        default=0,
+        help_text="Sum of the carried forward days"
+    )
+    forced_runs = models.IntegerField(
+        default=0,
+        help_text="How many times a superuser forced a recompute"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Leave Carry Forward Run'
+        verbose_name_plural = 'Leave Carry Forward Runs'
+        unique_together = [['tenant', 'from_year']]
+
+    def __str__(self):
+        return f"Carry forward {self.from_year} -> {self.to_year}"

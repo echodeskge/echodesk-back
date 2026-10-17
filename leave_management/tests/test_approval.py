@@ -83,6 +83,39 @@ class TestNextApproverRole(LeaveTestCase):
         self.assertIsNone(role)
 
 
+    def test_closed_statuses_have_no_next_role(self):
+        # 'approved' used to fall back to rank 0 and report 'manager', so
+        # the final step of a 3-level chain never moved the balance.
+        self.create_approval_chain(level=1, approver_role='manager')
+        self.create_approval_chain(level=2, approver_role='hr')
+        self.create_approval_chain(level=3, approver_role='admin')
+        lt = self.create_leave_type()
+        employee = self.create_user(email='emp@test.com')
+        for closed in ('approved', 'rejected', 'cancelled'):
+            request = self.create_leave_request(employee, lt, status=closed)
+            self.assertIsNone(get_next_approver_role(request), closed)
+
+    def test_three_level_chain_progress(self):
+        self.create_approval_chain(level=1, approver_role='manager')
+        self.create_approval_chain(level=2, approver_role='hr')
+        self.create_approval_chain(level=3, approver_role='admin')
+        lt = self.create_leave_type()
+        employee = self.create_user(email='emp@test.com')
+        expected = {'pending': 'manager', 'manager_approved': 'hr', 'hr_approved': 'admin'}
+        for current, role in expected.items():
+            request = self.create_leave_request(employee, lt, status=current)
+            self.assertEqual(get_next_approver_role(request), role, current)
+
+    def test_hr_only_settings_chain(self):
+        self.create_leave_settings(require_manager_approval=False, require_hr_approval=True)
+        lt = self.create_leave_type()
+        employee = self.create_user(email='emp@test.com')
+        pending = self.create_leave_request(employee, lt, status='pending')
+        self.assertEqual(get_next_approver_role(pending), 'hr')
+        done = self.create_leave_request(employee, lt, status='hr_approved')
+        self.assertIsNone(get_next_approver_role(done))
+
+
 class TestApprovalWorkflow(LeaveTestCase):
     """Test the full approval workflow via API."""
     pass
