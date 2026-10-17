@@ -5551,56 +5551,79 @@ def user_rating_sessions(request, user_id):
     else:
         end_date = today
 
+    chat_qs = ChatRating.objects.filter(
+        rated_user_id=user_id,
+        created_at__date__gte=start_date,
+        created_at__date__lte=end_date,
+    ) if source in ('all', 'social') else ChatRating.objects.none()
+    call_qs = CallRating.objects.filter(
+        rated_user_id=user_id,
+        created_at__date__gte=start_date,
+        created_at__date__lte=end_date,
+        rating__gt=0,
+    ) if source in ('all', 'calls') else CallRating.objects.none()
+
+    paged = bool(request.query_params.get('page') or request.query_params.get('page_size'))
+    if paged:
+        # Optional paging (mobile): page in the DB. Each source contributes
+        # at most start+page_size (id, created_at) pairs, the pairs are
+        # merged newest first, and only the rows on the page are loaded.
+        page = _positive_int_param(request.query_params.get('page'), 1)
+        page_size = min(_positive_int_param(request.query_params.get('page_size'), 50), 200)
+        start = (page - 1) * page_size
+        need = start + page_size
+        total_sessions = chat_qs.count() + call_qs.count()
+        heads = [
+            (created, 'chat', pk) for pk, created in
+            chat_qs.order_by('-created_at', '-id').values_list('id', 'created_at')[:need]
+        ] + [
+            (created, 'call', pk) for pk, created in
+            call_qs.order_by('-created_at', '-id').values_list('id', 'created_at')[:need]
+        ]
+        heads.sort(key=lambda h: h[0], reverse=True)
+        heads = heads[start:need]
+        chat_ids = [pk for _, kind, pk in heads if kind == 'chat']
+        call_ids = [pk for _, kind, pk in heads if kind == 'call']
+        chat_ratings = list(chat_qs.filter(id__in=chat_ids).order_by('-created_at', '-id'))
+        call_ratings = list(call_qs.filter(id__in=call_ids).select_related('call_log')
+                            .order_by('-created_at', '-id'))
+    else:
+        # Web: the full list, exactly as before.
+        chat_ratings = list(chat_qs.order_by('-created_at'))
+        call_ratings = list(call_qs.select_related('call_log').order_by('-created_at'))
+
     sessions = []
+    names = _rating_customer_names(chat_ratings)
+    archived_keys = _rating_archived_keys(chat_ratings)
+    for rating in chat_ratings:
+        sessions.append({
+            'id': rating.id,
+            'platform': rating.platform,
+            'conversation_id': rating.conversation_id,
+            'account_id': rating.account_id,
+            'customer_name': names.get(rating.id) or rating.conversation_id,
+            'rating': rating.rating if rating.rating > 0 else None,
+            'comment': rating.comment or '',
+            'session_started_at': rating.session_started_at.isoformat() if rating.session_started_at else None,
+            'session_ended_at': rating.session_ended_at.isoformat() if rating.session_ended_at else None,
+            'created_at': rating.created_at.isoformat(),
+            'is_archived': rating.id in archived_keys,
+        })
 
-    # --- Social (ChatRating) sessions ---
-    if source in ('all', 'social'):
-        chat_ratings = list(ChatRating.objects.filter(
-            rated_user_id=user_id,
-            created_at__date__gte=start_date,
-            created_at__date__lte=end_date,
-        ).order_by('-created_at'))
-        names = _rating_customer_names(chat_ratings)
-        archived_keys = _rating_archived_keys(chat_ratings)
-
-        for rating in chat_ratings:
-            sessions.append({
-                'id': rating.id,
-                'platform': rating.platform,
-                'conversation_id': rating.conversation_id,
-                'account_id': rating.account_id,
-                'customer_name': names.get(rating.id) or rating.conversation_id,
-                'rating': rating.rating if rating.rating > 0 else None,
-                'comment': rating.comment or '',
-                'session_started_at': rating.session_started_at.isoformat() if rating.session_started_at else None,
-                'session_ended_at': rating.session_ended_at.isoformat() if rating.session_ended_at else None,
-                'created_at': rating.created_at.isoformat(),
-                'is_archived': rating.id in archived_keys,
-            })
-
-    # --- Call (CallRating) sessions ---
-    if source in ('all', 'calls'):
-        call_ratings = CallRating.objects.filter(
-            rated_user_id=user_id,
-            created_at__date__gte=start_date,
-            created_at__date__lte=end_date,
-            rating__gt=0,
-        ).select_related('call_log').order_by('-created_at')
-
-        for rating in call_ratings:
-            sessions.append({
-                'id': rating.id,
-                'platform': 'phone_' + rating.review_method,  # phone_sms or phone_callback
-                'conversation_id': rating.caller_number,
-                'account_id': None,
-                'customer_name': rating.caller_number,
-                'rating': rating.rating,
-                'comment': rating.comment or '',
-                'session_started_at': rating.call_log.started_at.isoformat() if rating.call_log and rating.call_log.started_at else None,
-                'session_ended_at': rating.call_log.ended_at.isoformat() if rating.call_log and rating.call_log.ended_at else None,
-                'created_at': rating.created_at.isoformat(),
-                'is_archived': False,
-            })
+    for rating in call_ratings:
+        sessions.append({
+            'id': rating.id,
+            'platform': 'phone_' + rating.review_method,  # phone_sms or phone_callback
+            'conversation_id': rating.caller_number,
+            'account_id': None,
+            'customer_name': rating.caller_number,
+            'rating': rating.rating,
+            'comment': rating.comment or '',
+            'session_started_at': rating.call_log.started_at.isoformat() if rating.call_log and rating.call_log.started_at else None,
+            'session_ended_at': rating.call_log.ended_at.isoformat() if rating.call_log and rating.call_log.ended_at else None,
+            'created_at': rating.created_at.isoformat(),
+            'is_archived': False,
+        })
 
     # Sort combined sessions by created_at descending
     sessions.sort(key=lambda s: s['created_at'], reverse=True)
@@ -5617,54 +5640,77 @@ def user_rating_sessions(request, user_id):
     except User.DoesNotExist:
         user_info = {'id': user_id, 'email': 'Unknown', 'name': 'Unknown User'}
 
-    total_sessions = len(sessions)
     payload = {
         'user': user_info,
         'start_date': start_date.isoformat(),
         'end_date': end_date.isoformat(),
         'sessions': sessions,
-        'total_sessions': total_sessions,
+        'total_sessions': total_sessions if paged else len(sessions),
     }
-    # Optional paging (mobile). Without page/page_size the full list is
-    # returned exactly as before (web).
-    if request.query_params.get('page') or request.query_params.get('page_size'):
-        page = _positive_int_param(request.query_params.get('page'), 1)
-        page_size = min(_positive_int_param(request.query_params.get('page_size'), 50), 200)
-        start = (page - 1) * page_size
-        payload['sessions'] = sessions[start:start + page_size]
+    if paged:
         payload['page'] = page
         payload['page_size'] = page_size
-        payload['has_next'] = start + page_size < total_sessions
+        payload['has_next'] = need < total_sessions
     return Response(payload)
 
 
 def _rating_customer_names(ratings):
-    """Customer display names for ChatRating rows, one query per platform."""
+    """Customer display names for ChatRating rows, one query per platform.
+
+    Names are keyed by (account, customer id) so the same sender id on two
+    pages/numbers resolves to its own page's name; when the rating has no
+    account, or its account has no message from that customer, the newest
+    name for that customer id is used.
+    """
     by_platform = {}
     for r in ratings:
         by_platform.setdefault(r.platform, []).append(r)
     names = {}
 
-    def latest_by(qs, key_field, value_fields):
-        return {
-            row[key_field]: row
-            for row in qs.order_by(key_field, '-timestamp').distinct(key_field).values(key_field, *value_fields)
-        }
+    def latest_by(qs, account_field, key_field, value_fields):
+        rows = (
+            qs.order_by(account_field, key_field, '-timestamp')
+            .distinct(account_field, key_field)
+            .values(account_field, key_field, 'timestamp', *value_fields)
+        )
+        by_pair, by_key = {}, {}
+        for row in rows:
+            key = row[key_field]
+            by_pair[(str(row[account_field]), key)] = row
+            current = by_key.get(key)
+            if current is None or row['timestamp'] > current['timestamp']:
+                by_key[key] = row
+        return by_pair, by_key
+
+    def pick(found, rating, *keys):
+        by_pair, by_key = found
+        account = str(rating.account_id) if rating.account_id not in (None, '') else None
+        if account:
+            for key in keys:
+                if (account, key) in by_pair:
+                    return by_pair[(account, key)]
+        # No message on the rating's own account (or no account recorded):
+        # newest name for that customer id anywhere.
+        for key in keys:
+            if key in by_key:
+                return by_key[key]
+        return None
 
     if 'facebook' in by_platform:
         keys = {r.conversation_id for r in by_platform['facebook']}
         found = latest_by(FacebookMessage.objects.filter(sender_id__in=keys, is_from_page=False),
-                          'sender_id', ['sender_name'])
+                          'page_connection__page_id', 'sender_id', ['sender_name'])
         for r in by_platform['facebook']:
-            row = found.get(r.conversation_id)
+            row = pick(found, r, r.conversation_id)
             if row and row['sender_name']:
                 names[r.id] = row['sender_name']
     if 'instagram' in by_platform:
         keys = {r.conversation_id for r in by_platform['instagram']}
         found = latest_by(InstagramMessage.objects.filter(sender_id__in=keys, is_from_business=False),
-                          'sender_id', ['sender_username', 'sender_name'])
+                          'account_connection__instagram_account_id', 'sender_id',
+                          ['sender_username', 'sender_name'])
         for r in by_platform['instagram']:
-            row = found.get(r.conversation_id)
+            row = pick(found, r, r.conversation_id)
             if row and (row['sender_username'] or row['sender_name']):
                 names[r.id] = row['sender_username'] or row['sender_name']
     if 'whatsapp' in by_platform:
@@ -5672,18 +5718,18 @@ def _rating_customer_names(ratings):
         for r in by_platform['whatsapp']:
             keys.update({r.conversation_id, r.conversation_id.lstrip('+'), '+' + r.conversation_id.lstrip('+')})
         found = latest_by(WhatsAppMessage.objects.filter(from_number__in=keys, is_from_business=False),
-                          'from_number', ['contact_name'])
+                          'business_account__waba_id', 'from_number', ['contact_name'])
         for r in by_platform['whatsapp']:
-            row = found.get(r.conversation_id) or found.get(r.conversation_id.lstrip('+')) \
-                or found.get('+' + r.conversation_id.lstrip('+'))
+            row = pick(found, r, r.conversation_id, r.conversation_id.lstrip('+'),
+                       '+' + r.conversation_id.lstrip('+'))
             if row and row['contact_name']:
                 names[r.id] = row['contact_name']
     if 'telegram' in by_platform:
         peers = {int(r.conversation_id) for r in by_platform['telegram'] if str(r.conversation_id).isdigit()}
         found = latest_by(TelegramMessage.objects.filter(peer_id__in=peers, is_from_business=False),
-                          'peer_id', ['peer_name', 'peer_username'])
+                          'account__telegram_user_id', 'peer_id', ['peer_name', 'peer_username'])
         for r in by_platform['telegram']:
-            row = found.get(int(r.conversation_id)) if str(r.conversation_id).isdigit() else None
+            row = pick(found, r, int(r.conversation_id)) if str(r.conversation_id).isdigit() else None
             if row and (row['peer_name'] or row['peer_username']):
                 names[r.id] = row['peer_name'] or row['peer_username']
     if 'widget' in by_platform:
@@ -5696,12 +5742,14 @@ def _rating_customer_names(ratings):
         sessions = WidgetSession.objects.filter(
             Q(session_id__in=set(keys.values())) | Q(visitor_id__in=set(keys.values()))
         ).order_by('-last_seen_at')
-        by_key = {}
+        by_pair, by_key = {}, {}
         for ws in sessions:
-            by_key.setdefault(ws.session_id, ws)
-            by_key.setdefault(ws.visitor_id, ws)
+            for key in (ws.session_id, ws.visitor_id):
+                by_pair.setdefault((str(ws.connection_id), key), ws)
+                by_key.setdefault(key, ws)
         for r in by_platform['widget']:
-            ws = by_key.get(keys[r.id])
+            account = str(r.account_id) if r.account_id not in (None, '') else None
+            ws = (by_pair.get((account, keys[r.id])) if account else None) or by_key.get(keys[r.id])
             if ws:
                 names[r.id] = ws.visitor_name or f"Website visitor {ws.visitor_id[:6]}"
     return names
@@ -5933,6 +5981,9 @@ def submit_public_rating(request, token):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+UNIFIED_LIST_MAX_PAGE = 100
+
+
 @extend_schema(
     summary="Get unified conversations from all social platforms",
     description="""
@@ -5959,7 +6010,7 @@ def submit_public_rating(request, token):
             name='page',
             type=OpenApiTypes.INT,
             location=OpenApiParameter.QUERY,
-            description='Page number (default: 1)',
+            description='Page number (default: 1, max: 100; 400 beyond)',
             required=False,
         ),
         OpenApiParameter(
@@ -6035,6 +6086,12 @@ def unified_conversations(request):
     search_query = request.query_params.get('search', '').strip().lower()
     page = _positive_int_param(request.query_params.get('page'), 1)
     page_size = min(_positive_int_param(request.query_params.get('page_size'), 50), 200)
+    if page > UNIFIED_LIST_MAX_PAGE:
+        # Each platform reads page*page_size rows: keep that bounded.
+        return Response(
+            {'error': f'page must be at most {UNIFIED_LIST_MAX_PAGE}; narrow the list with search or filters'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     email_folder = request.query_params.get('folder', 'INBOX')
     assigned_only = request.query_params.get('assigned', '').lower() == 'true'
     archived_only = request.query_params.get('archived', '').lower() == 'true'
@@ -6079,7 +6136,7 @@ def unified_conversations(request):
     params = request.query_params.copy()
 
     next_url = None
-    if end_idx < total_count:
+    if end_idx < total_count and page < UNIFIED_LIST_MAX_PAGE:
         params['page'] = page + 1
         next_url = f"{base_url}?{params.urlencode()}"
 
@@ -8791,18 +8848,102 @@ TEMPLATE_STATUS_EVENTS = {
 }
 
 
+WABA_TENANT_CACHE_TTL = 60 * 60       # owner of a WABA, once found
+WABA_TENANT_MISS_TTL = 5 * 60         # "no tenant has this WABA"
+_WABA_MISS = '__none__'
+
+
+def _waba_cache_key(waba_id):
+    return f'social:waba_tenant:{waba_id}'
+
+
+def _schema_has_waba(schema_name, waba_id):
+    from django.db import transaction
+    try:
+        # Savepoint: a tenant schema without the tables must not poison an
+        # enclosing transaction. Only reached on a cache miss.
+        with schema_context(schema_name), transaction.atomic():
+            return WhatsAppBusinessAccount.objects.filter(waba_id=str(waba_id)).exists()
+    except Exception:  # noqa: BLE001 — tenant schema without the tables yet
+        return False
+
+
+def resolve_tenant_by_waba_id(waba_id, use_cache=True):
+    """Tenant schema owning a WhatsApp Business Account id, or None.
+
+    Template webhooks carry only the WABA id. The public routing table is
+    keyed by phone_number_id, so it is used to narrow the search: tenants
+    with a WhatsApp route are checked first, then every other tenant. The
+    first schema holding the WABA wins and is cached (misses are cached
+    briefly), so a webhook normally costs one cache read plus one check of
+    the cached schema instead of a query and a transaction per tenant.
+    """
+    from django.core.cache import cache
+    from tenants.models import SocialPlatformRoute, Tenant
+
+    waba_id = str(waba_id or '').strip()
+    if not waba_id:
+        return None
+    key = _waba_cache_key(waba_id)
+    if use_cache:
+        try:
+            cached = cache.get(key)
+        except Exception:  # noqa: BLE001
+            cached = None
+        if cached == _WABA_MISS:
+            return None
+        if cached and _schema_has_waba(cached, waba_id):
+            return cached
+
+    candidates, others = [], []
+    try:
+        with schema_context('public'):
+            candidates = list(
+                SocialPlatformRoute.objects.filter(platform='whatsapp', is_active=True)
+                .order_by('tenant_schema').values_list('tenant_schema', flat=True).distinct()
+            )
+    except Exception:  # noqa: BLE001 — fall back to the plain tenant list
+        candidates = []
+    try:
+        with schema_context('public'):
+            others = list(Tenant.objects.exclude(schema_name='public')
+                          .order_by('schema_name').values_list('schema_name', flat=True))
+    except Exception:  # noqa: BLE001
+        others = []
+    found = None
+    for schema_name in dict.fromkeys(candidates + others):
+        if schema_name == 'public':
+            continue
+        if _schema_has_waba(schema_name, waba_id):
+            found = schema_name
+            break
+    try:
+        if found:
+            cache.set(key, found, WABA_TENANT_CACHE_TTL)
+        else:
+            cache.set(key, _WABA_MISS, WABA_TENANT_MISS_TTL)
+    except Exception:  # noqa: BLE001
+        pass
+    return found
+
+
 def handle_whatsapp_template_status_update(waba_id, value):
-    """Apply a ``message_template_status_update`` webhook to every tenant
-    that has this WABA, and notify their admins. Returns rows updated.
+    """Apply a ``message_template_status_update`` webhook to the tenant that
+    owns this WABA (see ``resolve_tenant_by_waba_id``) and notify its admins.
+    Returns rows updated.
 
     Payload: {event, message_template_id, message_template_name,
     message_template_language, reason}. REINSTATED means approved again.
     """
+    from django.db import transaction
     from .notifications import notify_whatsapp_template_status
-    from tenants.models import Tenant
 
     event = str(value.get('event') or '').upper()
     if not waba_id or event not in TEMPLATE_STATUS_EVENTS:
+        return 0
+    schema_name = resolve_tenant_by_waba_id(waba_id)
+    if not schema_name:
+        logger.info(f"Template status webhook for unknown WABA {waba_id} — ignored")
         return 0
     new_status = 'APPROVED' if event == 'REINSTATED' else event
     meta_id = str(value.get('message_template_id') or '')
@@ -8810,35 +8951,30 @@ def handle_whatsapp_template_status_update(waba_id, value):
     language = value.get('message_template_language') or ''
     reason = str(value.get('reason') or '')
 
-    from django.db import transaction
-
     updated = 0
-    for tenant in Tenant.objects.exclude(schema_name='public'):
-        try:
-            with schema_context(tenant.schema_name), transaction.atomic():
-                templates = WhatsAppMessageTemplate.objects.filter(
-                    business_account__waba_id=str(waba_id),
-                ).select_related('business_account', 'created_by')
-                match = Q(template_id=meta_id) if meta_id else Q(pk__in=[])
-                if name:
-                    name_q = Q(name=name)
-                    if language:
-                        name_q &= Q(language=language)
-                    match |= name_q
-                for template in templates.filter(match):
-                    previous = template.status
-                    if previous == new_status:
-                        continue
-                    template.status = new_status
-                    if meta_id and not template.template_id:
-                        template.template_id = meta_id
-                    template.save(update_fields=['status', 'template_id', 'updated_at'])
-                    updated += 1
-                    notify_whatsapp_template_status(template, previous, reason)
-        except ProgrammingError:
-            continue  # tenant schema without the tables yet
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"Template status update failed for {tenant.schema_name}: {exc}")
+    try:
+        with schema_context(schema_name), transaction.atomic():
+            templates = WhatsAppMessageTemplate.objects.filter(
+                business_account__waba_id=str(waba_id),
+            ).select_related('business_account', 'created_by')
+            match = Q(template_id=meta_id) if meta_id else Q(pk__in=[])
+            if name:
+                name_q = Q(name=name)
+                if language:
+                    name_q &= Q(language=language)
+                match |= name_q
+            for template in templates.filter(match):
+                previous = template.status
+                if previous == new_status:
+                    continue
+                template.status = new_status
+                if meta_id and not template.template_id:
+                    template.template_id = meta_id
+                template.save(update_fields=['status', 'template_id', 'updated_at'])
+                updated += 1
+                notify_whatsapp_template_status(template, previous, reason)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"Template status update failed for {schema_name}: {exc}")
     return updated
 
 

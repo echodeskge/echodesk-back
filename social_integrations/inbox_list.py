@@ -14,7 +14,7 @@ from django.db.models import (
     Case, CharField, Count, Exists, F, Func, OuterRef, Q, Subquery, Value, When,
 )
 from django.db.models.expressions import RawSQL
-from django.db.models.functions import Cast
+from django.db.models.functions import Cast, Concat, Substr
 from tenant_schemas.utils import schema_context
 
 from .models import (
@@ -244,8 +244,16 @@ def _widget_heads(ctx, connection_ids):
         _conv=F('session_id'),
     )
     if ctx.search:
+        # Match what the list shows: the visitor's name, or the fallback
+        # label 'Website visitor <first 6 of visitor id>' when there is none.
+        qs = qs.annotate(_label=Case(
+            When(Q(visitor_name__isnull=True) | Q(visitor_name=''),
+                 then=Concat(Value('Website visitor '), Substr('visitor_id', 1, 6))),
+            default=F('visitor_name'),
+            output_field=CharField(),
+        ))
         qs = qs.filter(
-            Q(visitor_name__icontains=ctx.search)
+            Q(_label__icontains=ctx.search)
             | Exists(WidgetMessage.objects.filter(
                 id=OuterRef('_last_id'), message_text__icontains=ctx.search,
             ))
