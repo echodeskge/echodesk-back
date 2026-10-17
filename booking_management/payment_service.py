@@ -221,16 +221,22 @@ class BookingPaymentService:
             dict: {'status': 'no_refund' | 'refunded' | 'manual_required', 'amount': Decimal}
         Never raises: a refund that can't be made automatically is recorded on
         the booking for staff to handle, and the cancellation stands.
+
+        Only the money paid online is refunded through BOG. Payments staff
+        recorded by hand (manual_payments) stay on the booking; see
+        utils.flag_manual_refund.
         """
-        if not booking.bog_order_id or not booking.paid_amount:
+        from .utils import calculate_refund_amount, online_paid_amount
+
+        online_paid = online_paid_amount(booking)
+        if not booking.bog_order_id or online_paid <= 0:
             return {'status': 'no_refund', 'amount': Decimal('0')}
 
         # Never refund the same booking twice.
         if ((booking.payment_metadata or {}).get('refund') or {}).get('status') == 'requested':
             return {'status': 'no_refund', 'amount': Decimal('0')}
 
-        # Calculate refund amount based on policy
-        from .utils import calculate_refund_amount
+        # Calculate refund amount based on policy (online part only)
         refund_amount = calculate_refund_amount(booking, self.settings)
 
         if refund_amount <= 0:
@@ -239,7 +245,7 @@ class BookingPaymentService:
 
         metadata = dict(booking.payment_metadata or {})
         try:
-            full = refund_amount >= booking.paid_amount
+            full = refund_amount >= online_paid
             result = self.bog_service.refund_payment(
                 order_id=booking.bog_order_id,
                 amount=None if full else refund_amount,

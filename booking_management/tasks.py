@@ -265,6 +265,8 @@ def _send_reminders_for_tenant(schema_name):
 
 # "Your next client in N minutes" push to the assigned staff member.
 STAFF_REMINDER_MINUTES = 30
+# A booking the staff member made for themselves this recently gets no reminder.
+STAFF_REMINDER_SELF_BOOKED_MINUTES = 15
 
 
 @shared_task
@@ -290,23 +292,38 @@ def _send_staff_reminders_for_tenant(minutes=STAFF_REMINDER_MINUTES):
     from booking_management.staff_notifications import notify_assigned_staff
     from booking_management.utils import get_booking_settings, tenant_now
 
+    from django.db.models import Q
+
     now = tenant_now(get_booking_settings())
     horizon = now + timedelta(minutes=minutes)
+    # (now, horizon] as a datetime window: just before midnight it also
+    # covers bookings early the next day.
+    if horizon.date() == now.date():
+        window = Q(date=now.date(), start_time__gt=now.time(), start_time__lte=horizon.time())
+    else:
+        window = (
+            Q(date=now.date(), start_time__gt=now.time())
+            | Q(date__gt=now.date(), date__lt=horizon.date())
+            | Q(date=horizon.date(), start_time__lte=horizon.time())
+        )
     bookings = Booking.objects.filter(
-        date=now.date(),
+        window,
         status__in=['pending', 'confirmed'],
         staff__isnull=False,
         staff_reminder_sent=False,
-        start_time__gt=now.time(),
     ).select_related('client', 'service', 'staff', 'staff__user')
-    if horizon.date() == now.date():
-        bookings = bookings.filter(start_time__lte=horizon.time())
 
+    self_booked_since = timezone.now() - timedelta(minutes=STAFF_REMINDER_SELF_BOOKED_MINUTES)
     sent = 0
     for booking in bookings:
         try:
             # Flag first: a failing push must not repeat on every run.
             Booking.objects.filter(pk=booking.pk).update(staff_reminder_sent=True)
+            if (booking.created_by_id and booking.created_by_id == booking.staff.user_id
+                    and booking.created_at and booking.created_at >= self_booked_since):
+                # The staff member just booked this client themselves (a
+                # walk-in): they know it's coming.
+                continue
             starts_in = int((datetime.combine(booking.date, booking.start_time) - now).total_seconds() // 60)
             if notify_assigned_staff(booking, 'reminder', minutes=max(starts_in, 1)):
                 sent += 1

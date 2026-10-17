@@ -475,30 +475,78 @@ def add_minutes_to_time(t, minutes):
     return dt.time()
 
 
+def manual_paid_amount(booking):
+    """What staff recorded by hand (cash at the desk, terminal, transfer):
+    the sum of Booking.manual_payments. This money never went through the
+    online payment provider, so it can't be refunded through it."""
+    total = Decimal('0')
+    for payment in booking.manual_payments or []:
+        try:
+            total += Decimal(str((payment or {}).get('amount') or 0))
+        except (ArithmeticError, ValueError, TypeError, AttributeError):
+            continue
+    return total
+
+
+def online_paid_amount(booking):
+    """The part of paid_amount that was paid online (BOG)."""
+    paid = Decimal(str(booking.paid_amount or 0))
+    return max(Decimal('0'), paid - manual_paid_amount(booking))
+
+
+def _apply_refund_policy(amount, settings):
+    if amount <= 0:
+        return Decimal('0')
+    if settings.refund_policy == 'full':
+        return amount
+    elif settings.refund_policy == 'partial_50':
+        return (amount * Decimal('0.5')).quantize(Decimal('0.01'))
+    elif settings.refund_policy == 'partial_25':
+        return (amount * Decimal('0.25')).quantize(Decimal('0.01'))
+    else:  # no_refund
+        return Decimal('0')
+
+
 def calculate_refund_amount(booking, settings):
     """
-    Calculate refund amount based on cancellation policy
+    How much to refund through the payment provider, by the cancellation policy.
 
-    Args:
-        booking: Booking instance
-        settings: BookingSettings instance
+    Only the online part of paid_amount counts: payments staff recorded by
+    hand (Booking.manual_payments) are returned by hand, see
+    calculate_manual_refund_due.
 
     Returns:
         Decimal: Refund amount
     """
-    paid = Decimal(str(booking.paid_amount or 0))
-    if paid == 0:
-        return Decimal('0')
+    return _apply_refund_policy(online_paid_amount(booking), settings)
 
-    # Check cancellation policy
-    if settings.refund_policy == 'full':
-        return paid
-    elif settings.refund_policy == 'partial_50':
-        return (paid * Decimal('0.5')).quantize(Decimal('0.01'))
-    elif settings.refund_policy == 'partial_25':
-        return (paid * Decimal('0.25')).quantize(Decimal('0.01'))
-    else:  # no_refund
+
+def calculate_manual_refund_due(booking, settings):
+    """How much of the hand-recorded money staff must give back by hand,
+    by the same cancellation policy."""
+    manual = min(manual_paid_amount(booking), Decimal(str(booking.paid_amount or 0)))
+    return _apply_refund_policy(max(Decimal('0'), manual), settings)
+
+
+def flag_manual_refund(booking, settings):
+    """Record on a cancelled booking that recorded cash must be returned by hand.
+
+    The manual payments stay as they are; a line is added to staff_notes and
+    payment_metadata['manual_refund'] keeps the amount. Idempotent.
+    Returns the amount due (Decimal, 0 when nothing is due).
+    """
+    due = calculate_manual_refund_due(booking, settings)
+    if due <= 0:
         return Decimal('0')
+    metadata = dict(booking.payment_metadata or {})
+    if (metadata.get('manual_refund') or {}).get('status') == 'due':
+        return Decimal(str(metadata['manual_refund'].get('amount') or due))
+    metadata['manual_refund'] = {'status': 'due', 'amount': str(due)}
+    note = f'Refund {due} GEL by hand: recorded manually (cash/terminal/transfer), not refundable online.'
+    booking.staff_notes = f'{booking.staff_notes}\n{note}' if booking.staff_notes else note
+    booking.payment_metadata = metadata
+    booking.save(update_fields=['staff_notes', 'payment_metadata', 'updated_at'])
+    return due
 
 
 def can_cancel_booking(booking, settings):

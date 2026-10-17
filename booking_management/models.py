@@ -355,6 +355,12 @@ class Booking(models.Model):
     # [{amount, method, note, recorded_by, recorded_by_name, recorded_at}]
     manual_payments = models.JSONField(default=list, blank=True, help_text="Payments recorded by staff")
 
+    # Dashboard user who booked it by hand (null for customer/recurring bookings)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='+', help_text="Staff user who created the booking in the dashboard/app",
+    )
+
     # Cancellation
     cancelled_at = models.DateTimeField(blank=True, null=True)
     cancelled_by = models.CharField(max_length=50, blank=True, choices=[('client', 'Client'), ('staff', 'Staff'), ('admin', 'Admin')])
