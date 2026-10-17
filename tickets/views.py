@@ -1,6 +1,7 @@
 from rest_framework import viewsets, permissions, filters, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied
 from django_filters.rest_framework import DjangoFilterBackend
 import django_filters
 from django.db.models import Q, F, Max, Count, Prefetch, Exists, OuterRef, Subquery, IntegerField
@@ -17,7 +18,7 @@ from .models import (
     ItemList, ListItem, TicketForm, TicketFormSubmission, TicketAttachment,
     BoardTelegramConnection
 )
-from .permissions import CanManageColumns, CanManageTags, CanManageSettings
+from .permissions import CanManageColumns, CanManageSettings
 from .serializers import (
     TicketSerializer, TicketListSerializer, TagSerializer,
     TicketCommentSerializer, TicketColumnSerializer,
@@ -191,13 +192,60 @@ class BoardPermission(permissions.BasePermission):
         return self.has_permission(request, view)
 
 
+def accessible_boards(user, base_qs=None):
+    """
+    Boards ``user`` may see: all of them for staff/superusers; otherwise the
+    boards they are attached to directly (board_users / order_users), through
+    an active group (board_groups), or boards open to everyone (no users and
+    no groups attached). ``BoardViewSet`` and the column endpoints share this.
+    """
+    qs = Board.objects.all() if base_qs is None else base_qs
+    if not user or not user.is_authenticated:
+        return qs.none()
+    if user.is_superuser or user.is_staff:
+        return qs
+
+    # Access check via Exists subqueries — avoids Cartesian join across 3+ M2Ms
+    BoardUsers = Board.board_users.through
+    BoardGroups = Board.board_groups.through
+    OrderUsers = Board.order_users.through
+
+    user_group_ids = list(
+        user.tenant_groups.filter(is_active=True).values_list('id', flat=True)
+    )
+
+    has_users_sq = BoardUsers.objects.filter(board_id=OuterRef('pk'))
+    has_groups_sq = BoardGroups.objects.filter(board_id=OuterRef('pk'))
+    user_in_board_sq = BoardUsers.objects.filter(board_id=OuterRef('pk'), user_id=user.id)
+    user_in_orders_sq = OrderUsers.objects.filter(board_id=OuterRef('pk'), user_id=user.id)
+    group_in_board_sq = (
+        BoardGroups.objects.filter(board_id=OuterRef('pk'), tenantgroup_id__in=user_group_ids)
+        if user_group_ids else BoardGroups.objects.none()
+    )
+
+    return qs.annotate(
+        _has_users=Exists(has_users_sq),
+        _has_groups=Exists(has_groups_sq),
+        _user_in_board=Exists(user_in_board_sq),
+        _user_in_orders=Exists(user_in_orders_sq),
+        _group_in_board=Exists(group_in_board_sq),
+    ).filter(
+        Q(_user_in_board=True)
+        | Q(_user_in_orders=True)
+        | Q(_group_in_board=True)
+        | Q(_has_users=False, _has_groups=False)
+    )
+
+
 class TicketColumnViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing ticket columns (Kanban board columns).
 
     Anyone authenticated can read columns. Create, update, delete and reorder
     need staff/superuser or the ``manage_columns`` permission (individual
-    flag or manager/admin role).
+    flag or manager/admin role). Every action only sees columns of boards the
+    caller can access (``accessible_boards``; staff/superusers see all), and a
+    column's ``board`` cannot be changed after creation.
     """
     serializer_class = TicketColumnSerializer
     permission_classes = [CanManageColumns]
@@ -206,10 +254,25 @@ class TicketColumnViewSet(viewsets.ModelViewSet):
     ordering = ['position', 'created_at']
 
     def get_queryset(self):
-        """Annotate queryset with tickets_count to avoid N+1 queries."""
-        return TicketColumn.objects.select_related('created_by', 'board').annotate(
-            tickets_count=Count('tickets')
-        )
+        """
+        Columns of the boards the caller can access (all boards for
+        staff/superusers), annotated with tickets_count to avoid N+1 queries.
+        Columns of other boards are 404 for every action, reads included.
+        """
+        if getattr(self, 'swagger_fake_view', False):
+            return TicketColumn.objects.none()
+        qs = TicketColumn.objects.select_related('created_by', 'board')
+        user = self.request.user
+        if not (user.is_superuser or user.is_staff):
+            qs = qs.filter(board__in=accessible_boards(user).values('pk'))
+        return qs.annotate(tickets_count=Count('tickets'))
+
+    def perform_create(self, serializer):
+        """Only allow creating columns on boards the caller can access."""
+        board = serializer.validated_data.get('board')
+        if board is not None and not accessible_boards(self.request.user).filter(pk=board.pk).exists():
+            raise PermissionDenied('You do not have access to this board.')
+        serializer.save()
 
     def get_serializer_class(self):
         """Use different serializers for different actions."""
@@ -324,14 +387,20 @@ class TicketColumnViewSet(viewsets.ModelViewSet):
         """Get all columns with their tickets for Kanban board view."""
         # Resolve the target board in a single query: explicit id if provided,
         # otherwise prefer the default board and fall back to the first one.
+        # Only boards the caller can access (all for staff/superusers); an
+        # inaccessible board_id is reported as not found.
         board_id = request.query_params.get('board_id')
+        boards = accessible_boards(request.user)
 
         if board_id:
-            board = Board.objects.filter(id=board_id).first()
+            try:
+                board = boards.filter(id=int(board_id)).first()
+            except (TypeError, ValueError):
+                board = None
             if not board:
                 return Response({'error': 'Board not found'}, status=404)
         else:
-            board = Board.objects.order_by('-is_default', 'id').first()
+            board = boards.order_by('-is_default', 'id').first()
 
         columns_qs = (
             TicketColumn.objects.filter(board=board)
@@ -926,12 +995,13 @@ class TicketViewSet(viewsets.ModelViewSet):
 class TagViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing tags.
-    Every authenticated user can list and read tags (to label tickets);
-    create, update and delete need staff/superuser or ``manage_tags``.
+    All authenticated users can create, view, update, and delete tags. The web
+    label dialog offers these to every user, so they are not gated by
+    ``manage_tags`` (unchanged from before the parity work).
     """
     queryset = Tag.objects.select_related('created_by').all()
     serializer_class = TagSerializer
-    permission_classes = [CanManageTags]
+    permission_classes = [permissions.IsAuthenticated]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['name']
     ordering = ['name']
@@ -1577,45 +1647,10 @@ class BoardViewSet(viewsets.ModelViewSet):
             ),
         )
 
-        # Superusers and staff can see all boards
-        if user.is_superuser or user.is_staff:
-            return base_qs.select_related('created_by').prefetch_related(
-                'board_users', 'board_groups', 'order_users', 'columns'
-            )
-
-        # Access check via Exists subqueries — avoids Cartesian join across 3+ M2Ms
-        BoardUsers = Board.board_users.through
-        BoardGroups = Board.board_groups.through
-        OrderUsers = Board.order_users.through
-
-        user_group_ids = list(
-            user.tenant_groups.filter(is_active=True).values_list('id', flat=True)
-        )
-
-        has_users_sq = BoardUsers.objects.filter(board_id=OuterRef('pk'))
-        has_groups_sq = BoardGroups.objects.filter(board_id=OuterRef('pk'))
-        user_in_board_sq = BoardUsers.objects.filter(board_id=OuterRef('pk'), user_id=user.id)
-        user_in_orders_sq = OrderUsers.objects.filter(board_id=OuterRef('pk'), user_id=user.id)
-        group_in_board_sq = (
-            BoardGroups.objects.filter(board_id=OuterRef('pk'), tenantgroup_id__in=user_group_ids)
-            if user_group_ids else BoardGroups.objects.none()
-        )
-
-        return base_qs.annotate(
-            _has_users=Exists(has_users_sq),
-            _has_groups=Exists(has_groups_sq),
-            _user_in_board=Exists(user_in_board_sq),
-            _user_in_orders=Exists(user_in_orders_sq),
-            _group_in_board=Exists(group_in_board_sq),
-        ).filter(
-            Q(_user_in_board=True)
-            | Q(_user_in_orders=True)
-            | Q(_group_in_board=True)
-            | Q(_has_users=False, _has_groups=False)
-        ).select_related('created_by').prefetch_related(
+        return accessible_boards(user, base_qs).select_related('created_by').prefetch_related(
             'board_users', 'board_groups', 'order_users', 'columns'
         )
-    
+
     def perform_create(self, serializer):
         """Set the created_by field when creating a board."""
         serializer.save(created_by=self.request.user)

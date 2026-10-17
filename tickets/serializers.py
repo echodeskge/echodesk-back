@@ -207,12 +207,17 @@ class TicketColumnCreateSerializer(serializers.ModelSerializer):
 
 
 class TicketColumnUpdateSerializer(serializers.ModelSerializer):
-    """Serializer for updating ticket columns. The response carries the id."""
+    """Serializer for updating ticket columns. The response carries the id.
+
+    ``board`` is read-only: moving a column to another board is not supported
+    (it would move every ticket in it, and with it ticket visibility). A
+    ``board`` value sent in the body is ignored.
+    """
 
     class Meta:
         model = TicketColumn
         fields = ['id', 'name', 'description', 'color', 'position', 'is_default', 'is_closed_status', 'track_time', 'board']
-        read_only_fields = ['id']
+        read_only_fields = ['id', 'board']
 
     def validate_color(self, value):
         return validate_hex_color(value)

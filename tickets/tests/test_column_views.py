@@ -17,7 +17,7 @@ class TestColumnCRUD(TicketTestCase):
 
     def test_agent_without_manage_columns_cannot_create_column(self):
         admin = self.create_admin()
-        agent = self.create_user(email='col-agent-create@test.com')  # is_staff but not superuser
+        agent = self.create_user(email='col-agent-create@test.com')  # plain agent: no manage_columns, not staff
         board = self.create_board(created_by=admin)
         resp = self.api_post('/api/columns/', {
             'name': 'New Column', 'board': board.id, 'position': 0
