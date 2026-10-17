@@ -121,6 +121,10 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
     # Likewise two different missed calls must stay two notifications.
     if metadata.get('call_log_id') is not None:
         recent_filter['metadata__call_log_id'] = metadata['call_log_id']
+    # Same for bookings: two different bookings changing inside the window
+    # are two notifications, each linking to its own booking.
+    if metadata.get('booking_id') is not None:
+        recent_filter['metadata__booking_id'] = metadata['booking_id']
     recent = Notification.objects.filter(**recent_filter).first()
 
     if recent:
@@ -194,6 +198,7 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
                 'url': nav_url,
                 'ticket_id': ticket_id,
                 'leave_request_id': notification.metadata.get('leave_request_id'),
+                'booking_id': notification.metadata.get('booking_id'),
                 # Chat-style notifications (team chat, social inbox) carry the
                 # thread + sender so a push tap can deep-link straight into it.
                 'conversation_id': notification.metadata.get('conversation_id'),

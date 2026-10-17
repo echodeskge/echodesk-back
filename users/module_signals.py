@@ -189,43 +189,28 @@ try:
 
     @receiver(post_save, sender=Booking)
     def notify_booking_events(sender, instance, created, **kwargs):
-        from users.notification_utils import create_notification
+        """Tell the assigned staff member when one of their bookings is
+        confirmed or cancelled.
+
+        Not on creation: whoever creates a booking sends the "new booking"
+        notice itself (customer site → notify_staff_of_booking, staff →
+        the admin create view), so a booking created as confirmed must not
+        also arrive as "confirmed". Callers that already told the staff set
+        ``instance._skip_staff_notification``; ``instance._notification_actor``
+        (a User) is never notified about their own change.
+        """
+        if created or getattr(instance, '_skip_staff_notification', False):
+            return
+        from booking_management.staff_notifications import notify_assigned_staff
 
         old_status = getattr(instance, '_old_status', None)
+        actor = getattr(instance, '_notification_actor', None)
 
-        # Booking confirmed
         if old_status != 'confirmed' and instance.status == 'confirmed':
-            # Notify assigned staff
-            if instance.staff and instance.staff.user:
-                create_notification(
-                    user=instance.staff.user,
-                    notification_type='booking_confirmed',
-                    title=f'Booking {instance.booking_number} confirmed',
-                    message=f'Booking on {instance.date} at {instance.start_time} has been confirmed',
-                    metadata={
-                        'booking_id': instance.id,
-                        'booking_number': instance.booking_number,
-                        'date': str(instance.date),
-                        'start_time': str(instance.start_time),
-                    },
-                    link_url=f'/bookings/bookings/{instance.id}',
-                )
+            notify_assigned_staff(instance, 'confirmed', actor=actor)
 
-        # Booking cancelled
         if old_status != 'cancelled' and instance.status == 'cancelled':
-            if instance.staff and instance.staff.user:
-                create_notification(
-                    user=instance.staff.user,
-                    notification_type='booking_cancelled',
-                    title=f'Booking {instance.booking_number} cancelled',
-                    message=f'Booking on {instance.date} at {instance.start_time} has been cancelled',
-                    metadata={
-                        'booking_id': instance.id,
-                        'booking_number': instance.booking_number,
-                        'cancelled_by': instance.cancelled_by or '',
-                    },
-                    link_url=f'/bookings/bookings/{instance.id}',
-                )
+            notify_assigned_staff(instance, 'cancelled', actor=actor)
 
 except ImportError:
     pass

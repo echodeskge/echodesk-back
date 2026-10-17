@@ -27,6 +27,7 @@ from .views_client import (
 from .views_admin import (
     dashboard_stats,
     staff_schedule,
+    admin_slots,
     booking_settings,
     booking_settings_test_sms,
     AdminServiceCategoryViewSet,
@@ -107,6 +108,7 @@ urlpatterns = [
     # ========================================================================
     path('admin/dashboard/', dashboard_stats, name='admin-dashboard'),
     path('admin/schedule/', staff_schedule, name='admin-schedule'),
+    path('admin/slots/', admin_slots, name='admin-slots'),
     path('admin/settings/', booking_settings, name='admin-settings'),
     path('admin/settings/test-sms/', booking_settings_test_sms, name='admin-settings-test-sms'),
     path('admin/', include(admin_router.urls)),

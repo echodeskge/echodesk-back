@@ -189,6 +189,7 @@ class TestCreateNotificationDispatch(EchoDeskTenantTestCase):
             'ticket_id', 'leave_request_id', 'conversation_id', 'sender_id',
             'call_log_id',
             'platform', 'account_id', 'chat_id',
+            'ticket_id', 'leave_request_id', 'booking_id', 'conversation_id', 'sender_id',
         })
         # not a chat notification: the chat deep-link keys are present but empty
         self.assertIsNone(data['conversation_id'])
