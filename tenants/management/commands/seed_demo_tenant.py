@@ -22,6 +22,10 @@ is skipped once its rows exist; a module that failed is rolled back and
 retried on the next run). It never calls an external service; social, e-mail
 and PBX connections are DB rows with fake tokens, and Asterisk realtime sync
 is switched off while seeding.
+
+The store settings (EcommerceSettings: store info, cash on delivery + pickup,
+18 % VAT, storefront look) are their own module, so an older demo tenant is
+topped up on the next run. No payment-gateway credential is ever written.
 """
 import time as _time
 from datetime import timedelta
