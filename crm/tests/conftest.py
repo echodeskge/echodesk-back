@@ -16,6 +16,41 @@ class CrmTestCase(EchoDeskTenantTestCase):
     CRM-specific test case with factory helpers for all CRM models.
     """
 
+    # Every calls endpoint needs the tenant subscription to include
+    # ``ip_calling``; tests that check the gate set this to False.
+    enable_ip_calling = True
+
+    def setUp(self):
+        super().setUp()
+        if self.enable_ip_calling:
+            self.set_ip_calling(True)
+
+    def set_ip_calling(self, enabled):
+        """Add / remove ``ip_calling`` on the test tenant's subscription."""
+        from decimal import Decimal
+        from tenants.feature_models import Feature
+        from tenants.models import TenantSubscription
+
+        feature, _ = Feature.objects.get_or_create(
+            key='ip_calling',
+            defaults={
+                'name': 'IP Calling',
+                'price_per_user_gel': Decimal('0'),
+                'price_unlimited_gel': Decimal('0'),
+                'category': 'communication',
+                'is_active': True,
+            },
+        )
+        sub, _ = TenantSubscription.objects.get_or_create(
+            tenant=self.tenant,
+            defaults={'is_active': True, 'starts_at': timezone.now(), 'agent_count': 10},
+        )
+        if enabled:
+            sub.selected_features.add(feature)
+        else:
+            sub.selected_features.remove(feature)
+        return sub
+
     @staticmethod
     def get_results(resp):
         """Extract results from a paginated or non-paginated response."""

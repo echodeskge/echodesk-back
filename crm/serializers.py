@@ -7,59 +7,123 @@ from .models import (
 )
 
 
-class UserPhoneAssignmentSerializer(serializers.ModelSerializer):
-    """Serializer for user phone number assignments"""
+class MaskedSecretField(serializers.CharField):
+    """A writable secret that is never echoed back.
+
+    Responses always carry ``''`` in its place, so the response shape (and the
+    generated TypeScript types the web dashboard compiles against) stays the
+    same while the secret itself never leaves the server. Use the companion
+    ``has_<field>`` flag to know whether a value is stored.
+    """
+
+    def to_representation(self, value):
+        return ''
+
+
+class SecretFieldsMixin:
+    """Secret handling for ModelSerializers.
+
+    * every name in ``secret_fields`` is a :class:`MaskedSecretField`
+      (responses show ``''``);
+    * on update the secrets are optional, and a blank / null value means
+      "keep the stored secret", so edit forms that cannot show the current
+      value do not wipe it.
+    """
+
+    secret_fields = ()
+
+    def get_fields(self):
+        fields = super().get_fields()
+        for name in self.secret_fields:
+            field = fields.get(name)
+            if field is None:
+                continue
+            if not isinstance(field, MaskedSecretField):
+                masked = MaskedSecretField(
+                    max_length=getattr(field, 'max_length', None),
+                    required=field.required,
+                    allow_blank=getattr(field, 'allow_blank', False),
+                    help_text=field.help_text,
+                )
+                fields[name] = field = masked
+            if self.instance is not None:
+                field.required = False
+                field.allow_blank = True
+                field.allow_null = True
+        return fields
+
+    def update(self, instance, validated_data):
+        for name in self.secret_fields:
+            if name in validated_data and validated_data[name] in (None, ''):
+                validated_data.pop(name)
+        return super().update(instance, validated_data)
+
+
+class UserPhoneAssignmentSerializer(SecretFieldsMixin, serializers.ModelSerializer):
+    """User <-> extension assignment. ``extension_password`` is write-only in
+    effect: required on create, always ``''`` in responses, blank on update
+    keeps the stored one."""
+    secret_fields = ('extension_password',)
+
     user_name = serializers.SerializerMethodField()
     user_email = serializers.SerializerMethodField()
+    has_extension_password = serializers.SerializerMethodField()
 
     class Meta:
         model = UserPhoneAssignment
         fields = [
             'id', 'user', 'user_name', 'user_email', 'sip_configuration',
-            'extension', 'extension_password', 'phone_number', 'display_name',
+            'extension', 'extension_password', 'has_extension_password',
+            'phone_number', 'display_name',
             'is_primary', 'is_active', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
+    @extend_schema_field(serializers.CharField)
     def get_user_name(self, obj):
         return obj.user.get_full_name() or obj.user.email
 
+    @extend_schema_field(serializers.CharField)
     def get_user_email(self, obj):
         return obj.user.email
 
-
-class UserPhoneAssignmentDetailSerializer(serializers.ModelSerializer):
-    """Detailed serializer including the full SIP config for the user's assignment"""
-    sip_configuration = serializers.SerializerMethodField()
-
-    class Meta:
-        model = UserPhoneAssignment
-        fields = [
-            'id', 'user', 'sip_configuration', 'extension', 'extension_password',
-            'phone_number', 'display_name', 'is_primary', 'is_active'
-        ]
-
-    def get_sip_configuration(self, obj):
-        return SipConfigurationDetailSerializer(obj.sip_configuration).data
+    @extend_schema_field(serializers.BooleanField)
+    def get_has_extension_password(self, obj):
+        return bool(obj.extension_password)
 
 
-class SipConfigurationSerializer(serializers.ModelSerializer):
-    """Serializer for SIP configuration management"""
+class SipConfigurationSerializer(SecretFieldsMixin, serializers.ModelSerializer):
+    """SIP configuration create/update. ``password`` and ``turn_password``
+    are never returned (``''``); blank on update keeps the stored value."""
+    secret_fields = ('password', 'turn_password')
+
+    # Optional on create too: the web form creates the config first and
+    # sets the password in a later edit.
+    password = MaskedSecretField(max_length=255, required=False, allow_blank=True)
+    turn_password = MaskedSecretField(max_length=255, required=False, allow_blank=True)
     user_assignments = UserPhoneAssignmentSerializer(many=True, read_only=True)
+    has_password = serializers.SerializerMethodField()
+    has_turn_password = serializers.SerializerMethodField()
 
     class Meta:
         model = SipConfiguration
         fields = [
             'id', 'name', 'sip_server', 'sip_port', 'username', 'password',
             'realm', 'proxy', 'phone_number', 'websocket_path', 'stun_server', 'turn_server',
-            'turn_username', 'turn_password', 'is_active', 'is_default',
+            'turn_username', 'turn_password', 'has_password', 'has_turn_password',
+            'is_active', 'is_default',
             'max_concurrent_calls', 'created_at', 'updated_at', 'user_assignments'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
-        extra_kwargs = {
-            'password': {'write_only': False},
-        }
-    
+
+    @extend_schema_field(serializers.BooleanField)
+    def get_has_password(self, obj):
+        return bool(obj.password)
+
+    @extend_schema_field(serializers.BooleanField)
+    def get_has_turn_password(self, obj):
+        return bool(obj.turn_password)
+
     def create(self, validated_data):
         validated_data['created_by'] = self.context['request'].user
         return super().create(validated_data)
@@ -74,18 +138,110 @@ class SipConfigurationListSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'sip_server', 'phone_number', 'is_active', 'is_default', 'assignment_count']
 
 
+SOFTPHONE_CONTEXT_KEY = 'softphone_credentials'
+
+
 class SipConfigurationDetailSerializer(serializers.ModelSerializer):
-    """Detailed serializer including sensitive fields for configuration"""
+    """SIP configuration detail (read-only).
+
+    By default it carries no secrets: ``password`` and ``turn_password`` are
+    ``''`` and every nested ``user_assignments[].extension_password`` is
+    ``''`` (see the ``has_*`` flags).
+
+    The softphone endpoints (``my_config``, ``webrtc_config``) put
+    ``{'username': ..., 'password': ...}`` under ``softphone_credentials`` in
+    the context: then ``username``/``password`` are the caller's own SIP
+    credentials, ``turn_password`` is filled (ICE needs it) and
+    ``user_assignments`` is ``[]``.
+    """
+    username = serializers.SerializerMethodField()
+    password = serializers.SerializerMethodField()
+    turn_password = serializers.SerializerMethodField()
     user_assignments = UserPhoneAssignmentSerializer(many=True, read_only=True)
+    has_password = serializers.SerializerMethodField()
+    has_turn_password = serializers.SerializerMethodField()
 
     class Meta:
         model = SipConfiguration
         fields = [
             'id', 'name', 'sip_server', 'sip_port', 'username', 'password',
             'realm', 'proxy', 'phone_number', 'websocket_path', 'stun_server', 'turn_server',
-            'turn_username', 'turn_password', 'is_active', 'is_default',
+            'turn_username', 'turn_password', 'has_password', 'has_turn_password',
+            'is_active', 'is_default',
             'max_concurrent_calls', 'user_assignments'
         ]
+
+    def _softphone(self):
+        return self.context.get(SOFTPHONE_CONTEXT_KEY)
+
+    @extend_schema_field(serializers.CharField)
+    def get_username(self, obj):
+        creds = self._softphone()
+        return creds['username'] if creds else obj.username
+
+    @extend_schema_field(serializers.CharField)
+    def get_password(self, obj):
+        creds = self._softphone()
+        return (creds['password'] or '') if creds else ''
+
+    @extend_schema_field(serializers.CharField)
+    def get_turn_password(self, obj):
+        return obj.turn_password if self._softphone() else ''
+
+    @extend_schema_field(serializers.BooleanField)
+    def get_has_password(self, obj):
+        return bool(obj.password)
+
+    @extend_schema_field(serializers.BooleanField)
+    def get_has_turn_password(self, obj):
+        return bool(obj.turn_password)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if self._softphone():
+            data['user_assignments'] = []
+        return data
+
+
+class UserPhoneAssignmentDetailSerializer(SecretFieldsMixin, serializers.ModelSerializer):
+    """Assignment detail with the (secret-free) SIP config it belongs to."""
+    secret_fields = ('extension_password',)
+
+    sip_configuration = serializers.SerializerMethodField()
+    has_extension_password = serializers.SerializerMethodField()
+
+    class Meta:
+        model = UserPhoneAssignment
+        fields = [
+            'id', 'user', 'sip_configuration', 'extension', 'extension_password',
+            'has_extension_password',
+            'phone_number', 'display_name', 'is_primary', 'is_active'
+        ]
+
+    @extend_schema_field(SipConfigurationDetailSerializer)
+    def get_sip_configuration(self, obj):
+        context = {k: v for k, v in self.context.items() if k != SOFTPHONE_CONTEXT_KEY}
+        return SipConfigurationDetailSerializer(obj.sip_configuration, context=context).data
+
+    @extend_schema_field(serializers.BooleanField)
+    def get_has_extension_password(self, obj):
+        return bool(obj.extension_password)
+
+
+class MySoftphoneConfigSerializer(serializers.Serializer):
+    """Response of ``GET /api/sip-configurations/my_config/``: the caller's
+    own extension and credentials (``sip_configuration.username/password``
+    are the same credentials). ``id`` is null when the caller has no
+    extension and the tenant's default (shared) SIP account is returned."""
+    id = serializers.IntegerField(allow_null=True)
+    user = serializers.IntegerField()
+    sip_configuration = SipConfigurationDetailSerializer()
+    extension = serializers.CharField()
+    extension_password = serializers.CharField()
+    phone_number = serializers.CharField(allow_blank=True)
+    display_name = serializers.CharField(allow_blank=True)
+    is_primary = serializers.BooleanField()
+    is_active = serializers.BooleanField()
 
 
 def _is_admin_request(serializer):
@@ -98,6 +254,24 @@ def _is_admin_request(serializer):
     return bool(user.is_staff or user.is_superuser)
 
 
+def _format_duration(duration):
+    if not duration:
+        return None
+    total_seconds = int(duration.total_seconds())
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _user_display_name(user):
+    if user is None:
+        return None
+    return f"{user.first_name} {user.last_name}".strip()
+
+
 class CallLogSerializer(serializers.ModelSerializer):
     """Enhanced serializer for CallLog model with SIP support"""
 
@@ -105,7 +279,9 @@ class CallLogSerializer(serializers.ModelSerializer):
     transferred_to_user_name = serializers.SerializerMethodField()
     duration_display = serializers.SerializerMethodField()
     client_name = serializers.SerializerMethodField()
-    sip_config_name = serializers.CharField(source='sip_configuration.name', read_only=True)
+    sip_config_name = serializers.CharField(
+        source='sip_configuration.name', read_only=True, allow_null=True,
+    )
     recording_url = serializers.SerializerMethodField()
     call_quality_score = serializers.SerializerMethodField()
 
@@ -146,7 +322,7 @@ class CallLogSerializer(serializers.ModelSerializer):
             return ''
         return recording.file_url or ''
 
-    @extend_schema_field(serializers.FloatField)
+    @extend_schema_field(serializers.FloatField(allow_null=True))
     def get_call_quality_score(self, obj):
         """Customer review rating (1-5 from IVR). Admin-only — agents
         shouldn't see how individual customers rated them."""
@@ -154,7 +330,7 @@ class CallLogSerializer(serializers.ModelSerializer):
             return None
         return obj.call_quality_score
 
-    @extend_schema_field(serializers.CharField)
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_client_name(self, obj):
         """Get client name from social_client first, then CRM client"""
         if obj.social_client:
@@ -163,32 +339,19 @@ class CallLogSerializer(serializers.ModelSerializer):
             return obj.client.name
         return None
 
-    @extend_schema_field(serializers.CharField)
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_handled_by_name(self, obj):
         """Get the name of the user who handled the call"""
-        if obj.handled_by:
-            return f"{obj.handled_by.first_name} {obj.handled_by.last_name}".strip()
-        return None
+        return _user_display_name(obj.handled_by)
 
-    @extend_schema_field(serializers.CharField)
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_transferred_to_user_name(self, obj):
-        if obj.transferred_to_user:
-            return f"{obj.transferred_to_user.first_name} {obj.transferred_to_user.last_name}".strip()
-        return None
+        return _user_display_name(obj.transferred_to_user)
 
-    @extend_schema_field(serializers.CharField)
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_duration_display(self, obj):
-        """Display duration in human-readable format"""
-        if obj.duration:
-            total_seconds = int(obj.duration.total_seconds())
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-            seconds = total_seconds % 60
-            if hours > 0:
-                return f"{hours}:{minutes:02d}:{seconds:02d}"
-            else:
-                return f"{minutes}:{seconds:02d}"
-        return None
+        """Display duration in human-readable format (null when 0/empty)."""
+        return _format_duration(obj.duration)
 
 
 class ConsultationInitiateSerializer(serializers.Serializer):
@@ -239,6 +402,13 @@ class CallStatusUpdateSerializer(serializers.Serializer):
     recording_url = serializers.URLField(required=False, allow_blank=True)
 
 
+class CallEndRequestSerializer(serializers.Serializer):
+    """Body of ``POST /api/call-logs/{id}/end_call/``. Everything is
+    optional and ignored (the server decides ended vs missed); send ``{}``.
+    ``status`` is accepted only for older clients that still send it."""
+    status = serializers.CharField(required=False, help_text='Ignored.')
+
+
 class ClientSerializer(serializers.ModelSerializer):
     """Serializer for Client model"""
     
@@ -264,7 +434,7 @@ class CallEventSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'timestamp']
     
-    @extend_schema_field(serializers.CharField)
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_user_name(self, obj):
         """Get the name of the user who triggered the event"""
         if obj.user:
@@ -288,7 +458,7 @@ class CallRecordingSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'recording_id', 'created_at', 'updated_at']
     
-    @extend_schema_field(serializers.CharField)
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_duration_display(self, obj):
         """Display duration in human-readable format"""
         if obj.duration:
@@ -302,7 +472,7 @@ class CallRecordingSerializer(serializers.ModelSerializer):
                 return f"{minutes}:{seconds:02d}"
         return None
     
-    @extend_schema_field(serializers.CharField)
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_file_size_display(self, obj):
         """Display file size in human-readable format"""
         if obj.file_size:
@@ -316,19 +486,17 @@ class CallRecordingSerializer(serializers.ModelSerializer):
         return None
 
 
-class CallLogDetailSerializer(serializers.ModelSerializer):
-    """Detailed serializer for CallLog with events and recording"""
+class CallLogDetailSerializer(CallLogSerializer):
+    """Call log detail: every list field plus the event timeline and the
+    recording (admin-only; null for agents and calls without one)."""
 
-    handled_by_name = serializers.SerializerMethodField()
-    duration_display = serializers.SerializerMethodField()
-    client_name = serializers.CharField(source='client.name', read_only=True)
-    sip_config_name = serializers.CharField(source='sip_configuration.name', read_only=True)
     events = CallEventSerializer(many=True, read_only=True)
     recording = serializers.SerializerMethodField()
-    recording_url = serializers.SerializerMethodField()
-    call_quality_score = serializers.SerializerMethodField()
 
-    @extend_schema_field(CallRecordingSerializer)
+    class Meta(CallLogSerializer.Meta):
+        fields = CallLogSerializer.Meta.fields + ['events', 'recording']
+
+    @extend_schema_field(CallRecordingSerializer(allow_null=True))
     def get_recording(self, obj):
         """Nested CallRecording — admin-only."""
         if not _is_admin_request(self):
@@ -338,60 +506,6 @@ class CallLogDetailSerializer(serializers.ModelSerializer):
         except CallRecording.DoesNotExist:
             return None
         return CallRecordingSerializer(recording, context=self.context).data
-
-    @extend_schema_field(serializers.CharField)
-    def get_recording_url(self, obj):
-        """Fall back to CallRecording.file_url; admin-only."""
-        if not _is_admin_request(self):
-            return ''
-        if obj.recording_url:
-            return obj.recording_url
-        try:
-            recording = obj.recording
-        except CallRecording.DoesNotExist:
-            return ''
-        return recording.file_url or ''
-
-    @extend_schema_field(serializers.FloatField)
-    def get_call_quality_score(self, obj):
-        """Customer review rating (1-5 from IVR). Admin-only."""
-        if not _is_admin_request(self):
-            return None
-        return obj.call_quality_score
-
-    class Meta:
-        model = CallLog
-        fields = [
-            'id', 'call_id', 'caller_number', 'recipient_number',
-            'direction', 'call_type', 'started_at', 'answered_at',
-            'ended_at', 'duration', 'duration_display', 'status',
-            'notes', 'sip_call_id', 'client', 'client_name',
-            'handled_by', 'handled_by_name', 'sip_configuration',
-            'sip_config_name', 'recording_url', 'call_quality_score',
-            'created_at', 'updated_at', 'events', 'recording'
-        ]
-        read_only_fields = ['id', 'call_id', 'created_at', 'updated_at', 'client']
-
-    @extend_schema_field(serializers.CharField)
-    def get_handled_by_name(self, obj):
-        """Get the name of the user who handled the call"""
-        if obj.handled_by:
-            return f"{obj.handled_by.first_name} {obj.handled_by.last_name}".strip()
-        return None
-
-    @extend_schema_field(serializers.CharField)
-    def get_duration_display(self, obj):
-        """Display duration in human-readable format"""
-        if obj.duration:
-            total_seconds = int(obj.duration.total_seconds())
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-            seconds = total_seconds % 60
-            if hours > 0:
-                return f"{hours}:{minutes:02d}:{seconds:02d}"
-            else:
-                return f"{minutes}:{seconds:02d}"
-        return None
 
 
 class PbxSettingsSerializer(serializers.ModelSerializer):
@@ -471,60 +585,79 @@ class PbxSettingsSerializer(serializers.ModelSerializer):
             return f.url
         return None
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_greeting_url(self, obj):
         return self._get_url(obj, 'sound_greeting')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_after_hours_url(self, obj):
         return self._get_url(obj, 'sound_after_hours')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_queue_hold_url(self, obj):
         return self._get_url(obj, 'sound_queue_hold')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_voicemail_prompt_url(self, obj):
         return self._get_url(obj, 'sound_voicemail_prompt')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_thank_you_url(self, obj):
         return self._get_url(obj, 'sound_thank_you')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_transfer_hold_url(self, obj):
         return self._get_url(obj, 'sound_transfer_hold')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_review_prompt_url(self, obj):
         return self._get_url(obj, 'sound_review_prompt')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_review_invalid_url(self, obj):
         return self._get_url(obj, 'sound_review_invalid')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_review_thanks_url(self, obj):
         return self._get_url(obj, 'sound_review_thanks')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_queue_position_1_url(self, obj):
         return self._get_url(obj, 'sound_queue_position_1')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_queue_position_2_url(self, obj):
         return self._get_url(obj, 'sound_queue_position_2')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_queue_position_3_url(self, obj):
         return self._get_url(obj, 'sound_queue_position_3')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_queue_position_4_url(self, obj):
         return self._get_url(obj, 'sound_queue_position_4')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_queue_position_5_url(self, obj):
         return self._get_url(obj, 'sound_queue_position_5')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_queue_position_6_url(self, obj):
         return self._get_url(obj, 'sound_queue_position_6')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_queue_position_7_url(self, obj):
         return self._get_url(obj, 'sound_queue_position_7')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_queue_position_8_url(self, obj):
         return self._get_url(obj, 'sound_queue_position_8')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_queue_position_9_url(self, obj):
         return self._get_url(obj, 'sound_queue_position_9')
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_sound_queue_position_10_url(self, obj):
         return self._get_url(obj, 'sound_queue_position_10')
 
@@ -544,7 +677,7 @@ class CallRatingSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_at', 'rated_at']
 
-    @extend_schema_field(serializers.CharField)
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_rated_user_name(self, obj):
         if obj.rated_user:
             return f"{obj.rated_user.first_name} {obj.rated_user.last_name}".strip()
@@ -556,25 +689,28 @@ class CallRatingSerializer(serializers.ModelSerializer):
 # ---------------------------------------------------------------------------
 
 
-class TrunkSerializer(serializers.ModelSerializer):
-    """Full serializer for ``Trunk`` — used on retrieve/create/update."""
+class TrunkSerializer(SecretFieldsMixin, serializers.ModelSerializer):
+    """Full serializer for ``Trunk`` — used on retrieve/create/update.
+    ``password`` is never returned (``''``); blank on update keeps the stored value."""
+    secret_fields = ('password',)
+
+    has_password = serializers.SerializerMethodField()
 
     class Meta:
         model = Trunk
         fields = [
             'id', 'name', 'provider',
-            'sip_server', 'sip_port', 'username', 'password',
+            'sip_server', 'sip_port', 'username', 'password', 'has_password',
             'realm', 'proxy', 'register',
             'codecs', 'caller_id_number', 'phone_numbers',
             'is_active', 'is_default',
             'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
-        extra_kwargs = {
-            # Password is returned so admins can copy it back into provisioning
-            # scripts; the viewset is already gated by ip_calling feature.
-            'password': {'write_only': False},
-        }
+
+    @extend_schema_field(serializers.BooleanField)
+    def get_has_password(self, obj):
+        return bool(obj.password)
 
 
 class TrunkListSerializer(serializers.ModelSerializer):
@@ -583,6 +719,15 @@ class TrunkListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Trunk
         fields = ['id', 'name', 'provider', 'phone_numbers', 'is_active']
+
+
+def _queue_member_count(queue):
+    """Use the ``active_member_count`` annotation from the viewset when
+    present (one query for the whole page); fall back to a COUNT."""
+    annotated = getattr(queue, 'active_member_count', None)
+    if annotated is not None:
+        return annotated
+    return queue.members.filter(is_active=True).count()
 
 
 class QueueSerializer(serializers.ModelSerializer):
@@ -608,7 +753,7 @@ class QueueSerializer(serializers.ModelSerializer):
     @extend_schema_field(serializers.IntegerField)
     def get_member_count(self, obj):
         """Active QueueMember rows for this queue (materialised by sync layer)."""
-        return obj.members.filter(is_active=True).count()
+        return _queue_member_count(obj)
 
 
 class QueueListSerializer(serializers.ModelSerializer):
@@ -627,7 +772,7 @@ class QueueListSerializer(serializers.ModelSerializer):
 
     @extend_schema_field(serializers.IntegerField)
     def get_member_count(self, obj):
-        return obj.members.filter(is_active=True).count()
+        return _queue_member_count(obj)
 
 
 class QueueMemberSerializer(serializers.ModelSerializer):
@@ -682,7 +827,7 @@ class InboundRouteSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
-    @extend_schema_field(serializers.CharField)
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_destination_extension_display(self, obj):
         if obj.destination_extension:
             return f"ext {obj.destination_extension.extension} ({obj.destination_extension.phone_number})"
@@ -741,6 +886,7 @@ class PbxServerSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at',
         ]
 
+    @extend_schema_field(serializers.CharField)
     def get_install_command(self, obj):
         request = self.context.get('request') if self.context else None
         if request is None:

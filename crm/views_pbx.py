@@ -1,21 +1,24 @@
 """ViewSets for the PBX management panel (Trunks, Queues, Inbound routes).
 
-All endpoints are gated by the ``ip_calling`` subscription feature via the
-``HasSubscriptionFeature`` DRF permission class. The sync layer that mirrors
-these rows into Asterisk's realtime Postgres is built in a follow-up step.
+All endpoints are gated by the ``ip_calling`` subscription feature. Reads
+are open to every user with the feature (the phone app shows a read-only
+PBX glance); writes need a PBX admin (staff, superuser or
+``manage_settings``, see ``crm.permissions``). PBX servers are PBX-admin
+only for reads too, because the response carries the enrollment token.
 """
 
+from django.db.models import Count, Q
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema
 from rest_framework import filters, permissions, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from tenants.permissions import HasSubscriptionFeature
-
+from .permissions import HasIpCallingFeature, IsPbxAdmin, IsPbxAdminOrReadOnly
 from .models import InboundRoute, Queue, QueueMember, Trunk
 from .serializers import (
     InboundRouteSerializer,
+    PbxServerSerializer,
     QueueListSerializer,
     QueueMemberSerializer,
     QueueSerializer,
@@ -24,10 +27,7 @@ from .serializers import (
 )
 
 
-class _SipCallingFeature(HasSubscriptionFeature):
-    """Bind ``HasSubscriptionFeature`` to the ``ip_calling`` feature key."""
-
-    required_feature = 'ip_calling'
+_READ_OR_ADMIN = [permissions.IsAuthenticated, HasIpCallingFeature, IsPbxAdminOrReadOnly]
 
 
 @extend_schema(tags=['PBX'])
@@ -39,7 +39,7 @@ class TrunkViewSet(viewsets.ModelViewSet):
     ``ip_calling`` subscription feature.
     """
 
-    permission_classes = [permissions.IsAuthenticated, _SipCallingFeature]
+    permission_classes = _READ_OR_ADMIN
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['is_active', 'is_default', 'register', 'provider']
     search_fields = ['name', 'provider', 'sip_server', 'username', 'realm']
@@ -65,7 +65,7 @@ class QueueViewSet(viewsets.ModelViewSet):
     by the sync layer. Gated by the ``ip_calling`` subscription feature.
     """
 
-    permission_classes = [permissions.IsAuthenticated, _SipCallingFeature]
+    permission_classes = _READ_OR_ADMIN
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['is_active', 'is_default', 'strategy', 'group']
     search_fields = ['name', 'slug', 'group__name']
@@ -73,7 +73,10 @@ class QueueViewSet(viewsets.ModelViewSet):
     ordering = ['-is_default', 'name']
 
     def get_queryset(self):
-        return Queue.objects.select_related('group').prefetch_related('members').all()
+        # One COUNT for the whole page instead of one per queue.
+        return Queue.objects.select_related('group').annotate(
+            active_member_count=Count('members', filter=Q(members__is_active=True)),
+        )
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -90,7 +93,7 @@ class QueueMemberViewSet(viewsets.ReadOnlyModelViewSet):
     """
 
     serializer_class = QueueMemberSerializer
-    permission_classes = [permissions.IsAuthenticated, _SipCallingFeature]
+    permission_classes = [permissions.IsAuthenticated, HasIpCallingFeature]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['queue', 'is_active', 'paused']
     search_fields = [
@@ -113,7 +116,7 @@ class InboundRouteViewSet(viewsets.ModelViewSet):
     """CRUD for DID-to-destination routing rules."""
 
     serializer_class = InboundRouteSerializer
-    permission_classes = [permissions.IsAuthenticated, _SipCallingFeature]
+    permission_classes = _READ_OR_ADMIN
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['destination_type', 'is_active', 'trunk', 'destination_queue']
     search_fields = ['did', 'ivr_custom_context', 'trunk__name', 'destination_queue__slug']
@@ -132,10 +135,11 @@ class PbxServerViewSet(viewsets.ModelViewSet):
 
     On create, triggers provisioning (new realtime DB + role + migrate).
     Passwords are write-only in the response; admins can only read a
-    masked placeholder once the server is registered.
+    masked placeholder once the server is registered. PBX admins only
+    (reads included): the response carries the install enrollment token.
     """
 
-    permission_classes = [permissions.IsAuthenticated, _SipCallingFeature]
+    permission_classes = [permissions.IsAuthenticated, HasIpCallingFeature, IsPbxAdmin]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['name', 'fqdn', 'realtime_db_name']
     ordering_fields = ['name', 'fqdn', 'status', 'created_at']
@@ -161,6 +165,7 @@ class PbxServerViewSet(viewsets.ModelViewSet):
             pbx.save(update_fields=['status', 'notes', 'updated_at'])
             raise
 
+    @extend_schema(responses={200: PbxServerSerializer})
     @action(detail=True, methods=['post'], url_path='regenerate-token')
     def regenerate_token(self, request, pk=None):
         pbx = self.get_object()
