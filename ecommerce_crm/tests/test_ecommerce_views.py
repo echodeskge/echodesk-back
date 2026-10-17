@@ -12,7 +12,7 @@ from decimal import Decimal
 from django.contrib.auth import get_user_model
 from rest_framework import status
 
-from users.tests.conftest import EchoDeskTenantTestCase
+from ecommerce_crm.tests.base import EcommerceTenantTestCase as EchoDeskTenantTestCase
 from ecommerce_crm.models import (
     Language,
     AttributeDefinition,

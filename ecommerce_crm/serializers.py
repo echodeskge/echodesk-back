@@ -48,10 +48,16 @@ class AttributeDefinitionSerializer(serializers.ModelSerializer):
 
 class ProductImageSerializer(serializers.ModelSerializer):
     """Serializer for product images"""
+    # Write-only: POST /admin/images/ needs it (ProductImage.product is NOT
+    # NULL); nested image lists and add_image supply the product themselves.
+    product = serializers.PrimaryKeyRelatedField(
+        queryset=Product.objects.all(), write_only=True, required=False,
+        help_text='Product id (required on POST /admin/images/)',
+    )
 
     class Meta:
         model = ProductImage
-        fields = ['id', 'image', 'alt_text', 'sort_order', 'created_at']
+        fields = ['id', 'product', 'image', 'alt_text', 'sort_order', 'created_at']
         read_only_fields = ['created_at']
 
 
@@ -74,6 +80,7 @@ class ProductAttributeValueSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['created_at', 'updated_at']
 
+    @extend_schema_field(serializers.JSONField(allow_null=True))
     def get_value(self, obj):
         """Get the appropriate value based on attribute type"""
         return obj.get_value()
@@ -265,6 +272,7 @@ class ProductListSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['created_at', 'updated_at']
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_image(self, obj):
         return _first_image_url(obj.image)
 
@@ -272,9 +280,11 @@ class ProductListSerializer(serializers.ModelSerializer):
     def get_images(self, obj):
         return _merged_product_images(obj)
 
+    @extend_schema_field(serializers.FloatField(allow_null=True))
     def get_average_rating(self, obj):
         return _annotated_average_rating(obj)
 
+    @extend_schema_field(serializers.IntegerField())
     def get_review_count(self, obj):
         return _annotated_review_count(obj)
 
@@ -293,6 +303,7 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     created_by_name = serializers.SerializerMethodField()
     updated_by_name = serializers.SerializerMethodField()
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_image(self, obj):
         return _first_image_url(obj.image)
 
@@ -315,19 +326,23 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['created_at', 'updated_at', 'created_by', 'updated_by']
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_created_by_name(self, obj):
         if obj.created_by:
             return f"{obj.created_by.first_name} {obj.created_by.last_name}".strip() or obj.created_by.email
         return None
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_updated_by_name(self, obj):
         if obj.updated_by:
             return f"{obj.updated_by.first_name} {obj.updated_by.last_name}".strip() or obj.updated_by.email
         return None
 
+    @extend_schema_field(serializers.FloatField(allow_null=True))
     def get_average_rating(self, obj):
         return _annotated_average_rating(obj)
 
+    @extend_schema_field(serializers.IntegerField())
     def get_review_count(self, obj):
         return _annotated_review_count(obj)
 
@@ -607,6 +622,7 @@ class FavoriteProductSerializer(serializers.ModelSerializer):
         fields = ['id', 'client', 'product', 'created_at']
         read_only_fields = ['id', 'created_at']
 
+    @extend_schema_field(ProductListSerializer)
     def get_product(self, obj):
         """Return product details in the current language context"""
         from .serializers import ProductListSerializer
@@ -661,6 +677,7 @@ class EcommerceClientSerializer(serializers.ModelSerializer):
         from .models import EcommerceClient
         self.Meta.model = EcommerceClient
 
+    @extend_schema_field(FavoriteProductSerializer(many=True))
     def get_favorites(self, obj):
         """Return client's favorite products with product details"""
         from .serializers import FavoriteProductSerializer
@@ -778,6 +795,7 @@ class CartListSerializer(serializers.ModelSerializer):
         fields = ['id', 'client', 'client_name', 'status', 'items_count', 'updated_at']
         read_only_fields = ['id', 'updated_at']
 
+    @extend_schema_field(serializers.IntegerField())
     def get_items_count(self, obj):
         return getattr(obj, '_items_count', obj.items.count())
 
@@ -807,7 +825,7 @@ class CartItemCreateSerializer(serializers.ModelSerializer):
 class OrderItemSerializer(serializers.ModelSerializer):
     """Serializer for order items"""
     subtotal = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
-    product_image = serializers.CharField(source='product.image', read_only=True)
+    product_image = serializers.CharField(source='product.image', read_only=True, allow_null=True)
 
     class Meta:
         model = OrderItem
@@ -831,6 +849,7 @@ class OrderListSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'order_number', 'created_at']
 
+    @extend_schema_field(serializers.IntegerField(help_text="Number of line items (detail total_items is the quantity sum)"))
     def get_total_items(self, obj):
         # Reads the annotation from OrderViewSet.get_queryset (list action);
         # falls back to a COUNT for other callers.
@@ -860,23 +879,62 @@ class PromoCodeSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'times_used', 'created_at']
 
+    def validate(self, attrs):
+        instance = self.instance
+        def current(field):
+            if field in attrs:
+                return attrs[field]
+            return getattr(instance, field, None) if instance is not None else None
+
+        errors = {}
+        value = current('discount_value')
+        dtype = current('discount_type')
+        if value is not None and value <= 0:
+            errors['discount_value'] = 'Discount must be greater than 0.'
+        elif value is not None and dtype == 'percentage' and value > 100:
+            errors['discount_value'] = 'A percentage discount cannot exceed 100.'
+        valid_from, valid_until = current('valid_from'), current('valid_until')
+        if valid_from and valid_until and valid_until <= valid_from:
+            errors['valid_until'] = 'valid_until must be after valid_from.'
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
 
 class ProductReviewSerializer(serializers.ModelSerializer):
     """Serializer for product reviews"""
     client_name = serializers.SerializerMethodField()
+    product_name = serializers.JSONField(source='product.name', read_only=True,
+                                         help_text='Multilingual product name {lang: text}')
+    product_sku = serializers.CharField(source='product.sku', read_only=True)
+    product_image = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductReview
         fields = [
-            'id', 'product', 'client', 'client_name', 'rating', 'title',
+            'id', 'product', 'product_name', 'product_sku', 'product_image',
+            'client', 'client_name', 'rating', 'title',
             'content', 'is_verified_purchase', 'is_approved', 'created_at'
         ]
         read_only_fields = [
             'id', 'client', 'is_verified_purchase', 'is_approved', 'created_at'
         ]
 
+    @extend_schema_field(serializers.CharField())
     def get_client_name(self, obj):
         return obj.client.first_name or 'Anonymous'
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_product_image(self, obj):
+        return _first_image_url(obj.product.image) if obj.product_id else None
+
+
+class OrderClientDetailsSerializer(serializers.Serializer):
+    """Schema of Order.client_details (the contact typed at checkout)."""
+    id = serializers.IntegerField()
+    full_name = serializers.CharField()
+    email = serializers.CharField()
+    phone_number = serializers.CharField()
 
 
 class ProductReviewCreateSerializer(serializers.ModelSerializer):
@@ -918,6 +976,7 @@ class OrderSerializer(serializers.ModelSerializer):
             'paid_at', 'payment_provider', 'bog_order_id', 'payment_url', 'payment_metadata'
         ]
 
+    @extend_schema_field(OrderClientDetailsSerializer)
     def get_client_details(self, obj):
         """Return client basic info"""
         return {

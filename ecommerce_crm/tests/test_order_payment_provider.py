@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 from rest_framework import status
 
-from users.tests.conftest import EchoDeskTenantTestCase
+from ecommerce_crm.tests.base import EcommerceTenantTestCase as EchoDeskTenantTestCase
 from ecommerce_crm.models import EcommerceSettings, Order, Product
 from ecommerce_crm.payment_utils import PaymentProviderError, resolve_card_provider
 from ecommerce_crm.tests.test_guest_checkout import GUEST_URL, GuestCheckoutTestMixin, _mock_bog

@@ -10,7 +10,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
 from rest_framework import status
 
-from users.tests.conftest import EchoDeskTenantTestCase
+from ecommerce_crm.tests.base import EcommerceTenantTestCase as EchoDeskTenantTestCase
 from ecommerce_crm.models import (
     Product,
     EcommerceClient,
@@ -302,12 +302,14 @@ class TestProductFiltering(EcommerceExtendedTestMixin, EchoDeskTenantTestCase):
         for r in results:
             self.assertLessEqual(r['quantity'], r.get('low_stock_threshold', 10))
 
-    def test_default_list_returns_active_only(self):
+    def test_default_list_returns_every_status(self):
         self._make_product(sku='DEF-ACT', status='active')
         self._make_product(sku='DEF-DRF', status='draft')
         resp = self.api_get(PROD_URL, user=self.admin)
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         results = _results(resp)
         statuses = {r['status'] for r in results}
-        # By default, only active products are returned
-        self.assertNotIn('draft', statuses)
+        # The admin list shows every status unless ?status narrows it
+        # (the web "All" filter sends no status).
+        self.assertIn('draft', statuses)
+        self.assertIn('active', statuses)
