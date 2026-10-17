@@ -203,6 +203,23 @@ class SipConfigurationDetailSerializer(serializers.ModelSerializer):
         return data
 
 
+class SoftphoneSipConfigurationSerializer(SipConfigurationDetailSerializer):
+    """``SipConfigurationDetail`` as the softphone endpoints return it
+    (``webrtc_config``, ``my_config.sip_configuration``), plus
+    ``sip_enabled``: true when ``username``/``password`` hold credentials
+    the caller may register with, false when they are blank (no extension
+    of their own), so the client can skip SIP registration."""
+    sip_enabled = serializers.SerializerMethodField()
+
+    class Meta(SipConfigurationDetailSerializer.Meta):
+        fields = SipConfigurationDetailSerializer.Meta.fields + ['sip_enabled']
+
+    @extend_schema_field(serializers.BooleanField)
+    def get_sip_enabled(self, obj):
+        creds = self._softphone() or {}
+        return bool(creds.get('username') and creds.get('password'))
+
+
 class UserPhoneAssignmentDetailSerializer(SecretFieldsMixin, serializers.ModelSerializer):
     """Assignment detail with the (secret-free) SIP config it belongs to."""
     secret_fields = ('extension_password',)
@@ -232,16 +249,19 @@ class MySoftphoneConfigSerializer(serializers.Serializer):
     """Response of ``GET /api/sip-configurations/my_config/``: the caller's
     own extension and credentials (``sip_configuration.username/password``
     are the same credentials). ``id`` is null when the caller has no
-    extension and the tenant's default (shared) SIP account is returned."""
+    extension and the tenant's default (shared) SIP account is returned
+    (staff / superusers / the configuration's creator only). ``sip_enabled``
+    is true when ``extension``/``extension_password`` can register."""
     id = serializers.IntegerField(allow_null=True)
     user = serializers.IntegerField()
-    sip_configuration = SipConfigurationDetailSerializer()
+    sip_configuration = SoftphoneSipConfigurationSerializer()
     extension = serializers.CharField()
     extension_password = serializers.CharField()
     phone_number = serializers.CharField(allow_blank=True)
     display_name = serializers.CharField(allow_blank=True)
     is_primary = serializers.BooleanField()
     is_active = serializers.BooleanField()
+    sip_enabled = serializers.BooleanField()
 
 
 def _is_admin_request(serializer):

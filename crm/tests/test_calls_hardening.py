@@ -456,16 +456,20 @@ class TestSoftphoneCredentials(CrmTestCase):
         self.assertNotIn('COLLEAGUE-PW', body)
         self.assertNotIn('MY-EXT-PW', body)
 
-    def test_my_config_fallback_on_tenant_without_extensions(self):
-        # Legacy single-account tenant: no extensions at all.
+    def test_my_config_no_shared_password_for_agent_even_without_extensions(self):
+        # Legacy single-account tenant: no extensions at all. The shared
+        # account may be the trunk login, so agents never get it; the
+        # webrtc_config shape stays the same with sip_enabled false.
         UserPhoneAssignment.objects.all().delete()
         loner = self.create_user(email='sp-loner3@test.com')
         resp = self.api_get('/api/sip-configurations/my_config/', user=loner)
-        self.assertEqual(resp.status_code, 200)
-        self.assertIsNone(resp.data['id'])
-        self.assertEqual(resp.data['extension_password'], 'TRUNK-SECRET')
+        self.assertEqual(resp.status_code, 404)
+        self.assertNotIn('TRUNK-SECRET', _body(resp))
         resp = self.api_get(f'/api/sip-configurations/{self.config.id}/webrtc_config/', user=loner)
-        self.assertEqual(resp.data['password'], 'TRUNK-SECRET')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['password'], '')
+        self.assertIs(resp.data['sip_enabled'], False)
+        self.assertNotIn('TRUNK-SECRET', _body(resp))
 
     def test_my_config_404_without_any_config(self):
         SipConfiguration.objects.update(is_default=False)

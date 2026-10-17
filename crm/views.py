@@ -21,6 +21,7 @@ from .serializers import (
     UserPhoneAssignmentSerializer, UserPhoneAssignmentDetailSerializer,
     PbxSettingsSerializer, ConsultationInitiateSerializer, MergeConferenceSerializer,
     CallRatingSerializer, MySoftphoneConfigSerializer, SOFTPHONE_CONTEXT_KEY,
+    SoftphoneSipConfigurationSerializer,
     CallEndSerializer,
 )
 from .permissions import (
@@ -28,7 +29,12 @@ from .permissions import (
     is_pbx_admin,
 )
 from .filters import CallLogFilter, UserPhoneAssignmentFilter
-from .recording_hosts import is_allowed_recording_url
+from .recording_hosts import (
+    UnsafeRecordingURL,
+    is_allowed_recording_url,
+    open_recording,
+    safe_recording_content_type,
+)
 from .call_status import ANSWERED_ELSEWHERE_STATUS, answered_q, missed_q, FINAL_STATUSES
 
 logger = logging.getLogger(__name__)
@@ -187,17 +193,19 @@ def _softphone_credentials(user, sip_config):
 
 def _may_use_shared_account(user, sip_config):
     """Whether ``user`` (who has no extension on ``sip_config``) may get the
-    configuration's shared SIP account. PBX admins may; everyone else only on
-    a legacy single-account tenant: the config is the default one and the
-    tenant has no extensions at all. Once extensions exist the shared
-    password is never handed to agents."""
-    if is_pbx_admin(user):
+    configuration's shared SIP account password. It may be the provider
+    trunk login, so only staff / superusers and the user who created the
+    configuration get it; never other PBX admins (``manage_settings``) or
+    agents."""
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return False
+    if user.is_staff or user.is_superuser:
         return True
-    return bool(sip_config.is_default) and not UserPhoneAssignment.objects.exists()
+    return sip_config.created_by_id is not None and sip_config.created_by_id == user.id
 
 
 def _softphone_config_data(sip_config, username, password, request):
-    return SipConfigurationDetailSerializer(
+    return SoftphoneSipConfigurationSerializer(
         sip_config,
         context={'request': request, SOFTPHONE_CONTEXT_KEY: {'username': username, 'password': password}},
     ).data
@@ -244,12 +252,13 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
             "The SIP / ICE settings a softphone needs for this configuration. "
             "``username``/``password`` are the caller's own credentials: their "
             "active extension on this configuration, or the configuration's "
-            "shared account when they have none (PBX admins, or on the default "
-            "configuration of a tenant that has no extensions at all; otherwise "
-            "both are ''). ``user_assignments`` is always []."
+            "shared account when they have none (staff, superusers and the "
+            "configuration's creator only; otherwise both are '' and "
+            "``sip_enabled`` is false, so the client skips SIP registration). "
+            "``user_assignments`` is always []."
         ),
         responses={
-            200: SipConfigurationDetailSerializer,
+            200: SoftphoneSipConfigurationSerializer,
             400: OpenApiTypes.OBJECT,
             404: OpenApiTypes.OBJECT,
         }
@@ -336,8 +345,9 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
             "settings to register it. When the caller has no extension, the "
             "tenant's default active configuration is returned with its shared "
             "account as ``extension``/``extension_password`` and ``id: null``, "
-            "but only to PBX admins or on a tenant with no extensions at all. "
-            "404 otherwise. Never contains other users' credentials."
+            "but only to staff, superusers and the configuration's creator. "
+            "404 otherwise. Never contains other users' credentials. "
+            "``sip_enabled`` is true when the credentials can register."
         ),
         responses={200: MySoftphoneConfigSerializer, 404: OpenApiTypes.OBJECT},
     )
@@ -363,6 +373,7 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
                 'display_name': assignment.display_name,
                 'is_primary': assignment.is_primary,
                 'is_active': assignment.is_active,
+                'sip_enabled': bool(assignment.extension and assignment.extension_password),
             })
 
         # Fallback: return default config without assignment
@@ -380,6 +391,7 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
                 'display_name': '',
                 'is_primary': True,
                 'is_active': True,
+                'sip_enabled': bool(default_config.username and default_config.password),
             })
 
         if default_config:
@@ -489,11 +501,26 @@ class CallLogViewSet(viewsets.ModelViewSet):
         return super().update(request, *args, **kwargs)
 
     def perform_create(self, serializer):
-        # Automatically set the current user as the handler if not specified
-        if not serializer.validated_data.get('handled_by'):
+        # The softphone logs its own calls: a non-PBX-admin is always the
+        # handler of a call log they create. PBX admins may log a call for
+        # someone else (the caller when not specified).
+        if not is_pbx_admin(self.request.user) or not serializer.validated_data.get('handled_by'):
             serializer.save(handled_by=self.request.user)
         else:
             serializer.save()
+
+    def _may_change_call(self, call_log):
+        """Status / recording changes on a call log: its handling agent,
+        staff/superusers and PBX admins only."""
+        user = self.request.user
+        return (call_log.handled_by_id is not None and call_log.handled_by_id == user.id) \
+            or is_pbx_admin(user)
+
+    def _forbidden_call_change(self):
+        return Response(
+            {'error': 'Only the agent handling this call or a PBX administrator can change it.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     
     def _create_call_event(self, call_log, event_type, metadata=None, user=None):
         """Helper method to create call events"""
@@ -681,11 +708,14 @@ class CallLogViewSet(viewsets.ModelViewSet):
         summary="Update call status",
         description=(
             "Update the status of an ongoing call. ``recording_url``, when "
-            "given, must be on one of the tenant's PBX hosts (400 otherwise)."
+            "given, must be on one of the tenant's PBX hosts (400 otherwise). "
+            "Only the call's handling agent (``handled_by``), staff/superusers "
+            "and PBX admins may change a call (403 otherwise)."
         ),
         request=CallStatusUpdateSerializer,
         responses={
             200: CallLogSerializer,
+            403: OpenApiTypes.OBJECT,
             404: OpenApiTypes.OBJECT
         }
     )
@@ -693,6 +723,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def update_status(self, request, pk=None):
         """Update call status"""
         call_log = self.get_object()
+        if not self._may_change_call(call_log):
+            return self._forbidden_call_change()
         serializer = CallStatusUpdateSerializer(data=request.data)
         
         if serializer.is_valid():
@@ -752,15 +784,21 @@ class CallLogViewSet(viewsets.ModelViewSet):
         description=(
             "End an ongoing call and set ``ended_at``/``duration``. No body. "
             "An inbound call that was never answered ends as ``missed`` "
-            "(which fires the ``call_missed`` notification), unless another "
-            "agent's leg of the same ring-all call was answered, in which case "
-            "it ends as ``cancelled`` (answered elsewhere: counted neither as "
-            "answered nor as missed). 400 when the call is already over."
+            "(which queues the ``call_missed`` notification), unless another "
+            "agent's leg of the same queue attempt was already answered, in "
+            "which case it ends as ``cancelled`` (answered elsewhere: counted "
+            "neither as answered nor as missed). A ``missed`` leg is also "
+            "re-labelled ``cancelled`` later when the queue's next agent "
+            "answers (sequential strategies such as rrmemory), and then nobody "
+            "is notified. 400 when the call is already over. "
+            "Only the call's handling agent (``handled_by``), staff/superusers "
+            "and PBX admins may end it (403 otherwise)."
         ),
         request=CallEndSerializer,
         responses={
             200: CallLogSerializer,
             400: OpenApiTypes.OBJECT,
+            403: OpenApiTypes.OBJECT,
             404: OpenApiTypes.OBJECT,
         }
     )
@@ -770,6 +808,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
         from .call_notifications import find_answered_sibling
 
         call_log = self.get_object()
+        if not self._may_change_call(call_log):
+            return self._forbidden_call_change()
 
         if call_log.status in FINAL_STATUSES:
             return Response(
@@ -944,14 +984,6 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 {'error': 'No recording on this call'},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        if not is_allowed_recording_url(source_url):
-            logger.warning(
-                "Recording proxy refused non-PBX host for call %s (%s)", call_log.pk, source_url,
-            )
-            return Response(
-                {'error': 'Recording is not on an allowed recording host.'},
-                status=status.HTTP_404_NOT_FOUND,
-            )
 
         # Forward a Range request so the audio element can seek.
         upstream_headers = {}
@@ -959,13 +991,16 @@ class CallLogViewSet(viewsets.ModelViewSet):
             upstream_headers['Range'] = request.META['HTTP_RANGE']
 
         try:
-            upstream = _requests.get(
-                source_url,
-                headers=upstream_headers,
-                stream=True,
-                timeout=(5, 30),  # (connect, read)
-                # A redirect could point anywhere: do not follow it.
-                allow_redirects=False,
+            # Allow-listed host, http(s), public addresses only, pinned to
+            # the checked address; redirects are not followed.
+            upstream = open_recording(source_url, headers=upstream_headers, timeout=(5, 30))
+        except UnsafeRecordingURL as exc:
+            logger.warning(
+                "Recording proxy refused call %s (%s): %s", call_log.pk, source_url, exc,
+            )
+            return Response(
+                {'error': 'Recording is not on an allowed recording host.'},
+                status=status.HTTP_404_NOT_FOUND,
             )
         except _requests.RequestException as exc:
             logger.warning(
@@ -996,23 +1031,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
             finally:
                 upstream.close()
 
-        # Pick a Content-Type the browser's <audio> element will play. If the
-        # upstream nginx ever forgets the wav mime mapping (the system
-        # mime.types on Ubuntu doesn't ship with .wav) it sends
-        # application/octet-stream which Chrome/Safari refuse to play in an
-        # audio tag — override based on the source URL extension.
-        upstream_ct = (upstream.headers.get('Content-Type') or '').lower()
-        url_lower = source_url.lower()
-        if url_lower.endswith('.wav') and (
-            not upstream_ct or upstream_ct == 'application/octet-stream'
-        ):
-            content_type = 'audio/wav'
-        elif url_lower.endswith('.mp3') and (
-            not upstream_ct or upstream_ct == 'application/octet-stream'
-        ):
-            content_type = 'audio/mpeg'
-        else:
-            content_type = upstream_ct or 'audio/wav'
+        # Only ever an audio type (or octet-stream): the body comes from a
+        # host a tenant admin chose, so it must never render as a page.
+        content_type = safe_recording_content_type(upstream.headers.get('Content-Type'), source_url)
 
         response = StreamingHttpResponse(
             iterator(),
@@ -1025,6 +1046,7 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 response[header] = upstream.headers[header]
         response['Cache-Control'] = 'private, max-age=600'
         response['Content-Disposition'] = f'inline; filename="call-{call_log.pk}.wav"'
+        response['X-Content-Type-Options'] = 'nosniff'
         return response
 
     @extend_schema(
