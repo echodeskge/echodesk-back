@@ -6,7 +6,7 @@ from .views import (
     TenantGroupViewSet, NotificationViewSet, tenant_homepage,
     TeamChatUserListView, TeamChatConversationViewSet, TeamChatMessageViewSet,
     upload_team_chat_file, team_chat_unread_count,
-    notification_preferences_list, notification_preferences_bulk_update
+    notification_preferences_list, notification_preferences_bulk_update, notification_preferences_types
 )
 
 router = DefaultRouter()
@@ -31,6 +31,7 @@ urlpatterns = [
     # Notification Preferences endpoints
     path('api/notification-preferences/', notification_preferences_list, name='notification-preferences-list'),
     path('api/notification-preferences/bulk/', notification_preferences_bulk_update, name='notification-preferences-bulk'),
+    path('api/notification-preferences/types/', notification_preferences_types, name='notification-preferences-types'),
 
     # Team Chat endpoints
     path('api/team-chat/users/', TeamChatUserListView.as_view(), name='team-chat-users'),

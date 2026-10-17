@@ -11,7 +11,7 @@ from django.utils import timezone
 from django.conf import settings
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
-    OpenApiParameter, extend_schema, extend_schema_view, inline_serializer,
+    OpenApiParameter, OpenApiResponse, extend_schema, extend_schema_view, inline_serializer,
 )
 import secrets
 import string
@@ -25,7 +25,8 @@ from .serializers import (
     TenantGroupSerializer, TenantGroupCreateSerializer, NotificationSerializer,
     TeamChatUserSerializer, TeamChatConversationSerializer, TeamChatConversationDetailSerializer,
     TeamChatMessageSerializer, TeamChatCreateMessageSerializer, TeamChatFileUploadSerializer,
-    NotificationPreferenceSerializer
+    NotificationPreferenceSerializer, NotificationPreferenceBulkItemSerializer,
+    NotificationPreferenceTypeSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -721,39 +722,106 @@ class NotificationViewSet(viewsets.ModelViewSet):
 from rest_framework.decorators import api_view, permission_classes as perm_classes
 
 
+@extend_schema(
+    operation_id='notification_preferences_retrieve',
+    summary="The current user's stored notification preferences",
+    description=(
+        'Only types the user has customised have a row; every other type is '
+        'delivered with in_app/sound/push = true. GET '
+        '/api/notification-preferences/types/ returns every type with its '
+        'effective values.'
+    ),
+    responses={200: NotificationPreferenceSerializer(many=True)},
+    tags=['notification-preferences'],
+)
 @api_view(['GET'])
 @perm_classes([permissions.IsAuthenticated])
 def notification_preferences_list(request):
     """List all notification preferences for the current user."""
-    prefs = NotificationPreference.objects.filter(user=request.user)
+    prefs = NotificationPreference.objects.filter(user=request.user).order_by('notification_type')
     return Response(NotificationPreferenceSerializer(prefs, many=True).data)
 
 
+@extend_schema(
+    operation_id='notification_preferences_types_retrieve',
+    summary='Every notification type with the effective preference of the current user',
+    responses={200: NotificationPreferenceTypeSerializer(many=True)},
+    tags=['notification-preferences'],
+)
+@api_view(['GET'])
+@perm_classes([permissions.IsAuthenticated])
+def notification_preferences_types(request):
+    """All Notification.NOTIFICATION_TYPES merged with the user's rows."""
+    stored = {
+        pref.notification_type: pref
+        for pref in NotificationPreference.objects.filter(user=request.user)
+    }
+    rows = []
+    for key, label in Notification.NOTIFICATION_TYPES:
+        pref = stored.get(key)
+        rows.append({
+            'notification_type': key,
+            'label': str(label),
+            'in_app': pref.in_app if pref else True,
+            'sound': pref.sound if pref else True,
+            'push': pref.push if pref else True,
+            'is_customized': pref is not None,
+        })
+    return Response(NotificationPreferenceTypeSerializer(rows, many=True).data)
+
+
+@extend_schema(
+    operation_id='notification_preferences_bulk_update',
+    summary='Create or update several notification preferences',
+    description=(
+        'Body: a JSON array of {notification_type, in_app?, sound?, push?}. '
+        'notification_type must be a known type (400 otherwise; nothing is '
+        'saved when any item is invalid). Omitted channels keep their stored '
+        'value, or true for a new row. Duplicate types: the last item wins. '
+        'Returns the saved rows, one per distinct type, in request order.'
+    ),
+    request=NotificationPreferenceBulkItemSerializer(many=True),
+    responses={
+        200: NotificationPreferenceSerializer(many=True),
+        400: OpenApiResponse(description='Body is not a list, or an item is invalid'),
+    },
+    tags=['notification-preferences'],
+)
 @api_view(['PUT'])
 @perm_classes([permissions.IsAuthenticated])
 def notification_preferences_bulk_update(request):
     """Bulk update notification preferences. Accepts a list of {notification_type, in_app, sound, push}."""
-    prefs_data = request.data  # list of {notification_type, in_app, sound, push}
+    prefs_data = request.data
     if not isinstance(prefs_data, list):
         return Response(
             {'error': 'Request body must be a list of preference objects'},
             status=status.HTTP_400_BAD_REQUEST
         )
+    serializer = NotificationPreferenceBulkItemSerializer(data=prefs_data, many=True)
+    serializer.is_valid(raise_exception=True)
+
+    # Merge duplicates (last wins) while keeping first-seen order
+    merged = {}
+    for item in serializer.validated_data:
+        merged.setdefault(item['notification_type'], {}).update(item)
+
     results = []
-    for pref_data in prefs_data:
-        notification_type = pref_data.get('notification_type')
-        if not notification_type:
-            continue
-        obj, _ = NotificationPreference.objects.update_or_create(
-            user=request.user,
-            notification_type=notification_type,
-            defaults={
-                'in_app': pref_data.get('in_app', True),
-                'sound': pref_data.get('sound', True),
-                'push': pref_data.get('push', True),
-            }
-        )
-        results.append(NotificationPreferenceSerializer(obj).data)
+    with transaction.atomic():
+        existing = {
+            pref.notification_type: pref
+            for pref in NotificationPreference.objects.select_for_update().filter(
+                user=request.user, notification_type__in=list(merged)
+            )
+        }
+        for notification_type, item in merged.items():
+            pref = existing.get(notification_type) or NotificationPreference(
+                user=request.user, notification_type=notification_type
+            )
+            for channel in ('in_app', 'sound', 'push'):
+                if channel in item:
+                    setattr(pref, channel, item[channel])
+            pref.save()
+            results.append(NotificationPreferenceSerializer(pref).data)
     return Response(results)
 
 
@@ -775,7 +843,7 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from django.db.models import F, Q, Max, Prefetch
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
-    OpenApiParameter, extend_schema, extend_schema_view, inline_serializer,
+    OpenApiParameter, OpenApiResponse, extend_schema, extend_schema_view, inline_serializer,
 )
 
 from .notification_utils import create_team_chat_message_notification
