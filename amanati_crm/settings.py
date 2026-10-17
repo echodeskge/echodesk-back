@@ -708,6 +708,11 @@ CELERY_BEAT_SCHEDULE = {
         # Each salon sets how many hours before the visit to remind
         'schedule': crontab(minute='*/10'),
     },
+    'send-staff-booking-reminders': {
+        'task': 'booking_management.tasks.send_staff_booking_reminders',
+        # Push to the assigned staff member ~30 min before each client
+        'schedule': crontab(minute='*/5'),
+    },
     'cancel-unpaid-bookings': {
         'task': 'booking_management.tasks.cancel_unpaid_bookings',
         # Releases slots held by abandoned online card payments (30 min grace)

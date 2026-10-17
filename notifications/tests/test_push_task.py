@@ -186,7 +186,7 @@ class TestCreateNotificationDispatch(EchoDeskTenantTestCase):
         data = kwargs['data']
         self.assertEqual(set(data.keys()), {
             'notification_id', 'notification_type', 'link_url', 'url',
-            'ticket_id', 'leave_request_id', 'conversation_id', 'sender_id',
+            'ticket_id', 'leave_request_id', 'booking_id', 'conversation_id', 'sender_id',
         })
         # not a chat notification: the chat deep-link keys are present but empty
         self.assertIsNone(data['conversation_id'])

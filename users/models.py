@@ -530,6 +530,7 @@ class Notification(models.Model):
         ('booking_confirmed', 'Booking Confirmed'),
         ('booking_cancelled', 'Booking Cancelled'),
         ('booking_reminder', 'Booking Reminder'),
+        ('booking_assigned', 'Booking Assigned'),
         # Calls
         ('call_missed', 'Missed Call'),
         ('call_voicemail', 'New Voicemail'),

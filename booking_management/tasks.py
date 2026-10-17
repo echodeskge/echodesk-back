@@ -75,6 +75,9 @@ def _create_recurring_bookings_for_tenant(schema_name):
                 client_notes=f'Auto-created from recurring booking #{recurring.id}',
             )
 
+            from booking_management.staff_notifications import notify_assigned_staff
+            notify_assigned_staff(booking, 'created')
+
             # Advance the recurring booking schedule
             recurring.last_created_booking = booking
             recurring.current_occurrences += 1
@@ -258,6 +261,58 @@ def _send_reminders_for_tenant(schema_name):
             )
 
     return reminded
+
+
+# "Your next client in N minutes" push to the assigned staff member.
+STAFF_REMINDER_MINUTES = 30
+
+
+@shared_task
+def send_staff_booking_reminders():
+    """Remind staff members, in every tenant, of a client coming up soon."""
+    from tenant_schemas.utils import schema_context
+    from tenants.models import Tenant
+
+    total = 0
+    for tenant in Tenant.objects.exclude(schema_name='public'):
+        try:
+            with schema_context(tenant.schema_name):
+                total += _send_staff_reminders_for_tenant()
+        except Exception:
+            logger.exception('Error sending staff booking reminders for tenant %s', tenant.schema_name)
+    return total
+
+
+def _send_staff_reminders_for_tenant(minutes=STAFF_REMINDER_MINUTES):
+    """Notify each assigned staff member once about a booking starting within
+    `minutes` (on the business's clock). Returns how many were notified."""
+    from booking_management.models import Booking
+    from booking_management.staff_notifications import notify_assigned_staff
+    from booking_management.utils import get_booking_settings, tenant_now
+
+    now = tenant_now(get_booking_settings())
+    horizon = now + timedelta(minutes=minutes)
+    bookings = Booking.objects.filter(
+        date=now.date(),
+        status__in=['pending', 'confirmed'],
+        staff__isnull=False,
+        staff_reminder_sent=False,
+        start_time__gt=now.time(),
+    ).select_related('client', 'service', 'staff', 'staff__user')
+    if horizon.date() == now.date():
+        bookings = bookings.filter(start_time__lte=horizon.time())
+
+    sent = 0
+    for booking in bookings:
+        try:
+            # Flag first: a failing push must not repeat on every run.
+            Booking.objects.filter(pk=booking.pk).update(staff_reminder_sent=True)
+            starts_in = int((datetime.combine(booking.date, booking.start_time) - now).total_seconds() // 60)
+            if notify_assigned_staff(booking, 'reminder', minutes=max(starts_in, 1)):
+                sent += 1
+        except Exception:
+            logger.exception('Error sending staff reminder for booking %s', booking.booking_number)
+    return sent
 
 
 # How long a customer has to complete an online card payment before the
