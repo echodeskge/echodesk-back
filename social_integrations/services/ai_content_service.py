@@ -4,6 +4,7 @@ from django.conf import settings
 from openai import OpenAI, PermissionDeniedError
 
 from social_integrations.models import AutoPostSettings, AutoPostContent
+from social_integrations.services.ai_providers import AINotConfiguredError
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ class AIContentService:
     def __init__(self):
         api_key = getattr(settings, 'OPENAI_API_KEY', '')
         if not api_key:
-            raise ValueError("OPENAI_API_KEY is not configured")
+            raise AINotConfiguredError("OPENAI_API_KEY is not configured")
         self.client = OpenAI(api_key=api_key)
         self.model = getattr(settings, 'OPENAI_MODEL', 'gpt-4o')
 

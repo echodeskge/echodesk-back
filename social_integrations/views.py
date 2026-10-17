@@ -78,6 +78,7 @@ from .conversation_keys import (
     assignment_conversation_id, assignment_lookup_ids, session_conversation_id,
 )
 from .schema_serializers import *  # noqa: F401,F403 — documentation shapes for extend_schema
+from .ai_errors import AI_NOT_CONFIGURED_RESPONSE
 from .oauth_state import (
     make_oauth_state, oauth_result_redirect, read_oauth_state, return_to_from_request,
 )
@@ -13138,14 +13139,25 @@ def auto_post_edit(request, pk):
 @extend_schema(
     summary='Generate an auto-post now',
     request=None,
-    responses={201: AutoPostContentSerializer, 500: SocialErrorSerializer},
+    description=(
+        "Generate a post with AI right now. Returns 503 "
+        "`{code: 'ai_not_configured', detail}` when no AI provider key is "
+        "configured."
+    ),
+    responses={
+        201: AutoPostContentSerializer,
+        500: SocialErrorSerializer,
+        503: AI_NOT_CONFIGURED_RESPONSE,
+    },
     tags=['Social - Auto-posting'],
 )
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialSettings])
 def auto_post_generate(request):
     """Manually trigger post generation"""
+    from .ai_errors import ai_not_configured_response
     from .services.ai_content_service import AIContentService
+    from .services.ai_providers import AINotConfiguredError
 
     try:
         auto_settings, _ = AutoPostSettings.objects.get_or_create(pk=1, defaults={})
@@ -13155,6 +13167,9 @@ def auto_post_generate(request):
 
         serializer = AutoPostContentSerializer(result)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+    except AINotConfiguredError as e:
+        logger.info(f"Auto-post generation skipped, AI not configured: {e}")
+        return ai_not_configured_response()
     except Exception as e:
         logger.error(f"Error generating auto-post: {e}")
         return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

@@ -13,6 +13,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from .ai_errors import AI_NOT_CONFIGURED_RESPONSE, ai_not_configured_response
 from .models import (
     AICompanionChannel,
     AICompanionSettings,
@@ -21,7 +22,7 @@ from .models import (
 )
 from .permissions import CanManageAICompanion, CanUseAICompanion
 from .services import ai_companion
-from .services.ai_providers import AICompanionError
+from .services.ai_providers import AICompanionError, AINotConfiguredError
 from .services.conversation_transcript import PLATFORM_MESSAGE_CONFIG
 
 logger = logging.getLogger(__name__)
@@ -204,8 +205,17 @@ def ai_companion_settings(request):
 
 @extend_schema(
     request=ConversationTripleSerializer,
-    responses={201: AISummaryCreatedSerializer, 400: AIErrorSerializer, 422: AIErrorSerializer},
-    description="Generate an AI summary of the whole conversation (synchronous)",
+    responses={
+        201: AISummaryCreatedSerializer,
+        400: AIErrorSerializer,
+        422: AIErrorSerializer,
+        503: AI_NOT_CONFIGURED_RESPONSE,
+    },
+    description=(
+        "Generate an AI summary of the whole conversation (synchronous). "
+        "Returns 503 `{code: 'ai_not_configured', detail}` when no AI provider "
+        "key is configured; 422 for provider failures."
+    ),
 )
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanUseAICompanion])
@@ -221,6 +231,9 @@ def ai_summarize_conversation(request):
             conversation_id=_state_conversation_id(data['platform'], data['conversation_id'], data['account_id']),
             requested_by=request.user,
         )
+    except AINotConfiguredError as exc:
+        logger.info('AI summary skipped, AI not configured: %s', exc)
+        return ai_not_configured_response()
     except ValueError as exc:
         return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
     except AICompanionError as exc:
@@ -321,8 +334,17 @@ def ai_conversation_state(request):
 
 @extend_schema(
     request=AITestSerializer,
-    responses={200: AITestResponseSerializer, 400: AIErrorSerializer, 422: AIErrorSerializer},
-    description="Dry-run one customer message against the companion prompt",
+    responses={
+        200: AITestResponseSerializer,
+        400: AIErrorSerializer,
+        422: AIErrorSerializer,
+        503: AI_NOT_CONFIGURED_RESPONSE,
+    },
+    description=(
+        "Dry-run one customer message against the companion prompt. Returns "
+        "503 `{code: 'ai_not_configured', detail}` when no AI provider key is "
+        "configured."
+    ),
 )
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageAICompanion])
@@ -359,6 +381,8 @@ def ai_companion_test(request):
         run.completed_at = dj_timezone.now()
         run.error_message = str(exc)[:2000]
         run.save()
+        if isinstance(exc, AINotConfiguredError):
+            return ai_not_configured_response()
         return Response({'error': str(exc)}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
     run.completed_at = dj_timezone.now()

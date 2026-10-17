@@ -7,6 +7,7 @@ persistence, and dispatch, not the LLMs.
 from datetime import timedelta
 from unittest.mock import patch
 
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status
 
@@ -18,7 +19,8 @@ from social_integrations.models import (
     ConversationSummary,
 )
 from social_integrations.services import ai_companion
-from social_integrations.services.ai_providers import AICompanionError
+from social_integrations.ai_errors import AI_NOT_CONFIGURED_CODE
+from social_integrations.services.ai_providers import AICompanionError, AINotConfiguredError
 from social_integrations.tasks import ai_companion_reply_task
 from .conftest import SocialIntegrationTestCase
 
@@ -449,3 +451,98 @@ class TestAiViews(AICompanionTestCase):
             }, user=self.agent)
         self.assertEqual(resp.data['mode'], 'ai')
         self.assertEqual(resp.data['reason'], '')
+
+
+@override_settings(ANTHROPIC_API_KEY='', OPENAI_API_KEY='')
+class TestAiNotConfigured(AICompanionTestCase):
+    """No tenant key and no platform env key -> stable 503 contract."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='ai-nc-admin@test.com')
+        self.agent = self.create_user(email='ai-nc-agent@test.com')
+
+    def assertNotConfigured(self, resp):
+        self.assertEqual(resp.status_code, status.HTTP_503_SERVICE_UNAVAILABLE, resp.data)
+        self.assertEqual(resp.data['code'], AI_NOT_CONFIGURED_CODE)
+        self.assertTrue(resp.data['detail'])
+
+    def test_generate_structured_raises_not_configured(self):
+        from social_integrations.services import ai_providers
+        with self.assertRaises(AINotConfiguredError) as ctx:
+            ai_providers.generate_structured(
+                provider='anthropic', model='', api_key='', system='s',
+                messages=[], tool_name='t', tool_schema={},
+            )
+        # Back-compat: still an AICompanionError and a ValueError.
+        self.assertIsInstance(ctx.exception, AICompanionError)
+        self.assertIsInstance(ctx.exception, ValueError)
+
+    def test_summarize_returns_503(self):
+        enable_companion(api_key='')
+        conn = self.create_fb_connection()
+        self.create_fb_message(
+            page_connection=conn, sender_id='psid_nc',
+            message_text='hello', is_from_page=False,
+        )
+        resp = self.api_post('/api/social/ai/summarize/', {
+            'platform': 'facebook',
+            'conversation_id': 'psid_nc',
+            'account_id': conn.page_id,
+        }, user=self.agent)
+        self.assertNotConfigured(resp)
+        self.assertFalse(ConversationSummary.objects.exists())
+        run = AICompanionRun.objects.get(kind='summary')
+        self.assertFalse(run.success)
+
+    def test_summarize_validation_error_stays_400(self):
+        resp = self.api_post('/api/social/ai/summarize/', {
+            'platform': 'facebook',
+        }, user=self.agent)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_summarize_empty_conversation_stays_400(self):
+        resp = self.api_post('/api/social/ai/summarize/', {
+            'platform': 'facebook',
+            'conversation_id': 'nobody',
+            'account_id': 'nopage',
+        }, user=self.agent)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_tenant_key_override_is_used(self):
+        enable_companion(api_key='sk-tenant')
+        conn = self.create_fb_connection()
+        self.create_fb_message(
+            page_connection=conn, sender_id='psid_ok',
+            message_text='hello', is_from_page=False,
+        )
+        with patch.object(
+            ai_companion.ai_providers, '_anthropic_structured',
+            return_value=({'summary': 'ok'}, {}),
+        ) as call:
+            resp = self.api_post('/api/social/ai/summarize/', {
+                'platform': 'facebook',
+                'conversation_id': 'psid_ok',
+                'account_id': conn.page_id,
+            }, user=self.agent)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertEqual(call.call_args.args[1], 'sk-tenant')
+
+    def test_companion_test_returns_503(self):
+        enable_companion(api_key='')
+        resp = self.api_post('/api/social/ai/test/', {'message': 'hi'}, user=self.admin)
+        self.assertNotConfigured(resp)
+
+    def test_companion_test_missing_message_stays_400(self):
+        resp = self.api_post('/api/social/ai/test/', {}, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_auto_post_generate_returns_503(self):
+        import sys
+        from unittest.mock import MagicMock
+        # The openai SDK may be absent in test envs; the key check runs
+        # before any client is built, so a stub module is enough.
+        with patch.dict(sys.modules, {'openai': sys.modules.get('openai') or MagicMock()}):
+            resp = self.api_post('/api/social/auto-post/generate/', {}, user=self.admin)
+        self.assertNotConfigured(resp)
+

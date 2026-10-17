@@ -28,6 +28,19 @@ class AICompanionError(Exception):
     """Raised when a provider call fails or can't be interpreted."""
 
 
+class AINotConfiguredError(AICompanionError, ValueError):
+    """
+    Raised when no API key is available for the AI provider (neither a
+    tenant override nor the platform env key).
+
+    Subclasses AICompanionError so existing companion catch sites keep
+    working, and ValueError so the auto-post services (which historically
+    raised ValueError for a missing key) keep their contract. API views
+    map it to HTTP 503 ``{"code": "ai_not_configured", "detail": ...}``
+    via ``social_integrations.ai_errors``.
+    """
+
+
 def default_model(provider):
     if provider == 'anthropic':
         return settings.BLOG_AI_MODEL
@@ -63,7 +76,7 @@ def generate_structured(provider, model, api_key, system, messages,
     model = model or default_model(provider)
     api_key = api_key or default_api_key(provider)
     if not api_key:
-        raise AICompanionError(
+        raise AINotConfiguredError(
             f"No API key configured for provider '{provider}'."
         )
 
