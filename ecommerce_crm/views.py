@@ -5,7 +5,7 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from .tokens import is_shop_token_for_current_tenant, issue_shop_tokens
 from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiParameter, inline_serializer
 from drf_spectacular.types import OpenApiTypes
-from django_filters.rest_framework import DjangoFilterBackend, FilterSet, CharFilter, NumberFilter, BooleanFilter
+from django_filters.rest_framework import DjangoFilterBackend, FilterSet, CharFilter, NumberFilter, BooleanFilter, ChoiceFilter
 from django.db.models import Q, F, Count, Avg
 from django.core.cache import cache
 from django.utils.decorators import method_decorator
@@ -43,6 +43,11 @@ class ProtectedDestroyMixin:
             )
 
 
+# Defined once: building a new inline_serializer per decorated destroy made
+# drf-spectacular warn about several components named EcommerceDeleteConflict.
+_DELETE_CONFLICT = inline_serializer('EcommerceDeleteConflict', fields={'error': serializers.CharField()})
+
+
 def _destroy_schema(tag, summary):
     return extend_schema(
         tags=[tag],
@@ -51,7 +56,7 @@ def _destroy_schema(tag, summary):
             204: OpenApiResponse(description='Deleted'),
             403: OpenApiResponse(description='Not allowed'),
             409: OpenApiResponse(
-                response=inline_serializer('EcommerceDeleteConflict', fields={'error': serializers.CharField()}),
+                response=_DELETE_CONFLICT,
                 description='Still referenced by orders',
             ),
         },
@@ -303,7 +308,23 @@ class ProductFilter(FilterSet):
     )
     status__in = CharFilter(method='filter_status', help_text='Comma-separated statuses, e.g. active,draft')
     in_stock = BooleanFilter(method='filter_in_stock')
-    low_stock = BooleanFilter(method='filter_low_stock')
+    low_stock = BooleanFilter(
+        method='filter_low_stock',
+        help_text='true: inventory-tracked and 0 < quantity <= low_stock_threshold (sold-out excluded)',
+    )
+    stock = ChoiceFilter(
+        method='filter_stock',
+        choices=(
+            ('low', 'low'),
+            ('out', 'out'),
+            ('low_or_out', 'low_or_out'),
+        ),
+        help_text=(
+            'Inventory-tracked products only. low: 0 < quantity <= low_stock_threshold '
+            '(same as low_stock=true); out: quantity <= 0 (sold out or oversold); '
+            'low_or_out: quantity <= low_stock_threshold (the daily low-stock digest set).'
+        ),
+    )
     attributes = CharFilter(method='filter_by_attributes')
 
     class Meta:
@@ -348,6 +369,16 @@ class ProductFilter(FilterSet):
                 quantity__lte=F('low_stock_threshold'),
                 quantity__gt=0
             )
+        return queryset
+
+    def filter_stock(self, queryset, name, value):
+        tracked = queryset.filter(track_inventory=True)
+        if value == 'low':
+            return tracked.filter(quantity__lte=F('low_stock_threshold'), quantity__gt=0)
+        if value == 'out':
+            return tracked.filter(quantity__lte=0)
+        if value == 'low_or_out':
+            return tracked.filter(quantity__lte=F('low_stock_threshold'))
         return queryset
 
     def filter_by_attributes(self, queryset, name, value):
@@ -627,10 +658,10 @@ class ProductViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMix
         request=inline_serializer(
             name='BulkProductUpdateRequest',
             fields={
-                'product_ids': serializers.ListField(child=serializers.IntegerField()),
+                'product_ids': serializers.ListField(child=serializers.IntegerField(min_value=1)),
                 'status': serializers.ChoiceField(choices=Product.STATUS_CHOICES, required=False),
                 'price': serializers.DecimalField(max_digits=10, decimal_places=2, min_value=0, required=False),
-                'quantity': serializers.IntegerField(required=False),
+                'quantity': serializers.IntegerField(required=False, min_value=0),
                 'is_featured': serializers.BooleanField(required=False),
             },
         ),
@@ -649,9 +680,25 @@ class ProductViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMix
         """Bulk update product status / price / quantity / featured flag"""
         from decimal import Decimal, InvalidOperation
 
-        product_ids = request.data.get('product_ids', [])
-        if not product_ids or not isinstance(product_ids, (list, tuple)):
+        raw_ids = request.data.get('product_ids', [])
+        if not raw_ids or not isinstance(raw_ids, (list, tuple)):
             return Response({'error': 'product_ids is required'}, status=status.HTTP_400_BAD_REQUEST)
+        product_ids = []
+        for raw in raw_ids:
+            if isinstance(raw, bool):
+                pid = None
+            elif isinstance(raw, int):
+                pid = raw
+            elif isinstance(raw, str) and raw.strip().isdigit():
+                pid = int(raw.strip())
+            else:
+                pid = None
+            if pid is None or pid <= 0:
+                return Response(
+                    {'error': 'product_ids must be a list of positive integers'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            product_ids.append(pid)
 
         updates = {}
         if 'status' in request.data and request.data.get('status') not in (None, ''):
@@ -671,10 +718,20 @@ class ProductViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMix
                 return Response({'error': 'Price cannot be negative'}, status=status.HTTP_400_BAD_REQUEST)
             updates['price'] = price.quantize(Decimal('0.01'))
         if request.data.get('quantity') not in (None, ''):
-            try:
-                updates['quantity'] = int(request.data.get('quantity'))
-            except (TypeError, ValueError):
-                return Response({'error': 'Invalid quantity'}, status=status.HTTP_400_BAD_REQUEST)
+            raw_qty = request.data.get('quantity')
+            if isinstance(raw_qty, bool):
+                quantity = None
+            elif isinstance(raw_qty, int):
+                quantity = raw_qty
+            elif isinstance(raw_qty, str) and raw_qty.strip().lstrip('-').isdigit():
+                quantity = int(raw_qty.strip())
+            else:
+                quantity = None
+            if quantity is None:
+                return Response({'error': 'Invalid quantity: send a whole number'}, status=status.HTTP_400_BAD_REQUEST)
+            if quantity < 0:
+                return Response({'error': 'Quantity cannot be negative'}, status=status.HTTP_400_BAD_REQUEST)
+            updates['quantity'] = quantity
         if 'is_featured' in request.data and request.data.get('is_featured') is not None:
             value = request.data.get('is_featured')
             if isinstance(value, str):
