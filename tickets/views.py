@@ -29,7 +29,8 @@ from .serializers import (
     ItemListSerializer, ItemListMinimalSerializer, ListItemSerializer, ListItemMinimalSerializer,
     TicketFormSerializer, TicketFormMinimalSerializer, TicketFormSubmissionSerializer,
     TicketAttachmentSerializer, TicketHistorySerializer,
-    BoardTelegramConnectionSerializer, TicketCardSerializer
+    BoardTelegramConnectionSerializer, BoardTelegramConnectionCreateSerializer,
+    TicketCardSerializer
 )
 
 
@@ -1760,7 +1761,7 @@ class BoardViewSet(viewsets.ModelViewSet):
     @extend_schema(
         methods=['POST'],
         summary='Create the Telegram connection (needs edit_boards or staff)',
-        request=BoardTelegramConnectionSerializer,
+        request=BoardTelegramConnectionCreateSerializer,
         responses={
             201: BoardTelegramConnectionSerializer,
             400: OpenApiResponse(description='Connection already exists or bot_token_raw missing'),
@@ -1770,7 +1771,7 @@ class BoardViewSet(viewsets.ModelViewSet):
     @extend_schema(
         methods=['PUT'],
         summary='Update the Telegram connection (partial; needs edit_boards or staff)',
-        request=BoardTelegramConnectionSerializer,
+        request=BoardTelegramConnectionSerializer(partial=True),
         responses={
             200: BoardTelegramConnectionSerializer,
             403: OpenApiResponse(description='Needs edit_boards or staff'),
@@ -2050,9 +2051,11 @@ class ItemListViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary='Active root-level items of this list, with nested active children',
+        operation_id='item_lists_root_items_retrieve',
+        filters=False,
         responses={200: ListItemSerializer(many=True)},
     )
-    @action(detail=True, methods=['get'])
+    @action(detail=True, methods=['get'], pagination_class=None)
     def root_items(self, request, pk=None):
         """Get only root-level items for this list.
 
@@ -2077,9 +2080,11 @@ class ItemListViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary='Public, active item lists (no auth)',
+        operation_id='item_lists_public_retrieve',
+        filters=False,
         responses={200: ItemListSerializer(many=True)},
     )
-    @action(detail=False, methods=['get'], permission_classes=[permissions.AllowAny])
+    @action(detail=False, methods=['get'], permission_classes=[permissions.AllowAny], pagination_class=None)
     def public(self, request):
         """Get all public item lists accessible to ecommerce clients."""
         queryset = self.get_queryset().filter(is_public=True, is_active=True)
@@ -2088,9 +2093,11 @@ class ItemListViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary='Active items of a public list (no auth)',
+        operation_id='item_lists_public_items_retrieve',
+        filters=False,
         responses={200: ListItemSerializer(many=True), 404: OpenApiResponse(description='Public list not found')},
     )
-    @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny])
+    @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny], pagination_class=None)
     def public_items(self, request, pk=None):
         """Get items from a public list (only if the list is public).
 
@@ -2172,8 +2179,13 @@ class ListItemViewSet(viewsets.ModelViewSet):
             return ListItemMinimalSerializer
         return ListItemSerializer
 
-    @extend_schema(responses={200: ListItemSerializer(many=True)})
-    @action(detail=True, methods=['get'])
+    @extend_schema(
+        summary='Active direct children of this item (plain array)',
+        operation_id='list_items_children_retrieve',
+        filters=False,
+        responses={200: ListItemSerializer(many=True)},
+    )
+    @action(detail=True, methods=['get'], pagination_class=None)
     def children(self, request, pk=None):
         """Get direct children of this item."""
         item = self.get_object()
@@ -2181,8 +2193,13 @@ class ListItemViewSet(viewsets.ModelViewSet):
         serializer = ListItemSerializer(children, many=True, context={'request': request})
         return Response(serializer.data)
 
-    @extend_schema(responses={200: ListItemMinimalSerializer(many=True)})
-    @action(detail=True, methods=['get'])
+    @extend_schema(
+        summary='All descendants of this item, flattened (plain array)',
+        operation_id='list_items_all_descendants_retrieve',
+        filters=False,
+        responses={200: ListItemMinimalSerializer(many=True)},
+    )
+    @action(detail=True, methods=['get'], pagination_class=None)
     def all_descendants(self, request, pk=None):
         """Get all descendants of this item recursively."""
         item = self.get_object()
@@ -2392,14 +2409,16 @@ class TicketFormSubmissionViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary='Submissions of one form',
-        description='`form_id` is required (400 without it).',
+        description='`form_id` is required (400 without it). Returns a plain array (not paginated).',
+        operation_id='form_submissions_by_form_retrieve',
+        filters=False,
         parameters=[OpenApiParameter(
             name='form_id', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY,
             required=False, description='Form id (required; validated by the view)',
         )],
         responses={200: TicketFormSubmissionSerializer(many=True), 400: OpenApiResponse(description='form_id is required')},
     )
-    @action(detail=False, methods=['get'])
+    @action(detail=False, methods=['get'], pagination_class=None)
     def by_form(self, request):
         """Get submissions grouped by form."""
         form_id = request.query_params.get('form_id')

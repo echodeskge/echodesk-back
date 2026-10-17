@@ -533,9 +533,12 @@ class TenantSettingsSerializer(serializers.ModelSerializer):
     logo = serializers.SerializerMethodField()
     company_name = serializers.CharField(source='name', read_only=True)
     min_users_per_ticket = serializers.IntegerField(
-        min_value=0, max_value=100, required=False,
+        min_value=0, max_value=100,
         help_text='Minimum users on a ticket after initial assignment (0 = no minimum)',
     )
+    # Fields are marked required so the GET response schema lists them as
+    # always present; the only writer (PATCH) uses partial=True, so no field
+    # is required in requests.
 
     class Meta:
         model = Tenant
@@ -544,6 +547,10 @@ class TenantSettingsSerializer(serializers.ModelSerializer):
             'only_superadmin_can_delete_tickets', 'preferred_language',
         )
         read_only_fields = ('logo', 'company_name')
+        extra_kwargs = {
+            'only_superadmin_can_delete_tickets': {'required': True},
+            'preferred_language': {'required': True},
+        }
 
     @extend_schema_field(serializers.CharField(allow_null=True))
     def get_logo(self, obj):

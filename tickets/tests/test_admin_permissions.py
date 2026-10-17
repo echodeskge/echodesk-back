@@ -303,6 +303,28 @@ class TestTicketFormPermissionsAndFixes(AdminPermissionMixin, TicketTestCase):
         self.assertEqual([c['title'] for c in row['child_forms']], ['Active child'])
         self.assertIsInstance(row['submissions_count'], int)
 
+    def test_minimal_list_child_forms_query_count_is_flat(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        staff = self.make_staff('tf-nplus1@test.com')
+
+        def add_parent(i):
+            parent = self.create_ticket_form(title=f'P{i}')
+            self.create_ticket_form(title=f'C{i}a', parent_form=parent)
+            self.create_ticket_form(title=f'C{i}b', parent_form=parent, is_active=False)
+
+        add_parent(0)
+        self.api_get('/api/ticket-forms/', user=staff)  # warm caches
+        with CaptureQueriesContext(connection) as small:
+            self.assertEqual(self.api_get('/api/ticket-forms/', user=staff).status_code, 200)
+        for i in range(1, 6):
+            add_parent(i)
+        with CaptureQueriesContext(connection) as large:
+            resp = self.api_get('/api/ticket-forms/', user=staff)
+        self.assertEqual(resp.status_code, 200)
+        self.assertGreaterEqual(len(self.get_results(resp)), 6)
+        self.assertEqual(len(large), len(small), [q['sql'] for q in large.captured_queries])
+
 
 class TestFormSubmissionFixes(AdminPermissionMixin, TicketTestCase):
 

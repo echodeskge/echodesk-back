@@ -4,9 +4,10 @@ ticket forms).
 
 Reads stay open to every authenticated user (the kanban, ticket create sheet
 and ticket forms all need them). Writes need the matching tenant permission
-flag, checked through ``User.has_permission`` so individual ``can_*`` flags,
-role grants (manager/admin) and group ``can_*`` flags all count. Staff and
-superusers always pass.
+flag, checked through ``User.has_permission`` so the user's own ``can_*``
+flags and role grants (manager/admin) count. ``TenantGroup`` has no ``can_*``
+fields, so group membership grants nothing here. Staff and superusers always
+pass.
 """
 from rest_framework import permissions
 

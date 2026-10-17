@@ -112,6 +112,29 @@ class TestTenantSettings(EchoDeskTenantTestCase):
         self.assertIn(self.api_patch(SETTINGS_URL, {'min_users_per_ticket': 1}).status_code, (401, 403))
 
 
+class TestTenantLanguageUpdate(EchoDeskTenantTestCase):
+    URL = '/api/tenant/language/update/'
+
+    def test_agent_and_manager_cannot_change_tenant_language(self):
+        before = current_tenant().preferred_language
+        target = 'ru' if before != 'ru' else 'ka'
+        for user in (self.create_user(email='lang-agent@test.com'),
+                     self.create_manager(email='lang-mgr@test.com')):
+            resp = self.api_put(self.URL, {'preferred_language': target}, user=user)
+            self.assertEqual(resp.status_code, 403)
+        self.assertEqual(current_tenant().preferred_language, before)
+
+    def test_staff_and_admin_role_can_change_tenant_language(self):
+        staff = self.create_user(email='lang-staff@test.com', is_staff=True)
+        resp = self.api_put(self.URL, {'preferred_language': 'ka'}, user=staff)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(current_tenant().preferred_language, 'ka')
+        admin_role = self.create_user(email='lang-adminrole@test.com', role='admin')
+        resp = self.api_patch(self.URL, {'preferred_language': 'en'}, user=admin_role)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(current_tenant().preferred_language, 'en')
+
+
 class TestTenantLogo(LocalMediaMixin, EchoDeskTenantTestCase):
 
     def logo(self, name='logo.webp', content_type='image/webp'):

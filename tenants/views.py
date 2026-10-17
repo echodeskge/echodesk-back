@@ -804,15 +804,20 @@ def get_tenant_language(request):
 @permission_classes([permissions.IsAuthenticated])
 def update_tenant_language(request):
     """
-    Update the preferred language for the current tenant
-    Only authenticated users can change the language
+    Update the preferred language for the current tenant.
+
+    The language is tenant-wide, so this needs the same permission as
+    PATCH /api/tenant-settings/ (staff, superuser or ``manage_settings``).
     """
     if not hasattr(request, 'tenant') or request.tenant.schema_name == get_public_schema_name():
         return Response(
             {'error': 'This endpoint is only available from tenant subdomains'}, 
             status=status.HTTP_403_FORBIDDEN
         )
-    
+
+    if not _can_manage_tenant_settings(request.user):
+        return Response(_SETTINGS_FORBIDDEN, status=status.HTTP_403_FORBIDDEN)
+
     language = request.data.get('preferred_language')
     
     # Validate language choice
@@ -1366,8 +1371,9 @@ class TenantViewSet(viewsets.ModelViewSet):
 
 # Tenant Settings API
 def _can_manage_tenant_settings(user):
-    """Staff, superusers and users with ``manage_settings`` (flag, admin role
-    or group flag) may change workspace settings and the logo."""
+    """Staff, superusers and users with ``manage_settings`` (their own
+    ``can_manage_settings`` flag or the admin role) may change workspace
+    settings and the logo. Groups carry no ``can_*`` flags."""
     from tickets.permissions import user_can_manage
     return user_can_manage(user, 'manage_settings')
 

@@ -110,3 +110,38 @@ class TestAdminOpenApiContract(TicketTestCase):
             self.assertTrue(names <= set(params), path)
             for name in names:
                 self.assertFalse(params[name].get('required', False), f'{path} {name}')
+
+    def test_unpaginated_actions_are_plain_arrays(self):
+        paths = self.schema()['paths']
+        for path, op_id, ref in (
+            ('/api/item-lists/{id}/root_items/', 'item_lists_root_items_retrieve', 'ListItem'),
+            ('/api/item-lists/public/', 'item_lists_public_retrieve', 'ItemList'),
+            ('/api/item-lists/{id}/public_items/', 'item_lists_public_items_retrieve', 'ListItem'),
+            ('/api/list-items/{id}/children/', 'list_items_children_retrieve', 'ListItem'),
+            ('/api/list-items/{id}/all_descendants/', 'list_items_all_descendants_retrieve', 'ListItemMinimal'),
+            ('/api/form-submissions/by_form/', 'form_submissions_by_form_retrieve', 'TicketFormSubmission'),
+        ):
+            op = paths[path]['get']
+            self.assertEqual(op['operationId'], op_id, path)
+            body = op['responses']['200']['content']['application/json']['schema']
+            self.assertEqual(body.get('type'), 'array', path)
+            self.assertEqual(body['items']['$ref'], f'#/components/schemas/{ref}', path)
+            names = {p['name'] for p in op.get('parameters', [])}
+            self.assertFalse(names & {'page', 'page_size', 'search', 'ordering',
+                                      'item_list', 'parent', 'is_active',
+                                      'form', 'ticket', 'submitted_by'}, path)
+
+    def test_tenant_settings_response_fields_required(self):
+        required = set(self.component('TenantSettings')['required'])
+        self.assertTrue({'logo', 'company_name', 'min_users_per_ticket',
+                         'only_superadmin_can_delete_tickets', 'preferred_language'} <= required)
+        patch = self.body('/api/tenant-settings/', 'patch', key='requestBody')
+        self.assertFalse(self.component(patch['$ref'].rsplit('/', 1)[-1]).get('required'))
+
+    def test_board_telegram_request_bodies(self):
+        tg = self.schema()['paths']['/api/boards/{id}/telegram-connection/']
+        post = tg['post']['requestBody']['content']['application/json']['schema']['$ref'].rsplit('/', 1)[-1]
+        self.assertIn('bot_token_raw', self.component(post)['required'])
+        self.assertIn('chat_id', self.component(post)['required'])
+        put = tg['put']['requestBody']['content']['application/json']['schema']['$ref'].rsplit('/', 1)[-1]
+        self.assertFalse(self.component(put).get('required'))

@@ -1187,3 +1187,10 @@ class BoardTelegramConnectionSerializer(serializers.ModelSerializer):
         instance.is_active = validated_data.get('is_active', instance.is_active)
         instance.save()
         return instance
+
+
+class BoardTelegramConnectionCreateSerializer(BoardTelegramConnectionSerializer):
+    """Schema-only request body for POST telegram-connection: the bot token is
+    required on create (the view enforces it via
+    ``BoardTelegramConnectionSerializer.create``)."""
+    bot_token_raw = serializers.CharField(write_only=True, required=True)

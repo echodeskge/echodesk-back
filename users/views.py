@@ -807,6 +807,10 @@ def notification_preferences_bulk_update(request):
 
     results = []
     with transaction.atomic():
+        # Lock the user's own row so two concurrent first-time PUTs for the
+        # same new type run one after the other instead of both inserting
+        # and tripping the (user, notification_type) unique constraint.
+        list(type(request.user).objects.select_for_update().filter(pk=request.user.pk).values_list('pk', flat=True))
         existing = {
             pref.notification_type: pref
             for pref in NotificationPreference.objects.select_for_update().filter(
