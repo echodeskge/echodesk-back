@@ -21,6 +21,22 @@ class Department(models.Model):
         return self.name
 
 
+def current_subscription_feature_keys():
+    """
+    Keys of the active features on the current tenant's active subscription
+    (an empty list when there is none). The tenant is the one whose schema the
+    connection is on.
+    """
+    from django.db import connection
+    from tenants.models import Tenant
+
+    tenant = Tenant.objects.filter(schema_name=connection.schema_name).first()
+    subscription = tenant.current_subscription if tenant else None
+    if not subscription or not subscription.is_active:
+        return []
+    return list(subscription.selected_features.filter(is_active=True).values_list('key', flat=True))
+
+
 class TenantGroup(models.Model):
     """Custom group model with feature-based access control"""
     name = models.CharField(max_length=150, unique=True)
@@ -274,17 +290,35 @@ class User(AbstractBaseUser):
         if role_permissions.get(permission, False):
             return True
 
-        # Check group permissions (skip if we're in public schema / admin context)
-        try:
-            for group in self.tenant_groups.filter(is_active=True):
-                group_permission_field = f'can_{permission}'
-                if hasattr(group, group_permission_field) and getattr(group, group_permission_field, False):
-                    return True
-        except Exception:
-            # Likely in public schema (admin context) where tenant_groups don't exist
-            pass
-
+        # TenantGroup carries feature keys, not ``can_*`` flags, so groups never
+        # grant one of these permissions. (A loop over the user's groups used to
+        # run here and cost one query per failed check without ever matching.)
         return False
+
+    def _active_tenant_groups(self):
+        """The user's active tenant groups, served from a prefetch when present."""
+        if 'tenant_groups' in getattr(self, '_prefetched_objects_cache', {}):
+            return [group for group in self.tenant_groups.all() if group.is_active]
+        return list(self.tenant_groups.filter(is_active=True))
+
+    def revoke_auth_tokens(self, keep=None):
+        """
+        Sign the user out everywhere: delete the shared web ``Token`` and every
+        per-device ``AuthDeviceToken``. ``keep`` (a token instance, or a list
+        of them) survives, so "sign out other devices" can spare the caller.
+
+        Returns the number of device tokens deleted.
+        """
+        from rest_framework.authtoken.models import Token
+
+        keep_list = keep if isinstance(keep, (list, tuple)) else ([keep] if keep is not None else [])
+        keep_device_keys = [t.key for t in keep_list if isinstance(t, AuthDeviceToken)]
+        keep_shared = any(isinstance(t, Token) for t in keep_list)
+
+        if not keep_shared:
+            Token.objects.filter(user=self).delete()
+        deleted, _ = AuthDeviceToken.objects.filter(user=self).exclude(key__in=keep_device_keys).delete()
+        return deleted
     
     def get_all_permissions(self):
         """Get all permissions this user has (individual + group + role-based)"""
@@ -312,7 +346,7 @@ class User(AbstractBaseUser):
         group_features = set()
 
         try:
-            for group in self.tenant_groups.filter(is_active=True):
+            for group in self._active_tenant_groups():
                 group_features.update(group.get_feature_keys())
         except Exception:
             # Likely in public schema (admin context) where tenant_groups don't exist
@@ -376,9 +410,13 @@ class User(AbstractBaseUser):
         """
         return feature_key in self.get_feature_keys()
 
-    def get_feature_keys(self):
+    def get_feature_keys(self, subscription_feature_keys=None):
         """
         Get all feature keys this user has access to
+
+        ``subscription_feature_keys`` lets a caller that serializes many users
+        compute the tenant's subscription keys once
+        (``current_subscription_feature_keys()``) instead of once per user.
 
         Returns:
             list: List of feature keys the user can access
@@ -390,25 +428,12 @@ class User(AbstractBaseUser):
             - If user has no groups, returns empty list (except superadmin)
             - Superuser gets all subscription features regardless of groups
         """
-        from django.db import connection
-        from tenants.models import Tenant
-
         try:
-            # Get tenant's subscription
-            tenant = Tenant.objects.get(schema_name=connection.schema_name)
-            subscription = tenant.current_subscription
-            if not subscription or not subscription.is_active:
+            if subscription_feature_keys is None:
+                subscription_feature_keys = current_subscription_feature_keys()
+            subscription_feature_keys = set(subscription_feature_keys)
+            if not subscription_feature_keys:
                 return []
-
-            # Get features from subscription's selected_features
-            if not subscription.selected_features.exists():
-                return []
-
-            subscription_feature_keys = set(
-                subscription.selected_features.filter(
-                    is_active=True
-                ).values_list('key', flat=True)
-            )
 
             # Superuser gets all subscription features
             if self.is_superuser:
@@ -416,7 +441,7 @@ class User(AbstractBaseUser):
 
             # Get feature keys from user's tenant groups
             group_feature_keys = set()
-            for group in self.tenant_groups.filter(is_active=True):
+            for group in self._active_tenant_groups():
                 group_feature_keys.update(group.get_feature_keys())
 
             # If user has no groups, return empty list

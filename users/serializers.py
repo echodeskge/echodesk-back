@@ -32,7 +32,22 @@ class DepartmentSerializer(serializers.ModelSerializer):
 
     @extend_schema_field(serializers.IntegerField())
     def get_employee_count(self, obj):
-        return getattr(obj, '_employee_count', obj.employees.count())
+        if hasattr(obj, '_employee_count'):
+            return obj._employee_count
+        # Nested in user rows: count every department once per request
+        # instead of once per row.
+        context = self.context
+        if isinstance(context, dict) and context.get('request') is not None:
+            counts = context.get('_department_employee_counts')
+            if counts is None:
+                from django.db.models import Count
+                counts = dict(
+                    User.objects.filter(department__isnull=False)
+                    .values_list('department').annotate(n=Count('id'))
+                )
+                context['_department_employee_counts'] = counts
+            return counts.get(obj.pk, 0)
+        return obj.employees.count()
 
 
 class GroupSerializer(serializers.ModelSerializer):
@@ -116,14 +131,18 @@ class TenantGroupSerializer(serializers.ModelSerializer):
     class Meta:
         model = TenantGroup
         fields = [
-            'id', 'name', 'description', 'is_active', 'created_at', 'updated_at',
+            'id', 'name', 'description', 'is_active', 'is_booking_staff', 'created_at', 'updated_at',
             'member_count', 'features', 'feature_keys'
         ]
         read_only_fields = ['created_at', 'updated_at', 'member_count', 'feature_keys']
 
     @extend_schema_field(serializers.IntegerField())
     def get_member_count(self, obj):
-        return getattr(obj, '_member_count', obj.members.count())
+        # Not getattr(obj, '_member_count', obj.members.count()): the default
+        # is evaluated eagerly, which ran a COUNT even for annotated rows.
+        if hasattr(obj, '_member_count'):
+            return obj._member_count
+        return obj.members.count()
 
     @extend_schema_field(serializers.ListField(child=serializers.CharField()))
     def get_feature_keys(self, obj):
@@ -142,7 +161,12 @@ class TenantGroupCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = TenantGroup
-        fields = ['name', 'description', 'feature_ids']
+        fields = ['id', 'name', 'description', 'is_active', 'is_booking_staff', 'feature_ids']
+        read_only_fields = ['id']
+        extra_kwargs = {
+            'is_active': {'required': False},
+            'is_booking_staff': {'required': False},
+        }
 
     def create(self, validated_data):
         feature_ids = validated_data.pop('feature_ids', [])
@@ -161,6 +185,10 @@ class TenantGroupCreateSerializer(serializers.ModelSerializer):
         # Update basic fields
         instance.name = validated_data.get('name', instance.name)
         instance.description = validated_data.get('description', instance.description)
+        if 'is_active' in validated_data:
+            instance.is_active = validated_data['is_active']
+        if 'is_booking_staff' in validated_data:
+            instance.is_booking_staff = validated_data['is_booking_staff']
         instance.save()
 
         # Update features if provided
@@ -311,7 +339,19 @@ class UserSerializer(serializers.ModelSerializer):
     @extend_schema_field(serializers.ListField(child=serializers.CharField()))
     def get_feature_keys(self, obj):
         """Get all feature keys this user has access to"""
-        return obj.get_feature_keys()
+        # The subscription's keys are the same for every row; look them up
+        # once per serializer context instead of once per user.
+        context = self.context
+        keys = context.get('_subscription_feature_keys') if isinstance(context, dict) else None
+        if keys is None:
+            from .models import current_subscription_feature_keys
+            try:
+                keys = current_subscription_feature_keys()
+            except Exception:
+                keys = None
+            if keys is not None and isinstance(context, dict):
+                context['_subscription_feature_keys'] = keys
+        return obj.get_feature_keys(subscription_feature_keys=keys)
 
     @extend_schema_field(USER_ALL_PERMISSIONS_SCHEMA)
     def get_all_permissions(self, obj):
@@ -431,12 +471,18 @@ class UserCreateSerializer(ManagerIdMixin, EmailUniquenessMixin, serializers.Mod
         model = User
         fields = [
             'email', 'first_name', 'last_name',
-            'role', 'status', 'phone_number', 'department_id', 'manager_id',
+            'role', 'status', 'phone_number', 'job_title', 'department_id', 'manager_id',
             'group_ids', 'tenant_group_ids', 'user_permission_ids'
         ]
         extra_kwargs = {
             'phone_number': {'required': False},
+            'job_title': {'required': False},
         }
+
+    def validate_department_id(self, value):
+        if value is not None and not Department.objects.filter(pk=value).exists():
+            raise serializers.ValidationError('Department not found.')
+        return value
 
     def create(self, validated_data):
         group_ids = validated_data.pop('group_ids', [])
@@ -460,6 +506,10 @@ class UserCreateSerializer(ManagerIdMixin, EmailUniquenessMixin, serializers.Mod
 
 class UserUpdateSerializer(ManagerIdMixin, EmailUniquenessMixin, serializers.ModelSerializer):
     """Serializer for updating users"""
+    department_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text="ID of the user's department (null clears it)"
+    )
     manager_id = serializers.IntegerField(
         required=False, allow_null=True,
         help_text="ID of the user's direct manager (null clears it)"
@@ -484,14 +534,26 @@ class UserUpdateSerializer(ManagerIdMixin, EmailUniquenessMixin, serializers.Mod
         model = User
         fields = [
             'email', 'first_name', 'last_name', 'role', 'status',
-            'phone_number', 'job_title', 'is_active', 'manager_id',
+            'phone_number', 'job_title', 'is_active', 'is_staff', 'department_id', 'manager_id',
             'group_ids', 'tenant_group_ids', 'user_permission_ids'
         ]
         extra_kwargs = {
             # PATCH is the only update path used by the UI; keep email optional
             # so other-field updates don't have to resend it.
             'email': {'required': False},
+            'is_staff': {
+                'required': False,
+                'help_text': (
+                    'Staff flag (billing, security and user admin). Only a superuser '
+                    'can change it; the value is ignored for everyone else.'
+                ),
+            },
         }
+
+    def validate_department_id(self, value):
+        if value is not None and not Department.objects.filter(pk=value).exists():
+            raise serializers.ValidationError('Department not found.')
+        return value
 
     def update(self, instance, validated_data):
         # Django auth groups / user_permissions no longer exist on User
@@ -501,11 +563,15 @@ class UserUpdateSerializer(ManagerIdMixin, EmailUniquenessMixin, serializers.Mod
         validated_data.pop('user_permission_ids', None)
         tenant_group_ids = validated_data.pop('tenant_group_ids', None)
         has_manager, manager = self.pop_manager(validated_data)
+        has_department = 'department_id' in validated_data
+        department_id = validated_data.pop('department_id', None)
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         if has_manager:
             instance.manager = manager
+        if has_department:
+            instance.department_id = department_id
         instance.save()
 
         if tenant_group_ids is not None:
@@ -523,9 +589,54 @@ class BulkUserActionSerializer(serializers.Serializer):
         ('deactivate', 'Deactivate'),
         ('delete', 'Delete'),
         ('change_role', 'Change Role'),
+        ('reset_password', 'Send a new password'),
+        ('add_to_group', 'Add to tenant group'),
+        ('remove_from_group', 'Remove from tenant group'),
     ])
-    role = serializers.ChoiceField(choices=User.ROLE_CHOICES, required=False)
-    group_id = serializers.IntegerField(required=False)
+    role = serializers.ChoiceField(
+        choices=User.ROLE_CHOICES, required=False,
+        help_text='Required for change_role.',
+    )
+    group_id = serializers.IntegerField(
+        required=False,
+        help_text='Tenant group id; required for add_to_group / remove_from_group.',
+    )
+
+    def validate(self, attrs):
+        action = attrs.get('action')
+        # change_role without a role keeps its historical
+        # {"error": "Role is required ..."} 400 from the view.
+        if action in ('add_to_group', 'remove_from_group'):
+            group_id = attrs.get('group_id')
+            if group_id is None:
+                raise serializers.ValidationError({'group_id': 'group_id is required for this action'})
+            if not TenantGroup.objects.filter(pk=group_id).exists():
+                raise serializers.ValidationError({'group_id': 'Tenant group not found'})
+        return attrs
+
+
+class BulkUserActionResponseSerializer(serializers.Serializer):
+    """Result of ``POST /api/users/bulk_action/``."""
+    message = serializers.CharField()
+    affected = serializers.IntegerField(help_text='Number of users the action was applied to.')
+    skipped_user_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        help_text='Requested users left untouched (yourself, or superusers when you are not one).',
+    )
+
+
+class UserMessageResponseSerializer(serializers.Serializer):
+    message = serializers.CharField()
+
+
+class AuthDeviceSerializer(serializers.Serializer):
+    """A signed-in device of the current user (``AuthDeviceToken``)."""
+    id = serializers.CharField(help_text='Opaque device session id (a hash prefix; never the token itself).')
+    platform = serializers.ChoiceField(choices=['web', 'ios', 'android'])
+    device_name = serializers.CharField(allow_blank=True)
+    created_at = serializers.DateTimeField()
+    last_used_at = serializers.DateTimeField(allow_null=True)
+    is_current = serializers.BooleanField(help_text='True for the device making this request.')
 
 
 class PasswordChangeSerializer(serializers.Serializer):

@@ -6,7 +6,8 @@ from .views import (
     TenantGroupViewSet, NotificationViewSet, tenant_homepage,
     TeamChatUserListView, TeamChatConversationViewSet, TeamChatMessageViewSet,
     upload_team_chat_file, team_chat_unread_count,
-    notification_preferences_list, notification_preferences_bulk_update
+    notification_preferences_list, notification_preferences_bulk_update,
+    auth_devices_list, auth_device_revoke, auth_devices_revoke_others,
 )
 
 router = DefaultRouter()
@@ -27,6 +28,11 @@ urlpatterns = [
     path('api/users/password-reset/', password_reset_request, name='password-reset-request'),
     path('api/users/password-reset/confirm/', password_reset_confirm, name='password-reset-confirm'),
     path('api/', include(router.urls)),
+
+    # Signed-in devices of the current user (mobile AuthDeviceToken sessions)
+    path('api/auth/devices/', auth_devices_list, name='auth-devices-list'),
+    path('api/auth/devices/revoke-others/', auth_devices_revoke_others, name='auth-devices-revoke-others'),
+    path('api/auth/devices/<str:id>/', auth_device_revoke, name='auth-devices-revoke'),
 
     # Notification Preferences endpoints
     path('api/notification-preferences/', notification_preferences_list, name='notification-preferences-list'),

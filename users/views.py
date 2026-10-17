@@ -1,23 +1,25 @@
 from rest_framework import viewsets, status, permissions, serializers as drf_serializers
-from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.decorators import action, api_view, permission_classes as drf_permission_classes
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction, IntegrityError
-from django.db.models import Count
+from django.db.models import Count, Prefetch
 from django.utils import timezone
 from django.conf import settings
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
-    OpenApiParameter, extend_schema, extend_schema_view, inline_serializer,
+    OpenApiParameter, OpenApiResponse, extend_schema, extend_schema_view, inline_serializer,
 )
+import hashlib
 import secrets
 import string
 import logging
+from rest_framework.authtoken.models import Token
 from .tasks import send_user_invitation_email_task, send_new_password_email_task
-from .models import Department, TenantGroup, Notification, NotificationPreference, UserOnlineStatus, TeamChatConversation, TeamChatMessage, HiddenTeamChatConversation
+from .models import AuthDeviceToken, Department, TenantGroup, Notification, NotificationPreference, UserOnlineStatus, TeamChatConversation, TeamChatMessage, HiddenTeamChatConversation
 from .serializers import (
     UserSerializer, UserCreateSerializer, UserUpdateSerializer, UserDirectorySerializer,
     GroupSerializer, GroupCreateSerializer, PermissionSerializer,
@@ -25,7 +27,8 @@ from .serializers import (
     TenantGroupSerializer, TenantGroupCreateSerializer, NotificationSerializer,
     TeamChatUserSerializer, TeamChatConversationSerializer, TeamChatConversationDetailSerializer,
     TeamChatMessageSerializer, TeamChatCreateMessageSerializer, TeamChatFileUploadSerializer,
-    NotificationPreferenceSerializer
+    NotificationPreferenceSerializer, BulkUserActionResponseSerializer, UserMessageResponseSerializer,
+    AuthDeviceSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,6 +52,18 @@ def _wants_lite(request):
     return str(value).lower() in ('1', 'true', 'yes')
 
 
+def _full_user_queryset():
+    """
+    Users with everything ``UserSerializer`` reads: nested groups come with
+    their features and a member count, so a page costs a constant number of
+    queries however many rows it has.
+    """
+    groups = TenantGroup.objects.annotate(_member_count=Count('members', distinct=True)).prefetch_related('features')
+    return User.objects.select_related('department', 'manager', 'booking_staff').prefetch_related(
+        Prefetch('tenant_groups', queryset=groups),
+    )
+
+
 def _directory_queryset():
     """Users with exactly what UserDirectorySerializer reads, nothing more."""
     return User.objects.select_related('department', 'manager').prefetch_related('tenant_groups')
@@ -56,6 +71,40 @@ def _directory_queryset():
 
 def _can_manage_users(user):
     return user.has_permission('manage_users') or user.is_staff
+
+
+# Statuses that take a user's access away; moving a user into one signs them
+# out everywhere.
+REVOKING_STATUSES = ('inactive', 'suspended')
+
+
+def _guard_target(actor, target):
+    """Only a superuser may change, reset or delete a superuser account."""
+    if target.is_superuser and not actor.is_superuser:
+        raise PermissionDenied('Only a superuser can change a superuser account.')
+
+
+def _guard_role_change(actor, current_role, new_role):
+    """Granting or removing the admin role is reserved to superusers."""
+    if not new_role or new_role == current_role:
+        return
+    if 'admin' in (current_role, new_role) and not actor.is_superuser:
+        raise PermissionDenied('Only a superuser can grant or remove the admin role.')
+
+
+def _revoke_tokens_for(user_ids):
+    """Delete the shared web token and every device token of these users."""
+    user_ids = list(user_ids)
+    if not user_ids:
+        return
+    Token.objects.filter(user_id__in=user_ids).delete()
+    AuthDeviceToken.objects.filter(user_id__in=user_ids).delete()
+
+
+ERROR_RESPONSE = inline_serializer(
+    name='UserErrorResponse',
+    fields={'error': drf_serializers.CharField()},
+)
 
 
 @extend_schema_view(
@@ -255,7 +304,7 @@ class UserViewSet(viewsets.ModelViewSet):
         if self._use_lite():
             queryset = _directory_queryset()
         else:
-            queryset = User.objects.select_related('department', 'manager', 'booking_staff').prefetch_related('tenant_groups', 'tenant_groups__features').all()
+            queryset = _full_user_queryset()
 
         # role / status / department / manager / is_active / is_staff are
         # handled by DjangoFilterBackend (filterset_fields); `group` is not a
@@ -283,6 +332,7 @@ class UserViewSet(viewsets.ModelViewSet):
         # Check if user has permission to manage users
         if not self.request.user.has_permission('manage_users') and not self.request.user.is_staff:
             raise PermissionDenied("You don't have permission to manage users")
+        _guard_role_change(self.request.user, None, serializer.validated_data.get('role'))
 
         # Generate temporary password (12 characters: letters, digits, special chars)
         alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
@@ -361,29 +411,51 @@ class UserViewSet(viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         # Check if user has permission to manage users or is updating their own profile
-        user_being_updated = self.get_object()
-        is_privileged = (
-            self.request.user.has_permission('manage_users') or
-            self.request.user.is_staff
-        )
-        if not is_privileged and user_being_updated != self.request.user:
+        actor = self.request.user
+        user_being_updated = serializer.instance
+        is_privileged = _can_manage_users(actor)
+        if not is_privileged and user_being_updated != actor:
             raise PermissionDenied("You don't have permission to manage users")
 
+        data = serializer.validated_data
         # If user is updating themselves and is not privileged, restrict to safe
         # fields (email is intentionally excluded, so only admins can change it).
-        if not is_privileged and user_being_updated == self.request.user:
+        if not is_privileged and user_being_updated == actor:
             safe_fields = {'first_name', 'last_name', 'phone_number', 'job_title'}
-            for field in list(serializer.validated_data.keys()):
+            for field in list(data.keys()):
                 if field not in safe_fields:
-                    serializer.validated_data.pop(field)
+                    data.pop(field)
+        else:
+            _guard_target(actor, user_being_updated)
+            if 'role' in data:
+                _guard_role_change(actor, user_being_updated.role, data['role'])
+            # is_staff unlocks billing, security and user admin: superusers
+            # only. Anyone else's value is dropped (the dashboard's booking-staff
+            # toggle sends it), as it always was.
+            if 'is_staff' in data and not actor.is_superuser:
+                data.pop('is_staff')
+            if user_being_updated == actor and (
+                data.get('is_active') is False or data.get('status') in REVOKING_STATUSES
+            ):
+                raise ValidationError({'error': 'You cannot deactivate or suspend your own account.'})
 
         old_email = user_being_updated.email
+        old_status = user_being_updated.status
+        old_is_active = user_being_updated.is_active
         user = serializer.save()
 
         # When an admin changes a user's email, the email is their login
         # identity, so issue a fresh password and send it to the NEW address.
-        if user.email and user.email != old_email:
+        email_changed = bool(user.email and user.email != old_email)
+        if email_changed:
             self._reset_password_and_notify(user)
+
+        lost_access = (
+            (old_is_active and not user.is_active)
+            or (user.status in REVOKING_STATUSES and old_status != user.status)
+        )
+        if email_changed or lost_access:
+            user.revoke_auth_tokens()
     
     def perform_destroy(self, instance):
         # Check if user has permission to manage users
@@ -393,83 +465,167 @@ class UserViewSet(viewsets.ModelViewSet):
         # Don't allow users to delete themselves
         if instance == self.request.user:
             raise PermissionDenied("You cannot delete your own account")
-        
+        _guard_target(self.request.user, instance)
+
         instance.delete()
     
+    @extend_schema(
+        summary='Bulk user action',
+        description=(
+            'Apply one action to several users. Needs `manage_users` or staff. '
+            '`change_role` needs `role`; `add_to_group` / `remove_from_group` need '
+            '`group_id`; `reset_password` emails each user a fresh temporary password '
+            'and signs them out. You are never deactivated, deleted or reset by your own '
+            'bulk action, and non-superusers cannot touch superusers; such ids come back '
+            'in `skipped_user_ids`. Granting the admin role (or changing an admin\'s role) '
+            'needs a superuser: granting returns 403, admins in a role change are skipped. '
+            'Deactivating signs the users out of every session.'
+        ),
+        request=BulkUserActionSerializer,
+        responses={
+            200: BulkUserActionResponseSerializer,
+            400: OpenApiResponse(description='Validation error'),
+            403: OpenApiResponse(description='No permission'),
+        },
+    )
     @action(detail=False, methods=['post'])
     def bulk_action(self, request):
         """Perform bulk actions on users"""
-        if not request.user.has_permission('manage_users') and not request.user.is_staff:
+        actor = request.user
+        if not _can_manage_users(actor):
             raise PermissionDenied('You do not have permission to manage users')
-        
+
         serializer = BulkUserActionSerializer(data=request.data)
-        if serializer.is_valid():
-            user_ids = serializer.validated_data['user_ids']
-            action_type = serializer.validated_data['action']
-            
-            users = User.objects.filter(id__in=user_ids)
-            
-            if action_type == 'activate':
-                count = users.count()
-                users.update(is_active=True, status='active')
-                message = f'Activated {count} users'
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-            elif action_type == 'deactivate':
-                count = users.count()
-                users.update(is_active=False, status='inactive')
-                message = f'Deactivated {count} users'
+        user_ids = serializer.validated_data['user_ids']
+        action_type = serializer.validated_data['action']
+        role = serializer.validated_data.get('role')
 
-            elif action_type == 'delete':
-                # Don't allow deletion of current user
-                users = users.exclude(id=request.user.id)
-                count = users.count()
-                users.delete()
-                message = f'Deleted {count} users'
+        if action_type == 'change_role':
+            if not role:
+                return Response(
+                    {'error': 'Role is required for change_role action'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            _guard_role_change(actor, None, role)
 
-            elif action_type == 'change_role':
-                role = serializer.validated_data.get('role')
-                if role:
-                    count = users.count()
-                    users.update(role=role)
-                    message = f'Changed role to {role} for {count} users'
+        users = User.objects.filter(id__in=user_ids)
+        skipped = set()
+        if not actor.is_superuser:
+            skipped.update(users.filter(is_superuser=True).values_list('id', flat=True))
+            if action_type == 'change_role':
+                skipped.update(users.filter(role='admin').values_list('id', flat=True))
+        if action_type in ('deactivate', 'delete', 'reset_password'):
+            if actor.id in user_ids:
+                skipped.add(actor.id)
+        targets = users.exclude(id__in=skipped)
+        target_ids = list(targets.values_list('id', flat=True))
+        count = len(target_ids)
+
+        if action_type == 'activate':
+            User.objects.filter(id__in=target_ids).update(is_active=True, status='active')
+            message = f'Activated {count} users'
+
+        elif action_type == 'deactivate':
+            User.objects.filter(id__in=target_ids).update(is_active=False, status='inactive')
+            _revoke_tokens_for(target_ids)
+            message = f'Deactivated {count} users'
+
+        elif action_type == 'delete':
+            User.objects.filter(id__in=target_ids).delete()
+            message = f'Deleted {count} users'
+
+        elif action_type == 'change_role':
+            User.objects.filter(id__in=target_ids).update(role=role)
+            message = f'Changed role to {role} for {count} users'
+
+        elif action_type == 'reset_password':
+            for user in User.objects.filter(id__in=target_ids):
+                self._reset_password_and_notify(user)
+            _revoke_tokens_for(target_ids)
+            message = f'Sent new passwords to {count} users'
+
+        else:  # add_to_group / remove_from_group
+            group = TenantGroup.objects.get(pk=serializer.validated_data['group_id'])
+            for user in User.objects.filter(id__in=target_ids):
+                if action_type == 'add_to_group':
+                    user.tenant_groups.add(group)
                 else:
-                    return Response(
-                        {'error': 'Role is required for change_role action'},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-            
-            return Response({'message': message})
-        
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    
+                    user.tenant_groups.remove(group)
+            verb = 'Added' if action_type == 'add_to_group' else 'Removed'
+            preposition = 'to' if action_type == 'add_to_group' else 'from'
+            message = f'{verb} {count} users {preposition} group {group.name}'
+
+        return Response({
+            'message': message,
+            'affected': count,
+            'skipped_user_ids': sorted(i for i in skipped if i in set(user_ids)),
+        })
+
+    @extend_schema(
+        summary="Change a user's password",
+        description=(
+            'Set a new password. Your own, or another user\'s with `manage_users`/staff '
+            '(superuser accounts only by a superuser). `old_password` is always YOUR '
+            'current password (re-authentication). Changing someone else\'s password '
+            'signs them out of every session.'
+        ),
+        request=PasswordChangeSerializer,
+        responses={
+            200: UserMessageResponseSerializer,
+            400: OpenApiResponse(description='Validation error'),
+            403: OpenApiResponse(description='No permission'),
+        },
+    )
     @action(detail=True, methods=['post'])
     def change_password(self, request, pk=None):
         """Change user password"""
         user = self.get_object()
 
         # Users can only change their own password unless they have manage_users permission
-        if (user != request.user and
-            not request.user.has_permission('manage_users') and
-            not request.user.is_staff):
-            raise PermissionDenied('You can only change your own password')
+        if user != request.user:
+            if not _can_manage_users(request.user):
+                raise PermissionDenied('You can only change your own password')
+            _guard_target(request.user, user)
 
         serializer = PasswordChangeSerializer(data=request.data, context={'request': request})
         if serializer.is_valid():
             user.set_password(serializer.validated_data['new_password'])
             user.save()
+            if user != request.user:
+                user.revoke_auth_tokens()
             return Response({'message': 'Password changed successfully'})
 
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+    @extend_schema(
+        summary='Email a user a new password',
+        description=(
+            'Generate a temporary password, require a change at next sign-in, email it '
+            'to the user and sign them out of every session (web and devices). Needs '
+            '`manage_users`/staff; superuser accounts only by a superuser.'
+        ),
+        request=None,
+        responses={
+            200: UserMessageResponseSerializer,
+            403: OpenApiResponse(description='No permission'),
+            500: ERROR_RESPONSE,
+        },
+    )
     @action(detail=True, methods=['post'])
     def send_new_password(self, request, pk=None):
         """Generate new password and email it to user"""
         # Check permission
-        if not request.user.has_permission('manage_users') and not request.user.is_staff:
+        if not _can_manage_users(request.user):
             raise PermissionDenied('You do not have permission to manage users')
 
         user = self.get_object()
+        _guard_target(request.user, user)
         email_sent = self._reset_password_and_notify(user)
+        # The password changed either way, so the old sessions must go.
+        user.revoke_auth_tokens()
 
         if email_sent:
             return Response({'message': 'New password sent successfully'})
@@ -485,6 +641,51 @@ TENANT_GROUP_MEMBERS_RESPONSE = inline_serializer(
         'count': drf_serializers.IntegerField(),
         'group': drf_serializers.CharField(help_text='Group name'),
         'members': UserSerializer(many=True),
+    },
+)
+
+
+GROUP_USER_IDS_REQUEST = inline_serializer(
+    name='TenantGroupUserIds',
+    fields={'user_ids': drf_serializers.ListField(child=drf_serializers.IntegerField())},
+)
+GROUP_ADD_USERS_RESPONSE = inline_serializer(
+    name='TenantGroupAddUsersResponse',
+    fields={
+        'message': drf_serializers.CharField(),
+        'added_users': drf_serializers.ListField(child=drf_serializers.EmailField()),
+    },
+)
+GROUP_REMOVE_USERS_RESPONSE = inline_serializer(
+    name='TenantGroupRemoveUsersResponse',
+    fields={
+        'message': drf_serializers.CharField(),
+        'removed_users': drf_serializers.ListField(child=drf_serializers.EmailField()),
+    },
+)
+GROUP_AVAILABLE_FEATURES_RESPONSE = inline_serializer(
+    name='TenantGroupAvailableFeaturesResponse',
+    fields={
+        'categories': inline_serializer(
+            name='TenantGroupFeatureCategory',
+            many=True,
+            fields={
+                'category': drf_serializers.CharField(),
+                'category_display': drf_serializers.CharField(),
+                'features': inline_serializer(
+                    name='TenantGroupAvailableFeature',
+                    many=True,
+                    fields={
+                        'id': drf_serializers.IntegerField(),
+                        'key': drf_serializers.CharField(),
+                        'name': drf_serializers.CharField(),
+                        'description': drf_serializers.CharField(),
+                        'icon': drf_serializers.CharField(),
+                        'sort_order': drf_serializers.IntegerField(),
+                    },
+                ),
+            },
+        ),
     },
 )
 
@@ -526,6 +727,12 @@ class TenantGroupViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("You don't have permission to manage groups")
         instance.delete()
 
+    @extend_schema(
+        summary='Add users to a group',
+        description='Needs `manage_groups` or staff.',
+        request=GROUP_USER_IDS_REQUEST,
+        responses={200: GROUP_ADD_USERS_RESPONSE, 400: ERROR_RESPONSE, 403: OpenApiResponse(description='No permission')},
+    )
     @action(detail=True, methods=['post'])
     def add_users(self, request, pk=None):
         """Add users to this tenant group"""
@@ -550,6 +757,12 @@ class TenantGroupViewSet(viewsets.ModelViewSet):
             'added_users': [user.email for user in users]
         })
     
+    @extend_schema(
+        summary='Remove users from a group',
+        description='Needs `manage_groups` or staff.',
+        request=GROUP_USER_IDS_REQUEST,
+        responses={200: GROUP_REMOVE_USERS_RESPONSE, 400: ERROR_RESPONSE, 403: OpenApiResponse(description='No permission')},
+    )
     @action(detail=True, methods=['post'])
     def remove_users(self, request, pk=None):
         """Remove users from this tenant group"""
@@ -592,9 +805,7 @@ class TenantGroupViewSet(viewsets.ModelViewSet):
             members = _directory_queryset().filter(tenant_groups=tenant_group)
             serializer = UserDirectorySerializer(members, many=True)
         else:
-            members = tenant_group.members.select_related('department', 'manager').prefetch_related(
-                'tenant_groups', 'tenant_groups__features',
-            ).all()
+            members = _full_user_queryset().filter(tenant_groups=tenant_group)
             serializer = UserSerializer(members, many=True)
 
         return Response({
@@ -603,6 +814,18 @@ class TenantGroupViewSet(viewsets.ModelViewSet):
             'members': serializer.data
         })
 
+    @extend_schema(
+        summary='Features assignable to groups',
+        description=(
+            "The tenant subscription's active features grouped by category. With "
+            '`group_id`, features already assigned to that group are included too.'
+        ),
+        parameters=[OpenApiParameter(
+            name='group_id', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False,
+            description='Group being edited.',
+        )],
+        responses={200: GROUP_AVAILABLE_FEATURES_RESPONSE, 400: ERROR_RESPONSE},
+    )
     @action(detail=False, methods=['get'])
     def available_features(self, request):
         """Get all available features that can be assigned to groups based on tenant's subscription"""
@@ -615,6 +838,13 @@ class TenantGroupViewSet(viewsets.ModelViewSet):
             tenant = request.tenant if hasattr(request, 'tenant') else None
             # Get optional group_id to include features already assigned to that group
             group_id = request.query_params.get('group_id')
+            if group_id in ('', None):
+                group_id = None
+            else:
+                try:
+                    group_id = int(group_id)
+                except (TypeError, ValueError):
+                    return Response({'error': 'group_id must be an integer'}, status=status.HTTP_400_BAD_REQUEST)
 
             if tenant and hasattr(tenant, 'schema_name') and tenant.schema_name != 'public':
                 # Get features available to this tenant through their subscription's selected_features
@@ -672,9 +902,10 @@ class TenantGroupViewSet(viewsets.ModelViewSet):
                 'categories': categories_list
             })
 
-        except Exception as e:
+        except Exception:
+            logger.exception('Failed to fetch available features')
             return Response(
-                {'error': f'Failed to fetch available features: {str(e)}'},
+                {'error': 'Failed to fetch available features'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
@@ -775,7 +1006,7 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from django.db.models import F, Q, Max, Prefetch
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
-    OpenApiParameter, extend_schema, extend_schema_view, inline_serializer,
+    OpenApiParameter, OpenApiResponse, extend_schema, extend_schema_view, inline_serializer,
 )
 
 from .notification_utils import create_team_chat_message_notification
@@ -1384,3 +1615,108 @@ def team_chat_unread_count(request):
     ).count()
 
     return Response({'count': count})
+
+
+# ---------------------------------------------------------------------------
+# Signed-in devices (per-device AuthDeviceToken sessions of the current user)
+# ---------------------------------------------------------------------------
+
+def device_session_id(key):
+    """Public id of a device session: a hash prefix, so the key never leaves."""
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def _serialize_device(token, current):
+    return {
+        'id': device_session_id(token.key),
+        'platform': token.platform,
+        'device_name': token.device_name,
+        'created_at': token.created_at,
+        'last_used_at': token.last_used_at,
+        'is_current': current is not None and isinstance(current, AuthDeviceToken) and current.key == token.key,
+    }
+
+
+@extend_schema(
+    operation_id='auth_devices_list',
+    summary='My signed-in devices',
+    description=(
+        "The current user's mobile device sessions, most recently used first. "
+        '`is_current` marks the device making the request. The web dashboard shares '
+        'one session per user and is not listed.'
+    ),
+    responses={200: AuthDeviceSerializer(many=True)},
+    tags=['Authentication'],
+)
+@api_view(['GET'])
+@drf_permission_classes([permissions.IsAuthenticated])
+def auth_devices_list(request):
+    tokens = sorted(
+        AuthDeviceToken.objects.filter(user=request.user),
+        key=lambda t: (t.last_used_at or t.created_at),
+        reverse=True,
+    )
+    data = [_serialize_device(t, request.auth) for t in tokens]
+    return Response(AuthDeviceSerializer(data, many=True).data)
+
+
+@extend_schema(
+    operation_id='auth_devices_revoke',
+    summary='Sign out a device',
+    description=(
+        'Delete one of your device sessions by its `id` from the device list. '
+        'Revoking the current device signs this app out.'
+    ),
+    request=None,
+    responses={204: None, 404: OpenApiResponse(description='No such device session')},
+    tags=['Authentication'],
+)
+@api_view(['DELETE'])
+@drf_permission_classes([permissions.IsAuthenticated])
+def auth_device_revoke(request, id):
+    for token in AuthDeviceToken.objects.filter(user=request.user):
+        if device_session_id(token.key) == id:
+            token.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+    return Response({'error': 'Device session not found'}, status=status.HTTP_404_NOT_FOUND)
+
+
+@extend_schema(
+    operation_id='auth_devices_revoke_others',
+    summary='Sign out all other devices',
+    description=(
+        'Delete every device session of yours except the one making the request. '
+        'With `include_web` (default true) the shared web dashboard session is ended '
+        'too, unless it is the session making the request.'
+    ),
+    request=inline_serializer(
+        name='RevokeOtherDevices',
+        fields={'include_web': drf_serializers.BooleanField(required=False, default=True)},
+    ),
+    responses={200: inline_serializer(
+        name='RevokeOtherDevicesResponse',
+        fields={
+            'revoked': drf_serializers.IntegerField(help_text='Device sessions deleted.'),
+            'web_session_revoked': drf_serializers.BooleanField(),
+        },
+    )},
+    tags=['Authentication'],
+)
+@api_view(['POST'])
+@drf_permission_classes([permissions.IsAuthenticated])
+def auth_devices_revoke_others(request):
+    include_web = request.data.get('include_web', True)
+    if isinstance(include_web, str):
+        include_web = include_web.lower() not in ('0', 'false', 'no', '')
+    current = request.auth
+    devices = AuthDeviceToken.objects.filter(user=request.user)
+    if isinstance(current, AuthDeviceToken):
+        devices = devices.exclude(key=current.key)
+    revoked, _ = devices.delete()
+
+    web_revoked = False
+    if include_web and not isinstance(current, Token):
+        web_revoked, _ = Token.objects.filter(user=request.user).delete()
+        web_revoked = bool(web_revoked)
+
+    return Response({'revoked': revoked, 'web_session_revoked': web_revoked})
