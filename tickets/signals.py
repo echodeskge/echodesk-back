@@ -18,6 +18,7 @@ import re
 from asgiref.sync import async_to_sync
 from django.db import connection
 from tenant_schemas.utils import schema_context
+from users.notification_texts import CATALOG as _TEXTS, T
 
 User = get_user_model()
 
@@ -189,19 +190,11 @@ def send_bug_report_notification(instance, metadata, status_key):
     if not reporter_tenant or not reporter_email:
         return
 
-    status_titles = {
-        'received': 'Bug report received',
-        'in_progress': 'Bug fix in progress',
-        'fixed': 'Bug report fixed',
-    }
-    status_messages = {
-        'received': 'Your bug report has been received and is scheduled for development.',
-        'in_progress': 'We are currently working on fixing your reported bug.',
-        'fixed': 'Your reported bug has been fixed. Thank you for the report!',
-    }
-
-    title = status_titles.get(status_key, 'Bug report update')
-    message = status_messages.get(status_key, 'Your bug report status has been updated.')
+    # Rendered in the reporter's language (their tenant's default when they
+    # have not chosen one).
+    text_key = status_key if f'bug_report.{status_key}.title' in _TEXTS else 'update'
+    title = T(f'bug_report.{text_key}.title')
+    message = T(f'bug_report.{text_key}.message')
 
     try:
         with schema_context(reporter_tenant):
@@ -240,13 +233,15 @@ def notify_on_ticket_assignment(sender, instance, created, **kwargs):
         if assigned_by and assigned_user.id == assigned_by.id:
             return
 
-        assigner_name = assigned_by.get_full_name() if assigned_by else "Someone"
+        assigner_name = assigned_by.get_full_name() if assigned_by else T('common.someone')
+        role_key = f'ticket.role.{instance.role}'
+        role = T(role_key) if role_key in _TEXTS else instance.get_role_display()
 
         create_notification(
             user=assigned_user,
             notification_type='ticket_assigned',
-            title=f'Assigned to: {ticket.title}',
-            message=f'{assigner_name} assigned you to this ticket as {instance.get_role_display()}',
+            title=T('ticket.assigned.title', ticket=ticket.title),
+            message=T('ticket.assigned.message', assigner=assigner_name, role=role),
             ticket_id=ticket.id,
             metadata={
                 'role': instance.role,
@@ -277,8 +272,8 @@ def notify_on_ticket_comment(sender, instance, created, **kwargs):
             create_notification(
                 user=mentioned_user,
                 notification_type='ticket_mentioned',
-                title=f'Mentioned in: {ticket.title}',
-                message=f'{commenter.get_full_name()} mentioned you in a comment',
+                title=T('ticket.mentioned.title', ticket=ticket.title),
+                message=T('ticket.mentioned.message', commenter=commenter.get_full_name()),
                 ticket_id=ticket.id,
                 metadata={
                     'comment_id': instance.id,
@@ -291,8 +286,8 @@ def notify_on_ticket_comment(sender, instance, created, **kwargs):
         create_notification(
             user=ticket.created_by,
             notification_type='ticket_commented',
-            title=f'New comment on: {ticket.title}',
-            message=f'{commenter.get_full_name()} added a comment',
+            title=T('ticket.commented.title', ticket=ticket.title),
+            message=T('ticket.commented.message', commenter=commenter.get_full_name()),
             ticket_id=ticket.id,
             metadata={
                 'comment_id': instance.id,
@@ -309,8 +304,8 @@ def notify_on_ticket_comment(sender, instance, created, **kwargs):
         create_notification(
             user=assigned_user,
             notification_type='ticket_commented',
-            title=f'New comment on: {ticket.title}',
-            message=f'{commenter.get_full_name()} added a comment',
+            title=T('ticket.commented.title', ticket=ticket.title),
+            message=T('ticket.commented.message', commenter=commenter.get_full_name()),
             ticket_id=ticket.id,
             metadata={
                 'comment_id': instance.id,
@@ -583,8 +578,8 @@ def notify_on_ticket_status_change(sender, instance, created, **kwargs):
             create_notification(
                 user=assigned_user,
                 notification_type='ticket_status_changed',
-                title=f'Status changed: {instance.title}',
-                message=f'Ticket status changed from "{old_column_name}" to "{new_column_name}"',
+                title=T('ticket.status_changed.title', ticket=instance.title),
+                message=T('ticket.status_changed.message', old=old_column_name, new=new_column_name),
                 ticket_id=instance.id,
                 metadata={
                     'old_status': old_column_name,
@@ -645,8 +640,8 @@ def notify_on_ticket_status_change(sender, instance, created, **kwargs):
                 create_notification(
                     user=user,
                     notification_type='ticket_assigned',
-                    title=f'Department assigned: {instance.title}',
-                    message=f'Ticket assigned to your department "{new_department.name}"',
+                    title=T('ticket.department_assigned.title', ticket=instance.title),
+                    message=T('ticket.department_assigned.message', department=new_department.name),
                     ticket_id=instance.id,
                     metadata={
                         'department_id': new_department.id,

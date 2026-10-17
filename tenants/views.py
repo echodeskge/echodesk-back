@@ -278,6 +278,13 @@ def tenant_dashboard(request):
                         'type': 'boolean',
                         'description': 'True when the user can open the leave management manager views (staff, manager role, or has direct reports)'
                     },
+                    'preferred_language': {
+                        'type': 'string', 'enum': ['en', 'ka'], 'nullable': True,
+                        'description': (
+                            "Language of server-written texts for this user (notifications, "
+                            "pushes). null = the tenant's preferred_language."
+                        ),
+                    },
                     'date_joined': {'type': 'string', 'format': 'date-time'},
                     'last_login': {'type': 'string', 'format': 'date-time'},
                     'is_active': {'type': 'boolean'},
@@ -421,6 +428,7 @@ def tenant_profile(request):
         'is_staff': user.is_staff,
         'is_superuser': user.is_superuser,
         'is_leave_manager': is_leave_manager(user),
+        'preferred_language': user.preferred_language,
         'date_joined': user.date_joined,
         'last_login': user.last_login,
         'is_active': user.is_active,
@@ -621,14 +629,21 @@ def get_subscription_me(request):
 @extend_schema(
     operation_id='update_tenant_profile',
     summary='Update User Profile',
-    description='Update current user profile information (first_name and last_name only).',
+    description=(
+        'Update current user profile information: first_name, last_name and '
+        'preferred_language ("en" | "ka" | null; null = follow the tenant language). '
+        'preferred_language sets the language of notifications and pushes for this '
+        'user; it only changes when sent here (logging in never changes it). '
+        'An unsupported language returns 400.'
+    ),
     # Raw schema dicts must sit under a media type, or drf-spectacular reads
     # their keys ('type', 'properties') as media types.
     request={'application/json': {
         'type': 'object',
         'properties': {
             'first_name': {'type': 'string'},
-            'last_name': {'type': 'string'}
+            'last_name': {'type': 'string'},
+            'preferred_language': {'type': 'string', 'enum': ['en', 'ka'], 'nullable': True},
         }
     }},
     responses={
@@ -662,6 +677,14 @@ def update_tenant_profile(request):
     data = request.data
     
     # Update allowed fields
+    if 'preferred_language' in data:
+        language = data['preferred_language'] or None
+        if language is not None and language not in ('en', 'ka'):
+            return Response(
+                {'preferred_language': ['Must be "en", "ka" or null.']},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        user.preferred_language = language
     if 'first_name' in data:
         user.first_name = data['first_name']
     if 'last_name' in data:
@@ -676,6 +699,7 @@ def update_tenant_profile(request):
             'email': user.email,
             'first_name': user.first_name,
             'last_name': user.last_name,
+            'preferred_language': user.preferred_language,
             'is_staff': user.is_staff,
             'is_superuser': user.is_superuser
         }

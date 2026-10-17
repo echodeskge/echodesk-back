@@ -336,6 +336,7 @@ def send_missed_call_notifications(call_log_id):
     re-checks the status and the queue attempt's other legs every time. A
     leg that is answered elsewhere is re-labelled ``cancelled`` instead.
     """
+    from users.notification_texts import T
     from users.notification_utils import create_notification
 
     from .models import CallLog
@@ -367,8 +368,8 @@ def send_missed_call_notifications(call_log_id):
             create_notification(
                 user=user,
                 notification_type='call_missed',
-                title='Missed call',
-                message=f'Missed inbound call from {call_log.caller_number}',
+                title=T('call.missed.title'),
+                message=T('call.missed.message', number=call_log.caller_number),
                 metadata=dict(metadata),
                 link_url=link_url,
             )

@@ -192,6 +192,18 @@ class User(AbstractBaseUser):
         help_text="Can configure social media integration settings"
     )
 
+    # Language of the texts the server writes for this user (notifications,
+    # pushes). Null = follow the tenant's preferred_language. Only an explicit
+    # profile / user update sets it; logging in never does.
+    LANGUAGE_CHOICES = [
+        ('en', 'English'),
+        ('ka', 'Georgian'),
+    ]
+    preferred_language = models.CharField(
+        max_length=5, choices=LANGUAGE_CHOICES, null=True, blank=True, default=None,
+        help_text="Language for notifications and pushes (en/ka). Empty = the tenant's language.",
+    )
+
     # Group membership
     tenant_groups = models.ManyToManyField(TenantGroup, blank=True, related_name='members')
     

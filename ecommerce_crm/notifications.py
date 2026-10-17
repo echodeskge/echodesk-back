@@ -135,13 +135,15 @@ LOW_STOCK_LIST_LINK = '/ecommerce/products?stock=low_or_out&status=active'
 
 def notify_order_created(order):
     """New cash-on-delivery order. Sent once per order."""
+    from users.notification_texts import T
+
     if _already_sent(ORDER_CREATED, 'order_id', order.id):
         return 0
-    name = order.contact_name or 'A customer'
+    name = order.contact_name or T('order.a_customer')
     return _fan_out(
         ORDER_CREATED,
-        title=f'New order {order.order_number}',
-        message=f'{name} ordered {order.total_amount} {CURRENCY} (cash on delivery)',
+        title=T('order.created.title', number=order.order_number),
+        message=T('order.created.message', name=name, amount=order.total_amount, currency=CURRENCY),
         metadata=_order_metadata(order),
         link_url=order_link(order.id),
     )
@@ -149,40 +151,55 @@ def notify_order_created(order):
 
 def notify_order_paid(order):
     """Order payment cleared. Sent once per order."""
+    from users.notification_texts import T
+
     if _already_sent(ORDER_PAID, 'order_id', order.id):
         return 0
-    name = order.contact_name or 'A customer'
+    name = order.contact_name or T('order.a_customer')
     return _fan_out(
         ORDER_PAID,
-        title=f'Order {order.order_number} paid',
-        message=f'{name} paid {order.total_amount} {CURRENCY}',
+        title=T('order.paid.title', number=order.order_number),
+        message=T('order.paid.message', name=name, amount=order.total_amount, currency=CURRENCY),
         metadata=_order_metadata(order),
         link_url=order_link(order.id),
     )
 
 
 def notify_low_stock(products, total_count=None):
-    """One digest notification for the products that are low on stock."""
+    """One digest notification for the products that are low on stock.
+
+    Texts are rendered per recipient; product names ({en, ka} dicts) follow
+    the recipient's language too."""
+    from users.notification_texts import LazyText, T
+
     products = list(products)
     if not products:
         return 0
     total = total_count if total_count is not None else len(products)
 
-    def _name(p):
+    def _name(p, language='en'):
         if isinstance(p.name, dict):
-            return p.name.get('en') or next(iter(p.name.values()), p.sku) or p.sku
+            return (
+                p.name.get(language) or p.name.get('en')
+                or next((v for v in p.name.values() if v), p.sku) or p.sku
+            )
         return str(p.name or p.sku)
 
     if total == 1:
         product = products[0]
-        title = f'Low stock: {_name(product)}'
-        message = f'{product.sku} has {product.quantity} left (alert at {product.low_stock_threshold})'
+        title = T('stock.low_one.title', name=LazyText(lambda language: _name(product, language)))
+        message = T(
+            'stock.low_one.message', sku=product.sku, quantity=product.quantity,
+            threshold=product.low_stock_threshold,
+        )
         link = product_link(product.id)
     else:
-        names = ', '.join(_name(p) for p in products[:3])
-        more = f' and {total - 3} more' if total > 3 else ''
-        title = f'{total} products are low on stock'
-        message = f'{names}{more}'
+        names = LazyText(lambda language: ', '.join(_name(p, language) for p in products[:3]))
+        title = T('stock.low_many.title', count=total)
+        if total > 3:
+            message = T('stock.low_many.message_more', names=names, count=total - 3)
+        else:
+            message = T('stock.low_many.message', names=names)
         link = LOW_STOCK_LIST_LINK
     metadata = {
         'product_ids': [p.id for p in products[:50]],

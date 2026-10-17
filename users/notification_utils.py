@@ -74,9 +74,16 @@ def reset_unread(user, tenant_schema=None):
 # ---------------------------------------------------------------------------
 
 def create_notification(user, notification_type, title, message, ticket_id=None,
-                        metadata=None, link_url=''):
+                        metadata=None, link_url='', language=None):
     """
     Create a Notification row, broadcast it over WebSocket, and send a Web Push.
+
+    ``title`` / ``message`` are plain strings (stored as-is) or
+    ``users.notification_texts`` LocalizedText / LazyText values, rendered
+    here in the recipient's language (``language`` overrides it; default
+    ``user_language(user)``: User.preferred_language → tenant language →
+    'ka'). The stored row, the WebSocket event and the push all carry the
+    same rendered texts.
 
     Includes duplicate / batching logic (Phase 5): within a 30-second window for
     the same user + type + ticket, the existing notification is updated rather
@@ -84,6 +91,7 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
     """
     from users.models import Notification, NotificationPreference
     from users.consumers import send_notification_to_user
+    from users.notification_texts import T, normalize_language, render, user_language
     from asgiref.sync import async_to_sync
     from django.utils.timesince import timesince
 
@@ -104,6 +112,11 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
 
     if not should_create_in_app:
         return None  # User disabled this notification type
+
+    # --- Render the texts in the recipient's language ---
+    language = normalize_language(language) or user_language(user, tenant_schema)
+    title = render(title, language)
+    message = render(message, language)
 
     # --- Phase 5: batching / debounce (30-second window) ---
     recent_filter = {
@@ -135,7 +148,8 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
         # Update the existing notification instead of creating a new one
         batch_count = recent.metadata.get('batch_count', 1) + 1
         recent.title = title
-        recent.message = f"{message} (+{batch_count - 1} more)"
+        more = render(T('common.batch_more', count=batch_count - 1), language)
+        recent.message = f"{message} {more}"
         recent.metadata['batch_count'] = batch_count
         recent.metadata.update(metadata)
         recent.is_read = False  # Re-mark as unread
@@ -308,16 +322,20 @@ def has_open_team_chat_socket(user):
     ).exists()
 
 
-def team_chat_message_preview(message):
+def team_chat_message_preview(message, language='en'):
     """Short, human-readable preview of a team chat message for notifications."""
+    from users.notification_texts import T, render
+
     text = (message.text or '').strip()
     if message.message_type == 'image':
-        return text[:TEAM_CHAT_PREVIEW_LENGTH] if text else 'Sent a photo'
+        return text[:TEAM_CHAT_PREVIEW_LENGTH] if text else render(T('team_chat.photo'), language)
     if message.message_type == 'voice':
-        return 'Sent a voice message'
+        return render(T('team_chat.voice'), language)
     if message.message_type == 'file':
         name = message.file_name or ''
-        return f'Sent a file: {name}'[:TEAM_CHAT_PREVIEW_LENGTH] if name else 'Sent a file'
+        if not name:
+            return render(T('team_chat.file'), language)
+        return render(T('team_chat.file_named', name=name), language)[:TEAM_CHAT_PREVIEW_LENGTH]
     return text[:TEAM_CHAT_PREVIEW_LENGTH]
 
 
@@ -349,12 +367,14 @@ def create_team_chat_message_notification(message, recipient=None):
     if has_open_team_chat_socket(recipient):
         return None
 
+    from users.notification_texts import LazyText
+
     title = sender.get_full_name() or sender.email
     return create_notification(
         user=recipient,
         notification_type='team_chat_message',
         title=title,
-        message=team_chat_message_preview(message),
+        message=LazyText(lambda language: team_chat_message_preview(message, language)),
         ticket_id=None,
         metadata={
             'conversation_id': message.conversation_id,
@@ -416,6 +436,15 @@ def users_with_feature(feature_key):
     ).distinct()
 
 
+def platform_label(platform):
+    """Platform display name for notification texts: localized where the
+    name is a word ('Widget', 'Email'), the brand name otherwise."""
+    from users.notification_texts import CATALOG, T
+
+    key = f'social.platform.{platform}'
+    return T(key) if key in CATALOG else (platform or '')
+
+
 def build_social_chat_id(platform, account_id, conversation_key):
     """Prefixed inbox chat id (``fb_<page>_<psid>``, ``wa_<waba>_<phone>``,
     ``tg_<account>_<peer>``, ``widget_<conn>_<session>`` …) or None."""
@@ -464,16 +493,23 @@ def create_social_message_notification(platform, sender_name, message_text,
     Metadata (also copied into the push ``data``): platform (display name,
     e.g. 'Facebook'), platform_key (lowercase), conversation_id (unprefixed
     key mark-read clears by), chat_id, sender_id, sender_name, account_id.
+
+    The title is rendered per recipient language; ``sender_name`` and
+    ``message_text`` may be LocalizedText (e.g. the widget's "Website
+    visitor …" / "Sent an attachment" fallbacks). Metadata keeps the English
+    sender_name.
     """
-    title = f"New {platform} message from {sender_name}"
-    msg = (message_text or '')[:100]
+    from users.notification_texts import T, render, truncate
+
+    title = T('social.message.title', platform=platform_label(platform), sender=sender_name)
+    msg = truncate(message_text or '', 100)
     chat_id = build_social_chat_id(platform, account_id, chat_conversation_key or sender_id)
     meta = {
         'platform': platform,
         'platform_key': (platform or '').lower(),
         'conversation_id': conversation_id,
         'chat_id': chat_id,
-        'sender_name': sender_name,
+        'sender_name': render(sender_name, 'en'),
         'sender_id': sender_id,
         'account_id': account_id,
     }
@@ -509,9 +545,12 @@ def create_ai_handoff_notification(platform, conversation_id, account_id,
     inbox. The link deep-links into the exact chat so the agent lands where
     the AI stopped.
     """
-    display_name = sender_name or 'a customer'
-    title = f"AI needs a human: {platform} chat with {display_name}"
-    msg = (reason or 'The AI assistant asked for a human to take over.')[:200]
+    from users.notification_texts import T, truncate
+
+    display_name = sender_name or T('social.a_customer')
+    title = T('social.ai_handoff.title', platform=platform_label(platform), customer=display_name)
+    # The AI's own reason is free text and stays as written.
+    msg = truncate(reason or T('social.ai_handoff.default_reason'), 200)
     chat_id = build_social_chat_id(platform, account_id, conversation_id)
     meta = {
         'platform': platform,
