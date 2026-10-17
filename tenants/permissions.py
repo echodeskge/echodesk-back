@@ -133,6 +133,9 @@ def check_subscription_limit(request, limit_type):
         }
 
     if limit_type == 'users':
+        # Recount live: the stored counter is not trustworthy on its own
+        # (bulk updates, hand-created tenants). Updates it in place too.
+        _refresh_user_count(subscription)
         current = subscription.current_users
         # Feature-based subscription: use agent_count as limit
         limit = subscription.agent_count or float('inf')
@@ -166,6 +169,18 @@ def check_subscription_limit(request, limit_type):
     }
 
 
+def _refresh_user_count(subscription):
+    """Sync ``subscription.current_users`` with the live billable count."""
+    import logging
+    from .user_count import sync_subscription_user_count
+    try:
+        sync_subscription_user_count(subscription.tenant, subscription=subscription)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            'Failed to recount users for subscription %s', subscription.pk
+        )
+
+
 def get_subscription_info(request):
     """
     Get complete subscription information for the tenant
@@ -183,6 +198,9 @@ def get_subscription_info(request):
             'has_subscription': False,
             'error': 'No active subscription found'
         }
+
+    # Live user count (also persisted) so 'usage' and 'usage_limits' agree.
+    _refresh_user_count(subscription)
 
     # Build subscription info
     subscription_data = {
