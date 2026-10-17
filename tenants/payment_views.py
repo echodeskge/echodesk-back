@@ -17,6 +17,7 @@ from .models import (
     SubscriptionEvent, PaymentRetrySchedule
 )
 from .bog_payment import bog_service
+from .serializers import SavedCardSerializer
 from .services import SingleFrontendDeploymentService
 from .email_service import email_service
 from .subscription_utils import schedule_payment_retries, cancel_pending_retries
@@ -101,14 +102,16 @@ def trigger_tenant_processing(schema_name):
     operation_id='create_subscription_payment',
     summary='Create Subscription Payment',
     description='Create a payment session for subscribing to or upgrading a package',
-    request={
+    # Raw schema dicts must sit under a media type, or drf-spectacular reads
+    # their keys ('type', 'properties') as media types.
+    request={'application/json': {
         'type': 'object',
         'properties': {
             'package_id': {'type': 'integer'},
             'agent_count': {'type': 'integer', 'default': 1},
         },
         'required': ['package_id']
-    },
+    }},
     responses={
         200: OpenApiResponse(
             description='Payment session created',
@@ -1844,8 +1847,8 @@ def reactivate_subscription_payment(request):
     summary='Get Saved Payment Card',
     description='Retrieve the saved payment card for the current tenant',
     responses={
-        200: OpenApiResponse(description='Saved card details'),
-        404: OpenApiResponse(description='No saved card found')
+        200: SavedCardSerializer(many=True),
+        403: OpenApiResponse(description='Not staff'),
     },
     tags=['Payments']
 )
@@ -2317,14 +2320,31 @@ def add_ecommerce_card(request):
 @extend_schema(
     operation_id='list_invoices',
     summary='List Invoices',
-    description='Get list of invoices for the current tenant',
+    description='Subscription invoices of the current tenant. Staff or superuser only.',
     responses={
         200: inline_serializer(
             name='InvoiceListResponse',
             fields={
-                'invoices': serializers.ListField(child=serializers.DictField())
+                'invoices': inline_serializer(
+                    name='SubscriptionInvoice', many=True,
+                    fields={
+                        'id': serializers.IntegerField(),
+                        'invoice_number': serializers.CharField(),
+                        'amount': serializers.FloatField(),
+                        'currency': serializers.CharField(),
+                        'description': serializers.CharField(),
+                        'package_name': serializers.CharField(allow_null=True),
+                        'agent_count': serializers.IntegerField(),
+                        'invoice_date': serializers.DateTimeField(),
+                        'paid_date': serializers.DateTimeField(allow_null=True),
+                        'due_date': serializers.DateField(allow_null=True),
+                        'pdf_url': serializers.CharField(allow_blank=True),
+                        'pdf_generated': serializers.BooleanField(),
+                    },
+                ),
             }
         ),
+        403: OpenApiResponse(description='Not staff/superuser'),
     },
     tags=['Payments']
 )
@@ -2334,6 +2354,13 @@ def list_invoices(request):
     """
     Get list of invoices for the current tenant
     """
+    # Billing history is for the people who manage billing.
+    if not (request.user.is_staff or request.user.is_superuser):
+        return Response(
+            {'error': 'Only administrators can view invoices'},
+            status=status.HTTP_403_FORBIDDEN
+        )
+
     try:
         # Get invoices for the current tenant
         invoices = Invoice.objects.filter(tenant=request.tenant).select_related('payment_order')

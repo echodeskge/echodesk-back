@@ -3,6 +3,7 @@ from django.contrib.auth import get_user_model, authenticate
 from rest_framework.authtoken.models import Token
 from .models import Tenant, SavedCard, TenantSubscription, DashboardAppearanceSettings, SecurityLog, TenantIPWhitelist
 import re
+from drf_spectacular.utils import extend_schema_field
 
 User = get_user_model()
 
@@ -454,6 +455,7 @@ class SecurityLogSerializer(serializers.ModelSerializer):
         )
         read_only_fields = fields
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_user_email(self, obj):
         """Get user email - primarily from attempted_email since we store it on login"""
         # attempted_email is always populated on login, so use that
@@ -472,6 +474,7 @@ class TenantIPWhitelistSerializer(serializers.ModelSerializer):
         )
         read_only_fields = ('id', 'created_by', 'created_by_email', 'created_at', 'updated_at')
 
+    @extend_schema_field(serializers.EmailField(allow_null=True))
     def get_created_by_email(self, obj):
         """Get creator email if exists"""
         if obj.created_by:

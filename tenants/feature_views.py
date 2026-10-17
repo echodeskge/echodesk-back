@@ -6,6 +6,8 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view, permission_classes as drf_permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework import serializers
+from drf_spectacular.utils import extend_schema, inline_serializer, OpenApiResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from datetime import timedelta
@@ -22,6 +24,7 @@ from .feature_serializers import (
 )
 from .subscription_service import SubscriptionService
 from .bog_payment import bog_service
+from .security_views import IsStaffOrSuperUser
 import logging
 import uuid
 
@@ -152,8 +155,60 @@ class TenantPermissionViewSet(viewsets.ReadOnlyModelViewSet):
 # TenantPermission (above) shows which permissions are available to grant based on package features
 
 
+# Subscription changes move money (prorated charges) and change what every
+# user can use, so they are limited to staff / superusers -- the same people
+# the dashboard shows the Subscription settings page to.
+BILLING_PERMISSIONS = [IsAuthenticated, IsStaffOrSuperUser]
+
+_ERROR = inline_serializer(name='SubscriptionErrorResponse', fields={'error': serializers.CharField()})
+_FORBIDDEN = OpenApiResponse(description='Not staff/superuser')
+
+_FEATURE_REF = inline_serializer(
+    name='SubscriptionFeatureRef',
+    fields={
+        'id': serializers.IntegerField(),
+        'key': serializers.CharField(),
+        'name': serializers.CharField(),
+        'price_per_user_gel': serializers.FloatField(required=False),
+    },
+)
+
+
+@extend_schema(
+    operation_id='add_feature_to_subscription',
+    summary='Add a feature to the subscription',
+    description=(
+        'Staff or superuser only. When a prorated charge is due (and `charge_immediately` '
+        'is not false) nothing changes yet: the response has `requires_payment: true` and a '
+        '`payment_url` to complete. Otherwise the feature is added at once (`success: true`).'
+    ),
+    request=inline_serializer(
+        name='AddSubscriptionFeature',
+        fields={
+            'feature_id': serializers.IntegerField(),
+            'charge_immediately': serializers.BooleanField(required=False, default=True),
+        },
+    ),
+    responses={
+        200: inline_serializer(
+            name='AddSubscriptionFeatureResponse',
+            fields={
+                'success': serializers.BooleanField(),
+                'message': serializers.CharField(),
+                'requires_payment': serializers.BooleanField(required=False),
+                'payment_url': serializers.URLField(required=False),
+                'feature': _FEATURE_REF,
+                'prorated_cost': serializers.FloatField(),
+                'new_monthly_cost': serializers.FloatField(required=False),
+                'days_remaining': serializers.IntegerField(),
+            },
+        ),
+        400: _ERROR, 403: _FORBIDDEN, 404: _ERROR, 500: _ERROR,
+    },
+    tags=['Subscription'],
+)
 @api_view(['POST'])
-@drf_permission_classes([IsAuthenticated])
+@drf_permission_classes(BILLING_PERMISSIONS)
 def add_feature_to_subscription(request):
     """
     Add a feature to the tenant's subscription
@@ -346,8 +401,31 @@ def add_feature_to_subscription(request):
     return Response(response_data)
 
 
+@extend_schema(
+    operation_id='remove_feature_from_subscription',
+    summary='Remove a feature from the subscription',
+    description='Staff or superuser only. Core features cannot be removed.',
+    request=inline_serializer(
+        name='RemoveSubscriptionFeature',
+        fields={'feature_id': serializers.IntegerField()},
+    ),
+    responses={
+        200: inline_serializer(
+            name='RemoveSubscriptionFeatureResponse',
+            fields={
+                'success': serializers.BooleanField(),
+                'message': serializers.CharField(),
+                'feature': _FEATURE_REF,
+                'cost_reduction': serializers.FloatField(),
+                'new_monthly_cost': serializers.FloatField(),
+            },
+        ),
+        400: _ERROR, 403: _FORBIDDEN, 404: _ERROR,
+    },
+    tags=['Subscription'],
+)
 @api_view(['POST'])
-@drf_permission_classes([IsAuthenticated])
+@drf_permission_classes(BILLING_PERMISSIONS)
 def remove_feature_from_subscription(request):
     """
     Remove a feature from the tenant's subscription
@@ -427,8 +505,34 @@ def remove_feature_from_subscription(request):
     })
 
 
+@extend_schema(
+    operation_id='update_agent_count',
+    summary='Change the subscription agent count',
+    description='Staff or superuser only.',
+    request=inline_serializer(
+        name='UpdateAgentCount',
+        fields={'agent_count': serializers.IntegerField(min_value=1)},
+    ),
+    responses={
+        200: inline_serializer(
+            name='UpdateAgentCountResponse',
+            fields={
+                'success': serializers.BooleanField(),
+                'message': serializers.CharField(),
+                'old_agent_count': serializers.IntegerField(),
+                'new_agent_count': serializers.IntegerField(),
+                'old_monthly_cost': serializers.FloatField(),
+                'new_monthly_cost': serializers.FloatField(),
+                'prorated_difference': serializers.FloatField(),
+                'days_remaining': serializers.IntegerField(),
+            },
+        ),
+        400: _ERROR, 403: _FORBIDDEN,
+    },
+    tags=['Subscription'],
+)
 @api_view(['PUT'])
-@drf_permission_classes([IsAuthenticated])
+@drf_permission_classes(BILLING_PERMISSIONS)
 def update_agent_count(request):
     """
     Update the agent count for the subscription
@@ -498,8 +602,42 @@ def update_agent_count(request):
     })
 
 
+@extend_schema(
+    operation_id='get_available_features',
+    summary='Features available to add to the subscription',
+    description=(
+        'Staff or superuser only. `features_by_category` maps a category display name '
+        'to its features, with pricing for the current agent count.'
+    ),
+    responses={
+        200: inline_serializer(
+            name='SubscriptionAvailableFeatures',
+            fields={
+                'agent_count': serializers.IntegerField(),
+                'features_by_category': serializers.DictField(
+                    child=inline_serializer(
+                        name='SubscriptionAvailableFeature', many=True,
+                        fields={
+                            'id': serializers.IntegerField(),
+                            'key': serializers.CharField(),
+                            'name': serializers.CharField(),
+                            'description': serializers.CharField(),
+                            'price_per_user_gel': serializers.FloatField(),
+                            'price_unlimited_gel': serializers.FloatField(allow_null=True),
+                            'monthly_cost_for_current_agents': serializers.FloatField(),
+                            'is_selected': serializers.BooleanField(),
+                            'icon': serializers.CharField(),
+                        },
+                    ),
+                ),
+            },
+        ),
+        400: _ERROR, 403: _FORBIDDEN,
+    },
+    tags=['Subscription'],
+)
 @api_view(['GET'])
-@drf_permission_classes([IsAuthenticated])
+@drf_permission_classes(BILLING_PERMISSIONS)
 def get_available_features(request):
     """
     Get all available features that can be added to subscription
