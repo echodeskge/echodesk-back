@@ -90,6 +90,30 @@ python manage.py createsuperuser
 python manage.py runserver
 ```
 
+### **Demo tenant (local data for every module)**
+
+```bash
+python manage.py seed_demo_tenant            # idempotent: re-running never duplicates rows
+python manage.py seed_demo_tenant --reset    # drop the demo schema and seed it again
+```
+
+Creates tenant schema `demo` on `demo.api.lvh.me` (set `API_DOMAIN=api.lvh.me`,
+`MAIN_DOMAIN=lvh.me`) with every feature enabled and sample data in tickets,
+leave, invoices, bookings, e-commerce, social inbox (Facebook / Instagram /
+WhatsApp / Telegram / website widget), calls, team chat and notifications.
+Social, e-mail and PBX connections are DB rows with fake tokens; nothing calls
+an external service.
+
+| Login | Role |
+|---|---|
+| `admin@demo.ge` | superuser + staff, admin |
+| `manager@demo.ge` | manager (leave manager of agent) |
+| `agent@demo.ge` | agent |
+| `staff1@demo.ge` … `staff6@demo.ge` | extra team members |
+
+Password for every demo user: **`Demo12345!`**. The command refuses to touch a
+tenant it did not create.
+
 ### **Frontend Setup**
 
 ```bash
