@@ -30,6 +30,18 @@ class LeaveSettingsSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['tenant', 'created_at', 'updated_at']
 
+    def validate(self, attrs):
+        # One settings row per tenant (OneToOne): a second POST used to
+        # raise an IntegrityError (500). PATCH/PUT the existing row instead.
+        if self.instance is None:
+            request = self.context.get('request')
+            tenant = getattr(request, 'tenant', None)
+            if tenant is not None and LeaveSettings.objects.filter(tenant=tenant).exists():
+                raise serializers.ValidationError(
+                    'Leave settings already exist for this organization; update them instead'
+                )
+        return attrs
+
 
 # ============================================================================
 # LEAVE TYPE SERIALIZERS
@@ -43,7 +55,9 @@ class LeaveTypeListSerializer(serializers.ModelSerializer):
         model = LeaveType
         fields = [
             'id', 'code', 'name', 'name_display', 'is_paid',
-            'requires_approval', 'color', 'is_active', 'sort_order'
+            'requires_approval', 'color', 'is_active', 'sort_order',
+            'calculation_method', 'default_days_per_year', 'accrual_rate_per_month',
+            'max_carry_forward_days', 'carry_forward_expiry_months',
         ]
 
     def get_name_display(self, obj):
@@ -102,9 +116,10 @@ class LeaveTypeCreateUpdateSerializer(serializers.ModelSerializer):
         ]
 
     def validate_code(self, value):
-        """Ensure code is unique within tenant"""
+        """Ensure code is unique within tenant (codes are stored upper-case)"""
+        value = value.upper()
         tenant = self.context['request'].tenant
-        queryset = LeaveType.objects.filter(tenant=tenant, code=value)
+        queryset = LeaveType.objects.filter(tenant=tenant, code__iexact=value)
 
         if self.instance:
             queryset = queryset.exclude(pk=self.instance.pk)
@@ -112,19 +127,27 @@ class LeaveTypeCreateUpdateSerializer(serializers.ModelSerializer):
         if queryset.exists():
             raise serializers.ValidationError(f"Leave type with code '{value}' already exists")
 
-        return value.upper()
+        return value
+
+    def _current(self, attrs, field, default):
+        """Submitted value, else the stored one (PATCH), else the default."""
+        if field in attrs:
+            return attrs[field]
+        if self.instance is not None:
+            return getattr(self.instance, field)
+        return default
 
     def validate(self, attrs):
         """Validate calculation method fields"""
-        calculation_method = attrs.get('calculation_method', self.instance.calculation_method if self.instance else 'annual')
+        calculation_method = self._current(attrs, 'calculation_method', 'annual')
 
         if calculation_method == 'annual':
-            if attrs.get('default_days_per_year', 0) <= 0:
+            if (self._current(attrs, 'default_days_per_year', 0) or 0) <= 0:
                 raise serializers.ValidationError({
                     'default_days_per_year': 'Must be greater than 0 for annual calculation'
                 })
         elif calculation_method == 'accrual':
-            if attrs.get('accrual_rate_per_month', 0) <= 0:
+            if (self._current(attrs, 'accrual_rate_per_month', 0) or 0) <= 0:
                 raise serializers.ValidationError({
                     'accrual_rate_per_month': 'Must be greater than 0 for accrual calculation'
                 })
@@ -250,6 +273,7 @@ class LeaveRequestDetailSerializer(serializers.ModelSerializer):
             'manager_approver', 'manager_approver_name', 'manager_approved_at',
             'manager_comments', 'hr_approver', 'hr_approver_name', 'hr_approved_at',
             'hr_comments', 'final_approver', 'final_approver_name', 'final_approved_at',
+            'final_comments',
             'rejected_by', 'rejected_by_name', 'rejected_at', 'rejection_reason',
             'cancelled_at', 'cancellation_reason', 'attachment', 'created_at', 'updated_at'
         ]
@@ -424,23 +448,27 @@ class LeaveRequestUpdateSerializer(serializers.ModelSerializer):
         return attrs
 
     def update(self, instance, validated_data):
-        """Update request and adjust pending balance if days changed"""
+        """Update request and adjust pending balance if days or year changed"""
+        from django.db import transaction
+
         old_days = instance.total_days
+        old_year = instance.start_date.year
 
-        # Update instance
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
-        instance.save()
-
-        # Adjust pending balance if total days changed
-        if 'total_days' in validated_data:
-            new_days = validated_data['total_days']
-            if new_days != old_days:
-                # Remove old pending amount
+        with transaction.atomic():
+            # Release the OLD pending amount before anything changes. (This
+            # used to run after the new day count was set, so it removed the
+            # new count and added it straight back: a net change of zero.)
+            new_days = validated_data.get('total_days', old_days)
+            new_start = validated_data.get('start_date', instance.start_date)
+            moves = new_days != old_days or new_start.year != old_year
+            if moves:
                 update_leave_balance(instance, action='cancel')
-                # Set instance total_days to new value
-                instance.total_days = new_days
-                # Add new pending amount
+
+            for attr, value in validated_data.items():
+                setattr(instance, attr, value)
+            instance.save()
+
+            if moves:
                 update_leave_balance(instance, action='pending')
 
         return instance
@@ -462,6 +490,56 @@ class LeaveApprovalSerializer(serializers.Serializer):
 class LeaveCancellationSerializer(serializers.Serializer):
     """Serializer for cancelling leave requests"""
     reason = serializers.CharField(required=False, allow_blank=True)
+
+
+class LeaveActionResponseSerializer(serializers.Serializer):
+    """Body returned by the admin approve / reject / cancel / initialize actions"""
+    success = serializers.BooleanField()
+    message = serializers.CharField()
+    status = serializers.ChoiceField(
+        choices=LeaveRequest.STATUS_CHOICES, required=False,
+        help_text='New request status (approve, reject and cancel only)'
+    )
+
+
+class LeaveErrorResponseSerializer(serializers.Serializer):
+    """Error body of the leave actions"""
+    error = serializers.CharField()
+
+
+class CarryForwardRequestSerializer(serializers.Serializer):
+    """Input of the carry forward action"""
+    from_year = serializers.IntegerField(min_value=2000, max_value=2100)
+    to_year = serializers.IntegerField(
+        min_value=2000, max_value=2100,
+        help_text='Must be from_year + 1'
+    )
+    force = serializers.BooleanField(
+        required=False, default=False,
+        help_text='Superusers only: recompute a carry forward that already ran '
+                  '(overwrites the carried forward days of to_year)'
+    )
+
+    def validate(self, attrs):
+        if attrs['to_year'] != attrs['from_year'] + 1:
+            raise serializers.ValidationError({'to_year': 'to_year must be from_year + 1'})
+        return attrs
+
+
+class CarryForwardResponseSerializer(serializers.Serializer):
+    """Outcome of the carry forward action"""
+    success = serializers.BooleanField()
+    message = serializers.CharField()
+    already_run = serializers.BooleanField(
+        help_text='True when this year was already carried forward and nothing changed'
+    )
+    carried_forward = serializers.IntegerField(
+        help_text='Balances that received carried forward days in this call (0 when already_run)'
+    )
+    from_year = serializers.IntegerField()
+    to_year = serializers.IntegerField()
+    run_at = serializers.DateTimeField(help_text='When the carry forward for from_year (last) ran')
+    total_days = serializers.DecimalField(max_digits=8, decimal_places=1)
 
 
 # ============================================================================
@@ -538,8 +616,19 @@ class LeaveApprovalChainSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         """Ensure unique level per leave type and tenant"""
         tenant = self.context['request'].tenant
-        leave_type = attrs.get('leave_type')
-        level = attrs['level']
+        # On PATCH the omitted fields keep their stored values (this used to
+        # raise KeyError on a missing 'level' and treat a missing leave_type
+        # as "all leave types").
+        if 'leave_type' in attrs:
+            leave_type = attrs['leave_type']
+        else:
+            leave_type = self.instance.leave_type if self.instance else None
+        if 'level' in attrs:
+            level = attrs['level']
+        elif self.instance is not None:
+            level = self.instance.level
+        else:
+            raise serializers.ValidationError({'level': 'This field is required.'})
 
         queryset = LeaveApprovalChain.objects.filter(
             tenant=tenant,

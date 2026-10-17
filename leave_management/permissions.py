@@ -127,8 +127,12 @@ class CanManageLeaveBalances(permissions.BasePermission):
         if request.user.is_staff or request.user.is_superuser:
             return True
 
-        # HR role has access
-        if request.user.has_perm('leave_management.manage_balances'):
+        # HR role has access. The codename is the one LeaveBalance.Meta
+        # defines (it used to check a non-existent 'manage_balances'). Note
+        # that in a tenant schema has_perm resolves through
+        # User.has_permission, which has no leave permissions yet, so in
+        # practice this is staff / superuser only.
+        if request.user.has_perm('leave_management.manage_leave_balances'):
             return True
 
         return False

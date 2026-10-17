@@ -3,6 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
+from django.db import transaction
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema, OpenApiParameter
 
@@ -16,7 +17,7 @@ from .permissions import (
     HasLeaveManagementFeature, IsLeaveManager, CanApproveLeave
 )
 from .utils import (
-    update_leave_balance, get_next_approver_role,
+    update_leave_balance, get_next_approver_role, apply_approval_step,
     team_q, filter_by_status_in
 )
 
@@ -126,21 +127,12 @@ class ManagerLeaveRequestViewSet(viewsets.ReadOnlyModelViewSet):
 
         comments = serializer.validated_data.get('comments', '')
 
-        leave_request.manager_approver = request.user
-        leave_request.manager_approved_at = timezone.now()
-        leave_request.manager_comments = comments
-        leave_request.status = 'manager_approved'
-
-        # Check if this is final approval (no HR approval required)
-        next_role_after = get_next_approver_role(leave_request)
-        if not next_role_after:
-            leave_request.status = 'approved'
-            leave_request.final_approver = request.user
-            leave_request.final_approved_at = timezone.now()
-            # Update balance from pending to used
-            update_leave_balance(leave_request, action='approve')
-
-        leave_request.save()
+        # Records the manager step; when no HR/admin step follows it also
+        # finalises the request and moves the days from pending to used.
+        with transaction.atomic():
+            apply_approval_step(leave_request, request.user, comments)
+            leave_request._leave_actor = request.user
+            leave_request.save()
 
         return Response({
             'success': True,
@@ -171,6 +163,7 @@ class ManagerLeaveRequestViewSet(viewsets.ReadOnlyModelViewSet):
         leave_request.rejected_by = request.user
         leave_request.rejected_at = timezone.now()
         leave_request.rejection_reason = serializer.validated_data.get('comments', '')
+        leave_request._leave_actor = request.user
         leave_request.save()
 
         # Remove from pending balance

@@ -338,67 +338,125 @@ def process_accrual(user, leave_type, tenant, current_date=None):
     return days_to_accrue
 
 
-def carry_forward_balances(tenant, from_year, to_year):
+def carryable_days(balance, leave_type):
     """
-    Carry forward unused leave balances from one year to next
+    Days of ``balance`` that may move to the next year: what is left of the
+    year's allowance (allocated + carried in - used; pending requests are
+    NOT subtracted, they belong to the old year and are settled there),
+    capped at the leave type's max_carry_forward_days.
+    """
+    remaining = balance.allocated_days + balance.carried_forward_days - balance.used_days
+    if remaining <= 0:
+        return Decimal('0')
+    return min(remaining, Decimal(str(leave_type.max_carry_forward_days)))
 
-    Args:
-        tenant: Tenant object
-        from_year: Year to carry forward from
-        to_year: Year to carry forward to
+
+class CarryForwardAlreadyRun(Exception):
+    """Raised when a carry forward for the year already ran and force is off."""
+
+    def __init__(self, run):
+        super().__init__(f'Carry forward from {run.from_year} already ran')
+        self.run = run
+
+
+def carry_forward_balances(tenant, from_year, to_year, user=None, force=False):
+    """
+    Carry forward unused leave balances from one year to the next.
+
+    Idempotent: the run is recorded in LeaveCarryForwardRun (one row per
+    tenant and from_year). A second run raises CarryForwardAlreadyRun unless
+    ``force`` is set; a forced run recomputes and OVERWRITES the carried
+    forward days of the target year, so it never double counts.
+
+    Each target balance's ``carried_forward_days`` is set to (not increased
+    by) the carryable amount, so re-applying gives the same result.
 
     Returns:
-        int: Number of balances carried forward
+        tuple: (LeaveCarryForwardRun, int balances_updated)
     """
-    from .models import LeaveBalance, LeaveType
+    from .models import LeaveBalance, LeaveType, LeaveCarryForwardRun
 
-    carried_forward = 0
+    from_year = int(from_year)
+    to_year = int(to_year)
 
-    # Get all leave types that allow carry forward
-    leave_types = LeaveType.objects.filter(
-        tenant=tenant,
-        is_active=True,
-        max_carry_forward_days__gt=0
-    )
+    with transaction.atomic():
+        run = (
+            LeaveCarryForwardRun.objects.select_for_update()
+            .filter(tenant=tenant, from_year=from_year)
+            .first()
+        )
+        if run is not None and not force:
+            raise CarryForwardAlreadyRun(run)
 
-    for leave_type in leave_types:
-        # Get all balances for from_year
-        old_balances = LeaveBalance.objects.filter(
+        carried_forward = 0
+        total_days = Decimal('0')
+
+        leave_types = LeaveType.objects.filter(
             tenant=tenant,
-            leave_type=leave_type,
-            year=from_year
+            is_active=True,
+            max_carry_forward_days__gt=0
         )
 
-        for old_balance in old_balances:
-            # Calculate unused days
-            unused_days = old_balance.available_days
+        for leave_type in leave_types:
+            old_balances = LeaveBalance.objects.filter(
+                tenant=tenant,
+                leave_type=leave_type,
+                year=from_year
+            )
 
-            if unused_days > 0:
-                # Limit to max carry forward
-                carry_forward_days = min(
-                    unused_days,
-                    Decimal(str(leave_type.max_carry_forward_days))
-                )
+            for old_balance in old_balances:
+                carry_days = carryable_days(old_balance, leave_type)
 
-                # Create or update balance for new year
-                new_balance, created = LeaveBalance.objects.get_or_create(
+                new_balance = LeaveBalance.objects.select_for_update().filter(
                     tenant=tenant,
-                    user=old_balance.user,
+                    user_id=old_balance.user_id,
                     leave_type=leave_type,
                     year=to_year,
-                    defaults={
-                        'allocated_days': leave_type.default_days_per_year,
-                        'carried_forward_days': carry_forward_days
-                    }
-                )
+                ).first()
 
-                if not created:
-                    new_balance.carried_forward_days += carry_forward_days
-                    new_balance.save()
+                if new_balance is None:
+                    if carry_days <= 0:
+                        continue
+                    LeaveBalance.objects.create(
+                        tenant=tenant,
+                        user_id=old_balance.user_id,
+                        leave_type=leave_type,
+                        year=to_year,
+                        allocated_days=(
+                            leave_type.default_days_per_year
+                            if leave_type.calculation_method == 'annual'
+                            else Decimal('0')
+                        ),
+                        carried_forward_days=carry_days,
+                    )
+                elif new_balance.carried_forward_days != carry_days:
+                    new_balance.carried_forward_days = carry_days
+                    new_balance.save(update_fields=['carried_forward_days', 'updated_at'])
+                elif carry_days <= 0:
+                    continue
 
-                carried_forward += 1
+                if carry_days > 0:
+                    carried_forward += 1
+                    total_days += carry_days
 
-    return carried_forward
+        if run is None:
+            run = LeaveCarryForwardRun.objects.create(
+                tenant=tenant,
+                from_year=from_year,
+                to_year=to_year,
+                run_by=user,
+                balances_count=carried_forward,
+                total_days=total_days,
+            )
+        else:
+            run.to_year = to_year
+            run.run_by = user
+            run.balances_count = carried_forward
+            run.total_days = total_days
+            run.forced_runs += 1
+            run.save()
+
+    return run, carried_forward
 
 
 def get_approval_chain(leave_request):
@@ -451,6 +509,31 @@ def get_approval_chain(leave_request):
     return [{'level': item.level, 'role': item.approver_role} for item in chain]
 
 
+# Approval progress. A request moves pending -> manager_approved ->
+# hr_approved -> approved; each status says which roles have signed off.
+# Chain steps are matched by ROLE (not by their numeric level), so an
+# HR-only chain stored at level 1 or 2 behaves the same and an 'admin' step
+# after HR is never skipped.
+APPROVAL_STATUS_RANK = {
+    'pending': 0,
+    'manager_approved': 1,
+    'hr_approved': 2,
+}
+APPROVER_ROLE_RANK = {
+    'manager': 1,
+    'hr': 2,
+    'admin': 3,
+}
+# Status a request gets once a step of the given role signs off. 'admin' is
+# always the last possible step, so it ends the chain.
+ROLE_APPROVED_STATUS = {
+    'manager': 'manager_approved',
+    'hr': 'hr_approved',
+    'admin': 'approved',
+}
+OPEN_APPROVAL_STATUSES = tuple(APPROVAL_STATUS_RANK)
+
+
 def get_next_approver_role(leave_request):
     """
     Determine the next required approver role based on current status
@@ -459,27 +542,71 @@ def get_next_approver_role(leave_request):
         leave_request: LeaveRequest object
 
     Returns:
-        str or None: Next approver role ('manager', 'hr', 'admin') or None if fully approved
+        str or None: Next approver role ('manager', 'hr', 'admin') or None if
+        fully approved, closed (approved/rejected/cancelled) or no approval
+        is required.
     """
+    current_rank = APPROVAL_STATUS_RANK.get(leave_request.status)
+    if current_rank is None:
+        # approved / rejected / cancelled: nothing left to approve. (This
+        # used to fall back to rank 0 and report 'manager' for an approved
+        # request, so the final approval never moved the balance.)
+        return None
+
     chain = get_approval_chain(leave_request)
 
     if not chain:
         return None
 
-    status_to_level = {
-        'pending': 0,
-        'manager_approved': 1,
-        'hr_approved': 2,
-    }
-
-    current_level = status_to_level.get(leave_request.status, 0)
-
-    # Find next required level
     for approval in chain:
-        if approval['level'] > current_level:
+        role_rank = APPROVER_ROLE_RANK.get(approval['role'], APPROVER_ROLE_RANK['admin'])
+        if role_rank > current_rank:
             return approval['role']
 
     return None  # All approvals completed
+
+
+def apply_approval_step(leave_request, user, comments=''):
+    """
+    Record ``user``'s approval of the next open step on ``leave_request``.
+
+    Sets the approver fields for the step's role, moves the status forward
+    and, when no step is left, finalises the request: status 'approved',
+    final approver recorded, pending days moved to used days. The caller
+    saves the request (inside its own transaction).
+
+    Returns the role of the step that was approved (None when the request
+    needed no approval at all and was approved directly).
+    """
+    now = timezone.now()
+    role = get_next_approver_role(leave_request)
+
+    if role == 'manager':
+        leave_request.manager_approver = user
+        leave_request.manager_approved_at = now
+        leave_request.manager_comments = comments or ''
+        leave_request.status = 'manager_approved'
+    elif role == 'hr':
+        leave_request.hr_approver = user
+        leave_request.hr_approved_at = now
+        leave_request.hr_comments = comments or ''
+        leave_request.status = 'hr_approved'
+    elif role == 'admin':
+        leave_request.final_approver = user
+        leave_request.final_approved_at = now
+        leave_request.final_comments = comments or ''
+        leave_request.status = 'approved'
+
+    if leave_request.status == 'approved' or get_next_approver_role(leave_request) is None:
+        leave_request.status = 'approved'
+        if not leave_request.final_approver_id:
+            leave_request.final_approver = user
+            leave_request.final_approved_at = now
+            if role is None:
+                leave_request.final_comments = comments or ''
+        update_leave_balance(leave_request, action='approve')
+
+    return role
 
 
 def can_user_approve(user, leave_request):
