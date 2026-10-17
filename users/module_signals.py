@@ -8,6 +8,7 @@ module is not installed.  Registered via UsersConfig.ready().
 from django.db.models.signals import post_save, pre_save
 from django.dispatch import receiver
 from django.contrib.auth import get_user_model
+from django.db.models import Q
 
 User = get_user_model()
 
@@ -137,14 +138,67 @@ try:
             return
 
         old_status = getattr(instance, '_old_status', None)
+        if old_status == instance.status:
+            return
 
-        # Approved (any approved state)
-        if old_status not in ('approved', 'manager_approved', 'hr_approved') and instance.status in ('approved', 'manager_approved', 'hr_approved'):
+        # Set by the views on the request object before saving; used to keep
+        # the person who acted out of their own notifications.
+        actor = getattr(instance, '_leave_actor', None)
+        actor_id = getattr(actor, 'pk', None)
+        period = f'{instance.start_date} - {instance.end_date}'
+        employee_name = instance.employee.get_full_name() or instance.employee.email
+
+        # Partial approval (pending -> manager_approved -> hr_approved): tell
+        # the employee it moved on, and the next approver it is their turn.
+        if instance.status in ('manager_approved', 'hr_approved'):
+            from leave_management.utils import get_next_approver_role
+
+            stage = 'manager' if instance.status == 'manager_approved' else 'HR'
+            next_role = get_next_approver_role(instance)
+            next_label = {'manager': 'manager', 'hr': 'HR', 'admin': 'admin'}.get(next_role, 'final')
+            if instance.employee_id != actor_id:
+                create_notification(
+                    user=instance.employee,
+                    notification_type='leave_request_progress',
+                    title='Leave request partially approved',
+                    message=(
+                        f'Your leave request for {period} was approved by {stage}; '
+                        f'it now awaits {next_label} approval'
+                    ),
+                    metadata={
+                        'leave_request_id': instance.id,
+                        'status': instance.status,
+                        'next_approver_role': next_role,
+                    },
+                    link_url=f'/leave/my-requests?id={instance.id}',
+                )
+
+            if next_role:
+                for approver, link in _leave_next_approvers(instance, next_role, actor_id):
+                    create_notification(
+                        user=approver,
+                        notification_type='leave_request_awaiting_approval',
+                        title=f'Leave request awaiting {next_label} approval',
+                        message=f'{employee_name} has a leave request ({instance.leave_type}) for {period} waiting for your approval',
+                        metadata={
+                            'leave_request_id': instance.id,
+                            'employee_name': employee_name,
+                            'leave_type': str(instance.leave_type),
+                            'start_date': str(instance.start_date),
+                            'end_date': str(instance.end_date),
+                            'status': instance.status,
+                            'next_approver_role': next_role,
+                        },
+                        link_url=link,
+                    )
+
+        # Final approval
+        if instance.status == 'approved':
             create_notification(
                 user=instance.employee,
                 notification_type='leave_request_approved',
                 title='Leave request approved',
-                message=f'Your leave request for {instance.start_date} - {instance.end_date} has been approved',
+                message=f'Your leave request for {period} has been approved',
                 metadata={
                     'leave_request_id': instance.id,
                     'status': instance.status,
@@ -153,18 +207,85 @@ try:
             )
 
         # Rejected
-        if old_status != 'rejected' and instance.status == 'rejected':
+        if instance.status == 'rejected':
             create_notification(
                 user=instance.employee,
                 notification_type='leave_request_rejected',
                 title='Leave request rejected',
-                message=f'Your leave request for {instance.start_date} - {instance.end_date} has been rejected',
+                message=f'Your leave request for {period} has been rejected',
                 metadata={
                     'leave_request_id': instance.id,
                     'rejection_reason': instance.rejection_reason or '',
                 },
                 link_url=f'/leave/my-requests?id={instance.id}',
             )
+
+        # Cancelled: the employee (when someone else cancelled it) and the
+        # people who already approved it or were due to approve it.
+        if instance.status == 'cancelled':
+            metadata = {
+                'leave_request_id': instance.id,
+                'previous_status': old_status,
+                'cancellation_reason': instance.cancellation_reason or '',
+            }
+            if instance.employee_id != actor_id:
+                create_notification(
+                    user=instance.employee,
+                    notification_type='leave_request_cancelled',
+                    title='Leave request cancelled',
+                    message=f'Your leave request for {period} has been cancelled',
+                    metadata=metadata,
+                    link_url=f'/leave/my-requests?id={instance.id}',
+                )
+            recipients = {}
+            for approver in (instance.manager_approver, instance.hr_approver, instance.final_approver):
+                if approver is not None:
+                    recipients[approver.pk] = approver
+            if old_status == 'pending' and not recipients:
+                manager = instance.employee.manager
+                if manager is not None:
+                    recipients[manager.pk] = manager
+            for approver in recipients.values():
+                if approver.pk in (actor_id, instance.employee_id) or not approver.is_active:
+                    continue
+                create_notification(
+                    user=approver,
+                    notification_type='leave_request_cancelled',
+                    title='Leave request cancelled',
+                    message=f"{employee_name}'s leave request for {period} has been cancelled",
+                    metadata={**metadata, 'employee_name': employee_name},
+                    link_url=_leave_approver_link(approver, instance.id),
+                )
+
+    def _leave_approver_link(user, leave_request_id):
+        """Staff open the admin list, managers their team list."""
+        if user.is_staff or user.is_superuser:
+            return f'/leave/all-requests?id={leave_request_id}'
+        return f'/leave/team-requests?id={leave_request_id}'
+
+    def _leave_next_approvers(instance, next_role, actor_id):
+        """
+        (user, link_url) pairs for whoever acts on the next approval step.
+
+        - manager: the employee's active manager, else up to 10 staff users
+          (same rule as for a new request), linking to the team list;
+        - hr / admin: up to 10 active staff or superusers (HR means staff
+          until tenant groups can grant the leave permissions), linking to
+          the admin list.
+        """
+        exclude = {instance.employee_id}
+        if actor_id:
+            exclude.add(actor_id)
+
+        if next_role == 'manager':
+            manager = instance.employee.manager
+            if manager and manager.is_active and manager.pk not in exclude:
+                return [(manager, f'/leave/team-requests?id={instance.id}')]
+
+        approvers = User.objects.filter(
+            Q(is_staff=True) | Q(is_superuser=True), is_active=True
+        ).exclude(id__in=exclude).order_by('id')[:10]
+        return [(u, _leave_approver_link(u, instance.id)) for u in approvers]
 
 except ImportError:
     pass
