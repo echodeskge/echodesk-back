@@ -185,7 +185,7 @@ class DemoSeeder:
         assert connection.schema_name == self.schema, 'run() must be called inside the tenant schema'
         from booking_management.models import Service
         from crm.models import CallLog, InboundRoute
-        from ecommerce_crm.models import Product
+        from ecommerce_crm.models import EcommerceSettings, Product
         from invoices.models import Invoice
         from leave_management.models import LeaveType
         from social_integrations.models import FacebookPageConnection
@@ -198,6 +198,9 @@ class DemoSeeder:
             self._module('tickets', Board.objects.filter(name='Customer Support').exists(), self.seed_tickets)
             self._module('leave', LeaveType.objects.filter(tenant=self.tenant, code='VAC').exists(), self.seed_leave)
             self._module('ecommerce', Product.objects.filter(sku='DEMO-001').exists(), self.seed_ecommerce)
+            # Separate module so demo tenants seeded before it existed get topped up.
+            self._module('store_settings', EcommerceSettings.objects.filter(
+                tenant=self.tenant).exclude(store_name='').exists(), self.seed_store_settings)
             self._module('invoices', Invoice.objects.filter(invoice_number__startswith='DEMO-').exists(), self.seed_invoices)
             self._module('bookings', Service.objects.filter(name__en='Classic haircut').exists(), self.seed_bookings)
             self._module('social', FacebookPageConnection.objects.filter(page_id=self._ext('fb-page')).exists(), self.seed_social)
@@ -752,6 +755,47 @@ class DemoSeeder:
             rating, title, content = review_texts[i % len(review_texts)]
             ProductReview.objects.create(product=sellable[i % 8], client=clients[i], rating=rating, title=title,
                                          content=content, is_verified_purchase=i % 2 == 0, is_approved=i != 7)
+
+    def seed_store_settings(self):
+        """Store info, payment / delivery options, tax and storefront look for
+        ``/api/ecommerce/admin/settings/`` (web /settings/ecommerce, mobile
+        Store settings). Never any gateway credential: client ids stay blank and
+        no secret is set, so only cash on delivery is active. Card payments stay
+        off, but the return URLs are filled in so they can be switched on from
+        the phone without tripping the serializer's return-URL check.
+        """
+        from ecommerce_crm.models import EcommerceSettings
+
+        storefront = f'https://{self.schema}.lvh.me'
+        EcommerceSettings.objects.update_or_create(tenant=self.tenant, defaults={
+            'store_name': 'EchoDesk Demo Store',
+            'store_email': demo_email('shop'),
+            'store_phone': '+995 32 200 01 11',
+            'ecommerce_payment_provider': 'bog',
+            'active_payment_providers': ['cash'],
+            'enable_cash_on_delivery': True,
+            'enable_card_payment': False,
+            'bog_return_url_success': f'{storefront}/payment/success',
+            'bog_return_url_fail': f'{storefront}/payment/fail',
+            'allow_pickup': True,
+            # Courier integration needs a real API key, so it stays off; the
+            # pickup point is plain address data the web form shows.
+            'quickshipper_enabled': False,
+            'quickshipper_pickup_contact_name': 'Nino Beridze',
+            'quickshipper_pickup_phone': '+995 555 100 001',
+            'quickshipper_pickup_address': '12 Rustaveli Ave',
+            'quickshipper_pickup_city': 'Tbilisi',
+            'quickshipper_pickup_latitude': Decimal('41.697000'),
+            'quickshipper_pickup_longitude': Decimal('44.799000'),
+            'quickshipper_pickup_extra_instructions': 'Shop entrance from the courtyard, 1st floor.',
+            # Georgian VAT: 18 %, included in shelf prices.
+            'tax_rate': Decimal('18.00'),
+            'tax_inclusive': True,
+            'tax_label': 'VAT',
+            'theme_preset': 'rounded',
+            'homepage_variant': 'modern',
+            'storefront_template': 'classic',
+        })
 
     # --------------------------------------------------------------- invoices
     def seed_invoices(self):
@@ -1322,7 +1366,8 @@ def demo_counts(tenant):
         CallLog, CallRecording, InboundRoute, PbxSettings, Queue, QueueMember, Trunk, UserPhoneAssignment,
     )
     from ecommerce_crm.models import (
-        EcommerceClient, Language, Order, Product, ProductReview, ProductVariant, PromoCode, ShippingMethod,
+        EcommerceClient, EcommerceSettings, Language, Order, Product, ProductReview, ProductVariant, PromoCode,
+        ShippingMethod,
     )
     from invoices.models import Invoice, InvoicePayment
     from leave_management.models import LeaveBalance, LeaveRequest, LeaveType, PublicHoliday
@@ -1362,6 +1407,7 @@ def demo_counts(tenant):
         'variants': ProductVariant.objects.count(),
         'promo_codes': PromoCode.objects.count(),
         'shipping_methods': ShippingMethod.objects.count(),
+        'ecommerce_settings': EcommerceSettings.objects.filter(tenant=tenant).count(),
         'ecommerce_clients': EcommerceClient.objects.count(),
         'orders': Order.objects.count(),
         'reviews': ProductReview.objects.count(),
