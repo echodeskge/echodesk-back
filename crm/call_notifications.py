@@ -5,8 +5,10 @@
 *transitions* into ``missed``/``no_answer``. The actual fan-out runs a few
 seconds later (Celery countdown) so that, with a ring-all queue where every
 ringing browser logged its own row, we can see whether a colleague picked
-the call up in the meantime. If one did, the row is re-labelled ``ended``
-(it rang here but was answered elsewhere) and nobody is notified.
+the call up in the meantime. If one did, the row is re-labelled
+``cancelled`` (it rang here but was answered elsewhere; counted neither as
+answered nor as missed) and nobody is notified. The task is queued only
+after the saving transaction commits.
 
 Recipients, in order:
 1. the call's ``handled_by`` user (the agent whose phone rang);
@@ -20,7 +22,7 @@ from datetime import timedelta
 
 from django.conf import settings
 
-from .call_status import MISSED_STATUSES, last_digits
+from .call_status import ANSWERED_ELSEWHERE_STATUS, MISSED_STATUSES, last_digits
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +32,21 @@ MISSED_CALL_NOTIFY_DELAY = getattr(settings, 'MISSED_CALL_NOTIFY_DELAY', 15)
 # Two inbound rows from the same caller started this close together are
 # treated as legs of the same ring-all call.
 SIBLING_WINDOW = timedelta(seconds=120)
+# Clock/latency slack when comparing one leg's timestamps with another's.
+SIBLING_SLACK = timedelta(seconds=5)
 
 
 def find_answered_sibling(call_log):
-    """Another inbound leg of the same call that somebody answered."""
+    """Another inbound leg of the same call that somebody answered.
+
+    A leg counts only when it was still live while this one rang: it had
+    not ended before this leg started, and it was answered no later than
+    this leg ended. So a caller who is answered, hangs up and calls back
+    unanswered within the window still gets a missed call.
+    """
+    from django.db.models import Q
+    from django.utils import timezone
+
     from .models import CallLog
 
     digits = last_digits(call_log.caller_number)
@@ -44,6 +57,9 @@ def find_answered_sibling(call_log):
         answered_at__isnull=False,
         started_at__gte=call_log.started_at - SIBLING_WINDOW,
         started_at__lte=call_log.started_at + SIBLING_WINDOW,
+    ).filter(
+        Q(ended_at__isnull=True) | Q(ended_at__gte=call_log.started_at - SIBLING_SLACK),
+        answered_at__lte=(call_log.ended_at or timezone.now()) + SIBLING_SLACK,
     ).exclude(pk=call_log.pk)
     if len(digits) >= 7:
         qs = qs.filter(caller_number__endswith=digits)
@@ -122,7 +138,7 @@ def send_missed_call_notifications(call_log_id):
     if sibling is not None:
         # It rang here but a colleague answered it: not a missed call.
         # queryset.update() so the post_save signal does not fire again.
-        CallLog.objects.filter(pk=call_log.pk).update(status='ended')
+        CallLog.objects.filter(pk=call_log.pk).update(status=ANSWERED_ELSEWHERE_STATUS)
         CallEvent.objects.create(
             call_log=call_log,
             event_type='ended',
@@ -160,12 +176,18 @@ def send_missed_call_notifications(call_log_id):
 
 
 def schedule_missed_call_notification(call_log_id):
-    """Queue :func:`send_missed_call_notifications` after a short delay."""
-    from django.db import connection
-
-    from .tasks import notify_missed_call
+    """Queue :func:`send_missed_call_notifications` after a short delay,
+    once the current transaction commits (a rolled-back save queues
+    nothing)."""
+    from django.db import connection, transaction
 
     schema = getattr(connection, 'schema_name', None) or 'public'
+    transaction.on_commit(lambda: _enqueue_missed_call_notification(call_log_id, schema))
+
+
+def _enqueue_missed_call_notification(call_log_id, schema):
+    from .tasks import notify_missed_call
+
     try:
         notify_missed_call.apply_async(
             args=[call_log_id, schema], countdown=MISSED_CALL_NOTIFY_DELAY,
@@ -175,4 +197,7 @@ def schedule_missed_call_notification(call_log_id):
             raise
         # Broker unreachable: notify inline rather than lose the alert.
         logger.warning('Celery unavailable, sending call_missed inline', exc_info=True)
-        send_missed_call_notifications(call_log_id)
+        from tenant_schemas.utils import schema_context
+
+        with schema_context(schema):
+            send_missed_call_notifications(call_log_id)

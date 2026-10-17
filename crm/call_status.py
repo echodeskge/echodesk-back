@@ -11,6 +11,10 @@ single definition used by the stats endpoints, the legacy
   call was picked up (``answered_at`` set or a positive duration).
 * missed (inbound only): status missed/no_answer, or a legacy ``ended`` row
   that was never picked up (no ``answered_at``, zero/empty duration).
+
+A ring-all leg that rang here while a colleague answered the call is saved
+as ``cancelled`` (see :data:`ANSWERED_ELSEWHERE_STATUS`), which neither
+definition counts, so one handled call does not show up as N-1 missed ones.
 """
 
 from datetime import timedelta
@@ -18,6 +22,9 @@ from datetime import timedelta
 from django.db.models import Q
 
 MISSED_STATUSES = ('missed', 'no_answer')
+# Status of an inbound leg that rang here but was answered by a colleague
+# (ring-all queue). Not answered here and not missed: excluded from both.
+ANSWERED_ELSEWHERE_STATUS = 'cancelled'
 # Statuses that mean the call is over; end_call refuses these.
 FINAL_STATUSES = ('ended', 'missed', 'failed', 'cancelled', 'no_answer', 'busy', 'transferred')
 

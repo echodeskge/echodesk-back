@@ -21,14 +21,15 @@ from .serializers import (
     UserPhoneAssignmentSerializer, UserPhoneAssignmentDetailSerializer,
     PbxSettingsSerializer, ConsultationInitiateSerializer, MergeConferenceSerializer,
     CallRatingSerializer, MySoftphoneConfigSerializer, SOFTPHONE_CONTEXT_KEY,
-    CallEndRequestSerializer,
+    CallEndSerializer,
 )
 from .permissions import (
     HasIpCallingFeature, IsPbxAdmin, IsPbxAdminOrReadOnly, CanViewCallStats,
     is_pbx_admin,
 )
 from .filters import CallLogFilter, UserPhoneAssignmentFilter
-from .call_status import answered_q, missed_q, FINAL_STATUSES
+from .recording_hosts import is_allowed_recording_url
+from .call_status import ANSWERED_ELSEWHERE_STATUS, answered_q, missed_q, FINAL_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +185,17 @@ def _softphone_credentials(user, sip_config):
     return sip_config.username, sip_config.password, None
 
 
+def _may_use_shared_account(user, sip_config):
+    """Whether ``user`` (who has no extension on ``sip_config``) may get the
+    configuration's shared SIP account. PBX admins may; everyone else only on
+    a legacy single-account tenant: the config is the default one and the
+    tenant has no extensions at all. Once extensions exist the shared
+    password is never handed to agents."""
+    if is_pbx_admin(user):
+        return True
+    return bool(sip_config.is_default) and not UserPhoneAssignment.objects.exists()
+
+
 def _softphone_config_data(sip_config, username, password, request):
     return SipConfigurationDetailSerializer(
         sip_config,
@@ -232,8 +244,9 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
             "The SIP / ICE settings a softphone needs for this configuration. "
             "``username``/``password`` are the caller's own credentials: their "
             "active extension on this configuration, or the configuration's "
-            "shared account when they have none (only for the default "
-            "configuration, or for PBX admins). ``user_assignments`` is always []."
+            "shared account when they have none (PBX admins, or on the default "
+            "configuration of a tenant that has no extensions at all; otherwise "
+            "both are ''). ``user_assignments`` is always []."
         ),
         responses={
             200: SipConfigurationDetailSerializer,
@@ -252,9 +265,9 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
             )
 
         username, password, assignment = _softphone_credentials(request.user, sip_config)
-        if assignment is None and not (sip_config.is_default or is_pbx_admin(request.user)):
-            # No extension on a non-default config: do not hand out its
-            # shared account to agents.
+        if assignment is None and not _may_use_shared_account(request.user, sip_config):
+            # No extension of their own: do not hand the shared account
+            # to agents (see _may_use_shared_account).
             username, password = '', ''
         return Response(_softphone_config_data(sip_config, username, password, request))
 
@@ -322,8 +335,9 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
             "The caller's own primary active extension with the SIP / ICE "
             "settings to register it. When the caller has no extension, the "
             "tenant's default active configuration is returned with its shared "
-            "account as ``extension``/``extension_password`` and ``id: null``. "
-            "404 when neither exists. Never contains other users' credentials."
+            "account as ``extension``/``extension_password`` and ``id: null``, "
+            "but only to PBX admins or on a tenant with no extensions at all. "
+            "404 otherwise. Never contains other users' credentials."
         ),
         responses={200: MySoftphoneConfigSerializer, 404: OpenApiTypes.OBJECT},
     )
@@ -353,7 +367,7 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
 
         # Fallback: return default config without assignment
         default_config = SipConfiguration.objects.filter(is_default=True, is_active=True).first()
-        if default_config:
+        if default_config and _may_use_shared_account(request.user, default_config):
             return Response({
                 'id': None,
                 'user': request.user.id,
@@ -368,6 +382,11 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
                 'is_active': True,
             })
 
+        if default_config:
+            return Response(
+                {'detail': 'No phone extension is assigned to you'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         return Response({'detail': 'No SIP configuration found'}, status=status.HTTP_404_NOT_FOUND)
 
 
@@ -400,6 +419,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
     ViewSet for managing call logs with SIP integration.
 
     Handles both inbound and outbound calls, call status updates, and call history.
+    PUT/PATCH by a non-PBX-admin may change only ``notes`` (403 naming the
+    other fields otherwise).
     """
     serializer_class = CallLogSerializer
     # Every agent with ip_calling sees the tenant's call log (web parity);
@@ -442,13 +463,31 @@ class CallLogViewSet(viewsets.ModelViewSet):
         elif self.action == 'initiate_call':
             return CallInitiateSerializer
         elif self.action == 'end_call':
-            return CallEndRequestSerializer
+            return CallEndSerializer
         elif self.action == 'update_status':
             return CallStatusUpdateSerializer
         elif self.action == 'retrieve':
             return CallLogDetailSerializer
         return CallLogSerializer
     
+    # Fields a non-PBX-admin may change with PUT/PATCH /api/call-logs/{id}/.
+    # Status, handler, timing etc. feed the call statistics, so agents change
+    # those only through the call actions (update_status, end_call, ...).
+    AGENT_EDITABLE_FIELDS = frozenset({'notes'})
+
+    def update(self, request, *args, **kwargs):
+        if not is_pbx_admin(request.user):
+            disallowed = sorted(set(request.data.keys()) - self.AGENT_EDITABLE_FIELDS)
+            if disallowed:
+                return Response(
+                    {
+                        'error': 'Only PBX administrators can change these fields.',
+                        'fields': disallowed,
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+        return super().update(request, *args, **kwargs)
+
     def perform_create(self, serializer):
         # Automatically set the current user as the handler if not specified
         if not serializer.validated_data.get('handled_by'):
@@ -640,7 +679,10 @@ class CallLogViewSet(viewsets.ModelViewSet):
     
     @extend_schema(
         summary="Update call status",
-        description="Update the status of an ongoing call",
+        description=(
+            "Update the status of an ongoing call. ``recording_url``, when "
+            "given, must be on one of the tenant's PBX hosts (400 otherwise)."
+        ),
         request=CallStatusUpdateSerializer,
         responses={
             200: CallLogSerializer,
@@ -654,6 +696,12 @@ class CallLogViewSet(viewsets.ModelViewSet):
         serializer = CallStatusUpdateSerializer(data=request.data)
         
         if serializer.is_valid():
+            recording_url = serializer.validated_data.get('recording_url')
+            if recording_url and not is_allowed_recording_url(recording_url):
+                return Response(
+                    {'recording_url': ['Recording URL must be on one of the tenant\'s PBX hosts.']},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             old_status = call_log.status
             new_status = serializer.validated_data['status']
             
@@ -706,9 +754,10 @@ class CallLogViewSet(viewsets.ModelViewSet):
             "An inbound call that was never answered ends as ``missed`` "
             "(which fires the ``call_missed`` notification), unless another "
             "agent's leg of the same ring-all call was answered, in which case "
-            "it ends as ``ended``. 400 when the call is already over."
+            "it ends as ``cancelled`` (answered elsewhere: counted neither as "
+            "answered nor as missed). 400 when the call is already over."
         ),
-        request=CallEndRequestSerializer,
+        request=CallEndSerializer,
         responses={
             200: CallLogSerializer,
             400: OpenApiTypes.OBJECT,
@@ -737,7 +786,12 @@ class CallLogViewSet(viewsets.ModelViewSet):
             if call_log.direction == 'inbound':
                 outcome = 'answered_elsewhere' if find_answered_sibling(call_log) else 'missed'
 
-        call_log.status = 'missed' if outcome == 'missed' else 'ended'
+        if outcome == 'missed':
+            call_log.status = 'missed'
+        elif outcome == 'answered_elsewhere':
+            call_log.status = ANSWERED_ELSEWHERE_STATUS
+        else:
+            call_log.status = 'ended'
         call_log.save()
 
         # Create call event for call end
@@ -890,6 +944,14 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 {'error': 'No recording on this call'},
                 status=status.HTTP_404_NOT_FOUND,
             )
+        if not is_allowed_recording_url(source_url):
+            logger.warning(
+                "Recording proxy refused non-PBX host for call %s (%s)", call_log.pk, source_url,
+            )
+            return Response(
+                {'error': 'Recording is not on an allowed recording host.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         # Forward a Range request so the audio element can seek.
         upstream_headers = {}
@@ -902,6 +964,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 headers=upstream_headers,
                 stream=True,
                 timeout=(5, 30),  # (connect, read)
+                # A redirect could point anywhere: do not follow it.
+                allow_redirects=False,
             )
         except _requests.RequestException as exc:
             logger.warning(
@@ -913,7 +977,7 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
-        if upstream.status_code >= 400:
+        if upstream.status_code >= 300:
             logger.warning(
                 "Recording proxy got upstream %s for call %s (%s)",
                 upstream.status_code, call_log.pk, source_url,
@@ -1074,7 +1138,7 @@ class CallLogViewSet(viewsets.ModelViewSet):
             "softphone). Body: {transfer_to}."
         ),
         request=inline_serializer(
-            name='CallTransferRequest',
+            name='CallTransfer',
             fields={'transfer_to': drf_serializers.CharField()},
         ),
         responses={200: CallLogSerializer, 400: OpenApiTypes.OBJECT}
@@ -1680,7 +1744,14 @@ class ClientViewSet(viewsets.ModelViewSet):
     """
     serializer_class = ClientSerializer
     permission_classes = [permissions.IsAuthenticated]
-    
+
+    def get_permissions(self):
+        perms = super().get_permissions()
+        # Call history and caller-ID lookup are part of the calls surface.
+        if self.action in ('call_history', 'lookup_by_phone'):
+            perms.append(HasIpCallingFeature())
+        return perms
+
     def get_queryset(self):
         # In a multi-tenant setup, you might want to filter by tenant
         return Client.objects.all()
@@ -2393,8 +2464,14 @@ def _pbx_admin_required(request):
     )
 
 
-def _get_pbx_settings(sip_config_id):
+def _get_pbx_settings(sip_config_id, create=True):
+    """The PBX settings row of a SIP configuration. With ``create=False`` a
+    missing row comes back as an unsaved instance with the defaults, so a
+    read never writes."""
     sip_config = SipConfiguration.objects.get(id=sip_config_id)
+    if not create:
+        existing = PbxSettings.objects.filter(sip_configuration=sip_config).first()
+        return existing or PbxSettings(sip_configuration=sip_config)
     settings_obj, _ = PbxSettings.objects.get_or_create(sip_configuration=sip_config)
     return settings_obj
 
@@ -2402,7 +2479,11 @@ def _get_pbx_settings(sip_config_id):
 @extend_schema(
     methods=['GET'],
     summary="PBX settings (working hours, review SMS, sounds)",
-    description="Read the PBX settings of a SIP configuration (created with defaults on first read).",
+    description=(
+        "Read the PBX settings of a SIP configuration. When none are stored "
+        "yet, a PBX admin's read creates them with the defaults; other users "
+        "get the defaults without anything being saved (``id`` is null)."
+    ),
     responses={200: PbxSettingsSerializer, 404: OpenApiTypes.OBJECT},
 )
 @extend_schema(
@@ -2421,7 +2502,12 @@ def pbx_settings_detail(request, sip_config_id):
         if denied is not None:
             return denied
     try:
-        settings_obj = _get_pbx_settings(sip_config_id)
+        # Only a PBX admin's read may create the row (the web settings page
+        # reads before it writes); everyone else gets the defaults unsaved.
+        settings_obj = _get_pbx_settings(
+            sip_config_id,
+            create=request.method != 'GET' or is_pbx_admin(request.user),
+        )
     except SipConfiguration.DoesNotExist:
         return Response({'error': 'SIP configuration not found'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -2439,7 +2525,7 @@ def pbx_settings_detail(request, sip_config_id):
     summary="Upload a PBX sound",
     description="multipart/form-data {sound_type, file (.wav/.mp3/.ogg, <10MB)}. PBX admins only.",
     request={'multipart/form-data': inline_serializer(
-        name='PbxSoundUploadRequest',
+        name='PbxSoundUpload',
         fields={
             'sound_type': drf_serializers.ChoiceField(choices=_PBX_SOUND_TYPES),
             'file': drf_serializers.FileField(),
@@ -2504,7 +2590,7 @@ def pbx_settings_upload_sound(request, sip_config_id):
     summary="Remove a PBX sound",
     description="Revert one sound to the default. PBX admins only.",
     request=inline_serializer(
-        name='PbxSoundRemoveRequest',
+        name='PbxSoundRemove',
         fields={'sound_type': drf_serializers.ChoiceField(choices=_PBX_SOUND_TYPES)},
     ),
     responses={200: PbxSettingsSerializer, 400: OpenApiTypes.OBJECT, 403: OpenApiTypes.OBJECT, 404: OpenApiTypes.OBJECT},

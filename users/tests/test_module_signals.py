@@ -393,13 +393,15 @@ class TestCallSignals(EchoDeskTenantTestCase):
     def test_missed_inbound_call_notifies_handler(self, mock_incr, mock_async):
         from crm.models import CallLog
 
-        call = CallLog.objects.create(
-            caller_number='+995555123456',
-            recipient_number='+995555654321',
-            direction='inbound',
-            status='missed',
-            handled_by=self.agent,
-        )
+        # The notification is queued once the save commits.
+        with self.captureOnCommitCallbacks(execute=True):
+            call = CallLog.objects.create(
+                caller_number='+995555123456',
+                recipient_number='+995555654321',
+                direction='inbound',
+                status='missed',
+                handled_by=self.agent,
+            )
 
         notifs = Notification.objects.filter(
             notification_type='call_missed',
@@ -416,13 +418,14 @@ class TestCallSignals(EchoDeskTenantTestCase):
         from crm.models import CallLog
 
         staff = self.create_admin(email='call-sig-staff@test.com')
-        call = CallLog.objects.create(
-            caller_number='+995555111111',
-            recipient_number='+995555222222',
-            direction='inbound',
-            status='missed',
-            handled_by=None,
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            call = CallLog.objects.create(
+                caller_number='+995555111111',
+                recipient_number='+995555222222',
+                direction='inbound',
+                status='missed',
+                handled_by=None,
+            )
 
         notifs = Notification.objects.filter(notification_type='call_missed')
         self.assertTrue(notifs.filter(user=staff).exists())

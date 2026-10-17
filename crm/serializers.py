@@ -402,7 +402,7 @@ class CallStatusUpdateSerializer(serializers.Serializer):
     recording_url = serializers.URLField(required=False, allow_blank=True)
 
 
-class CallEndRequestSerializer(serializers.Serializer):
+class CallEndSerializer(serializers.Serializer):
     """Body of ``POST /api/call-logs/{id}/end_call/``. Everything is
     optional and ignored (the server decides ended vs missed); send ``{}``.
     ``status`` is accepted only for older clients that still send it."""
@@ -509,7 +509,10 @@ class CallLogDetailSerializer(CallLogSerializer):
 
 
 class PbxSettingsSerializer(serializers.ModelSerializer):
-    """Serializer for PBX working hours and sound management."""
+    """Serializer for PBX working hours and sound management. ``id`` is null
+    when nothing is stored yet (defaults shown to a non-admin reader)."""
+
+    id = serializers.IntegerField(read_only=True, allow_null=True)
 
     sound_greeting_url = serializers.SerializerMethodField()
     sound_after_hours_url = serializers.SerializerMethodField()

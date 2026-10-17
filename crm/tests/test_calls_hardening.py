@@ -435,9 +435,19 @@ class TestSoftphoneCredentials(CrmTestCase):
         self.assertNotIn('COLLEAGUE-PW', body)
         self.assertNotIn('TRUNK-SECRET', body)
 
-    def test_my_config_fallback_to_default_shared_account(self):
+    def test_my_config_no_shared_account_for_agent_once_extensions_exist(self):
         loner = self.create_user(email='sp-loner@test.com')
         resp = self.api_get('/api/sip-configurations/my_config/', user=loner)
+        self.assertEqual(resp.status_code, 404)
+        self.assertNotIn('TRUNK-SECRET', _body(resp))
+        resp = self.api_get(f'/api/sip-configurations/{self.config.id}/webrtc_config/', user=loner)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['username'], '')
+        self.assertEqual(resp.data['password'], '')
+        self.assertNotIn('TRUNK-SECRET', _body(resp))
+
+    def test_my_config_fallback_for_pbx_admin(self):
+        resp = self.api_get('/api/sip-configurations/my_config/', user=self.admin)
         self.assertEqual(resp.status_code, 200)
         self.assertIsNone(resp.data['id'])
         self.assertEqual(resp.data['extension'], 'shared')
@@ -445,6 +455,17 @@ class TestSoftphoneCredentials(CrmTestCase):
         body = _body(resp)
         self.assertNotIn('COLLEAGUE-PW', body)
         self.assertNotIn('MY-EXT-PW', body)
+
+    def test_my_config_fallback_on_tenant_without_extensions(self):
+        # Legacy single-account tenant: no extensions at all.
+        UserPhoneAssignment.objects.all().delete()
+        loner = self.create_user(email='sp-loner3@test.com')
+        resp = self.api_get('/api/sip-configurations/my_config/', user=loner)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.data['id'])
+        self.assertEqual(resp.data['extension_password'], 'TRUNK-SECRET')
+        resp = self.api_get(f'/api/sip-configurations/{self.config.id}/webrtc_config/', user=loner)
+        self.assertEqual(resp.data['password'], 'TRUNK-SECRET')
 
     def test_my_config_404_without_any_config(self):
         SipConfiguration.objects.update(is_default=False)
@@ -662,6 +683,12 @@ class TestMissedCallNotifications(CrmTestCase):
         self.admin = self.create_admin(email='mc-admin@test.com')
         self.agent = self.create_user(email='mc-agent@test.com')
         Notification.objects.filter(notification_type='call_missed').delete()
+        # The test transaction never commits: run on_commit callbacks at
+        # once (TestMissedCallOnCommit covers the deferral itself).
+        on_commit = patch('django.db.transaction.on_commit',
+                          side_effect=lambda fn, using=None, robust=False: fn())
+        on_commit.start()
+        self.addCleanup(on_commit.stop)
 
     def _notifs(self, user=None):
         qs = Notification.objects.filter(notification_type='call_missed')
@@ -687,7 +714,7 @@ class TestMissedCallNotifications(CrmTestCase):
         self.assertTrue(mock_push.called)
         self.assertEqual(mock_push.call_args.kwargs['data']['call_log_id'], call.id)
 
-    def test_end_call_answered_elsewhere_is_ended_without_notification(self, mock_push):
+    def test_end_call_answered_elsewhere_is_cancelled_without_notification(self, mock_push):
         colleague = self.create_user(email='mc-colleague@test.com')
         self.create_call_log(
             handled_by=colleague, status='answered', direction='inbound',
@@ -698,7 +725,7 @@ class TestMissedCallNotifications(CrmTestCase):
             caller_number='555777888',
         )
         resp = self.api_post(f'/api/call-logs/{mine.id}/end_call/', {}, user=self.agent)
-        self.assertEqual(resp.data['status'], 'ended')
+        self.assertEqual(resp.data['status'], 'cancelled')
         self.assertFalse(self._notifs().exists())
         self.assertTrue(mine.events.filter(metadata__outcome='answered_elsewhere').exists())
 
@@ -713,7 +740,7 @@ class TestMissedCallNotifications(CrmTestCase):
         CallLog.objects.filter(pk=mine.pk).update(status='missed')
         self.assertEqual(send_missed_call_notifications(mine.pk), 0)
         mine.refresh_from_db()
-        self.assertEqual(mine.status, 'ended')
+        self.assertEqual(mine.status, 'cancelled')
         self.assertFalse(self._notifs().exists())
 
     def test_answered_call_ends_normally(self, mock_push):
