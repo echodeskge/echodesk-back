@@ -16,7 +16,8 @@ from .models import Tenant, PendingRegistration, PaymentOrder, TenantDomain, Das
 from .feature_models import Feature
 from .serializers import (
     TenantSerializer, TenantCreateSerializer, TenantRegistrationSerializer,
-    TenantLoginSerializer, TenantDashboardDataSerializer, DashboardAppearanceSettingsSerializer
+    TenantLoginSerializer, TenantDashboardDataSerializer, DashboardAppearanceSettingsSerializer,
+    TenantSettingsSerializer,
 )
 from .services import SingleFrontendDeploymentService, TenantConfigAPI
 from .bog_payment import bog_service
@@ -286,7 +287,13 @@ def tenant_dashboard(request):
                             'properties': {
                                 'id': {'type': 'integer'},
                                 'name': {'type': 'string'},
+                                'feature_keys': {
+                                    'type': 'array',
+                                    'items': {'type': 'string'},
+                                    'description': 'Active feature keys granted by this group',
+                                },
                                 'permissions': {
+                                    'description': 'Legacy: not returned by this endpoint',
                                     'type': 'array',
                                     'items': {
                                         'type': 'object',
@@ -306,7 +313,24 @@ def tenant_dashboard(request):
                         'type': 'array',
                         'items': {'type': 'string'},
                         'description': 'List of all permission codenames user has'
-                    }
+                    },
+                    'permissions_list': {
+                        'type': 'array',
+                        'items': {'type': 'string'},
+                        'description': (
+                            'Sorted flat list of every tenant permission codename the user '
+                            'holds: individual can_* flags, role grants (manager: '
+                            'view_all_tickets, edit_all_tickets, delete_tickets, assign_tickets, '
+                            'view_reports, export_data, make_calls, manage_tags, manage_columns, '
+                            'view_boards, create_boards, edit_boards, view_social_messages, '
+                            'send_social_messages; admin additionally manage_users, manage_groups, '
+                            'manage_settings, delete_boards, manage_social_connections, '
+                            'manage_social_settings). Superusers get all. Same values as '
+                            'all_permissions, sorted. is_staff is NOT folded in: endpoints that accept staff check '
+                            'is_staff separately.'
+                        ),
+                    },
+                    'feature_keys': {'type': 'array', 'items': {'type': 'string'}},
                 }
             }
         ),
@@ -401,6 +425,7 @@ def tenant_profile(request):
         'is_active': user.is_active,
         'groups': groups_data,
         'all_permissions': list(all_permissions),
+        'permissions_list': sorted(all_permissions),
         'feature_keys': feature_keys
     }, status=status.HTTP_200_OK)
 
@@ -1340,29 +1365,51 @@ class TenantViewSet(viewsets.ModelViewSet):
 
 
 # Tenant Settings API
+def _can_manage_tenant_settings(user):
+    """Staff, superusers and users with ``manage_settings`` (flag, admin role
+    or group flag) may change workspace settings and the logo."""
+    from tickets.permissions import user_can_manage
+    return user_can_manage(user, 'manage_settings')
+
+
+_SETTINGS_FORBIDDEN = {'error': 'You need the manage_settings permission (or staff) to change workspace settings.'}
+
+
 @extend_schema(
+    methods=['GET'],
     operation_id='tenant_settings_get',
     summary='Get Tenant Settings',
-    description='Get current tenant settings including logo and company name',
+    description=(
+        'Workspace settings: logo URL, company name, ticket rules and the '
+        'dashboard language. Readable by every authenticated tenant user.'
+    ),
     responses={
-        200: OpenApiResponse(
-            description='Settings retrieved successfully',
-            response={
-                'type': 'object',
-                'properties': {
-                    'logo': {'type': 'string', 'nullable': True},
-                    'company_name': {'type': 'string'}
-                }
-            }
-        ),
-        403: OpenApiResponse(description='Not available from main domain')
+        200: TenantSettingsSerializer,
+        403: OpenApiResponse(description='Not available from main domain'),
     },
-    tags=['Tenant Settings']
+    tags=['Tenant Settings'],
 )
-@api_view(['GET'])
+@extend_schema(
+    methods=['PATCH'],
+    operation_id='tenant_settings_update',
+    summary='Update Tenant Settings',
+    description=(
+        'Partial update of min_users_per_ticket, only_superadmin_can_delete_tickets '
+        'and preferred_language. Needs staff, superuser or manage_settings. '
+        'Returns the full settings object.'
+    ),
+    request=TenantSettingsSerializer,
+    responses={
+        200: TenantSettingsSerializer,
+        400: OpenApiResponse(description='Validation error'),
+        403: OpenApiResponse(description='Needs manage_settings or staff, or called from the main domain'),
+    },
+    tags=['Tenant Settings'],
+)
+@api_view(['GET', 'PATCH'])
 @permission_classes([permissions.IsAuthenticated])
 def tenant_settings(request):
-    """Get tenant settings"""
+    """Get or update tenant settings"""
     if not hasattr(request, 'tenant') or request.tenant.schema_name == get_public_schema_name():
         return Response(
             {'error': 'This endpoint is only available from tenant subdomains'},
@@ -1370,10 +1417,20 @@ def tenant_settings(request):
         )
 
     tenant = request.tenant
-    return Response({
-        'logo': request.build_absolute_uri(tenant.logo.url) if tenant.logo else None,
-        'company_name': tenant.name
-    })
+    if request.method == 'PATCH':
+        if not _can_manage_tenant_settings(request.user):
+            return Response(_SETTINGS_FORBIDDEN, status=status.HTTP_403_FORBIDDEN)
+        serializer = TenantSettingsSerializer(
+            tenant, data=request.data, partial=True, context={'request': request}
+        )
+        serializer.is_valid(raise_exception=True)
+        changed = []
+        for field, value in serializer.validated_data.items():
+            setattr(tenant, field, value)
+            changed.append(field)
+        if changed:
+            tenant.save(update_fields=changed)
+    return Response(TenantSettingsSerializer(tenant, context={'request': request}).data)
 
 
 @extend_schema(
@@ -1423,7 +1480,10 @@ def tenant_public_branding(request):
 @extend_schema(
     operation_id='tenant_settings_upload_logo',
     summary='Upload Tenant Logo',
-    description='Upload a company logo for the tenant',
+    description=(
+        'Upload a company logo (JPG, PNG, GIF or WebP, max 2MB) as multipart '
+        'field `logo`. Needs staff, superuser or manage_settings.'
+    ),
     request={
         'multipart/form-data': {
             'type': 'object',
@@ -1447,19 +1507,21 @@ def tenant_public_branding(request):
             }
         ),
         400: OpenApiResponse(description='Invalid file or upload error'),
-        403: OpenApiResponse(description='Not available from main domain')
+        403: OpenApiResponse(description='Needs manage_settings or staff, or called from the main domain')
     },
     tags=['Tenant Settings']
 )
 @api_view(['POST'])
 @permission_classes([permissions.IsAuthenticated])
 def upload_logo(request):
-    """Upload tenant logo"""
+    """Upload tenant logo (staff / manage_settings)"""
     if not hasattr(request, 'tenant') or request.tenant.schema_name == get_public_schema_name():
         return Response(
             {'error': 'This endpoint is only available from tenant subdomains'},
             status=status.HTTP_403_FORBIDDEN
         )
+    if not _can_manage_tenant_settings(request.user):
+        return Response(_SETTINGS_FORBIDDEN, status=status.HTTP_403_FORBIDDEN)
 
     if 'logo' not in request.FILES:
         return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1467,10 +1529,10 @@ def upload_logo(request):
     logo_file = request.FILES['logo']
 
     # Validate file type
-    allowed_types = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif']
+    allowed_types = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp']
     if logo_file.content_type not in allowed_types:
         return Response(
-            {'error': 'Invalid file type. Only JPG, PNG, and GIF are allowed.'},
+            {'error': 'Invalid file type. Only JPG, PNG, GIF and WebP are allowed.'},
             status=status.HTTP_400_BAD_REQUEST
         )
 
@@ -1506,7 +1568,7 @@ def upload_logo(request):
 @extend_schema(
     operation_id='tenant_settings_remove_logo',
     summary='Remove Tenant Logo',
-    description='Remove the current tenant logo',
+    description='Remove the current tenant logo. Needs staff, superuser or manage_settings.',
     responses={
         200: OpenApiResponse(
             description='Logo removed successfully',
@@ -1517,19 +1579,21 @@ def upload_logo(request):
                 }
             }
         ),
-        403: OpenApiResponse(description='Not available from main domain')
+        403: OpenApiResponse(description='Needs manage_settings or staff, or called from the main domain')
     },
     tags=['Tenant Settings']
 )
 @api_view(['DELETE'])
 @permission_classes([permissions.IsAuthenticated])
 def remove_logo(request):
-    """Remove tenant logo"""
+    """Remove tenant logo (staff / manage_settings)"""
     if not hasattr(request, 'tenant') or request.tenant.schema_name == get_public_schema_name():
         return Response(
             {'error': 'This endpoint is only available from tenant subdomains'},
             status=status.HTTP_403_FORBIDDEN
         )
+    if not _can_manage_tenant_settings(request.user):
+        return Response(_SETTINGS_FORBIDDEN, status=status.HTTP_403_FORBIDDEN)
 
     try:
         tenant = request.tenant
