@@ -15,7 +15,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
 from rest_framework import status
 
-from users.tests.conftest import EchoDeskTenantTestCase
+from ecommerce_crm.tests.base import EcommerceTenantTestCase as EchoDeskTenantTestCase
 from ecommerce_crm.models import (
     Product,
     ProductImage,
@@ -84,12 +84,13 @@ class TestListProducts(ProductViewTestMixin, EchoDeskTenantTestCase):
         results = _results(resp)
         self.assertGreaterEqual(len(results), 5)
 
-    def test_list_products_default_active_only(self):
-        """Default list filters to active products only."""
+    def test_list_products_status_param_filters(self):
+        """?status=active narrows the (all-status) default list."""
         self._make_product('ACTIVE-1', status='active')
         self._make_product('DRAFT-1', status='draft')
-        resp = self.api_get(PROD_URL, user=self.admin)
+        resp = self.api_get(f'{PROD_URL}?status=active', user=self.admin)
         results = _results(resp)
+        self.assertTrue(results)
         for r in results:
             self.assertEqual(r['status'], 'active')
 

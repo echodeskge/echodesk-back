@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 from rest_framework import status
 
-from users.tests.conftest import EchoDeskTenantTestCase
+from ecommerce_crm.tests.base import EcommerceTenantTestCase as EchoDeskTenantTestCase
 from ecommerce_crm.models import (
     ClientAddress,
     EcommerceClient,

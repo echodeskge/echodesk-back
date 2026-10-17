@@ -4,12 +4,18 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from .tokens import is_shop_token_for_current_tenant, issue_shop_tokens
 from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiParameter, inline_serializer
+from drf_spectacular.types import OpenApiTypes
 from django_filters.rest_framework import DjangoFilterBackend, FilterSet, CharFilter, NumberFilter, BooleanFilter
 from django.db.models import Q, F, Count, Avg
 from django.core.cache import cache
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import never_cache
 from tenants.models import Tenant
+from .permissions import (
+    EcommercePermissionMixin,
+    EcommerceAdminWritePermission,
+    IsEcommerceAdmin,
+)
 
 
 class NoCacheMixin:
@@ -18,6 +24,38 @@ class NoCacheMixin:
     @method_decorator(never_cache)
     def dispatch(self, request, *args, **kwargs):
         return super().dispatch(request, *args, **kwargs)
+
+
+class ProtectedDestroyMixin:
+    """Answer 409 instead of a 500 when the row is still referenced
+    (orders keep PROTECT foreign keys to clients, addresses, products and
+    variants)."""
+
+    def destroy(self, request, *args, **kwargs):
+        from django.db.models import ProtectedError
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response(
+                {'error': 'This item is used by existing orders and cannot be deleted. '
+                          'Deactivate or archive it instead.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+
+def _destroy_schema(tag, summary):
+    return extend_schema(
+        tags=[tag],
+        summary=summary,
+        responses={
+            204: OpenApiResponse(description='Deleted'),
+            403: OpenApiResponse(description='Not allowed'),
+            409: OpenApiResponse(
+                response=inline_serializer('EcommerceDeleteConflict', fields={'error': serializers.CharField()}),
+                description='Still referenced by orders',
+            ),
+        },
+    )
 from .models import (
     Language,
     AttributeDefinition,
@@ -79,7 +117,8 @@ class LanguageViewSet(NoCacheMixin, viewsets.ModelViewSet):
     """
     queryset = Language.objects.all()
     serializer_class = LanguageSerializer
-    permission_classes = [IsAuthenticated]
+    # Reads: anyone with the e-commerce feature. Writes: store admins.
+    permission_classes = [EcommerceAdminWritePermission]
     filter_backends = [filters.OrderingFilter]
     ordering_fields = ['sort_order', 'code']
     ordering = ['sort_order', 'code']
@@ -141,13 +180,14 @@ class LanguageViewSet(NoCacheMixin, viewsets.ModelViewSet):
         return response
 
 
-class AttributeDefinitionViewSet(NoCacheMixin, viewsets.ModelViewSet):
+class AttributeDefinitionViewSet(NoCacheMixin, EcommercePermissionMixin, viewsets.ModelViewSet):
     """
     ViewSet for attribute definitions (Public access for frontend)
     """
     queryset = AttributeDefinition.objects.filter(is_active=True)
     serializer_class = AttributeDefinitionSerializer
-    permission_classes = [IsAuthenticated]
+    # Deleting an attribute cascades to every product's value for it.
+    manager_actions = ('destroy',)
     filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
     search_fields = ['key']
     filterset_fields = ['attribute_type', 'is_filterable']
@@ -197,25 +237,99 @@ class AttributeDefinitionViewSet(NoCacheMixin, viewsets.ModelViewSet):
         return super().destroy(request, *args, **kwargs)
 
 
+PRODUCT_STATUS_VALUES = tuple(code for code, _ in Product.STATUS_CHOICES)
+# Languages a product name may be stored in even when the tenant hasn't
+# created a Language row for them.
+_DEFAULT_NAME_LANGUAGES = ('en', 'ka', 'ru')
+
+
+def _product_name_languages():
+    codes = list(_DEFAULT_NAME_LANGUAGES)
+    try:
+        for code in Language.objects.values_list('code', flat=True):
+            if code and code not in codes and code.replace('-', '').replace('_', '').isalnum():
+                codes.append(code)
+    except Exception:
+        pass
+    return codes
+
+
+def _parse_stock_delta(request):
+    """Read {delta, reason} from an adjust-stock body. Returns (delta, reason, error_response)."""
+    raw = request.data.get('delta') if hasattr(request.data, 'get') else None
+    try:
+        if isinstance(raw, bool) or raw is None or str(raw).strip() == '':
+            raise ValueError
+        delta = int(str(raw).strip())
+        if str(delta) != str(raw).strip().lstrip('+'):
+            raise ValueError
+    except (TypeError, ValueError):
+        return None, '', Response({'error': 'delta must be a non-zero integer'}, status=status.HTTP_400_BAD_REQUEST)
+    if delta == 0:
+        return None, '', Response({'error': 'delta must be a non-zero integer'}, status=status.HTTP_400_BAD_REQUEST)
+    reason = str(request.data.get('reason') or '')[:255]
+    return delta, reason, None
+
+
+def _log_stock_adjustment(kind, pk, delta, new_quantity, reason, user):
+    import logging
+    logging.getLogger(__name__).info(
+        'Stock adjusted: %s %s delta=%s new_quantity=%s reason=%r by=%s',
+        kind, pk, delta, new_quantity, reason, getattr(user, 'email', user),
+    )
+
+
+def _parse_product_statuses(value):
+    """'all' / '' -> None (no filter); 'a,b' -> ['a', 'b']. Raises on unknown values."""
+    raw = [v.strip() for v in (value or '').split(',') if v.strip()]
+    if not raw or 'all' in raw:
+        return None
+    unknown = [v for v in raw if v not in PRODUCT_STATUS_VALUES]
+    if unknown:
+        raise serializers.ValidationError({
+            'status': f'Unknown status {unknown}. Use one of {list(PRODUCT_STATUS_VALUES)} or "all".'
+        })
+    return raw
+
+
 class ProductFilter(FilterSet):
     """Custom filter for products with attribute filtering support"""
     min_price = NumberFilter(field_name='price', lookup_expr='gte')
     max_price = NumberFilter(field_name='price', lookup_expr='lte')
-    search = CharFilter(method='search_filter')
+    search = CharFilter(method='search_filter', help_text='Matches SKU, slug, variant SKU and the name in any language')
+    status = CharFilter(
+        method='filter_status',
+        help_text='One status, "all", or a comma-separated list. Absent = every status.',
+    )
+    status__in = CharFilter(method='filter_status', help_text='Comma-separated statuses, e.g. active,draft')
     in_stock = BooleanFilter(method='filter_in_stock')
     low_stock = BooleanFilter(method='filter_low_stock')
     attributes = CharFilter(method='filter_by_attributes')
 
     class Meta:
         model = Product
-        fields = ['status', 'is_featured']
+        fields = ['is_featured']
+
+    def filter_status(self, queryset, name, value):
+        statuses = _parse_product_statuses(value)
+        if statuses is None:
+            return queryset
+        return queryset.filter(status__in=statuses)
 
     def search_filter(self, queryset, name, value):
-        """Search across multiple fields"""
-        return queryset.filter(
+        """Search SKU, slug, variant SKU and the multilingual name."""
+        value = (value or '').strip()
+        if not value:
+            return queryset
+        q = (
             Q(sku__icontains=value) |
-            Q(slug__icontains=value)
+            Q(slug__icontains=value) |
+            Q(variants__sku__icontains=value)
         )
+        for code in _product_name_languages():
+            q |= Q(**{f'name__{code}__icontains': value})
+        matching = Product.objects.filter(q).values('pk')
+        return queryset.filter(pk__in=matching)
 
     def filter_in_stock(self, queryset, name, value):
         """Filter products that are in stock"""
@@ -223,7 +337,8 @@ class ProductFilter(FilterSet):
             return queryset.filter(
                 Q(track_inventory=False) | Q(quantity__gt=0)
             )
-        return queryset.filter(track_inventory=True, quantity=0)
+        # Out of stock includes oversold (negative) quantities.
+        return queryset.filter(track_inventory=True, quantity__lte=0)
 
     def filter_low_stock(self, queryset, name, value):
         """Filter products with low stock"""
@@ -268,14 +383,16 @@ class ProductFilter(FilterSet):
         return queryset.distinct()
 
 
-class ProductViewSet(NoCacheMixin, viewsets.ModelViewSet):
+class ProductViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin, viewsets.ModelViewSet):
     """
     ViewSet for products with advanced filtering and sorting (Public access for frontend)
     """
-    permission_classes = [IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    manager_actions = ('destroy',)
+    # ``search`` is handled by ProductFilter.search_filter (sku, slug, variant
+    # sku and the name in every language). DRF's SearchFilter would also read
+    # ``search`` and AND its sku/slug-only match on top, hiding name matches.
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_class = ProductFilter
-    search_fields = ['sku', 'slug']
     ordering_fields = ['price', 'quantity', 'created_at', 'updated_at', 'sku']
     ordering = ['-created_at']
 
@@ -294,11 +411,9 @@ class ProductViewSet(NoCacheMixin, viewsets.ModelViewSet):
             _review_count=Count('reviews', filter=Q(reviews__is_approved=True), distinct=True),
         )
 
-        if self.action == 'list':
-            status_filter = self.request.query_params.get('status')
-            if not status_filter:
-                queryset = queryset.filter(status='active')
-
+        # The admin list returns every status unless ``status`` /
+        # ``status__in`` narrows it (ProductFilter). It used to default to
+        # active only, which made the web "All" filter show active products.
         return queryset
 
     def get_serializer_class(self):
@@ -319,11 +434,11 @@ class ProductViewSet(NoCacheMixin, viewsets.ModelViewSet):
         tags=['Ecommerce Admin - Products'],
         summary='List all products',
         description='''Get a list of products with advanced filtering:
+        - Status: every status when absent; ?status=active, ?status=all, ?status=active,draft or ?status__in=active,draft
         - Filter by price range: ?min_price=10&max_price=100
-        - Filter by status: ?status=active
-        - Filter by stock: ?in_stock=true&low_stock=false
+        - Filter by stock: ?in_stock=true&low_stock=false (in_stock=false includes oversold, negative stock)
         - Filter by attributes: ?attributes=color:red,size:large
-        - Search: ?search=keyword
+        - Search: ?search=keyword (SKU, slug, variant SKU, name in any language)
         '''
     )
     def list(self, request, *args, **kwargs):
@@ -361,53 +476,62 @@ class ProductViewSet(NoCacheMixin, viewsets.ModelViewSet):
     def partial_update(self, request, *args, **kwargs):
         return super().partial_update(request, *args, **kwargs)
 
-    @extend_schema(
-        tags=['Ecommerce Admin - Products'],
-        summary='Delete product'
-    )
+    @_destroy_schema('Ecommerce Admin - Products', 'Delete product (managers only; 409 when it has orders)')
     def destroy(self, request, *args, **kwargs):
         return super().destroy(request, *args, **kwargs)
+
+    def _paginated_list(self, products):
+        page = self.paginate_queryset(products)
+        if page is not None:
+            serializer = ProductListSerializer(page, many=True, context=self.get_serializer_context())
+            return self.get_paginated_response(serializer.data)
+        serializer = ProductListSerializer(products, many=True, context=self.get_serializer_context())
+        return Response(serializer.data)
 
     @extend_schema(
         tags=['Ecommerce Admin - Products'],
         summary='Get featured products',
-        description='Retrieve all products marked as featured'
+        description='Active products marked as featured (paginated; honours search/ordering).',
+        responses={200: ProductListSerializer(many=True)},
     )
     @action(detail=False, methods=['get'])
     def featured(self, request):
         """Get featured products"""
-        products = self.get_queryset().filter(is_featured=True, status='active')
-        page = self.paginate_queryset(products)
-        if page is not None:
-            serializer = ProductListSerializer(page, many=True, context=self.get_serializer_context())
-            return self.get_paginated_response(serializer.data)
-        serializer = ProductListSerializer(products, many=True, context=self.get_serializer_context())
-        return Response(serializer.data)
+        products = self.filter_queryset(self.get_queryset()).filter(is_featured=True, status='active')
+        return self._paginated_list(products)
 
     @extend_schema(
         tags=['Ecommerce Admin - Products'],
         summary='Get low stock products',
-        description='Retrieve all products with stock levels at or below their low stock threshold'
+        description=(
+            'Inventory-tracked products with 0 < quantity <= low_stock_threshold, any status unless '
+            'status/status__in narrows it (paginated; honours search/ordering).'
+        ),
+        responses={200: ProductListSerializer(many=True)},
     )
     @action(detail=False, methods=['get'])
     def low_stock(self, request):
         """Get products with low stock"""
-        products = self.get_queryset().filter(
+        products = self.filter_queryset(self.get_queryset()).filter(
             track_inventory=True,
             quantity__lte=F('low_stock_threshold'),
             quantity__gt=0
         )
-        page = self.paginate_queryset(products)
-        if page is not None:
-            serializer = ProductListSerializer(page, many=True, context=self.get_serializer_context())
-            return self.get_paginated_response(serializer.data)
-        serializer = ProductListSerializer(products, many=True, context=self.get_serializer_context())
-        return Response(serializer.data)
+        return self._paginated_list(products)
 
     @extend_schema(
         tags=['Ecommerce Admin - Products'],
         summary='Add image to product',
-        description='Upload and attach an image to a specific product'
+        description='Attach an image URL (upload it first) to a specific product',
+        request=inline_serializer(
+            name='ProductAddImageRequest',
+            fields={
+                'image': serializers.URLField(max_length=2000),
+                'alt_text': serializers.JSONField(required=False, help_text='{lang: text}'),
+                'sort_order': serializers.IntegerField(required=False),
+            },
+        ),
+        responses={201: ProductImageSerializer, 400: OpenApiResponse(description='Validation error')},
     )
     @action(detail=True, methods=['post'])
     def add_image(self, request, pk=None):
@@ -422,7 +546,10 @@ class ProductViewSet(NoCacheMixin, viewsets.ModelViewSet):
     @extend_schema(
         tags=['Ecommerce Admin - Products'],
         summary='Remove image from product',
-        description='Delete a specific image from a product'
+        description='Delete a specific image from a product',
+        parameters=[OpenApiParameter('image_id', int, OpenApiParameter.PATH)],
+        request=None,
+        responses={204: OpenApiResponse(description='Removed'), 404: OpenApiResponse(description='Image not found')},
     )
     @action(detail=True, methods=['delete'], url_path='remove_image/(?P<image_id>[^/.]+)')
     def remove_image(self, request, pk=None, image_id=None):
@@ -432,7 +559,7 @@ class ProductViewSet(NoCacheMixin, viewsets.ModelViewSet):
             image = product.images.get(id=image_id)
             image.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
-        except ProductImage.DoesNotExist:
+        except (ProductImage.DoesNotExist, ValueError):
             return Response(
                 {'error': 'Image not found'},
                 status=status.HTTP_404_NOT_FOUND
@@ -441,7 +568,21 @@ class ProductViewSet(NoCacheMixin, viewsets.ModelViewSet):
     @extend_schema(
         tags=['Ecommerce Admin - Products'],
         summary='Update product attributes',
-        description='Update all attributes for a specific product'
+        description='Replace all attribute values of a product. Each item sets one value_* field.',
+        request=inline_serializer(
+            name='ProductUpdateAttributesRequest',
+            fields={
+                'attributes': inline_serializer('ProductAttributeValueInput', many=True, fields={
+                    'attribute_id': serializers.IntegerField(),
+                    'value_text': serializers.CharField(required=False, allow_blank=True),
+                    'value_number': serializers.DecimalField(max_digits=15, decimal_places=4, required=False),
+                    'value_boolean': serializers.BooleanField(required=False),
+                    'value_date': serializers.DateField(required=False),
+                    'value_json': serializers.JSONField(required=False),
+                }),
+            },
+        ),
+        responses={200: ProductDetailSerializer},
     )
     @action(detail=True, methods=['post'])
     def update_attributes(self, request, pk=None):
@@ -478,13 +619,19 @@ class ProductViewSet(NoCacheMixin, viewsets.ModelViewSet):
 
     @extend_schema(
         tags=['Ecommerce Admin - Products'],
-        summary='Bulk update product status',
-        description='Update the status of multiple products at once',
+        summary='Bulk update products',
+        description=(
+            'Update several products at once. Send product_ids plus at least one of status, '
+            'price, quantity (absolute) or is_featured. Unknown statuses are rejected.'
+        ),
         request=inline_serializer(
             name='BulkProductUpdateRequest',
             fields={
                 'product_ids': serializers.ListField(child=serializers.IntegerField()),
-                'status': serializers.CharField(),
+                'status': serializers.ChoiceField(choices=Product.STATUS_CHOICES, required=False),
+                'price': serializers.DecimalField(max_digits=10, decimal_places=2, min_value=0, required=False),
+                'quantity': serializers.IntegerField(required=False),
+                'is_featured': serializers.BooleanField(required=False),
             },
         ),
         responses={
@@ -499,35 +646,125 @@ class ProductViewSet(NoCacheMixin, viewsets.ModelViewSet):
     )
     @action(detail=False, methods=['post'], url_path='bulk-update')
     def bulk_update(self, request):
-        """Bulk update product status"""
+        """Bulk update product status / price / quantity / featured flag"""
+        from decimal import Decimal, InvalidOperation
+
         product_ids = request.data.get('product_ids', [])
-        status_value = request.data.get('status')
+        if not product_ids or not isinstance(product_ids, (list, tuple)):
+            return Response({'error': 'product_ids is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-        if not product_ids or not status_value:
-            return Response({'error': 'product_ids and status are required'}, status=status.HTTP_400_BAD_REQUEST)
+        updates = {}
+        if 'status' in request.data and request.data.get('status') not in (None, ''):
+            status_value = request.data.get('status')
+            if status_value not in PRODUCT_STATUS_VALUES:
+                return Response(
+                    {'error': f'Invalid status. Use one of {list(PRODUCT_STATUS_VALUES)}.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            updates['status'] = status_value
+        if request.data.get('price') not in (None, ''):
+            try:
+                price = Decimal(str(request.data.get('price')))
+            except (InvalidOperation, ValueError):
+                return Response({'error': 'Invalid price'}, status=status.HTTP_400_BAD_REQUEST)
+            if price < 0:
+                return Response({'error': 'Price cannot be negative'}, status=status.HTTP_400_BAD_REQUEST)
+            updates['price'] = price.quantize(Decimal('0.01'))
+        if request.data.get('quantity') not in (None, ''):
+            try:
+                updates['quantity'] = int(request.data.get('quantity'))
+            except (TypeError, ValueError):
+                return Response({'error': 'Invalid quantity'}, status=status.HTTP_400_BAD_REQUEST)
+        if 'is_featured' in request.data and request.data.get('is_featured') is not None:
+            value = request.data.get('is_featured')
+            if isinstance(value, str):
+                value = value.strip().lower() in ('1', 'true', 'yes')
+            updates['is_featured'] = bool(value)
 
-        updated = Product.objects.filter(id__in=product_ids).update(status=status_value)
+        if not updates:
+            return Response(
+                {'error': 'product_ids and at least one of status, price, quantity, is_featured are required'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        updates['updated_by'] = request.user
+        from django.utils import timezone
+        updates['updated_at'] = timezone.now()
+        updated = Product.objects.filter(id__in=product_ids).update(**updates)
         return Response({'updated': updated})
 
+    @extend_schema(
+        tags=['Ecommerce Admin - Products'],
+        summary='Adjust product stock',
+        description=(
+            'Atomically add (positive delta) or remove (negative delta) stock, so a stock count on '
+            'the phone never overwrites concurrent order decrements. Returns the new quantity.'
+        ),
+        request=inline_serializer(
+            name='StockAdjustRequest',
+            fields={
+                'delta': serializers.IntegerField(help_text='Non-zero change, e.g. 5 or -2'),
+                'reason': serializers.CharField(required=False, allow_blank=True, max_length=255),
+            },
+        ),
+        responses={
+            200: inline_serializer(
+                name='StockAdjustResponse',
+                fields={
+                    'id': serializers.IntegerField(),
+                    'quantity': serializers.IntegerField(),
+                    'delta': serializers.IntegerField(),
+                    'reason': serializers.CharField(),
+                    'is_low_stock': serializers.BooleanField(),
+                },
+            ),
+            400: OpenApiResponse(description='delta missing, zero or not an integer'),
+        },
+    )
+    @action(detail=True, methods=['post'], url_path='adjust-stock')
+    def adjust_stock(self, request, pk=None):
+        product = self.get_object()
+        delta, reason, error = _parse_stock_delta(request)
+        if error:
+            return error
+        Product.objects.filter(pk=product.pk).update(
+            quantity=F('quantity') + delta, updated_by=request.user,
+        )
+        product.refresh_from_db(fields=['quantity', 'low_stock_threshold', 'track_inventory'])
+        _log_stock_adjustment('product', product.pk, delta, product.quantity, reason, request.user)
+        return Response({
+            'id': product.pk,
+            'quantity': product.quantity,
+            'delta': delta,
+            'reason': reason,
+            'is_low_stock': product.is_low_stock,
+        })
 
-class ProductImageViewSet(NoCacheMixin, viewsets.ModelViewSet):
+
+class ProductImageViewSet(NoCacheMixin, EcommercePermissionMixin, viewsets.ModelViewSet):
     """ViewSet for product images (Admin only)"""
     queryset = ProductImage.objects.all()
     serializer_class = ProductImageSerializer
-    permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['product']
     ordering_fields = ['sort_order', 'created_at']
     ordering = ['sort_order', 'id']
 
+    def perform_create(self, serializer):
+        # ProductImage.product is NOT NULL: without it the insert used to
+        # fail with an IntegrityError (500).
+        if not serializer.validated_data.get('product'):
+            raise serializers.ValidationError({'product': ['This field is required.']})
+        serializer.save()
 
-class ProductVariantViewSet(NoCacheMixin, viewsets.ModelViewSet):
+
+class ProductVariantViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin, viewsets.ModelViewSet):
     """ViewSet for product variants (Admin only)"""
     # All variants, including inactive ones: admins switch a variant off and
     # must still see it (and be able to switch it back on).
     queryset = ProductVariant.objects.all()
     serializer_class = ProductVariantAdminSerializer
-    permission_classes = [IsAuthenticated]
+    manager_actions = ('destroy',)
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['product', 'is_active']
     search_fields = ['sku']
@@ -539,12 +776,58 @@ class ProductVariantViewSet(NoCacheMixin, viewsets.ModelViewSet):
             'attribute_values__attribute'
         )
 
+    @_destroy_schema('Ecommerce Admin - Products', 'Delete variant (managers only; 409 when it has orders)')
+    def destroy(self, request, *args, **kwargs):
+        return super().destroy(request, *args, **kwargs)
 
-class EcommerceClientViewSet(NoCacheMixin, viewsets.ModelViewSet):
+    @extend_schema(
+        tags=['Ecommerce Admin - Products'],
+        summary='Adjust variant stock',
+        description='Atomically add or remove variant stock (see products adjust-stock).',
+        request=inline_serializer(
+            name='VariantStockAdjustRequest',
+            fields={
+                'delta': serializers.IntegerField(help_text='Non-zero change, e.g. 5 or -2'),
+                'reason': serializers.CharField(required=False, allow_blank=True, max_length=255),
+            },
+        ),
+        responses={
+            200: inline_serializer(
+                name='VariantStockAdjustResponse',
+                fields={
+                    'id': serializers.IntegerField(),
+                    'quantity': serializers.IntegerField(),
+                    'delta': serializers.IntegerField(),
+                    'reason': serializers.CharField(),
+                },
+            ),
+            400: OpenApiResponse(description='delta missing, zero or not an integer'),
+        },
+    )
+    @action(detail=True, methods=['post'], url_path='adjust-stock')
+    def adjust_stock(self, request, pk=None):
+        variant = self.get_object()
+        delta, reason, error = _parse_stock_delta(request)
+        if error:
+            return error
+        ProductVariant.objects.filter(pk=variant.pk).update(quantity=F('quantity') + delta)
+        variant.refresh_from_db(fields=['quantity'])
+        _log_stock_adjustment('variant', variant.pk, delta, variant.quantity, reason, request.user)
+        return Response({
+            'id': variant.pk,
+            'quantity': variant.quantity,
+            'delta': delta,
+            'reason': reason,
+        })
+
+
+class EcommerceClientViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin, viewsets.ModelViewSet):
     """ViewSet for managing ecommerce clients (Public access for frontend)"""
     queryset = EcommerceClient.objects.all()
     serializer_class = EcommerceClientSerializer
-    permission_classes = [IsAuthenticated]
+    # Reading shop customers needs the feature; editing or deleting them is
+    # for managers (email is the storefront login).
+    manager_actions = ('create', 'update', 'partial_update', 'destroy')
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['first_name', 'last_name', 'email', 'phone_number']
     filterset_fields = ['is_active', 'is_verified']
@@ -597,10 +880,7 @@ class EcommerceClientViewSet(NoCacheMixin, viewsets.ModelViewSet):
     def partial_update(self, request, *args, **kwargs):
         return super().partial_update(request, *args, **kwargs)
 
-    @extend_schema(
-        tags=['Ecommerce Admin - Clients'],
-        summary='Delete client'
-    )
+    @_destroy_schema('Ecommerce Admin - Clients', 'Delete client (managers only; 409 when the client has orders)')
     def destroy(self, request, *args, **kwargs):
         return super().destroy(request, *args, **kwargs)
 
@@ -1210,11 +1490,11 @@ def get_current_client(request):
         )
 
 
-class ClientAddressViewSet(NoCacheMixin, viewsets.ModelViewSet):
+class ClientAddressViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin, viewsets.ModelViewSet):
     """ViewSet for managing client addresses (Admin only)"""
     queryset = ClientAddress.objects.all()
     serializer_class = ClientAddressSerializer
-    permission_classes = [IsAuthenticated]
+    manager_actions = ('create', 'update', 'partial_update', 'destroy', 'set_default')
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['is_default', 'client']
     ordering_fields = ['created_at', 'is_default']
@@ -1260,18 +1540,16 @@ class ClientAddressViewSet(NoCacheMixin, viewsets.ModelViewSet):
     def partial_update(self, request, *args, **kwargs):
         return super().partial_update(request, *args, **kwargs)
 
-    @extend_schema(
-        tags=['Ecommerce Admin - Client Addresses'],
-        summary='Delete address',
-        description='Remove an address from a client'
-    )
+    @_destroy_schema('Ecommerce Admin - Client Addresses', 'Delete address (managers only; 409 when an order uses it)')
     def destroy(self, request, *args, **kwargs):
         return super().destroy(request, *args, **kwargs)
 
     @extend_schema(
         tags=['Ecommerce Admin - Client Addresses'],
         summary='Set address as default',
-        description='Mark a specific address as the default delivery address for the client'
+        description='Mark a specific address as the default delivery address for the client (managers only)',
+        request=None,
+        responses={200: ClientAddressSerializer},
     )
     @action(detail=True, methods=['post'])
     def set_default(self, request, pk=None):
@@ -1283,10 +1561,9 @@ class ClientAddressViewSet(NoCacheMixin, viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
-class FavoriteProductViewSet(NoCacheMixin, viewsets.ModelViewSet):
+class FavoriteProductViewSet(NoCacheMixin, EcommercePermissionMixin, viewsets.ModelViewSet):
     """ViewSet for managing client favorite products/wishlist (Admin only)"""
     queryset = FavoriteProduct.objects.all()
-    permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['client', 'product']
     ordering_fields = ['created_at']
@@ -1422,11 +1699,10 @@ class FavoriteProductViewSet(NoCacheMixin, viewsets.ModelViewSet):
             }, status=status.HTTP_201_CREATED)
 
 
-class CartViewSet(NoCacheMixin, viewsets.ModelViewSet):
+class CartViewSet(NoCacheMixin, EcommercePermissionMixin, viewsets.ModelViewSet):
     """ViewSet for managing shopping carts (Admin only)"""
     queryset = Cart.objects.all()
     serializer_class = CartSerializer
-    permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['client', 'status']
     ordering_fields = ['created_at', 'updated_at']
@@ -1532,10 +1808,9 @@ class CartViewSet(NoCacheMixin, viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
-class CartItemViewSet(NoCacheMixin, viewsets.ModelViewSet):
+class CartItemViewSet(NoCacheMixin, EcommercePermissionMixin, viewsets.ModelViewSet):
     """ViewSet for managing cart items (Admin only)"""
     queryset = CartItem.objects.all()
-    permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['cart', 'product']
 
@@ -1586,14 +1861,203 @@ class CartItemViewSet(NoCacheMixin, viewsets.ModelViewSet):
         return super().destroy(request, *args, **kwargs)
 
 
-class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
+ORDER_TERMINAL_STATUSES = ('cancelled', 'refunded')
+
+_ORDER_STATUS_TIMESTAMPS = {
+    'confirmed': 'confirmed_at',
+    'processing': 'processing_at',
+    'shipped': 'shipped_at',
+    'delivered': 'delivered_at',
+}
+
+
+class OrderStatusError(Exception):
+    """A status change that is not allowed (message is user-facing)."""
+
+
+def _refund_order(order):
+    """Mark ``order`` refunded, put its stock back and free its promo use.
+
+    Row-locked and re-checked, with ``F()`` stock updates, so a double
+    click or a refund racing a cancel can't restock twice. This is
+    bookkeeping only: no money is returned through the payment gateway.
+    Raises OrderStatusError when the order is already cancelled/refunded.
+    """
+    from django.db import transaction
+
+    with transaction.atomic():
+        locked = Order.objects.select_for_update().get(pk=order.pk)
+        if locked.status in ORDER_TERMINAL_STATUSES:
+            raise OrderStatusError('Order already refunded or cancelled')
+        for item in locked.items.select_related('product'):
+            product = item.product
+            if product and product.track_inventory:
+                Product.objects.filter(pk=product.pk).update(
+                    quantity=F('quantity') + item.quantity
+                )
+        if locked.promo_code_id:
+            PromoCode.objects.filter(
+                pk=locked.promo_code_id, times_used__gt=0
+            ).update(times_used=F('times_used') - 1)
+        locked.status = 'refunded'
+        locked.payment_status = 'refunded'
+        locked.save(update_fields=['status', 'payment_status', 'updated_at'])
+    order.status = locked.status
+    order.payment_status = locked.payment_status
+    return order
+
+
+def _apply_order_status(order, new_status, actor=None, data=None):
+    """Move ``order`` to ``new_status`` the way every admin path must.
+
+    * cancelled and refunded orders are final (their stock is already back);
+    * ``cancelled`` goes through ``Order.cancel()`` (restock + promo release);
+    * ``refunded`` goes through ``_refund_order`` (the caller checks that
+      the user may refund);
+    * other statuses stamp their timestamp, and ``shipped`` accepts
+      tracking_number / courier_provider / estimated_delivery_date.
+
+    Returns the e-mail type to send ('shipped' / 'delivered') or None.
+    Raises OrderStatusError for a change that is not allowed.
+    """
+    from django.utils import timezone
+
+    data = data or {}
+    if new_status not in dict(Order.STATUS_CHOICES):
+        raise OrderStatusError('Invalid status')
+
+    if order.status in ORDER_TERMINAL_STATUSES:
+        if new_status == order.status:
+            return None
+        raise OrderStatusError(
+            f'This order is {order.status}; its status can no longer be changed.'
+        )
+
+    if new_status == 'cancelled':
+        who = ''
+        if actor is not None:
+            who = getattr(actor, 'email', '') or str(actor)
+        order.cancel(reason=f'Cancelled by {who}' if who else 'Cancelled by staff')
+        return None
+
+    if new_status == 'refunded':
+        _refund_order(order)
+        return None
+
+    previous = order.status
+    order.status = new_status
+    ts_field = _ORDER_STATUS_TIMESTAMPS.get(new_status)
+    if ts_field and not getattr(order, ts_field):
+        setattr(order, ts_field, timezone.now())
+    if new_status == 'shipped':
+        for field in ('tracking_number', 'courier_provider', 'estimated_delivery_date'):
+            value = data.get(field)
+            if value:
+                setattr(order, field, value)
+    order.save()
+
+    if new_status != previous and new_status in ('shipped', 'delivered'):
+        return new_status
+    return None
+
+
+def _send_order_status_email(order, email_type):
+    if not email_type:
+        return
+    try:
+        from django.db import connection
+        from .tasks import send_order_email
+        send_order_email.delay(connection.schema_name, order.id, email_type)
+    except Exception:
+        pass  # Don't fail a status update because the e-mail task failed
+
+
+class OrderFilter(FilterSet):
+    """Admin order list filters."""
+    status__in = CharFilter(method='filter_status_in', help_text='Comma-separated statuses, e.g. pending,confirmed')
+    payment_status__in = CharFilter(method='filter_payment_status_in', help_text='Comma-separated payment statuses')
+    created_after = CharFilter(method='filter_created_after', help_text='ISO date or datetime (inclusive)')
+    created_before = CharFilter(method='filter_created_before', help_text='ISO date or datetime (inclusive when a date)')
+    has_tracking = BooleanFilter(method='filter_has_tracking', help_text='true: tracking number set; false: none')
+
+    class Meta:
+        model = Order
+        fields = ['client', 'status', 'payment_status', 'payment_method', 'payment_provider']
+
+    @staticmethod
+    def _csv(value):
+        return [v.strip() for v in (value or '').split(',') if v.strip()]
+
+    def filter_status_in(self, queryset, name, value):
+        values = self._csv(value)
+        return queryset.filter(status__in=values) if values else queryset
+
+    def filter_payment_status_in(self, queryset, name, value):
+        values = self._csv(value)
+        return queryset.filter(payment_status__in=values) if values else queryset
+
+    @staticmethod
+    def _parse(value, end=False):
+        from django.utils.dateparse import parse_date, parse_datetime
+        from django.utils import timezone
+        from datetime import datetime, time, timedelta
+        value = (value or '').strip()
+        d = None
+        if len(value) == 10:
+            # A plain date (parse_datetime would read it as midnight).
+            try:
+                d = parse_date(value)
+            except ValueError:
+                d = None
+        if d is None:
+            try:
+                dt = parse_datetime(value)
+            except ValueError:
+                dt = None
+            if dt is not None:
+                if timezone.is_naive(dt):
+                    dt = timezone.make_aware(dt)
+                return dt, False
+        if d is None:
+            raise serializers.ValidationError({'detail': f'Invalid date: {value}'})
+        if end:
+            d = d + timedelta(days=1)
+        return timezone.make_aware(datetime.combine(d, time.min)), True
+
+    def filter_created_after(self, queryset, name, value):
+        dt, _ = self._parse(value)
+        return queryset.filter(created_at__gte=dt)
+
+    def filter_created_before(self, queryset, name, value):
+        dt, is_date = self._parse(value, end=True)
+        if is_date:
+            return queryset.filter(created_at__lt=dt)
+        return queryset.filter(created_at__lte=dt)
+
+    def filter_has_tracking(self, queryset, name, value):
+        if value is None:
+            return queryset
+        if value:
+            return queryset.exclude(tracking_number='')
+        return queryset.filter(tracking_number='')
+
+
+_ORDER_ERROR = inline_serializer('EcommerceOrderError', fields={'error': serializers.CharField()})
+
+
+class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin, viewsets.ModelViewSet):
     """ViewSet for managing orders (Admin only)"""
     queryset = Order.objects.all()
-    permission_classes = [IsAuthenticated]
+    # Money moves, deletes and free-form edits of an order are for managers;
+    # status changes (fulfilment) are open to everyone with the feature.
+    manager_actions = (
+        'update', 'partial_update', 'destroy',
+        'refund', 'mark_paid', 'initiate_payment',
+    )
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['order_number', 'client__first_name', 'client__last_name', 'client__email',
                      'customer_first_name', 'customer_last_name', 'customer_email', 'customer_phone']
-    filterset_fields = ['client', 'status', 'payment_provider']
+    filterset_class = OrderFilter
     ordering_fields = ['created_at', 'total_amount', 'status']
     ordering = ['-created_at']
 
@@ -1624,7 +2088,12 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
     @extend_schema(
         tags=['Ecommerce Admin - Orders'],
         summary='List all orders',
-        description='Get all orders with filtering and search'
+        description=(
+            'Get all orders with filtering and search. Filters: status, status__in (csv), '
+            'payment_status, payment_status__in (csv), payment_method, payment_provider, client, '
+            'created_after / created_before (ISO date or datetime), has_tracking. '
+            'total_items in the list is the number of line items (not the quantity sum).'
+        ),
     )
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
@@ -1736,23 +2205,81 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
     @extend_schema(
         tags=['Ecommerce Admin - Orders'],
         summary='Update order',
-        description='Update order status, notes, etc.'
+        description=(
+            'Update order fields (managers only). A status change follows the same rules as '
+            'update_status: cancelled goes through the cancel flow (restock + promo release), '
+            'refunded through the refund flow, and cancelled/refunded orders cannot change status.'
+        ),
     )
     def update(self, request, *args, **kwargs):
         return super().update(request, *args, **kwargs)
 
     @extend_schema(
         tags=['Ecommerce Admin - Orders'],
+        summary='Partially update order',
+        description='Same rules as the full update (managers only).',
+    )
+    def partial_update(self, request, *args, **kwargs):
+        return super().partial_update(request, *args, **kwargs)
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        new_status = serializer.validated_data.get('status')
+        if new_status is None or new_status == instance.status:
+            serializer.save()
+            return
+        if instance.status in ORDER_TERMINAL_STATUSES:
+            raise serializers.ValidationError(
+                {'status': f'This order is {instance.status}; its status can no longer be changed.'}
+            )
+        if new_status in ORDER_TERMINAL_STATUSES:
+            serializer.validated_data.pop('status')
+            order = serializer.save()
+            try:
+                _apply_order_status(order, new_status, actor=self.request.user)
+            except OrderStatusError as exc:
+                raise serializers.ValidationError({'status': str(exc)})
+            return
+        order = serializer.save()
+        ts_field = _ORDER_STATUS_TIMESTAMPS.get(new_status)
+        if ts_field and not getattr(order, ts_field):
+            from django.utils import timezone
+            setattr(order, ts_field, timezone.now())
+            order.save(update_fields=[ts_field, 'updated_at'])
+
+    @_destroy_schema('Ecommerce Admin - Orders', 'Delete order (managers only)')
+    def destroy(self, request, *args, **kwargs):
+        return super().destroy(request, *args, **kwargs)
+
+    @extend_schema(
+        tags=['Ecommerce Admin - Orders'],
         summary='Update order status',
-        description='Change order status (pending, confirmed, shipped, etc.). '
-                    'Optionally include tracking_number, courier_provider, estimated_delivery_date '
-                    'when setting status to shipped.'
+        description=(
+            'Change order status. Optionally include tracking_number, courier_provider and '
+            'estimated_delivery_date when setting status to shipped. "cancelled" restocks the '
+            'items and releases the promo code use (same as a customer cancel). "refunded" '
+            'runs the refund flow and needs manager rights. Cancelled and refunded orders '
+            'cannot change status (400). Sends the shipped/delivered customer e-mails.'
+        ),
+        request=inline_serializer(
+            name='OrderStatusUpdateRequest',
+            fields={
+                'status': serializers.ChoiceField(choices=Order.STATUS_CHOICES),
+                'tracking_number': serializers.CharField(required=False, allow_blank=True),
+                'courier_provider': serializers.CharField(required=False, allow_blank=True),
+                'estimated_delivery_date': serializers.DateField(required=False, allow_null=True),
+            },
+        ),
+        responses={
+            200: OrderSerializer,
+            400: OpenApiResponse(response=_ORDER_ERROR, description='Missing/invalid status or a status change that is not allowed'),
+            403: OpenApiResponse(description='No access (refunded needs manager rights)'),
+        },
     )
     @action(detail=True, methods=['post'])
     def update_status(self, request, pk=None):
         """Update order status and trigger appropriate email notifications"""
-        from django.utils import timezone
-        from django.db import connection
+        from .permissions import is_ecommerce_manager
 
         order = self.get_object()
         new_status = request.data.get('status')
@@ -1763,53 +2290,42 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
         if new_status not in dict(Order.STATUS_CHOICES):
             return Response({'error': 'Invalid status'}, status=status.HTTP_400_BAD_REQUEST)
 
-        order.status = new_status
+        if new_status == 'refunded' and order.status != 'refunded' and not is_ecommerce_manager(request.user):
+            return Response(
+                {'error': 'Only managers can refund orders.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
-        # Update timestamps based on status
-        if new_status == 'confirmed' and not order.confirmed_at:
-            order.confirmed_at = timezone.now()
-        elif new_status == 'processing' and not order.processing_at:
-            order.processing_at = timezone.now()
-        elif new_status == 'shipped' and not order.shipped_at:
-            order.shipped_at = timezone.now()
-            # Allow setting shipping details when marking as shipped
-            tracking_number = request.data.get('tracking_number')
-            courier_provider = request.data.get('courier_provider')
-            estimated_delivery_date = request.data.get('estimated_delivery_date')
-            if tracking_number:
-                order.tracking_number = tracking_number
-            if courier_provider:
-                order.courier_provider = courier_provider
-            if estimated_delivery_date:
-                order.estimated_delivery_date = estimated_delivery_date
-        elif new_status == 'delivered' and not order.delivered_at:
-            order.delivered_at = timezone.now()
-        elif new_status == 'cancelled' and not order.cancelled_at:
-            order.cancelled_at = timezone.now()
+        try:
+            email_type = _apply_order_status(order, new_status, actor=request.user, data=request.data)
+        except OrderStatusError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        order.save()
+        _send_order_status_email(order, email_type)
 
-        # Send email notifications for status changes
-        email_type = None
-        if new_status == 'shipped':
-            email_type = 'shipped'
-        elif new_status == 'delivered':
-            email_type = 'delivered'
-
-        if email_type:
-            try:
-                from .tasks import send_order_email
-                send_order_email.delay(connection.schema_name, order.id, email_type)
-            except Exception:
-                pass  # Don't fail status update if email task fails
-
+        order.refresh_from_db()
         serializer = self.get_serializer(order)
         return Response(serializer.data)
 
     @extend_schema(
         tags=['Ecommerce Admin - Orders'],
         summary='Mark order as paid',
-        description='Mark a cash-on-delivery or pending order as paid. Sets payment_status to paid and records paid_at timestamp.'
+        description=(
+            'Mark a cash-on-delivery or pending order as paid (managers only). Sets payment_status '
+            'to paid, records paid_at and confirms a pending order. Refused (400) when the order is '
+            'already paid, refunded or cancelled. Queues the courier booking when configured.'
+        ),
+        request=inline_serializer(
+            name='OrderMarkPaidRequest',
+            fields={
+                'notes': serializers.CharField(required=False, allow_blank=True,
+                                               help_text='Appended to admin_notes as "[Payment] ..."'),
+            },
+        ),
+        responses={
+            200: OrderSerializer,
+            400: OpenApiResponse(response=_ORDER_ERROR, description='Already paid, refunded or cancelled'),
+        },
     )
     @action(detail=True, methods=['post'], url_path='mark-paid')
     def mark_paid(self, request, pk=None):
@@ -1821,6 +2337,12 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
         if order.payment_status == 'paid':
             return Response({'error': 'Order is already marked as paid'}, status=status.HTTP_400_BAD_REQUEST)
 
+        if order.payment_status in ('refunded', 'partially_refunded') or order.status in ORDER_TERMINAL_STATUSES:
+            return Response(
+                {'error': f'This order is {order.status if order.status in ORDER_TERMINAL_STATUSES else order.payment_status}; it cannot be marked as paid.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         order.payment_status = 'paid'
         order.paid_at = tz.now()
 
@@ -1831,7 +2353,7 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
                 order.confirmed_at = tz.now()
 
         # Accept optional payment notes
-        payment_notes = request.data.get('notes')
+        payment_notes = request.data.get('notes') if hasattr(request.data, 'get') else None
         if payment_notes:
             order.admin_notes = f"{order.admin_notes}\n[Payment] {payment_notes}".strip() if order.admin_notes else f"[Payment] {payment_notes}"
 
@@ -1851,7 +2373,11 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
     @extend_schema(
         tags=['Ecommerce Admin - Orders'],
         summary='Refund order',
-        description='Mark an order as refunded and restore stock for inventory-tracked products',
+        description=(
+            'Mark an order as refunded (managers only): restores stock for inventory-tracked '
+            'products and releases the promo code use, atomically. Bookkeeping only: no money '
+            'is returned through the payment gateway.'
+        ),
         request=None,
         responses={
             200: inline_serializer(
@@ -1860,7 +2386,7 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
                     'status': serializers.CharField(),
                 },
             ),
-            400: OpenApiResponse(description='Order already refunded or cancelled'),
+            400: OpenApiResponse(response=_ORDER_ERROR, description='Order already refunded or cancelled'),
         },
     )
     @action(detail=True, methods=['post'], url_path='refund')
@@ -1868,25 +2394,73 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
         """Mark order as refunded and restore stock"""
         order = self.get_object()
 
-        if order.status in ['refunded', 'cancelled']:
-            return Response({'error': 'Order already refunded or cancelled'}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Restore stock
-        for item in order.items.all():
-            if item.product and item.product.track_inventory:
-                item.product.quantity += item.quantity
-                item.product.save(update_fields=['quantity'])
-
-        order.status = 'refunded'
-        order.payment_status = 'refunded'
-        order.save(update_fields=['status', 'payment_status'])
+        try:
+            _refund_order(order)
+        except OrderStatusError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({'status': 'refunded'})
 
     @extend_schema(
         tags=['Ecommerce Admin - Orders'],
         summary='Order analytics',
-        description='Get order analytics: revenue, order counts, top products, status breakdown'
+        description=(
+            'Order analytics for the dashboard. Every figure excludes cancelled orders. '
+            'sales_trend only contains days with paid orders (fill missing days with zero).'
+        ),
+        responses={
+            200: inline_serializer(
+                name='OrderAnalyticsResponse',
+                fields={
+                    'revenue': inline_serializer('OrderAnalyticsRevenue', fields={
+                        'today': serializers.FloatField(),
+                        'week': serializers.FloatField(),
+                        'month': serializers.FloatField(),
+                        'total': serializers.FloatField(),
+                        'change': serializers.FloatField(),
+                    }),
+                    'orders': inline_serializer('OrderAnalyticsCounts', fields={
+                        'today': serializers.IntegerField(),
+                        'week': serializers.IntegerField(),
+                        'month': serializers.IntegerField(),
+                        'total': serializers.IntegerField(),
+                        'change': serializers.FloatField(),
+                    }),
+                    'avg_order_value': serializers.FloatField(),
+                    'top_products': inline_serializer('OrderAnalyticsTopProduct', many=True, fields={
+                        'product__name': serializers.JSONField(help_text='Multilingual name {lang: text}'),
+                        'sold': serializers.IntegerField(),
+                        'revenue': serializers.FloatField(),
+                    }),
+                    'order_status_breakdown': serializers.DictField(child=serializers.IntegerField()),
+                    'sales_trend': inline_serializer('OrderAnalyticsTrendPoint', many=True, fields={
+                        'date': serializers.DateField(),
+                        'revenue': serializers.FloatField(),
+                        'orders': serializers.IntegerField(),
+                    }),
+                    'customer_insights': inline_serializer('OrderAnalyticsCustomers', fields={
+                        'total': serializers.IntegerField(),
+                        'new': serializers.IntegerField(),
+                        'returning': serializers.IntegerField(),
+                    }),
+                    'revenue_by_method': inline_serializer('OrderAnalyticsPaymentMethod', many=True, fields={
+                        'payment_method': serializers.CharField(),
+                        'revenue': serializers.FloatField(),
+                        'count': serializers.IntegerField(),
+                        'percentage': serializers.FloatField(),
+                    }),
+                    'recent_orders': inline_serializer('OrderAnalyticsRecentOrder', many=True, fields={
+                        'id': serializers.IntegerField(),
+                        'order_number': serializers.CharField(),
+                        'status': serializers.CharField(),
+                        'payment_status': serializers.CharField(),
+                        'total_amount': serializers.FloatField(),
+                        'created_at': serializers.DateTimeField(),
+                        'client_name': serializers.CharField(),
+                    }),
+                },
+            ),
+        },
     )
     @action(detail=False, methods=['get'], url_path='analytics')
     def analytics(self, request):
@@ -2045,7 +2619,12 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
     @extend_schema(
         tags=['Ecommerce Admin - Orders'],
         summary='Bulk update order status',
-        description='Update the status of multiple orders at once. Sends email notifications for shipped/delivered.',
+        description=(
+            'Update the status of multiple orders at once (duplicate ids are ignored). Same rules '
+            'as update_status: cancelled restocks via the cancel flow; orders that are already '
+            'cancelled/refunded are skipped and listed in `skipped`. "refunded" is not accepted '
+            'here (refund orders one at a time). Sends e-mail notifications for shipped/delivered.'
+        ),
         request=inline_serializer(
             name='BulkUpdateStatusRequest',
             fields={
@@ -2054,20 +2633,28 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
             },
         ),
         responses={
-            200: OpenApiResponse(description='Orders updated successfully'),
-            400: OpenApiResponse(description='Validation error'),
+            200: inline_serializer(
+                name='BulkUpdateStatusResponse',
+                fields={
+                    'updated': serializers.IntegerField(),
+                    'status': serializers.CharField(),
+                    'order_ids': serializers.ListField(child=serializers.IntegerField()),
+                    'skipped': inline_serializer('BulkUpdateStatusSkipped', many=True, fields={
+                        'id': serializers.IntegerField(),
+                        'error': serializers.CharField(),
+                    }),
+                },
+            ),
+            400: OpenApiResponse(response=_ORDER_ERROR, description='Validation error'),
         },
     )
     @action(detail=False, methods=['post'], url_path='bulk-update-status')
     def bulk_update_status(self, request):
         """Bulk update the status of multiple orders"""
-        from django.utils import timezone
-        from django.db import connection
-
-        order_ids = request.data.get('order_ids', [])
+        raw_ids = request.data.get('order_ids', [])
         new_status = request.data.get('status')
 
-        if not order_ids:
+        if not raw_ids or not isinstance(raw_ids, (list, tuple)):
             return Response({'error': 'order_ids is required'}, status=status.HTTP_400_BAD_REQUEST)
 
         if not new_status:
@@ -2076,9 +2663,24 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
         if new_status not in dict(Order.STATUS_CHOICES):
             return Response({'error': 'Invalid status'}, status=status.HTTP_400_BAD_REQUEST)
 
-        orders = Order.objects.filter(id__in=order_ids)
-        if orders.count() != len(order_ids):
-            found_ids = set(orders.values_list('id', flat=True))
+        if new_status == 'refunded':
+            return Response(
+                {'error': 'Refund orders one at a time with the refund action.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        order_ids = []
+        try:
+            for oid in raw_ids:
+                oid = int(oid)
+                if oid not in order_ids:
+                    order_ids.append(oid)
+        except (TypeError, ValueError):
+            return Response({'error': 'order_ids must be integers'}, status=status.HTTP_400_BAD_REQUEST)
+
+        orders = list(Order.objects.filter(id__in=order_ids))
+        if len(orders) != len(order_ids):
+            found_ids = {o.id for o in orders}
             missing = [oid for oid in order_ids if oid not in found_ids]
             return Response(
                 {'error': f'Orders not found: {missing}'},
@@ -2086,40 +2688,28 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
             )
 
         updated_orders = []
+        skipped = []
         for order in orders:
-            order.status = new_status
-            if new_status == 'confirmed' and not order.confirmed_at:
-                order.confirmed_at = timezone.now()
-            elif new_status == 'processing' and not order.processing_at:
-                order.processing_at = timezone.now()
-            elif new_status == 'shipped' and not order.shipped_at:
-                order.shipped_at = timezone.now()
-            elif new_status == 'delivered' and not order.delivered_at:
-                order.delivered_at = timezone.now()
-            elif new_status == 'cancelled' and not order.cancelled_at:
-                order.cancelled_at = timezone.now()
-            order.save()
+            try:
+                email_type = _apply_order_status(order, new_status, actor=request.user)
+            except OrderStatusError as exc:
+                skipped.append({'id': order.id, 'error': str(exc)})
+                continue
             updated_orders.append(order)
-
-            # Send email notifications for shipped/delivered
-            email_type = None
-            if new_status == 'shipped':
-                email_type = 'shipped'
-            elif new_status == 'delivered':
-                email_type = 'delivered'
-
-            if email_type:
-                try:
-                    from .tasks import send_order_email
-                    send_order_email.delay(connection.schema_name, order.id, email_type)
-                except Exception:
-                    pass
+            _send_order_status_email(order, email_type)
 
         return Response({
             'updated': len(updated_orders),
             'status': new_status,
             'order_ids': [o.id for o in updated_orders],
+            'skipped': skipped,
         })
+
+    @extend_schema(exclude=True)
+    @action(detail=False, methods=['post'], url_path='bulk-update')
+    def bulk_update_alias(self, request):
+        """Alias of bulk-update-status: the web dashboard posts here."""
+        return self.bulk_update_status(request)
 
     @extend_schema(
         tags=['Ecommerce Admin - Orders'],
@@ -2166,7 +2756,40 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
     @extend_schema(
         tags=['Ecommerce Admin - Orders'],
         summary='Initiate payment for order',
-        description='Create BOG payment session for an order'
+        description=(
+            'Create a BOG payment session for an order with the tenant\'s own BOG merchant '
+            '(managers only). Shapes: an existing pending link returns {payment_url, '
+            'bog_order_id, status}; a new link also returns amount and currency; '
+            'payment_method=cash_on_delivery switches the order to COD and returns '
+            '{payment_method, message}.'
+        ),
+        request=inline_serializer(
+            name='OrderInitiatePaymentRequest',
+            fields={
+                'payment_method': serializers.ChoiceField(
+                    choices=[('card', 'card'), ('cash_on_delivery', 'cash_on_delivery')],
+                    required=False, default='card'),
+                'return_url_success': serializers.CharField(required=False, allow_blank=True),
+                'return_url_fail': serializers.CharField(required=False, allow_blank=True),
+            },
+        ),
+        responses={
+            200: inline_serializer(
+                name='OrderInitiatePaymentResponse',
+                fields={
+                    'payment_url': serializers.CharField(required=False),
+                    'bog_order_id': serializers.CharField(required=False),
+                    'amount': serializers.FloatField(required=False),
+                    'currency': serializers.CharField(required=False),
+                    'status': serializers.CharField(required=False),
+                    'payment_method': serializers.CharField(required=False),
+                    'message': serializers.CharField(required=False),
+                },
+            ),
+            400: OpenApiResponse(response=_ORDER_ERROR, description='Already paid, cancelled/refunded, or BOG not configured'),
+            500: OpenApiResponse(response=_ORDER_ERROR, description='The gateway call failed'),
+            503: OpenApiResponse(response=_ORDER_ERROR, description='Tenant BOG credentials could not be loaded'),
+        },
     )
     @action(detail=True, methods=['post'])
     def initiate_payment(self, request, pk=None):
@@ -2174,8 +2797,7 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
         Initiate payment for an order
         Creates a BOG payment session and returns payment URL
         """
-        from tenants.bog_payment import bog_service
-        import uuid
+        from .payment_utils import get_tenant_bog_service, BogCredentialError
 
         order = self.get_object()
 
@@ -2186,6 +2808,12 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        if order.status in ORDER_TERMINAL_STATUSES:
+            return Response(
+                {'error': f'This order is {order.status}; it cannot be paid.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         # Check if payment is pending
         if order.payment_url and order.payment_status == 'pending':
             return Response({
@@ -2193,25 +2821,6 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
                 'bog_order_id': order.bog_order_id,
                 'status': 'pending'
             })
-
-        # Get tenant's ecommerce settings — tenant MUST provide their own credentials
-        try:
-            from .models import EcommerceSettings
-            ecommerce_settings = EcommerceSettings.objects.get(tenant=request.tenant)
-        except EcommerceSettings.DoesNotExist:
-            return Response(
-                {'error': 'Payment not configured. Please set up payment credentials in ecommerce settings.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if not ecommerce_settings.has_bog_credentials:
-            return Response(
-                {'error': 'BOG payment credentials not configured. Please add your BOG Client ID and Secret in ecommerce settings.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        client_id = ecommerce_settings.bog_client_id
-        client_secret = ecommerce_settings.get_bog_secret()
 
         # Check payment method
         payment_method = request.data.get('payment_method', 'card')
@@ -2226,6 +2835,35 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
                 'message': 'Order will be paid on delivery'
             })
 
+        # Get tenant's ecommerce settings — tenant MUST provide their own credentials
+        try:
+            ecommerce_settings = EcommerceSettings.objects.get(tenant=request.tenant)
+        except EcommerceSettings.DoesNotExist:
+            return Response(
+                {'error': 'Payment not configured. Please set up payment credentials in ecommerce settings.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not ecommerce_settings.has_bog_credentials:
+            return Response(
+                {'error': 'BOG payment credentials not configured. Please add your BOG Client ID and Secret in ecommerce settings.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Charge through the TENANT's merchant account, never the platform's.
+        try:
+            bog_service_instance = get_tenant_bog_service(request.tenant)
+        except BogCredentialError:
+            import logging
+            logging.getLogger(__name__).exception(
+                'BOG credential error for tenant %s on order %s',
+                getattr(request.tenant, 'schema_name', request.tenant), order.order_number
+            )
+            return Response(
+                {'error': 'Payment is temporarily unavailable. Please try again later.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+
         # Create BOG payment
         try:
             # Generate callback URL
@@ -2233,8 +2871,7 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
             return_url_success = request.data.get('return_url_success', '')
             return_url_fail = request.data.get('return_url_fail', '')
 
-            # Create payment with tenant-specific or default credentials
-            payment_result = bog_service.create_payment(
+            payment_result = bog_service_instance.create_payment(
                 amount=float(order.total_amount),
                 currency='GEL',
                 description=f"Order {order.order_number}",
@@ -2257,6 +2894,7 @@ class OrderViewSet(NoCacheMixin, viewsets.ModelViewSet):
             order.payment_url = payment_result['payment_url']
             order.payment_status = 'pending'
             order.payment_method = 'card'
+            order.payment_provider = 'bog'
             order.payment_metadata = payment_result
             order.save()
 
@@ -2845,10 +3483,17 @@ def flitt_payment_webhook(request):
 class EcommerceSettingsViewSet(NoCacheMixin, viewsets.ModelViewSet):
     """ViewSet for managing ecommerce settings including BOG payment configuration"""
     serializer_class = EcommerceSettingsSerializer
-    permission_classes = [IsAuthenticated]
+    # Payment credentials, deployment and domains: reads need the feature,
+    # every write needs a store admin.
+    permission_classes = [EcommerceAdminWritePermission]
+    queryset = EcommerceSettings.objects.none()
+    # The web client passes String(settings.id); keep {id} typed as before.
+    schema_path_param_types = {'id': OpenApiTypes.STR}
 
     def get_queryset(self):
         """Return settings for the current tenant only"""
+        if getattr(self, 'swagger_fake_view', False):
+            return EcommerceSettings.objects.none()
         return EcommerceSettings.objects.filter(tenant=self.request.tenant)
 
     def perform_create(self, serializer):
@@ -3391,7 +4036,7 @@ class HomepageSectionViewSet(NoCacheMixin, viewsets.ModelViewSet):
     """
     queryset = HomepageSection.objects.all()
     serializer_class = HomepageSectionSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [EcommerceAdminWritePermission]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['section_type', 'is_active']
     ordering_fields = ['position', 'created_at']
@@ -3479,7 +4124,15 @@ class HomepageSectionViewSet(NoCacheMixin, viewsets.ModelViewSet):
     @extend_schema(
         tags=['Ecommerce Admin - Homepage Builder'],
         summary='Get section type choices',
-        description='Get available section types and display modes'
+        description='Get available section types and display modes',
+        responses={200: inline_serializer('HomepageSectionChoices', fields={
+            'section_types': inline_serializer('HomepageChoiceOption', many=True, fields={
+                'value': serializers.CharField(), 'label': serializers.CharField(),
+            }),
+            'display_modes': inline_serializer('HomepageDisplayModeOption', many=True, fields={
+                'value': serializers.CharField(), 'label': serializers.CharField(),
+            }),
+        })},
     )
     @action(detail=False, methods=['get'], url_path='choices')
     def get_choices(self, request):
@@ -3500,9 +4153,16 @@ class HomepageSectionViewSet(NoCacheMixin, viewsets.ModelViewSet):
     @extend_schema(
         tags=['Ecommerce Admin - Homepage Builder'],
         summary='List available homepage variants',
-        description='Get all predefined homepage variant templates with their section layouts'
+        description='Get all predefined homepage variant templates with their section layouts',
+        responses={200: inline_serializer('HomepageVariantSummary', many=True, fields={
+            'key': serializers.CharField(),
+            'name': serializers.CharField(),
+            'description': serializers.CharField(),
+            'section_count': serializers.IntegerField(),
+            'section_types': serializers.ListField(child=serializers.CharField()),
+        })},
     )
-    @action(detail=False, methods=['get'], url_path='variants')
+    @action(detail=False, methods=['get'], url_path='variants', pagination_class=None, filter_backends=[])
     def list_variants(self, request):
         """List all available homepage variant templates."""
         from .homepage_variants import HOMEPAGE_VARIANTS
@@ -3520,7 +4180,18 @@ class HomepageSectionViewSet(NoCacheMixin, viewsets.ModelViewSet):
     @extend_schema(
         tags=['Ecommerce Admin - Homepage Builder'],
         summary='Generate homepage from variant',
-        description='Delete all existing homepage sections and generate new ones from a predefined variant template'
+        description='Delete all existing homepage sections and generate new ones from a predefined variant template (store admins only)',
+        request=inline_serializer('HomepageGenerateFromVariantRequest', fields={
+            'variant': serializers.CharField(help_text='Key from the variants endpoint'),
+        }),
+        responses={
+            200: inline_serializer('HomepageGenerateFromVariantResponse', fields={
+                'variant': serializers.CharField(),
+                'sections': HomepageSectionSerializer(many=True),
+                'message': serializers.CharField(),
+            }),
+            400: OpenApiResponse(description='Invalid variant'),
+        },
     )
     @action(detail=False, methods=['post'], url_path='generate-from-variant')
     def generate_from_variant(self, request):
@@ -3559,11 +4230,11 @@ class HomepageSectionViewSet(NoCacheMixin, viewsets.ModelViewSet):
         })
 
 
-class ShippingMethodViewSet(NoCacheMixin, viewsets.ModelViewSet):
+class ShippingMethodViewSet(NoCacheMixin, EcommercePermissionMixin, viewsets.ModelViewSet):
     """Admin CRUD for shipping methods"""
     queryset = ShippingMethod.objects.all()
     serializer_class = ShippingMethodSerializer
-    permission_classes = [IsAuthenticated]
+    manager_actions = ('destroy',)
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['is_active']
     ordering_fields = ['position', 'price', 'created_at']
@@ -3594,11 +4265,11 @@ class ShippingMethodViewSet(NoCacheMixin, viewsets.ModelViewSet):
         return super().destroy(request, *args, **kwargs)
 
 
-class PromoCodeViewSet(NoCacheMixin, viewsets.ModelViewSet):
+class PromoCodeViewSet(NoCacheMixin, EcommercePermissionMixin, viewsets.ModelViewSet):
     """Admin CRUD for promo codes"""
     queryset = PromoCode.objects.all()
     serializer_class = PromoCodeSerializer
-    permission_classes = [IsAuthenticated]
+    manager_actions = ('destroy',)
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['code']
     filterset_fields = ['is_active', 'discount_type']
@@ -3630,11 +4301,11 @@ class PromoCodeViewSet(NoCacheMixin, viewsets.ModelViewSet):
         return super().destroy(request, *args, **kwargs)
 
 
-class ProductReviewAdminViewSet(NoCacheMixin, viewsets.ModelViewSet):
+class ProductReviewAdminViewSet(NoCacheMixin, EcommercePermissionMixin, viewsets.ModelViewSet):
     """Admin management for product reviews (approve/reject)"""
     queryset = ProductReview.objects.all()
     serializer_class = ProductReviewSerializer
-    permission_classes = [IsAuthenticated]
+    manager_actions = ('destroy',)
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['product', 'is_approved', 'is_verified_purchase', 'rating']
     ordering_fields = ['created_at', 'rating']
@@ -3666,7 +4337,9 @@ class ProductReviewAdminViewSet(NoCacheMixin, viewsets.ModelViewSet):
     @extend_schema(
         tags=['Ecommerce Admin - Reviews'],
         summary='Approve review',
-        description='Approve a product review to make it visible on the storefront'
+        description='Approve a product review to make it visible on the storefront',
+        request=None,
+        responses={200: ProductReviewSerializer},
     )
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
@@ -3678,7 +4351,9 @@ class ProductReviewAdminViewSet(NoCacheMixin, viewsets.ModelViewSet):
     @extend_schema(
         tags=['Ecommerce Admin - Reviews'],
         summary='Reject review',
-        description='Reject a product review to hide it from the storefront'
+        description='Reject a product review to hide it from the storefront',
+        request=None,
+        responses={200: ProductReviewSerializer},
     )
     @action(detail=True, methods=['post'])
     def reject(self, request, pk=None):
@@ -3775,7 +4450,7 @@ def _build_pickup_payload(s) -> dict:
     },
 )
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsEcommerceAdmin])
 def quickshipper_test_connection(request):
     settings_obj = _quickshipper_settings_or_none()
     client = client_from_settings(settings_obj)
@@ -4241,23 +4916,31 @@ def quickshipper_webhook(request):
     # never rewind from delivered → shipped, never overwrite cancelled.
     status_normalized = new_status.lower()
     now = timezone.now()
+    email_type = None
+    cancel_order = False
     if status_normalized in {'pickedup', 'picked_up', 'pickup', 'inprogress', 'in_progress', 'delivering', 'shipping'} and order.status not in ('shipped', 'delivered', 'cancelled', 'refunded'):
         order.status = 'shipped'
         order.shipped_at = order.shipped_at or now
         update_fields += ['status', 'shipped_at']
+        email_type = 'shipped'
     elif status_normalized in {'delivered', 'finished', 'completed'} and order.status not in ('delivered', 'cancelled', 'refunded'):
         order.status = 'delivered'
         order.delivered_at = order.delivered_at or now
         order.shipped_at = order.shipped_at or now
         update_fields += ['status', 'delivered_at', 'shipped_at']
-    elif status_normalized in {'cancelled', 'canceled', 'rejected', 'failed'} and order.status not in ('delivered', 'refunded'):
-        order.status = 'cancelled'
-        order.cancelled_at = order.cancelled_at or now
-        update_fields += ['status', 'cancelled_at']
+        email_type = 'delivered'
+    elif status_normalized in {'cancelled', 'canceled', 'rejected', 'failed'} and order.status not in ('delivered', 'refunded', 'cancelled'):
+        # Through Order.cancel(): restock + promo release under a row lock.
+        cancel_order = True
 
     if update_fields:
         order.updated_at = now
         update_fields.append('updated_at')
         order.save(update_fields=list(set(update_fields)))
+
+    if cancel_order:
+        order.cancel(reason=f'Courier reported {new_status}')
+
+    _send_order_status_email(order, email_type)
 
     return Response({'success': True, 'order_id': order.id, 'order_status': order.status})

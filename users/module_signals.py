@@ -216,6 +216,70 @@ except ImportError:
     pass
 
 # ---------------------------------------------------------------------------
+# E-commerce orders
+# ---------------------------------------------------------------------------
+try:
+    from ecommerce_crm.models import Order as EcommerceOrder
+
+    @receiver(pre_save, sender=EcommerceOrder)
+    def track_ecommerce_order_changes(sender, instance, **kwargs):
+        """Remember the previous payment state so post_save sees transitions."""
+        instance._old_payment_status = None
+        instance._old_payment_method = None
+        if instance.pk:
+            old = EcommerceOrder.objects.filter(pk=instance.pk).values(
+                'payment_status', 'payment_method'
+            ).first()
+            if old:
+                instance._old_payment_status = old['payment_status']
+                instance._old_payment_method = old['payment_method']
+
+    @receiver(post_save, sender=EcommerceOrder)
+    def notify_ecommerce_order_events(sender, instance, created, **kwargs):
+        """ecommerce_order_created for cash-on-delivery orders when placed,
+        ecommerce_order_paid when payment_status becomes paid. Unpaid card
+        orders never notify (the sweeper cancels the abandoned ones)."""
+        from django.db import transaction
+
+        old_payment_status = getattr(instance, '_old_payment_status', None)
+        old_payment_method = getattr(instance, '_old_payment_method', None)
+
+        became_paid = instance.payment_status == 'paid' and old_payment_status != 'paid'
+        became_cod = (
+            instance.payment_method == 'cash_on_delivery'
+            and (created or old_payment_method != 'cash_on_delivery')
+            and instance.status != 'cancelled'
+            and instance.payment_status != 'paid'
+        )
+        if not (became_paid or became_cod):
+            return
+
+        order_id = instance.pk
+
+        def _send():
+            import logging
+            from ecommerce_crm import notifications
+            try:
+                order = EcommerceOrder.objects.select_related('client').filter(pk=order_id).first()
+                if order is None:
+                    return
+                if became_cod:
+                    notifications.notify_order_created(order)
+                if became_paid:
+                    notifications.notify_order_paid(order)
+            except Exception:
+                # Never fail a checkout or a payment webhook over a notification.
+                logging.getLogger(__name__).exception(
+                    'E-commerce order notification failed for order %s', order_id
+                )
+
+        # After commit: a rolled-back checkout must not announce an order.
+        transaction.on_commit(_send)
+
+except ImportError:
+    pass
+
+# ---------------------------------------------------------------------------
 # Calls (CRM CallLog)
 # ---------------------------------------------------------------------------
 try:

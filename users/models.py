@@ -559,6 +559,10 @@ class Notification(models.Model):
         # Calls
         ('call_missed', 'Missed Call'),
         ('call_voicemail', 'New Voicemail'),
+        # E-commerce
+        ('ecommerce_order_created', 'New Shop Order'),
+        ('ecommerce_order_paid', 'Shop Order Paid'),
+        ('ecommerce_low_stock', 'Low Stock'),
         # Integrations
         ('email_sync_disabled', 'Email Sync Disabled'),
         # Social admin (auto-posting, WhatsApp template reviews, connection alerts)

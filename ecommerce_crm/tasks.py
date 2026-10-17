@@ -214,6 +214,17 @@ def check_low_stock_products(self):
                     if not low_stock.exists():
                         continue
 
+                    # In-app + push digest for the people who handle the shop
+                    # (independent of the store e-mail below).
+                    try:
+                        from .notifications import notify_low_stock
+                        ordered = low_stock.order_by('quantity', 'id')
+                        notify_low_stock(ordered[:50], total_count=ordered.count())
+                    except Exception as notify_exc:
+                        logger.error(
+                            f'Low stock notification failed for tenant {tenant.schema_name}: {notify_exc}'
+                        )
+
                     settings_obj = EcommerceSettings.objects.first()
                     if not settings_obj or not settings_obj.store_email:
                         logger.info(
