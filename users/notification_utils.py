@@ -195,6 +195,15 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
                 # thread + sender so a push tap can deep-link straight into it.
                 'conversation_id': notification.metadata.get('conversation_id'),
                 'sender_id': notification.metadata.get('sender_id'),
+                # Social inbox pushes: lowercase platform key, platform-side
+                # account id and the prefixed inbox chat id (fb_/ig_/wa_/
+                # tg_/widget_<account>_<key>) so a tap needs no URL parsing.
+                'platform': (
+                    notification.metadata.get('platform_key')
+                    or notification.metadata.get('platform')
+                ),
+                'account_id': notification.metadata.get('account_id'),
+                'chat_id': notification.metadata.get('chat_id'),
             },
             url=nav_url,
             tag=f'echodesk-{ticket_id or notification.id}',
@@ -341,86 +350,135 @@ def create_team_chat_message_notification(message, recipient=None):
 
 
 # ---------------------------------------------------------------------------
-# Social message notification helper
+# Social message notification helpers
 # ---------------------------------------------------------------------------
 
-def create_social_message_notification(platform, sender_name, message_text,
-                                       conversation_id, sender_id,
-                                       account_id=None,
-                                       assigned_user_id=None):
+SOCIAL_CHAT_PREFIXES = {
+    'facebook': 'fb',
+    'instagram': 'ig',
+    'whatsapp': 'wa',
+    'telegram': 'tg',
+    'widget': 'widget',
+    'email': 'email',
+    'tiktok': 'tiktok',
+}
+
+
+def users_with_feature(feature_key):
     """
-    Create a 'message_received' notification for an incoming social message.
+    Active users of the current tenant who have ``feature_key``.
 
-    If the conversation is assigned to a specific user, only that user is
-    notified and the link is deep-linked into the "Assigned to me" tab.
-    Otherwise, up to 10 active users are notified and the link opens the
-    "All chats" tab.
+    Same rule as ``User.has_feature`` (the tenant's subscription must include
+    the feature; superusers get every subscribed feature, everyone else needs
+    an active group that grants it), resolved in two queries instead of
+    several per user.
+    """
+    from django.contrib.auth import get_user_model
+    from django.db.models import Q
+    from tenants.models import Tenant
 
-    `account_id` is the platform-side account identifier (Facebook page_id,
-    Instagram instagram_account_id, or WhatsApp waba_id). Together with
-    sender_id it's used to build the frontend chat ID (fb_<page>_<sender>,
-    ig_<account>_<sender>, wa_<waba>_<phone>) so the notification click
-    opens the exact chat rather than the messages index.
+    User = get_user_model()
+    try:
+        tenant = Tenant.objects.get(schema_name=connection.schema_name)
+        subscription = tenant.current_subscription
+        if not subscription or not subscription.is_active:
+            return User.objects.none()
+        if not subscription.selected_features.filter(key=feature_key, is_active=True).exists():
+            return User.objects.none()
+    except Exception:
+        return User.objects.none()
+
+    return User.objects.filter(is_active=True).filter(
+        Q(is_superuser=True)
+        | Q(
+            tenant_groups__is_active=True,
+            tenant_groups__features__key=feature_key,
+            tenant_groups__features__is_active=True,
+        )
+    ).distinct()
+
+
+def build_social_chat_id(platform, account_id, conversation_key):
+    """Prefixed inbox chat id (``fb_<page>_<psid>``, ``wa_<waba>_<phone>``,
+    ``tg_<account>_<peer>``, ``widget_<conn>_<session>`` …) or None."""
+    platform_lower = (platform or '').lower()
+    prefix = SOCIAL_CHAT_PREFIXES.get(platform_lower)
+    if not prefix or not account_id or not conversation_key:
+        return None
+    key = str(conversation_key)
+    if platform_lower == 'whatsapp':
+        # The inbox strips the leading + from phone numbers in chat ids.
+        key = key.lstrip('+')
+    return f'{prefix}_{account_id}_{key}'
+
+
+def social_message_recipients(assigned_user_id=None):
+    """
+    Who is told about a new customer message.
+
+    An assigned chat notifies only its agent. An unassigned chat is visible
+    to every agent (hide_assigned_chats only hides chats assigned to someone
+    else), so it notifies every active user who has the social inbox
+    (``social_integrations``) — no arbitrary cap, no users without access.
     """
     from django.contrib.auth import get_user_model
     User = get_user_model()
 
+    if assigned_user_id:
+        return list(User.objects.filter(id=assigned_user_id, is_active=True))
+    return list(users_with_feature('social_integrations'))
+
+
+def create_social_message_notification(platform, sender_name, message_text,
+                                       conversation_id, sender_id,
+                                       account_id=None,
+                                       assigned_user_id=None,
+                                       chat_conversation_key=None):
+    """
+    Create a 'message_received' notification for an incoming social message.
+
+    Recipients: see ``social_message_recipients``. The link deep-links into
+    the exact chat: ``/messages/<chat_id>`` (``?tab=assigned`` for the
+    assigned agent) where chat_id is the inbox's prefixed id built from
+    ``account_id`` and ``chat_conversation_key`` (defaults to
+    ``sender_id``; widget passes the session id).
+
+    Metadata (also copied into the push ``data``): platform (display name,
+    e.g. 'Facebook'), platform_key (lowercase), conversation_id (unprefixed
+    key mark-read clears by), chat_id, sender_id, sender_name, account_id.
+    """
     title = f"New {platform} message from {sender_name}"
     msg = (message_text or '')[:100]
+    chat_id = build_social_chat_id(platform, account_id, chat_conversation_key or sender_id)
     meta = {
         'platform': platform,
+        'platform_key': (platform or '').lower(),
         'conversation_id': conversation_id,
+        'chat_id': chat_id,
         'sender_name': sender_name,
         'sender_id': sender_id,
         'account_id': account_id,
     }
 
-    # Build the chat ID in the exact format the frontend routes expect.
-    chat_id = None
-    if account_id and sender_id:
-        platform_lower = (platform or '').lower()
-        if platform_lower == 'facebook':
-            chat_id = f'fb_{account_id}_{sender_id}'
-        elif platform_lower == 'instagram':
-            chat_id = f'ig_{account_id}_{sender_id}'
-        elif platform_lower == 'whatsapp':
-            # Frontend strips the leading + from phone numbers when building
-            # the chat ID, so match that here.
-            normalized = str(sender_id).lstrip('+')
-            chat_id = f'wa_{account_id}_{normalized}'
-
     # Fallback: if we can't build a proper chat ID, keep the user at the
     # messages index rather than linking to a broken deep link.
     base_link = f'/messages/{chat_id}' if chat_id else '/messages'
+    link = f'{base_link}?tab=assigned' if assigned_user_id else base_link
 
-    if assigned_user_id:
-        try:
-            user = User.objects.get(id=assigned_user_id, is_active=True)
-            create_notification(
-                user=user,
-                notification_type='message_received',
-                title=title,
-                message=msg,
-                ticket_id=None,
-                metadata=meta,
-                link_url=f'{base_link}?tab=assigned',
-            )
-        except User.DoesNotExist:
-            pass
-    else:
-        # No assignment — notify up to 10 active users. For each of them the
-        # chat is NOT assigned to them personally, so open the "All chats" tab.
-        users = User.objects.filter(is_active=True)[:10]
-        for user in users:
-            create_notification(
-                user=user,
-                notification_type='message_received',
-                title=title,
-                message=msg,
-                ticket_id=None,
-                metadata=meta,
-                link_url=base_link,
-            )
+    created = []
+    for user in social_message_recipients(assigned_user_id):
+        notification = create_notification(
+            user=user,
+            notification_type='message_received',
+            title=title,
+            message=msg,
+            ticket_id=None,
+            metadata=dict(meta),
+            link_url=link,
+        )
+        if notification is not None:
+            created.append(notification)
+    return created
 
 
 def create_ai_handoff_notification(platform, conversation_id, account_id,
@@ -429,28 +487,23 @@ def create_ai_handoff_notification(platform, conversation_id, account_id,
     Notify agents that the AI companion escalated a conversation to a human.
 
     Audience mirrors create_social_message_notification: the assigned user
-    if the chat is assigned, otherwise up to 10 active users. The link
-    deep-links into the exact chat so the agent lands where the AI stopped.
+    if the chat is assigned, otherwise every active user with the social
+    inbox. The link deep-links into the exact chat so the agent lands where
+    the AI stopped.
     """
-    from django.contrib.auth import get_user_model
-    User = get_user_model()
-
     display_name = sender_name or 'a customer'
     title = f"AI needs a human: {platform} chat with {display_name}"
     msg = (reason or 'The AI assistant asked for a human to take over.')[:200]
+    chat_id = build_social_chat_id(platform, account_id, conversation_id)
     meta = {
         'platform': platform,
+        'platform_key': (platform or '').lower(),
         'conversation_id': conversation_id,
+        'chat_id': chat_id,
         'account_id': account_id,
         'sender_name': sender_name,
         'reason': reason,
     }
-
-    prefix_map = {
-        'facebook': 'fb', 'instagram': 'ig', 'whatsapp': 'wa', 'telegram': 'tg',
-    }
-    prefix = prefix_map.get((platform or '').lower(), (platform or '').lower())
-    chat_id = f'{prefix}_{account_id}_{conversation_id}' if account_id and conversation_id else None
     base_link = f'/messages/{chat_id}' if chat_id else '/messages'
 
     assigned_user_id = None
@@ -462,29 +515,31 @@ def create_ai_handoff_notification(platform, conversation_id, account_id,
     except Exception:
         pass
 
-    if assigned_user_id:
-        try:
-            user = User.objects.get(id=assigned_user_id, is_active=True)
-            create_notification(
-                user=user,
-                notification_type='ai_handoff_requested',
-                title=title,
-                message=msg,
-                ticket_id=None,
-                metadata=meta,
-                link_url=f'{base_link}?tab=assigned',
-            )
-            return
-        except User.DoesNotExist:
-            pass
+    recipients = social_message_recipients(assigned_user_id)
+    if assigned_user_id and not recipients:
+        # Assigned agent deactivated: fall back to everyone with the inbox.
+        recipients = social_message_recipients(None)
+        assigned_user_id = None
+    link = f'{base_link}?tab=assigned' if assigned_user_id else base_link
 
-    for user in User.objects.filter(is_active=True)[:10]:
+    for user in recipients:
         create_notification(
             user=user,
             notification_type='ai_handoff_requested',
             title=title,
             message=msg,
             ticket_id=None,
-            metadata=meta,
-            link_url=base_link,
+            metadata=dict(meta),
+            link_url=link,
         )
+
+
+def social_admin_recipients(permission='manage_social_settings'):
+    """Users who administer social settings/connections: active users with
+    the social inbox who are staff, superuser, role admin, or hold
+    ``permission``."""
+    return [
+        user for user in users_with_feature('social_integrations')
+        if user.is_staff or user.is_superuser or user.role == 'admin'
+        or user.has_permission(permission)
+    ]

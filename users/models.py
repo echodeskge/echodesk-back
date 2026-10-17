@@ -535,6 +535,11 @@ class Notification(models.Model):
         ('call_voicemail', 'New Voicemail'),
         # Integrations
         ('email_sync_disabled', 'Email Sync Disabled'),
+        # Social admin (auto-posting, WhatsApp template reviews, connection alerts)
+        ('auto_post_draft', 'Auto-post Awaiting Approval'),
+        ('auto_post_failed', 'Auto-post Failed'),
+        ('whatsapp_template_status', 'WhatsApp Template Status'),
+        ('system', 'System'),
     ]
 
     user = models.ForeignKey(

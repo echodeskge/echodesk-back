@@ -81,5 +81,8 @@ class Command(BaseCommand):
 
             post.save()
             logger.info(f"Post {post.id} for tenant {tenant.schema_name}: {post.status}")
+            if post.status == 'failed':
+                from social_integrations.notifications import notify_auto_post
+                notify_auto_post(post, 'failed')
 
         return published_count
