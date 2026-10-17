@@ -4,6 +4,7 @@ WebSocket consumers for real-time messaging functionality.
 
 import json
 import asyncio
+import time
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 from channels.layers import get_channel_layer
@@ -37,6 +38,28 @@ class MessagesConsumer(AsyncWebsocketConsumer):
             await self.close(code=4001)
             return
 
+        # The feed is the social inbox: same gate as the REST inbox
+        # (CanViewSocialMessages → the social_integrations feature).
+        # Users without it stay connected (the web dashboard opens this
+        # socket for everyone and would otherwise reconnect-loop) but never
+        # join the feed: the handshake says social_access=false and no
+        # message frames are delivered.
+        access = await self._load_access()
+        self.social_access = access['has_feature']
+        if not self.social_access:
+            print(f"[WebSocket] No social_integrations feature - connecting without the message feed")
+            await self.accept()
+            await self.send(text_data=json.dumps({
+                'type': 'connection',
+                'status': 'connected',
+                'tenant': self.tenant_schema,
+                'user_authenticated': True,
+                'social_access': False,
+            }))
+            return
+        self.is_privileged = access['is_privileged']
+        self._hide_assigned_cache = (access['hide_assigned'], time.monotonic())
+
         # Join the messages group for this tenant
         self.messages_group_name = f'messages_{self.tenant_schema}'
         
@@ -52,9 +75,10 @@ class MessagesConsumer(AsyncWebsocketConsumer):
             'type': 'connection',
             'status': 'connected',
             'tenant': self.tenant_schema,
-            'user_authenticated': not self.user.is_anonymous
+            'user_authenticated': not self.user.is_anonymous,
+            'social_access': True,
         }))
-        
+
         print(f"[WebSocket] Connected successfully for tenant: {self.tenant_schema}")
     
     async def disconnect(self, close_code):
@@ -78,6 +102,13 @@ class MessagesConsumer(AsyncWebsocketConsumer):
                     'timestamp': data.get('timestamp')
                 }))
             
+            elif message_type == 'subscribe_conversation' and not getattr(self, 'social_access', False):
+                await self.send(text_data=json.dumps({
+                    'type': 'error',
+                    'message': 'You do not have access to social messages',
+                    'code': 'FORBIDDEN',
+                }))
+
             elif message_type == 'subscribe_conversation':
                 # Subscribe to specific conversation updates
                 conversation_id = data.get('conversation_id')
@@ -115,9 +146,60 @@ class MessagesConsumer(AsyncWebsocketConsumer):
                 'message': 'Invalid JSON format'
             }))
     
+    # ------------------------------------------------------------------
+    # Access / per-user visibility
+    # ------------------------------------------------------------------
+    HIDE_ASSIGNED_TTL = 30  # seconds the hide_assigned_chats flag is cached
+
+    @database_sync_to_async
+    def _load_access(self):
+        from .models import SocialIntegrationSettings
+        with schema_context(self.tenant_schema):
+            has_feature = self.user.has_feature('social_integrations')
+            settings_obj = SocialIntegrationSettings.objects.first() if has_feature else None
+        return {
+            'has_feature': has_feature,
+            'is_privileged': bool(self.user.is_staff or self.user.is_superuser),
+            'hide_assigned': bool(settings_obj and settings_obj.hide_assigned_chats),
+        }
+
+    @database_sync_to_async
+    def _fetch_hide_assigned(self):
+        from .models import SocialIntegrationSettings
+        with schema_context(self.tenant_schema):
+            settings_obj = SocialIntegrationSettings.objects.first()
+        return bool(settings_obj and settings_obj.hide_assigned_chats)
+
+    async def _hide_assigned_enabled(self):
+        value, fetched_at = getattr(self, '_hide_assigned_cache', (False, 0.0))
+        if time.monotonic() - fetched_at > self.HIDE_ASSIGNED_TTL:
+            try:
+                value = await self._fetch_hide_assigned()
+            except Exception:  # noqa: BLE001 — keep the last known value
+                pass
+            self._hide_assigned_cache = (value, time.monotonic())
+        return value
+
+    async def _hidden_for_me(self, assigned_user_id):
+        """True when hide_assigned_chats hides this chat from this agent:
+        it is assigned to someone else and the agent is not staff."""
+        if assigned_user_id in (None, ''):
+            return False
+        if getattr(self, 'is_privileged', False):
+            return False
+        try:
+            if int(assigned_user_id) == self.user.id:
+                return False
+        except (TypeError, ValueError):
+            return False
+        return await self._hide_assigned_enabled()
+
     # Handlers for messages sent from Django views/signals
     async def new_message(self, event):
-        """Send new message to WebSocket"""
+        """Send new message to WebSocket (unless hide_assigned_chats hides
+        the chat from this agent)."""
+        if await self._hidden_for_me(event.get('assigned_user_id')):
+            return
         await self.send(text_data=json.dumps({
             'type': 'new_message',
             'message': event['message'],
@@ -164,6 +246,8 @@ class MessagesConsumer(AsyncWebsocketConsumer):
 
     async def conversation_update(self, event):
         """Send conversation update to WebSocket"""
+        if await self._hidden_for_me(event.get('assigned_user_id')):
+            return
         await self.send(text_data=json.dumps({
             'type': 'conversation_update',
             'conversation_id': event['conversation_id'],
@@ -400,11 +484,13 @@ class WidgetVisitorConsumer(AsyncWebsocketConsumer):
             # other visitor tabs of this session all listen there and filter
             # by session_id in new_message.
             conversation_id = f"widget_{self.connection_id}_{self.session_id}"
+            assigned_user_id = msg_dict.pop('_assigned_user_id', None)
             await self.channel_layer.group_send(self.tenant_group, {
                 'type': 'new_message',
                 'message': msg_dict,
                 'conversation_id': conversation_id,
                 'timestamp': msg_dict.get('timestamp'),
+                'assigned_user_id': assigned_user_id,
             })
             return
 
@@ -438,6 +524,12 @@ class WidgetVisitorConsumer(AsyncWebsocketConsumer):
             )
             session.last_seen_at = now
             session.save(update_fields=['last_seen_at'])
+            from .notifications import notify_widget_visitor_message, widget_assigned_user_id
+            try:
+                assigned_user_id = widget_assigned_user_id(session)
+            except Exception:  # noqa: BLE001
+                assigned_user_id = None
+            notify_widget_visitor_message(session, msg, assigned_user_id)
             return {
                 'message_id': msg.message_id,
                 'message_text': msg.message_text,
@@ -447,6 +539,7 @@ class WidgetVisitorConsumer(AsyncWebsocketConsumer):
                 'session_id': self.session_id,
                 'connection_id': self.connection_id,
                 'platform': 'widget',
+                '_assigned_user_id': assigned_user_id,
             }
 
     # Outbound handlers invoked by channel_layer.group_send

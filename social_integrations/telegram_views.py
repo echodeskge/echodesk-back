@@ -20,7 +20,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.db import connection as db_connection
 from django.utils import timezone
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import OpenApiParameter, OpenApiTypes, extend_schema, extend_schema_view
 from rest_framework import status, viewsets
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -466,8 +466,25 @@ def telegram_send_message(request):
     return Response({'success': True, 'message': sent.get('message')})
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='Telegram message history (newest first)',
+        description=(
+            'Messages of the tenant\'s Telegram accounts, newest first; use '
+            'page=2.. for older messages. Filter one chat with account_id + '
+            'peer_id. hide_assigned_chats hides chats assigned to other agents '
+            'from non-staff users.'
+        ),
+        parameters=[
+            OpenApiParameter('account_id', OpenApiTypes.STR, description='Telegram account user id (the tg_<account>_<peer> middle part)'),
+            OpenApiParameter('peer_id', OpenApiTypes.STR, description='Customer Telegram user id'),
+            OpenApiParameter('search', OpenApiTypes.STR, description='message_text contains'),
+        ],
+    ),
+)
 class TelegramMessageViewSet(viewsets.ReadOnlyModelViewSet):
     """Read-only Telegram message listing (mirrors WhatsAppMessageViewSet)."""
+    queryset = TelegramMessage.objects.none()  # schema typing; get_queryset() is used
 
     serializer_class = TelegramMessageSerializer
     permission_classes = [IsAuthenticated, CanViewSocialMessages]
@@ -489,5 +506,19 @@ class TelegramMessageViewSet(viewsets.ReadOnlyModelViewSet):
         search = self.request.query_params.get('search')
         if search:
             queryset = queryset.filter(message_text__icontains=search)
+
+        # hide_assigned_chats: non-staff agents don't see chats assigned to
+        # someone else (same rule as the fb/ig/wa viewsets and the inbox).
+        from .inbox_list import exclude_chats_assigned_to_others, hide_assigned_applies
+        if hide_assigned_applies(self.request):
+            from django.db.models import CharField
+            from django.db.models.functions import Cast
+            queryset = exclude_chats_assigned_to_others(
+                queryset.annotate(
+                    _acct=Cast('account__telegram_user_id', output_field=CharField()),
+                    _conv=Cast('peer_id', output_field=CharField()),
+                ),
+                'telegram', self.request.user,
+            )
 
         return queryset.order_by('-timestamp')

@@ -43,3 +43,14 @@ class WidgetMessageSerializer(serializers.ModelSerializer):
             'id', 'session_id', 'message_id', 'is_delivered', 'delivered_at',
             'is_read_by_visitor', 'is_read_by_staff', 'created_at',
         ]
+
+
+class WidgetAdminSendMessageSerializer(serializers.Serializer):
+    """Body of POST /api/widget/admin/messages/send/ (agent reply)."""
+    connection_id = serializers.IntegerField(help_text='Widget connection id (the widget_<conn>_<session> middle part)')
+    session_id = serializers.CharField(help_text='Widget session id (NOT the visitor id)')
+    message_text = serializers.CharField(required=False, allow_blank=True, max_length=10000)
+    attachments = serializers.ListField(
+        child=serializers.DictField(), required=False,
+        help_text='Already-hosted attachments [{url, name, content_type, size}]',
+    )

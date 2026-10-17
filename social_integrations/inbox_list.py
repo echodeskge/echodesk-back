@@ -80,6 +80,34 @@ def _apply_visibility(qs, platform, ctx, assignment_keys=('_conv',)):
     return qs
 
 
+def exclude_chats_assigned_to_others(qs, platform, user, assignment_keys=('_conv',)):
+    """Drop rows of chats actively assigned to another agent.
+
+    ``qs`` must annotate ``_acct`` plus every name in ``assignment_keys``.
+    Used by the per-platform message viewsets when hide_assigned_chats is on.
+    """
+    key_q = Q()
+    for key in assignment_keys:
+        key_q |= Q(conversation_id=OuterRef(key))
+    return qs.filter(~Exists(ChatAssignment.objects.filter(
+        key_q,
+        platform=platform,
+        account_id=OuterRef('_acct'),
+        status__in=ACTIVE_ASSIGNMENT_STATUSES,
+        assigned_user__isnull=False,
+    ).exclude(assigned_user=user)))
+
+
+def hide_assigned_applies(request):
+    """hide_assigned_chats is on and the caller is not staff/superuser."""
+    from .views import get_social_settings
+    user = request.user
+    if user.is_staff or user.is_superuser:
+        return False
+    settings_obj = get_social_settings(request)
+    return bool(settings_obj and settings_obj.hide_assigned_chats)
+
+
 def _take(qs, ctx, order=('-timestamp', '-id')):
     return qs.count(), list(qs.order_by(*order)[:ctx.need])
 

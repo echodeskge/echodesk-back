@@ -138,18 +138,31 @@ class TestCheckMessagingWindow(SocialIntegrationTestCase):
             user=self.agent,
         )
 
+    @patch.object(social_views, 'HUMAN_AGENT_TAG_SCHEMAS', None)
     def test_open_window(self):
         resp = self._check(timedelta(hours=1))
         self.assertTrue(resp.data['window_open'])
         self.assertTrue(resp.data['human_agent_window_open'])
         self.assertTrue(resp.data['can_reply'])
 
+    @patch.object(social_views, 'HUMAN_AGENT_TAG_SCHEMAS', None)
     def test_human_agent_window(self):
         resp = self._check(timedelta(days=3))
         self.assertFalse(resp.data['window_open'])
         self.assertTrue(resp.data['human_agent_window_open'])
         self.assertTrue(resp.data['can_reply'])
         self.assertGreater(resp.data['human_agent_hours_remaining'], 0)
+
+    @patch.object(social_views, 'HUMAN_AGENT_TAG_SCHEMAS', {'groot'})
+    def test_human_agent_window_closed_for_tenants_without_the_tag(self):
+        # The HUMAN_AGENT tag is only sent for allowlisted schemas, so a reply
+        # after 24h would fail here — don't report the 7-day window as open.
+        resp = self._check(timedelta(days=3))
+        self.assertFalse(resp.data['window_open'])
+        self.assertFalse(resp.data['human_agent_window_open'])
+        self.assertFalse(resp.data['can_reply'])
+        resp_fresh = self._check(timedelta(hours=1))
+        self.assertTrue(resp_fresh.data['can_reply'])
 
     def test_fully_expired(self):
         resp = self._check(timedelta(days=8))

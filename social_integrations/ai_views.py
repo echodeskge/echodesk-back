@@ -5,8 +5,9 @@ All endpoints are gated by the `ai_companion` feature; settings writes
 additionally require the admin role (see permissions module).
 """
 import logging
+from typing import Optional
 
-from drf_spectacular.utils import extend_schema, OpenApiParameter
+from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_serializer
 from rest_framework import serializers as drf_serializers, status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -53,7 +54,7 @@ class AICompanionSettingsSerializer(drf_serializers.ModelSerializer):
         ]
         read_only_fields = ['updated_at']
 
-    def get_has_api_key(self, obj):
+    def get_has_api_key(self, obj) -> bool:
         return bool(obj.api_key)
 
     def update(self, instance, validated_data):
@@ -92,7 +93,7 @@ class ConversationSummarySerializer(drf_serializers.ModelSerializer):
             'provider', 'model', 'created_at', 'requested_by_name',
         ]
 
-    def get_requested_by_name(self, obj):
+    def get_requested_by_name(self, obj) -> Optional[str]:
         if obj.requested_by:
             full = f"{obj.requested_by.first_name} {obj.requested_by.last_name}".strip()
             return full or obj.requested_by.email
@@ -107,6 +108,54 @@ class ConversationTripleSerializer(drf_serializers.Serializer):
 
 class AIStateUpdateSerializer(ConversationTripleSerializer):
     mode = drf_serializers.ChoiceField(choices=['ai', 'off'])
+
+
+# ── Response shapes (documentation for the generated clients) ──
+
+@extend_schema_serializer(component_name='AICompanionSettings')
+class AICompanionSettingsResponseSerializer(AICompanionSettingsSerializer):
+    """GET/PATCH /ai/settings/ response: settings plus the full channel list."""
+    channels = AICompanionChannelSerializer(many=True, read_only=True)
+
+
+class AIStateResponseSerializer(drf_serializers.Serializer):
+    mode = drf_serializers.ChoiceField(
+        choices=['ai', 'needs_human', 'off'],
+        help_text="'ai' (default when no state exists), 'needs_human' (escalated) or 'off' (paused)",
+    )
+    reason = drf_serializers.CharField(allow_blank=True)
+    last_ai_reply_at = drf_serializers.DateTimeField(allow_null=True)
+    updated_at = drf_serializers.DateTimeField(allow_null=True)
+
+
+class AISummaryCreatedSerializer(drf_serializers.Serializer):
+    summary = ConversationSummarySerializer()
+
+
+class AISummaryListSerializer(drf_serializers.Serializer):
+    results = ConversationSummarySerializer(many=True, help_text='At most 10, newest first')
+
+
+class AITestRequestSerializer(drf_serializers.Serializer):
+    message = drf_serializers.CharField()
+    guidance_prompt = drf_serializers.CharField(required=False, allow_blank=True)
+
+
+class AITestResponseSerializer(drf_serializers.Serializer):
+    action = drf_serializers.CharField(help_text="'reply' | 'handoff' | 'ignore'")
+    reply_text = drf_serializers.CharField(allow_blank=True)
+    reason = drf_serializers.CharField(allow_blank=True)
+
+
+class AIErrorSerializer(drf_serializers.Serializer):
+    error = drf_serializers.CharField()
+
+
+def _state_conversation_id(platform, conversation_id, account_id):
+    """AI state for widget chats is keyed by session id (the dashboard may
+    send the visitor id or the prefixed list id)."""
+    from .conversation_keys import session_conversation_id
+    return session_conversation_id(platform, conversation_id, account_id)
 
 
 def _get_or_create_settings():
@@ -131,8 +180,12 @@ def _settings_payload(obj):
 
 
 @extend_schema(
-    responses=AICompanionSettingsSerializer,
-    description="Get or update the tenant's AI companion configuration",
+    responses=AICompanionSettingsResponseSerializer,
+    description=(
+        "Get or update the tenant's AI companion configuration. PATCH `channels` "
+        "is a FULL-LIST sync: any channel not in the payload is deleted, so send "
+        "the complete list or omit the key."
+    ),
     methods=['GET', 'PATCH'],
     request=AICompanionSettingsSerializer,
 )
@@ -151,7 +204,7 @@ def ai_companion_settings(request):
 
 @extend_schema(
     request=ConversationTripleSerializer,
-    responses={201: ConversationSummarySerializer},
+    responses={201: AISummaryCreatedSerializer, 400: AIErrorSerializer, 422: AIErrorSerializer},
     description="Generate an AI summary of the whole conversation (synchronous)",
 )
 @api_view(['POST'])
@@ -165,7 +218,7 @@ def ai_summarize_conversation(request):
         summary = ai_companion.generate_summary(
             platform=data['platform'],
             account_id=data['account_id'],
-            conversation_id=data['conversation_id'],
+            conversation_id=_state_conversation_id(data['platform'], data['conversation_id'], data['account_id']),
             requested_by=request.user,
         )
     except ValueError as exc:
@@ -188,8 +241,9 @@ def ai_summarize_conversation(request):
         OpenApiParameter('conversation_id', str, required=True),
         OpenApiParameter('account_id', str, required=True),
     ],
-    responses=ConversationSummarySerializer(many=True),
-    description="List recent summaries for one conversation (newest first)",
+    responses=AISummaryListSerializer,
+    operation_id='social_ai_summaries_list',
+    description="List recent summaries for one conversation (newest first, at most 10)",
 )
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanUseAICompanion])
@@ -201,7 +255,7 @@ def ai_conversation_summaries(request):
     summaries = ConversationSummary.objects.filter(
         platform=data['platform'],
         account_id=data['account_id'],
-        conversation_id=data['conversation_id'],
+        conversation_id=_state_conversation_id(data['platform'], data['conversation_id'], data['account_id']),
     )[:10]
     return Response({
         'results': ConversationSummarySerializer(summaries, many=True).data,
@@ -210,12 +264,22 @@ def ai_conversation_summaries(request):
 
 @extend_schema(
     description=(
-        "GET: read the conversation's AI mode (defaults to mode 'ai' when "
-        "no state exists). POST: pause ('off') or resume ('ai') the AI for "
-        "this conversation."
+        "Read the conversation's AI mode (mode 'ai' when no state exists). "
+        "Widget chats accept the visitor id, session id or list id."
     ),
-    methods=['GET', 'POST'],
+    methods=['GET'],
+    parameters=[
+        OpenApiParameter('platform', str, required=True, enum=list(AI_PLATFORMS)),
+        OpenApiParameter('conversation_id', str, required=True),
+        OpenApiParameter('account_id', str, required=True),
+    ],
+    responses={200: AIStateResponseSerializer},
+)
+@extend_schema(
+    description="Pause ('off') or resume ('ai') the AI for this conversation.",
+    methods=['POST'],
     request=AIStateUpdateSerializer,
+    responses={200: AIStateResponseSerializer},
 )
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated, CanUseAICompanion])
@@ -230,7 +294,7 @@ def ai_conversation_state(request):
     if request.method == 'POST':
         state = ai_companion.set_conversation_mode(
             platform=data['platform'],
-            conversation_id=data['conversation_id'],
+            conversation_id=_state_conversation_id(data['platform'], data['conversation_id'], data['account_id']),
             account_id=data['account_id'],
             mode=data['mode'],
             reason='' if data['mode'] == 'ai' else 'Paused by agent',
@@ -238,7 +302,7 @@ def ai_conversation_state(request):
     else:
         state = AIConversationState.objects.filter(
             platform=data['platform'],
-            conversation_id=data['conversation_id'],
+            conversation_id=_state_conversation_id(data['platform'], data['conversation_id'], data['account_id']),
             account_id=data['account_id'],
         ).first()
 
@@ -256,16 +320,8 @@ def ai_conversation_state(request):
 
 
 @extend_schema(
-    request={
-        'application/json': {
-            'type': 'object',
-            'required': ['message'],
-            'properties': {
-                'message': {'type': 'string'},
-                'guidance_prompt': {'type': 'string'},
-            },
-        }
-    },
+    request=AITestRequestSerializer,
+    responses={200: AITestResponseSerializer, 400: AIErrorSerializer, 422: AIErrorSerializer},
     description="Dry-run one customer message against the companion prompt",
 )
 @api_view(['POST'])
