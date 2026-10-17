@@ -1012,18 +1012,23 @@ class Order(models.Model):
         so a double cancel (or a cancel racing the abandoned-order sweeper) can't
         restock twice. Stock is restored with an atomic ``F()`` update so it can't
         lose a concurrent checkout decrement. Returns True if it cancelled, False
-        if the order was already cancelled.
+        if the order was already cancelled or refunded (both are terminal: their
+        stock and promo use have already been given back).
         """
         from django.db import transaction
         from django.db.models import F
         from django.utils import timezone
 
-        if self.status == 'cancelled':
+        terminal = ('cancelled', 'refunded')
+        if self.status in terminal:
             return False
 
         with transaction.atomic():
             order = Order.objects.select_for_update().get(pk=self.pk)
-            if order.status == 'cancelled':
+            if order.status in terminal:
+                # Re-checked under the row lock: a refund (or another cancel)
+                # that committed first already restocked this order.
+                self.status = order.status
                 return False
 
             if restock:
