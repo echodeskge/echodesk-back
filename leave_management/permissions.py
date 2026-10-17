@@ -70,7 +70,13 @@ class CanApproveLeave(permissions.BasePermission):
     message = "You do not have permission to approve this leave request."
 
     def has_object_permission(self, request, view, obj):
-        from .utils import can_user_approve
+        from .utils import can_user_approve, is_self_approval, SELF_APPROVAL_MESSAGE
+
+        # Nobody but a superuser decides on their own request, on any route
+        # (staff used to pass straight through and could self-approve).
+        if is_self_approval(request.user, obj):
+            self.message = SELF_APPROVAL_MESSAGE
+            return False
 
         # Admins always have permission
         if request.user.is_staff or request.user.is_superuser:

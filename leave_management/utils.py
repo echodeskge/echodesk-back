@@ -351,6 +351,22 @@ def carryable_days(balance, leave_type):
     return min(remaining, Decimal(str(leave_type.max_carry_forward_days)))
 
 
+def _locked_carry_forward_run(tenant, from_year):
+    """
+    The LeaveCarryForwardRun row for (tenant, from_year), locked, or None.
+    A missing row locks nothing, so two concurrent first runs can both see
+    None; the loser then hits the unique constraint on create (an
+    IntegrityError the view turns into an already-ran response).
+    """
+    from .models import LeaveCarryForwardRun
+
+    return (
+        LeaveCarryForwardRun.objects.select_for_update()
+        .filter(tenant=tenant, from_year=from_year)
+        .first()
+    )
+
+
 class CarryForwardAlreadyRun(Exception):
     """Raised when a carry forward for the year already ran and force is off."""
 
@@ -380,11 +396,7 @@ def carry_forward_balances(tenant, from_year, to_year, user=None, force=False):
     to_year = int(to_year)
 
     with transaction.atomic():
-        run = (
-            LeaveCarryForwardRun.objects.select_for_update()
-            .filter(tenant=tenant, from_year=from_year)
-            .first()
-        )
+        run = _locked_carry_forward_run(tenant, from_year)
         if run is not None and not force:
             raise CarryForwardAlreadyRun(run)
 
@@ -509,20 +521,17 @@ def get_approval_chain(leave_request):
     return [{'level': item.level, 'role': item.approver_role} for item in chain]
 
 
-# Approval progress. A request moves pending -> manager_approved ->
-# hr_approved -> approved; each status says which roles have signed off.
-# Chain steps are matched by ROLE (not by their numeric level), so an
-# HR-only chain stored at level 1 or 2 behaves the same and an 'admin' step
-# after HR is never skipped.
+# Approval progress. A request moves through the chain one step at a time,
+# in LEVEL order (the order the chain is stored in), and its status names
+# the role of the last step that signed off: pending -> <role>_approved ->
+# ... -> approved. Because the steps are walked in level order, a chain
+# stored hr@1, manager@2 requires HR first and then the manager (matching
+# by role rank used to skip the manager step there). An 'admin' step always
+# ends the chain: there is no 'admin_approved' status, so it finalises.
 APPROVAL_STATUS_RANK = {
     'pending': 0,
     'manager_approved': 1,
     'hr_approved': 2,
-}
-APPROVER_ROLE_RANK = {
-    'manager': 1,
-    'hr': 2,
-    'admin': 3,
 }
 # Status a request gets once a step of the given role signs off. 'admin' is
 # always the last possible step, so it ends the chain.
@@ -532,6 +541,29 @@ ROLE_APPROVED_STATUS = {
     'admin': 'approved',
 }
 OPEN_APPROVAL_STATUSES = tuple(APPROVAL_STATUS_RANK)
+
+
+def _step_signed(leave_request, role):
+    """
+    True when the chain step(s) for ``role`` were already signed off on
+    ``leave_request``. A step counts as signed when its approver field (or
+    its timestamp, which survives the approver being deleted) is set, or
+    when the status names that role as the last sign-off. An 'admin' step
+    is never "signed" in this sense: it always finalises the request.
+    """
+    if role == 'manager':
+        return bool(
+            leave_request.manager_approver_id
+            or leave_request.manager_approved_at
+            or leave_request.status == 'manager_approved'
+        )
+    if role == 'hr':
+        return bool(
+            leave_request.hr_approver_id
+            or leave_request.hr_approved_at
+            or leave_request.status == 'hr_approved'
+        )
+    return False
 
 
 def get_next_approver_role(leave_request):
@@ -546,8 +578,7 @@ def get_next_approver_role(leave_request):
         fully approved, closed (approved/rejected/cancelled) or no approval
         is required.
     """
-    current_rank = APPROVAL_STATUS_RANK.get(leave_request.status)
-    if current_rank is None:
+    if leave_request.status not in APPROVAL_STATUS_RANK:
         # approved / rejected / cancelled: nothing left to approve. (This
         # used to fall back to rank 0 and report 'manager' for an approved
         # request, so the final approval never moved the balance.)
@@ -558,10 +589,36 @@ def get_next_approver_role(leave_request):
     if not chain:
         return None
 
-    for approval in chain:
-        role_rank = APPROVER_ROLE_RANK.get(approval['role'], APPROVER_ROLE_RANK['admin'])
-        if role_rank > current_rank:
-            return approval['role']
+    # Walk the steps in level order and return the first one that has not
+    # been signed off yet. A step is done when its approver field is set,
+    # so:
+    #   - hr@1, manager@2 requires HR first, then the manager;
+    #   - manager@1, hr@2, manager@3 still requires HR after the first
+    #     manager sign-off (jumping to the role's last position used to
+    #     skip HR there);
+    #   - a role listed twice needs only one sign-off (the request has one
+    #     approver field per role);
+    #   - a chain edited while a request is in flight resumes at the first
+    #     step of the new chain that nobody signed.
+    roles = [approval['role'] for approval in chain]
+
+    has_signoff_fields = bool(
+        leave_request.manager_approver_id or leave_request.manager_approved_at
+        or leave_request.hr_approver_id or leave_request.hr_approved_at
+    )
+    first_open = 0
+    if leave_request.status != 'pending' and not has_signoff_fields:
+        # A request whose status says a step signed but which carries no
+        # approver fields (legacy rows, direct status edits): trust the
+        # status and treat every step before the signed role's FIRST
+        # position as done too.
+        signed_role = leave_request.status[:-len('_approved')]
+        if signed_role in roles:
+            first_open = roles.index(signed_role)
+
+    for role in roles[first_open:]:
+        if not _step_signed(leave_request, role):
+            return role
 
     return None  # All approvals completed
 
@@ -609,6 +666,19 @@ def apply_approval_step(leave_request, user, comments=''):
     return role
 
 
+SELF_APPROVAL_MESSAGE = "You cannot approve or reject your own leave request."
+
+
+def is_self_approval(user, leave_request):
+    """
+    True when ``user`` would decide on their own leave request. Only a
+    superuser may do that (staff, HR and managers may not, on any route).
+    """
+    if user is None or getattr(user, 'is_superuser', False):
+        return False
+    return leave_request.employee_id == user.pk
+
+
 def can_user_approve(user, leave_request):
     """
     Check if user has permission to approve this leave request
@@ -620,6 +690,9 @@ def can_user_approve(user, leave_request):
     Returns:
         tuple: (bool, str) - (can_approve, reason)
     """
+    if is_self_approval(user, leave_request):
+        return False, SELF_APPROVAL_MESSAGE
+
     next_role = get_next_approver_role(leave_request)
 
     if not next_role:

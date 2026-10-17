@@ -113,17 +113,30 @@ try:
         from users.notification_utils import create_notification
 
         if created:
-            # Notify the employee's direct manager when one is assigned and
-            # active; otherwise fall back to staff users as a proxy for HR.
-            manager = instance.employee.manager
-            if manager and manager.is_active and manager.id != instance.employee_id:
-                managers = [manager]
+            from leave_management.utils import get_next_approver_role
+
+            # Notify whoever acts on the FIRST chain step. When that is HR
+            # or admin (e.g. a chain stored hr@1, manager@2), the manager
+            # cannot approve yet, so tell the HR / admin proxies instead.
+            first_role = get_next_approver_role(instance)
+            if first_role in ('hr', 'admin'):
+                recipients = _leave_next_approvers(instance, first_role, None)
             else:
-                managers = User.objects.filter(
-                    is_active=True, is_staff=True
-                ).exclude(id=instance.employee_id)[:10]
+                # Notify the employee's direct manager when one is assigned
+                # and active; otherwise fall back to staff users as a proxy
+                # for HR.
+                manager = instance.employee.manager
+                if manager and manager.is_active and manager.id != instance.employee_id:
+                    managers = [manager]
+                else:
+                    managers = User.objects.filter(
+                        is_active=True, is_staff=True
+                    ).exclude(id=instance.employee_id)[:10]
+                recipients = [
+                    (m, f'/leave/team-requests?id={instance.id}') for m in managers
+                ]
             employee_name = instance.employee.get_full_name() or instance.employee.email
-            for manager in managers:
+            for manager, link_url in recipients:
                 create_notification(
                     user=manager,
                     notification_type='leave_request_submitted',
@@ -136,7 +149,7 @@ try:
                         'start_date': str(instance.start_date),
                         'end_date': str(instance.end_date),
                     },
-                    link_url=f'/leave/team-requests?id={instance.id}',
+                    link_url=link_url,
                 )
             return
 

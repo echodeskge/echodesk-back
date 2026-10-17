@@ -3,7 +3,9 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
+from django.db import transaction
 from django.utils import timezone
+from rest_framework.exceptions import ValidationError
 from datetime import date
 from drf_spectacular.utils import extend_schema, OpenApiParameter
 
@@ -25,6 +27,7 @@ from .utils import (
     calculate_working_days, check_overlapping_leaves, check_leave_balance,
     initialize_leave_balances_for_user
 )
+from .views import lock_leave_request
 
 
 STATUS_IN_PARAM = OpenApiParameter(
@@ -92,20 +95,44 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         """Update leave request - only pending requests"""
-        if self.get_object().status != 'pending':
-            from rest_framework.exceptions import ValidationError
-            raise ValidationError('Only pending leave requests can be updated')
-        serializer.save()
+        # Lock the row and save onto the locked copy, so an approval that
+        # lands at the same moment is not overwritten back to 'pending'
+        # (the serializer saves every field of its instance).
+        with transaction.atomic():
+            locked = lock_leave_request(serializer.instance)
+            if locked.status != 'pending':
+                raise ValidationError('Only pending leave requests can be updated')
+            serializer.instance = locked
+            serializer.save()
 
     def perform_destroy(self, instance):
         """Delete leave request - only pending requests"""
-        if instance.status != 'pending':
-            from rest_framework.exceptions import ValidationError
-            raise ValidationError('Only pending leave requests can be deleted')
+        # Re-check the status on the locked row and release the pending
+        # days and delete in one transaction, so a concurrent approval
+        # cannot leave used days counted for a deleted request.
+        with transaction.atomic():
+            instance = lock_leave_request(instance)
+            if instance.status != 'pending':
+                raise ValidationError('Only pending leave requests can be deleted')
 
-        # Remove from pending balance
-        update_leave_balance(instance, action='cancel')
-        instance.delete()
+            # Remove from pending balance
+            update_leave_balance(instance, action='cancel')
+            instance.delete()
+
+    @staticmethod
+    def _cancel_error(leave_request):
+        """400 response when ``leave_request`` cannot be cancelled, else None."""
+        if leave_request.status == 'cancelled':
+            return Response(
+                {'error': 'Leave request is already cancelled'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if leave_request.status not in ['pending', 'manager_approved', 'hr_approved', 'approved']:
+            return Response(
+                {'error': 'Cannot cancel a rejected leave request'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        return None
 
     @extend_schema(
         tags=['Leave Management - Employee'],
@@ -117,36 +144,37 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
         """Cancel a leave request"""
         leave_request = self.get_object()
 
-        if leave_request.status == 'cancelled':
-            return Response(
-                {'error': 'Leave request is already cancelled'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if leave_request.status not in ['pending', 'manager_approved', 'hr_approved', 'approved']:
-            return Response(
-                {'error': 'Cannot cancel a rejected leave request'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        error = self._cancel_error(leave_request)
+        if error:
+            return error
 
         serializer = LeaveCancellationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        was_approved = leave_request.status == 'approved'
+        # Re-check on the locked row: an approval or rejection landing at
+        # the same moment is serialised with this cancel, so the balance is
+        # released from the bucket the request is really in (and only once).
+        with transaction.atomic():
+            leave_request = lock_leave_request(leave_request)
+            error = self._cancel_error(leave_request)
+            if error:
+                return error
 
-        leave_request.status = 'cancelled'
-        leave_request.cancelled_at = timezone.now()
-        leave_request.cancellation_reason = serializer.validated_data.get('reason', '')
-        leave_request._leave_actor = request.user
-        leave_request.save()
+            was_approved = leave_request.status == 'approved'
 
-        # Update balance
-        if was_approved:
-            # Return used days back
-            update_leave_balance(leave_request, action='cancel_approved')
-        else:
-            # Remove from pending
-            update_leave_balance(leave_request, action='cancel')
+            leave_request.status = 'cancelled'
+            leave_request.cancelled_at = timezone.now()
+            leave_request.cancellation_reason = serializer.validated_data.get('reason', '')
+            leave_request._leave_actor = request.user
+            leave_request.save()
+
+            # Update balance
+            if was_approved:
+                # Return used days back
+                update_leave_balance(leave_request, action='cancel_approved')
+            else:
+                # Remove from pending
+                update_leave_balance(leave_request, action='cancel')
 
         return Response({
             'success': True,

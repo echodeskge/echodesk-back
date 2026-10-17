@@ -11,15 +11,17 @@ from .models import LeaveRequest, LeaveBalance
 from .serializers import (
     LeaveRequestListSerializer, LeaveRequestDetailSerializer,
     LeaveApprovalSerializer,
-    LeaveBalanceListSerializer, LeaveBalanceDetailSerializer
+    LeaveBalanceListSerializer, LeaveBalanceDetailSerializer,
+    LeaveActionResponseSerializer,
 )
 from .permissions import (
     HasLeaveManagementFeature, IsLeaveManager, CanApproveLeave
 )
 from .utils import (
     update_leave_balance, get_next_approver_role, apply_approval_step,
-    team_q, filter_by_status_in
+    team_q, filter_by_status_in, OPEN_APPROVAL_STATUSES,
 )
+from .views import ACTION_ERROR_RESPONSE, FORBIDDEN_RESPONSE, lock_leave_request
 
 
 STATUS_IN_PARAM = OpenApiParameter(
@@ -107,7 +109,11 @@ class ManagerLeaveRequestViewSet(viewsets.ReadOnlyModelViewSet):
     @extend_schema(
         tags=['Leave Management - Manager'],
         summary='Approve team member leave request',
-        request=LeaveApprovalSerializer
+        description='Signs off the manager step of the approval chain. When '
+                    'no later step is left the request becomes approved. 403 '
+                    '{error} when the request awaits a different approver role.',
+        request=LeaveApprovalSerializer,
+        responses={200: LeaveActionResponseSerializer, 400: ACTION_ERROR_RESPONSE, 403: FORBIDDEN_RESPONSE},
     )
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, HasLeaveManagementFeature, IsLeaveManager, CanApproveLeave])
     def approve(self, request, pk=None):
@@ -130,6 +136,14 @@ class ManagerLeaveRequestViewSet(viewsets.ReadOnlyModelViewSet):
         # Records the manager step; when no HR/admin step follows it also
         # finalises the request and moves the days from pending to used.
         with transaction.atomic():
+            # Re-check on the locked row: a concurrent decision may have
+            # moved the request on while we waited.
+            leave_request = lock_leave_request(leave_request)
+            if get_next_approver_role(leave_request) != 'manager':
+                return Response(
+                    {'error': 'This leave request requires a different approver role'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
             apply_approval_step(leave_request, request.user, comments)
             leave_request._leave_actor = request.user
             leave_request.save()
@@ -143,36 +157,61 @@ class ManagerLeaveRequestViewSet(viewsets.ReadOnlyModelViewSet):
     @extend_schema(
         tags=['Leave Management - Manager'],
         summary='Reject team member leave request',
-        request=LeaveApprovalSerializer
+        description='Rejects a request that is pending or awaits the manager '
+                    'step; `comments` (the reason) are required.',
+        request=LeaveApprovalSerializer,
+        responses={200: LeaveActionResponseSerializer, 400: ACTION_ERROR_RESPONSE, 403: FORBIDDEN_RESPONSE},
     )
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, HasLeaveManagementFeature, IsLeaveManager, CanApproveLeave])
     def reject(self, request, pk=None):
         """Reject a team member's leave request"""
         leave_request = self.get_object()
 
-        if leave_request.status != 'pending':
+        if not self._manager_can_reject(leave_request):
             return Response(
-                {'error': 'Only pending requests can be rejected by managers'},
+                {'error': 'Managers can only reject a request that is pending or awaiting the manager step'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
         serializer = LeaveApprovalSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        leave_request.status = 'rejected'
-        leave_request.rejected_by = request.user
-        leave_request.rejected_at = timezone.now()
-        leave_request.rejection_reason = serializer.validated_data.get('comments', '')
-        leave_request._leave_actor = request.user
-        leave_request.save()
+        with transaction.atomic():
+            leave_request = lock_leave_request(leave_request)
+            if not self._manager_can_reject(leave_request):
+                return Response(
+                    {'error': 'Managers can only reject a request that is pending or awaiting the manager step'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            leave_request.status = 'rejected'
+            leave_request.rejected_by = request.user
+            leave_request.rejected_at = timezone.now()
+            leave_request.rejection_reason = serializer.validated_data.get('comments', '')
+            leave_request._leave_actor = request.user
+            leave_request.save()
 
-        # Remove from pending balance
-        update_leave_balance(leave_request, action='reject')
+            # Remove from pending balance
+            update_leave_balance(leave_request, action='reject')
 
         return Response({
             'success': True,
-            'message': 'Leave request rejected'
+            'message': 'Leave request rejected',
+            'status': leave_request.status,
         })
+
+    @staticmethod
+    def _manager_can_reject(leave_request):
+        """
+        A manager may reject a pending request, or one whose next open step
+        is the manager's (e.g. a chain stored hr@1, manager@2 after HR
+        signed off).
+        """
+        if leave_request.status == 'pending':
+            return True
+        return (
+            leave_request.status in OPEN_APPROVAL_STATUSES
+            and get_next_approver_role(leave_request) == 'manager'
+        )
 
     @extend_schema(
         tags=['Leave Management - Manager'],
