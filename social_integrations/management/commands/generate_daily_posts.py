@@ -91,9 +91,16 @@ class Command(BaseCommand):
             service = AIContentService()
             post = service.generate_post_for_tenant(auto_settings)
 
+            from social_integrations.notifications import notify_auto_post
+
             # If auto-approve, immediately mark for publishing
             if not auto_settings.require_approval and post.status == 'approved':
                 self._auto_publish(post)
+                if post.status == 'failed':
+                    notify_auto_post(post, 'failed')
+            elif post.status == 'draft':
+                # Needs a human: tell the social-settings admins (push + bell).
+                notify_auto_post(post, 'draft')
 
             logger.info(f"Generated post for {tenant.schema_name}: {post.id}")
             self.stdout.write(f"Generated post for {tenant.schema_name}: {post.id}")

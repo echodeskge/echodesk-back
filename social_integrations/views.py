@@ -74,10 +74,17 @@ from .serializers import (
 from .services.profile_pic_cache import get_facebook_profile_pic, get_instagram_profile
 from .services import ai_companion as ai_companion_service
 from .pagination import SocialMessagePagination
+from .conversation_keys import (
+    assignment_conversation_id, assignment_lookup_ids, session_conversation_id,
+)
+from .schema_serializers import *  # noqa: F401,F403 — documentation shapes for extend_schema
+from .oauth_state import (
+    make_oauth_state, oauth_result_redirect, read_oauth_state, return_to_from_request,
+)
 from .permissions import (
     CanManageSocialConnections, CanViewSocialMessages,
     CanSendSocialMessages, CanManageSocialSettings, IsSuperAdmin, IsStaffUser,
-    CanAccessSocial
+    CanAccessSocial, CanAccessSocialClients, CanManageSocialClientFields,
 )
 
 # Initialize logger
@@ -105,6 +112,15 @@ def get_social_settings(request):
         cached = SocialIntegrationSettings.objects.first()
         request._social_settings_cache = cached
     return cached
+
+
+def _positive_int_param(value, default):
+    """Parse a positive integer query param; fall back to ``default`` on junk."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def convert_facebook_timestamp(timestamp):
@@ -164,16 +180,61 @@ def get_assignment_for_conversation(platform, conversation_id, account_id):
     try:
         assignment = ChatAssignment.objects.filter(
             platform=platform,
-            conversation_id=conversation_id,
+            conversation_id__in=assignment_lookup_ids(platform, conversation_id, account_id),
             account_id=account_id,
             status__in=['active', 'in_session']  # Only active assignments
         ).first()
-        if assignment and assignment.assigned_user:
-            return assignment.assigned_user.id
+        if assignment and assignment.assigned_user_id:
+            return assignment.assigned_user_id
         return None
     except Exception as e:
         logger.error(f"Failed to get assignment for conversation: {e}")
         return None
+
+
+def _find_assignment(platform, conversation_id, account_id, **filters):
+    """The ChatAssignment for a chat, whichever id form the client sent.
+
+    Widget chats are matched by visitor id and session id (see
+    ``conversation_keys``); other platforms by the raw id.
+    """
+    return ChatAssignment.objects.filter(
+        platform=platform,
+        conversation_id__in=assignment_lookup_ids(platform, conversation_id, account_id),
+        account_id=account_id,
+        **filters,
+    ).select_related('assigned_user').order_by('-updated_at').first()
+
+
+def _archive_keys(platform, conversation_id, account_id):
+    """ConversationArchive keys for a chat (session id for widget)."""
+    raw = str(conversation_id or '').strip()
+    if platform == 'widget':
+        return [session_conversation_id(platform, raw, account_id)]
+    return [raw]
+
+
+_ACCOUNT_SCOPE_FIELDS = {
+    'facebook': 'page_connection__page_id',
+    'instagram': 'account_connection__instagram_account_id',
+    'whatsapp': 'business_account__waba_id',
+    'email': 'connection_id',
+    'widget': 'session__connection_id',
+    'telegram': 'account__telegram_user_id',
+}
+
+
+def _account_scope(platform, account_id):
+    """ORM filter kwargs limiting message queries to one platform account."""
+    field = _ACCOUNT_SCOPE_FIELDS.get(platform)
+    if not field or account_id in (None, ''):
+        return {}
+    if field in ('connection_id', 'session__connection_id', 'account__telegram_user_id'):
+        try:
+            return {field: int(account_id)}
+        except (TypeError, ValueError):
+            return {}
+    return {field: str(account_id)}
 
 
 def send_websocket_notification(tenant_schema, message_data, conversation_id, assigned_user_id=None):
@@ -652,7 +713,19 @@ class FacebookPageConnectionViewSet(viewsets.ModelViewSet):
         serializer.save()  # No user assignment needed in multi-tenant setup
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='Facebook message history (newest first)',
+        description='Filter one chat with page_id + sender_id; page=2.. for older messages.',
+        parameters=[
+        OpenApiParameter(name='page_id', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description='Facebook page id'),
+        OpenApiParameter(name='sender_id', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description='Customer PSID'),
+        OpenApiParameter(name='initial_load', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY, required=False, description='With the conversation filter: return the unread messages + the 10 newest only'),
+        ],
+    ),
+)
 class FacebookMessageViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = FacebookMessage.objects.none()  # schema typing; get_queryset() is used
     serializer_class = FacebookMessageSerializer
     permission_classes = [IsAuthenticated, CanViewSocialMessages]
     pagination_class = SocialMessagePagination
@@ -741,6 +814,18 @@ class FacebookMessageViewSet(viewsets.ReadOnlyModelViewSet):
         return base_queryset
 
 
+@extend_schema(
+    summary='Start the Facebook/Instagram connect OAuth',
+    parameters=[
+        OpenApiParameter(
+            name='return_to', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+            enum=['app'], required=False,
+            description="'app' → the callback finally redirects to echodesk://social/connections?platform=<p>&status=<ok|error>&message=… instead of the web page",
+        ),
+    ],
+    responses={200: OAuthStartResponseSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Connections'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def facebook_oauth_start(request):
@@ -769,13 +854,13 @@ def facebook_oauth_start(request):
         else:
             tenant_name = "amanati"  # Default fallback
         
-        # Simplified state parameter with just tenant schema
-        state_raw = f'tenant={tenant_name}'
-        state = quote(state_raw)  # URL encode the state
-        logger.info(f"Tenant object: {tenant_obj}")
-        logger.info(f"Extracted tenant schema: {tenant_name}")
-        logger.info(f"Generated raw state parameter: {state_raw}")
-        logger.info(f"URL encoded state parameter: {state}")
+        # Signed state: tenant + nonce + initiating user (+ return_to=app).
+        state = quote(make_oauth_state(
+            tenant_name,
+            user_id=request.user.id,
+            return_to=return_to_from_request(request),
+        ))
+        logger.info(f"Facebook OAuth start for tenant schema: {tenant_name}")
         
         # Facebook OAuth URL for business pages with Messenger Platform for Instagram
         # Using pages_messaging for both Facebook and Instagram messaging
@@ -816,59 +901,46 @@ def facebook_oauth_callback(request):
         error_description = request.GET.get('error_description')
         error_reason = request.GET.get('error_reason')
         state = request.GET.get('state')
-        
-        # Parse state to get tenant info - no user_id needed
-        tenant_name = None
-        is_publishing_upgrade = False
-        if state:
-            from urllib.parse import unquote
-            # URL decode the state parameter in case it's encoded
-            decoded_state = unquote(state)
-            logger.info(f"Raw state parameter: {state}")
-            logger.info(f"Decoded state parameter: {decoded_state}")
 
-            # State format: "tenant=amanati" or "tenant=amanati&publishing=true"
-            try:
-                for param in decoded_state.split('&'):
-                    if param.startswith('tenant='):
-                        tenant_name = param.split('=', 1)[1]
-                        logger.info(f"Parsed tenant_name: {tenant_name}")
-                    elif param.startswith('publishing='):
-                        is_publishing_upgrade = param.split('=', 1)[1].lower() == 'true'
-                        logger.info(f"Publishing upgrade: {is_publishing_upgrade}")
-            except (ValueError, IndexError) as e:
-                logger.error(f"Error parsing state parameter: {e}")
-                return JsonResponse({
-                    'status': 'error',
-                    'message': f'Invalid state parameter format: {state}',
-                    'error': str(e),
-                    'expected_format': 'tenant=TenantName'
-                })
-        
-        # Validate that we have required parameters
-        if not tenant_name:
-            logger.error(f"No tenant_name found in state: {state}")
-            frontend_url = f"https://amanati.{settings.MAIN_DOMAIN}"  # Default fallback
-            error_msg = "Tenant name not found in state parameter"
-            from urllib.parse import quote_plus
-            return redirect(f"{frontend_url}/social/connections?facebook_status=error&message={quote_plus(error_msg)}")
-        
-        # Extract tenant schema name from tenant_name - use tenant_name directly as schema
-        tenant_schema = tenant_name if tenant_name else 'amanati'
-        
+        # The state is signed by facebook_oauth_start(_publishing); anything
+        # else (forged, expired, replayed, legacy "tenant=x") is rejected.
+        oauth_state = read_oauth_state(state)
+        if not oauth_state:
+            logger.error("Facebook OAuth callback with an invalid state")
+            return oauth_result_redirect(
+                platform='facebook', ok=False,
+                message='Invalid or expired connection request. Please start again.',
+            )
+        tenant_name = oauth_state['tenant']
+        is_publishing_upgrade = oauth_state['publishing']
+        tenant_schema = tenant_name
+
         # Frontend dashboard URL using tenant name
         frontend_url = f"https://{tenant_schema}.{settings.MAIN_DOMAIN}"
-        
-        # Find a suitable user for this tenant (superuser or admin)
+
+        def _fb_redirect(ok, message='', **extra):
+            return oauth_result_redirect(
+                platform='facebook', ok=ok, message=message, state=oauth_state,
+                tenant_schema=tenant_schema, extra=extra or None,
+            )
+
+        # Find a suitable user for this tenant: the user who started the
+        # flow, else a superuser / admin / any active user.
         from tenant_schemas.utils import schema_context
         from django.contrib.auth import get_user_model
         User = get_user_model()
-        
+
         user_id = None
         with schema_context(tenant_schema):
+            if oauth_state.get('user_id'):
+                user_id = User.objects.filter(
+                    id=oauth_state['user_id'], is_active=True,
+                ).values_list('id', flat=True).first()
             # Try to find a superuser first
-            superuser = User.objects.filter(is_superuser=True, is_active=True).first()
-            if superuser:
+            superuser = None if user_id else User.objects.filter(is_superuser=True, is_active=True).first()
+            if user_id:
+                logger.info(f"Facebook OAuth started by user {user_id} in tenant {tenant_schema}")
+            elif superuser:
                 user_id = superuser.id
                 logger.info(f"Found superuser for tenant {tenant_schema}: {superuser.email}")
             else:
@@ -889,7 +961,7 @@ def facebook_oauth_callback(request):
             frontend_url = f"https://{tenant_schema}.{settings.MAIN_DOMAIN}"
             error_msg = f"No active users found in tenant {tenant_schema}"
             from urllib.parse import quote_plus
-            return redirect(f"{frontend_url}/social/connections?facebook_status=error&message={quote_plus(error_msg)}")
+            return _fb_redirect(False, error_msg)
         
         # Frontend dashboard URL
         frontend_url = f"https://{tenant_schema}.{settings.MAIN_DOMAIN}"
@@ -899,14 +971,14 @@ def facebook_oauth_callback(request):
             error_msg = f"Facebook OAuth failed: {error_description or error}"
             logger.error(f"Facebook OAuth error: {error} - {error_description}")
             from urllib.parse import quote_plus
-            return redirect(f"{frontend_url}/social/connections?facebook_status=error&message={quote_plus(error_msg)}")
+            return _fb_redirect(False, error_msg)
         
         # Handle missing code
         if not code:
             error_msg = "Authorization code not provided by Facebook"
             logger.error("Facebook OAuth callback missing authorization code")
             from urllib.parse import quote_plus
-            return redirect(f"{frontend_url}/social/connections?facebook_status=error&message={quote_plus(error_msg)}")
+            return _fb_redirect(False, error_msg)
         
         # Exchange authorization code for access token
         token_url = f"https://graph.facebook.com/{getattr(settings, 'SOCIAL_INTEGRATIONS', {}).get('FACEBOOK_API_VERSION', 'v23.0')}/oauth/access_token"
@@ -926,14 +998,14 @@ def facebook_oauth_callback(request):
             error_msg = f"Token exchange failed: {token_data.get('error', {}).get('message', 'Unknown error')}"
             logger.error(f"Facebook token exchange error: {token_data}")
             from urllib.parse import quote_plus
-            return redirect(f"{frontend_url}/social/connections?facebook_status=error&message={quote_plus(error_msg)}")
+            return _fb_redirect(False, error_msg)
         
         user_access_token = token_data.get('access_token')
         if not user_access_token:
             error_msg = "No access token received from Facebook"
             logger.error("Facebook token exchange did not return access token")
             from urllib.parse import quote_plus
-            return redirect(f"{frontend_url}/social/connections?facebook_status=error&message={quote_plus(error_msg)}")
+            return _fb_redirect(False, error_msg)
         
         # Get user's Facebook pages - simplified approach
         pages_url = f"https://graph.facebook.com/{getattr(settings, 'SOCIAL_INTEGRATIONS', {}).get('FACEBOOK_API_VERSION', 'v23.0')}/me/accounts"
@@ -956,14 +1028,16 @@ def facebook_oauth_callback(request):
             error_msg = f"Failed to fetch pages: {pages_data.get('error', {}).get('message', 'Unknown error')}"
             logger.error(f"Facebook pages fetch error: {pages_data}")
             from urllib.parse import quote_plus
-            return redirect(f"{frontend_url}/social/connections?facebook_status=error&message={quote_plus(error_msg)}")
+            return _fb_redirect(False, error_msg)
         
         pages = pages_data.get('data', [])
         
         # Enhanced debugging for no pages scenario
         if not pages:
             logger.warning("User has no Facebook pages to connect")
-            
+            if oauth_state.get('return_to') == 'app':
+                return _fb_redirect(False, 'No Facebook pages found for this account.')
+
             # Also try to get user info to see what we can access
             user_info_url = f"https://graph.facebook.com/{getattr(settings, 'SOCIAL_INTEGRATIONS', {}).get('FACEBOOK_API_VERSION', 'v23.0')}/me"
             user_info_params = {
@@ -1184,20 +1258,22 @@ def facebook_oauth_callback(request):
         
         # Redirect to tenant frontend with success parameters
         from urllib.parse import quote_plus
-        return redirect(f"{frontend_url}/social/connections?facebook_status=connected&pages={saved_pages}&message={quote_plus(success_msg)}")
+        return _fb_redirect(True, success_msg, pages=saved_pages)
         
     except Exception as e:
         logger.error(f"Facebook OAuth callback processing failed: {e}")
-        # Redirect to frontend with error message
-        frontend_url = f"https://amanati.{settings.MAIN_DOMAIN}"  # Default fallback
-        if 'tenant_schema' in locals() and tenant_schema:
-            frontend_url = f"https://{tenant_schema}.{settings.MAIN_DOMAIN}"
-        
         error_msg = f"OAuth processing failed: {str(e)}"
-        from urllib.parse import quote_plus
-        return redirect(f"{frontend_url}/social/connections?facebook_status=error&message={quote_plus(error_msg)}")
+        return oauth_result_redirect(
+            platform='facebook', ok=False, message=error_msg,
+            state=locals().get('oauth_state'), tenant_schema=locals().get('tenant_schema'),
+        )
 
 
+@extend_schema(
+    summary='Facebook connection status',
+    responses={200: FacebookStatusResponseSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Connections'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def facebook_connection_status(request):
@@ -1230,6 +1306,12 @@ def facebook_connection_status(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Disconnect all Facebook pages (soft, keeps messages)',
+    request=None,
+    responses={200: FacebookDisconnectResponseSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Connections'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def facebook_disconnect(request):
@@ -1283,6 +1365,12 @@ def facebook_disconnect(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Disconnect one Facebook page (soft, keeps messages)',
+    request=None,
+    responses={200: FacebookPageDisconnectResponseSerializer, 404: SocialErrorSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Connections'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def facebook_page_disconnect(request, page_id):
@@ -1332,6 +1420,13 @@ def facebook_page_disconnect(request, page_id):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Clear a platform\'s whole message history',
+    description='Broadcasts conversation_deleted with conversation_id=null.',
+    request=ClearHistorySerializer,
+    responses={200: ClearHistoryResponseSerializer, 400: SocialErrorSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Conversations'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def clear_platform_history(request):
@@ -1404,6 +1499,17 @@ def clear_platform_history(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Meta messaging window for a conversation',
+    description='24h window state (and, for FB/IG on tenants allowed to send the HUMAN_AGENT tag, the 7-day window).',
+    parameters=[
+        OpenApiParameter(name='platform', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=True, enum=['facebook', 'instagram', 'whatsapp']),
+        OpenApiParameter(name='conversation_id', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=True, description='sender id / WhatsApp number'),
+        OpenApiParameter(name='account_id', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=True, description='page id / IG account id / WABA id'),
+    ],
+    responses={200: MessagingWindowResponseSerializer, 400: SocialErrorSerializer},
+    tags=['Social - Conversations'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def check_messaging_window(request):
@@ -1470,8 +1576,16 @@ def check_messaging_window(request):
     # Agent feature). WhatsApp has no human-agent equivalent — replies
     # outside 24h require template messages instead.
     human_agent_hours = HUMAN_AGENT_WINDOW.total_seconds() / 3600
+    # The HUMAN_AGENT tag (replies for 7 days) is only sent for allowlisted
+    # tenants; elsewhere a reply after 24h fails, so don't report it open.
+    from django.db import connection as db_connection
+    human_agent_allowed = (
+        HUMAN_AGENT_TAG_SCHEMAS is None
+        or getattr(db_connection, 'schema_name', None) in HUMAN_AGENT_TAG_SCHEMAS
+    )
     human_agent_window_open = (
-        platform in ('facebook', 'instagram') and hours_passed <= human_agent_hours
+        human_agent_allowed
+        and platform in ('facebook', 'instagram') and hours_passed <= human_agent_hours
     )
     human_agent_hours_remaining = (
         max(0, round(human_agent_hours - hours_passed, 1)) if human_agent_window_open else 0
@@ -1489,32 +1603,11 @@ def check_messaging_window(request):
 
 
 @extend_schema(
-    request=FacebookSendMessageSerializer,
-    responses={
-        200: {
-            'type': 'object',
-            'properties': {
-                'success': {'type': 'boolean'},
-                'message': {'type': 'string'},
-                'facebook_message_id': {'type': 'string'}
-            }
-        },
-        400: {
-            'type': 'object',
-            'properties': {
-                'error': {'type': 'string'},
-                'details': {'type': 'object'}
-            }
-        },
-        404: {
-            'type': 'object',
-            'properties': {
-                'error': {'type': 'string'}
-            }
-        }
-    },
-    description="Send a message to a Facebook user",
-    summary="Send Facebook Message"
+    summary='Send a Facebook Messenger message',
+    description='JSON, or multipart with one `media` file.',
+    request={'application/json': FacebookSendMessageSerializer, 'multipart/form-data': FacebookSendMultipartSerializer},
+    responses={200: MetaSendResponseSerializer, 400: SocialErrorWithDetailsSerializer, 404: SocialErrorSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Messages'],
 )
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanSendSocialMessages])
@@ -2994,7 +3087,19 @@ class InstagramAccountConnectionViewSet(viewsets.ModelViewSet):
         serializer.save()  # No user assignment needed in multi-tenant setup
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='Instagram message history (newest first)',
+        description='Filter one chat with account_id + sender_id; page=2.. for older messages.',
+        parameters=[
+        OpenApiParameter(name='account_id', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description='Instagram business account id'),
+        OpenApiParameter(name='sender_id', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description='Customer IGSID'),
+        OpenApiParameter(name='initial_load', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY, required=False, description='With the conversation filter: return the unread messages + the 10 newest only'),
+        ],
+    ),
+)
 class InstagramMessageViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = InstagramMessage.objects.none()  # schema typing; get_queryset() is used
     serializer_class = InstagramMessageSerializer
     permission_classes = [IsAuthenticated, CanViewSocialMessages]
     pagination_class = SocialMessagePagination
@@ -3078,6 +3183,11 @@ class InstagramMessageViewSet(viewsets.ReadOnlyModelViewSet):
         return base_queryset
 
 
+@extend_schema(
+    summary='Instagram connection status',
+    responses={200: InstagramStatusResponseSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Connections'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def instagram_connection_status(request):
@@ -3107,6 +3217,12 @@ def instagram_connection_status(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Disconnect Instagram accounts',
+    request=None,
+    responses={200: InstagramDisconnectResponseSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Connections'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def instagram_disconnect(request):
@@ -3159,32 +3275,11 @@ def instagram_disconnect(request):
 
 
 @extend_schema(
-    request=InstagramSendMessageSerializer,
-    responses={
-        200: {
-            'type': 'object',
-            'properties': {
-                'success': {'type': 'boolean'},
-                'message': {'type': 'string'},
-                'instagram_message_id': {'type': 'string'}
-            }
-        },
-        400: {
-            'type': 'object',
-            'properties': {
-                'error': {'type': 'string'},
-                'details': {'type': 'object'}
-            }
-        },
-        404: {
-            'type': 'object',
-            'properties': {
-                'error': {'type': 'string'}
-            }
-        }
-    },
-    description="Send a message to an Instagram user",
-    summary="Send Instagram Message"
+    summary='Send an Instagram DM',
+    description='JSON, or multipart with one `media` file. reply_to_message_id threads the reply.',
+    request={'application/json': InstagramSendMessageSerializer, 'multipart/form-data': InstagramSendMultipartSerializer},
+    responses={200: MetaSendResponseSerializer, 400: SocialErrorWithDetailsSerializer, 404: SocialErrorSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Messages'],
 )
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanSendSocialMessages])
@@ -4144,6 +4239,12 @@ def social_settings(request):
 # CHAT ASSIGNMENT ENDPOINTS
 # =====================
 
+@extend_schema(
+    summary='My chat assignments',
+    operation_id='social_assignments_retrieve',
+    responses={200: ChatAssignmentSerializer(many=True)},
+    tags=['Social - Chat Assignment'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def my_assignments(request):
@@ -4156,6 +4257,15 @@ def my_assignments(request):
     return Response(serializer.data)
 
 
+@extend_schema(
+    summary='Every active/in-session/completed assignment + assignment settings',
+    description='Widget assignments are keyed by visitor id (the list row sender_id).',
+    parameters=[
+        OpenApiParameter(name='platforms', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description='CSV, default facebook,instagram,whatsapp,email,widget'),
+    ],
+    responses={200: BulkAssignmentStatusResponseSerializer},
+    tags=['Social - Chat Assignment'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def bulk_assignment_status(request):
@@ -4198,6 +4308,12 @@ def bulk_assignment_status(request):
     })
 
 
+@extend_schema(
+    summary='All chat assignments (staff only)',
+    operation_id='social_assignments_all_retrieve',
+    responses={200: ChatAssignmentSerializer(many=True), 403: SocialErrorSerializer},
+    tags=['Social - Chat Assignment'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def all_assignments(request):
@@ -4329,6 +4445,13 @@ def _broadcast_archive_change(request, *, platform, conversation_id, account_id,
         logger.warning('archive_update broadcast failed: %s', exc)
 
 
+@extend_schema(
+    summary='Assign a chat to me (starts the session)',
+    description='400 when assignment mode is off or another agent holds the chat; 200 {message, assignment} when it is already mine. Widget chats accept visitor id, session id or list id (stored under the visitor id).',
+    request=ChatAssignmentCreateSerializer,
+    responses={201: ChatAssignmentSerializer, 200: AssignmentMessageResponseSerializer, 400: SocialErrorSerializer},
+    tags=['Social - Chat Assignment'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def assign_chat(request):
@@ -4346,15 +4469,12 @@ def assign_chat(request):
         )
 
     platform = serializer.validated_data['platform']
-    conversation_id = serializer.validated_data['conversation_id']
+    raw_conversation_id = serializer.validated_data['conversation_id']
     account_id = serializer.validated_data['account_id']
+    conversation_id = assignment_conversation_id(platform, raw_conversation_id, account_id)
 
-    # Check if already assigned
-    existing = ChatAssignment.objects.filter(
-        platform=platform,
-        conversation_id=conversation_id,
-        account_id=account_id
-    ).first()
+    # Check if already assigned (under any id form of this chat)
+    existing = _find_assignment(platform, raw_conversation_id, account_id)
 
     if existing:
         # If assignment is 'completed' (waiting for rating), delete it and allow new assignment
@@ -4386,7 +4506,7 @@ def assign_chat(request):
     # Unarchive conversation if it was archived (assigning from history should reactivate)
     unarchived = ConversationArchive.objects.filter(
         platform=platform,
-        conversation_id=conversation_id,
+        conversation_id__in=_archive_keys(platform, raw_conversation_id, account_id),
         account_id=account_id
     ).delete()[0]
     if unarchived:
@@ -4397,6 +4517,12 @@ def assign_chat(request):
     return Response(ChatAssignmentSerializer(assignment).data, status=status.HTTP_201_CREATED)
 
 
+@extend_schema(
+    summary='Unassign a chat (assignee or staff)',
+    request=ConversationRefSerializer,
+    responses={200: SocialMessageResponseSerializer, 400: SocialErrorSerializer, 403: SocialErrorSerializer, 404: SocialErrorSerializer},
+    tags=['Social - Chat Assignment'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def unassign_chat(request):
@@ -4411,13 +4537,8 @@ def unassign_chat(request):
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    try:
-        assignment = ChatAssignment.objects.get(
-            platform=platform,
-            conversation_id=conversation_id,
-            account_id=account_id
-        )
-    except ChatAssignment.DoesNotExist:
+    assignment = _find_assignment(platform, conversation_id, account_id)
+    if assignment is None:
         return Response({'error': 'Assignment not found'}, status=status.HTTP_404_NOT_FOUND)
 
     # Only assigned user or admin can unassign
@@ -4443,6 +4564,13 @@ def unassign_chat(request):
     return Response({'message': 'Chat unassigned successfully'})
 
 
+@extend_schema(
+    summary='Transfer a chat to another agent',
+    description='Only the agent holding the chat (or staff) can transfer it; an unassigned chat can be routed by anyone with the inbox.',
+    request=ChatTransferSerializer,
+    responses={200: AssignmentMessageResponseSerializer, 400: SocialErrorSerializer, 403: SocialErrorSerializer, 404: SocialErrorSerializer},
+    tags=['Social - Chat Assignment'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def transfer_chat(request):
@@ -4469,17 +4597,13 @@ def transfer_chat(request):
     if target_user == request.user:
         return Response({'error': 'Cannot transfer chat to yourself'}, status=status.HTTP_400_BAD_REQUEST)
 
-    try:
-        assignment = ChatAssignment.objects.get(
-            platform=platform,
-            conversation_id=conversation_id,
-            account_id=account_id
-        )
-    except ChatAssignment.DoesNotExist:
+    is_privileged = request.user.is_staff or request.user.is_superuser
+    assignment = _find_assignment(platform, conversation_id, account_id)
+    if assignment is None:
         # If no assignment exists, create one for the target user
         assignment = ChatAssignment.objects.create(
             platform=platform,
-            conversation_id=conversation_id,
+            conversation_id=assignment_conversation_id(platform, conversation_id, account_id),
             account_id=account_id,
             assigned_user=target_user,
             status='in_session',
@@ -4491,6 +4615,18 @@ def transfer_chat(request):
             'message': f'Chat transferred to {target_user.get_full_name() or target_user.email}',
             'assignment': ChatAssignmentSerializer(assignment).data,
         })
+
+    # Only the agent holding the chat (or staff) may hand it to someone else.
+    held_by_other = (
+        assignment.status in ('active', 'in_session')
+        and assignment.assigned_user_id is not None
+        and assignment.assigned_user_id != request.user.id
+    )
+    if held_by_other and not is_privileged:
+        return Response(
+            {'error': 'Only the assigned agent or staff can transfer this chat'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     # Transfer the assignment
     previous_user = assignment.assigned_user
@@ -4513,6 +4649,13 @@ def transfer_chat(request):
     })
 
 
+@extend_schema(
+    summary='Start a session on my assigned chat',
+    description='400 unless session management is on; 404 unless the chat is assigned to me. When the session is already running the body is {message, assignment}.',
+    request=ConversationRefSerializer,
+    responses={200: ChatAssignmentSerializer, 400: SocialErrorSerializer, 404: SocialErrorSerializer},
+    tags=['Social - Chat Assignment'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def start_session(request):
@@ -4535,14 +4678,8 @@ def start_session(request):
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    try:
-        assignment = ChatAssignment.objects.get(
-            platform=platform,
-            conversation_id=conversation_id,
-            account_id=account_id,
-            assigned_user=request.user
-        )
-    except ChatAssignment.DoesNotExist:
+    assignment = _find_assignment(platform, conversation_id, account_id, assigned_user=request.user)
+    if assignment is None:
         return Response(
             {'error': 'Assignment not found or not assigned to you'},
             status=status.HTTP_404_NOT_FOUND
@@ -4563,6 +4700,13 @@ def start_session(request):
     return Response(ChatAssignmentSerializer(assignment).data)
 
 
+@extend_schema(
+    summary='End a chat session',
+    description='Completes the assignment, sends the rating request (fb/ig/wa/tg when enabled), archives the chat (archive_update) and for widget closes the WidgetSession (session_ended).',
+    request=ConversationRefSerializer,
+    responses={200: EndSessionResponseSerializer, 400: SocialErrorSerializer, 403: SocialErrorSerializer, 404: SocialErrorSerializer},
+    tags=['Social - Chat Assignment'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def end_session(request):
@@ -4585,18 +4729,17 @@ def end_session(request):
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    try:
-        assignment = ChatAssignment.objects.get(
-            platform=platform,
-            conversation_id=conversation_id,
-            account_id=account_id,
-            status='in_session'
-        )
-    except ChatAssignment.DoesNotExist:
+    assignment = _find_assignment(platform, conversation_id, account_id, status='in_session')
+    if assignment is None:
         return Response(
             {'error': 'Active session not found'},
             status=status.HTTP_404_NOT_FOUND
         )
+    raw_conversation_id = conversation_id
+    if platform == 'widget':
+        # Rating rows and the rating message use the chat's session key;
+        # the assignment itself stays keyed by visitor id.
+        conversation_id = session_conversation_id(platform, raw_conversation_id, account_id)
 
     # Only assigned user or admin/staff can end session
     if assignment.assigned_user != request.user and not request.user.is_staff and not request.user.is_superuser:
@@ -4834,7 +4977,7 @@ def get_assignment_status(request):
 
     archive_row = ConversationArchive.objects.filter(
         platform=platform,
-        conversation_id=conversation_id,
+        conversation_id__in=_archive_keys(platform, conversation_id, account_id),
         account_id=account_id,
     ).first()
     archive_data = {
@@ -4843,18 +4986,14 @@ def get_assignment_status(request):
         'archived_by_id': archive_row.archived_by_id if archive_row else None,
     }
 
-    try:
-        assignment = ChatAssignment.objects.select_related('assigned_user').get(
-            platform=platform,
-            conversation_id=conversation_id,
-            account_id=account_id
-        )
+    assignment = _find_assignment(platform, conversation_id, account_id)
+    if assignment is not None:
         return Response({
             'assignment': ChatAssignmentSerializer(assignment).data,
             'settings': settings_data,
             **archive_data,
         })
-    except ChatAssignment.DoesNotExist:
+    else:
         return Response({
             'assignment': None,
             'settings': settings_data,
@@ -5131,6 +5270,16 @@ def process_potential_rating_response(message_text, platform, conversation_id, a
     return False
 
 
+@extend_schema(
+    summary='Rating statistics per agent (staff only)',
+    parameters=[
+        OpenApiParameter(name='start_date', type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY, required=False, description='YYYY-MM-DD (default: 1st of this month)'),
+        OpenApiParameter(name='end_date', type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY, required=False, description='YYYY-MM-DD (default: today)'),
+        OpenApiParameter(name='source', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, enum=['all', 'social', 'calls'], description="default 'all'"),
+    ],
+    responses={200: RatingStatisticsResponseSerializer, 400: SocialErrorSerializer},
+    tags=['Social - Ratings'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, IsStaffUser])
 def rating_statistics(request):
@@ -5355,6 +5504,19 @@ def rating_statistics(request):
     })
 
 
+@extend_schema(
+    summary='One agent\'s rated sessions (staff only)',
+    description='Without page/page_size the full list is returned; with them `sessions` is that page and page/page_size/has_next are added.',
+    parameters=[
+        OpenApiParameter(name='start_date', type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY, required=False, description='YYYY-MM-DD (default: 1st of this month)'),
+        OpenApiParameter(name='end_date', type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY, required=False, description='YYYY-MM-DD (default: today)'),
+        OpenApiParameter(name='source', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, enum=['all', 'social', 'calls'], description="default 'all'"),
+        OpenApiParameter(name='page', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False),
+        OpenApiParameter(name='page_size', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False, description='max 200'),
+    ],
+    responses={200: UserRatingSessionsResponseSerializer},
+    tags=['Social - Ratings'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, IsStaffUser])
 def user_rating_sessions(request, user_id):
@@ -5393,82 +5555,27 @@ def user_rating_sessions(request, user_id):
 
     # --- Social (ChatRating) sessions ---
     if source in ('all', 'social'):
-        chat_ratings = ChatRating.objects.filter(
+        chat_ratings = list(ChatRating.objects.filter(
             rated_user_id=user_id,
             created_at__date__gte=start_date,
             created_at__date__lte=end_date,
-        ).order_by('-created_at')
+        ).order_by('-created_at'))
+        names = _rating_customer_names(chat_ratings)
+        archived_keys = _rating_archived_keys(chat_ratings)
 
         for rating in chat_ratings:
-            # Try to get customer info from the conversation
-            customer_name = None
-            customer_identifier = rating.conversation_id
-
-            if rating.platform == 'facebook':
-                msg = FacebookMessage.objects.filter(
-                    sender_id=rating.conversation_id,
-                    is_from_page=False
-                ).first()
-                if msg and msg.sender_name:
-                    customer_name = msg.sender_name
-            elif rating.platform == 'instagram':
-                msg = InstagramMessage.objects.filter(
-                    sender_id=rating.conversation_id,
-                    is_from_business=False
-                ).first()
-                if msg and msg.sender_username:
-                    customer_name = msg.sender_username
-            elif rating.platform == 'whatsapp':
-                msg = WhatsAppMessage.objects.filter(
-                    from_number=rating.conversation_id,
-                    is_from_business=False
-                ).first()
-                if msg and msg.contact_name:
-                    customer_name = msg.contact_name
-            elif rating.platform == 'telegram':
-                msg = TelegramMessage.objects.filter(
-                    peer_id=rating.conversation_id,
-                    is_from_business=False
-                ).first()
-                if msg and (msg.peer_name or msg.peer_username):
-                    customer_name = msg.peer_name or msg.peer_username
-            elif rating.platform == 'widget':
-                # Widget conversation_id is `widget_<conn>_<session_id>`.
-                # Pull the visitor name off the WidgetSession so the table
-                # shows "Lika" instead of the raw composite identifier.
-                # Mirrors the conventions in the conversations list
-                # (views.py around line 5759).
-                parts = (rating.conversation_id or '').split('_', 2)
-                widget_session_id = parts[2] if len(parts) >= 3 else None
-                if widget_session_id:
-                    ws = WidgetSession.objects.filter(
-                        session_id=widget_session_id
-                    ).first()
-                    if ws:
-                        customer_name = (
-                            ws.visitor_name
-                            or f"Website visitor {ws.visitor_id[:6]}"
-                        )
-
-            # Check if conversation is archived
-            is_archived = ConversationArchive.objects.filter(
-                platform=rating.platform,
-                conversation_id=rating.conversation_id,
-                account_id=rating.account_id,
-            ).exists()
-
             sessions.append({
                 'id': rating.id,
                 'platform': rating.platform,
                 'conversation_id': rating.conversation_id,
                 'account_id': rating.account_id,
-                'customer_name': customer_name or customer_identifier,
+                'customer_name': names.get(rating.id) or rating.conversation_id,
                 'rating': rating.rating if rating.rating > 0 else None,
                 'comment': rating.comment or '',
                 'session_started_at': rating.session_started_at.isoformat() if rating.session_started_at else None,
                 'session_ended_at': rating.session_ended_at.isoformat() if rating.session_ended_at else None,
                 'created_at': rating.created_at.isoformat(),
-                'is_archived': is_archived,
+                'is_archived': rating.id in archived_keys,
             })
 
     # --- Call (CallRating) sessions ---
@@ -5510,13 +5617,105 @@ def user_rating_sessions(request, user_id):
     except User.DoesNotExist:
         user_info = {'id': user_id, 'email': 'Unknown', 'name': 'Unknown User'}
 
-    return Response({
+    total_sessions = len(sessions)
+    payload = {
         'user': user_info,
         'start_date': start_date.isoformat(),
         'end_date': end_date.isoformat(),
         'sessions': sessions,
-        'total_sessions': len(sessions),
-    })
+        'total_sessions': total_sessions,
+    }
+    # Optional paging (mobile). Without page/page_size the full list is
+    # returned exactly as before (web).
+    if request.query_params.get('page') or request.query_params.get('page_size'):
+        page = _positive_int_param(request.query_params.get('page'), 1)
+        page_size = min(_positive_int_param(request.query_params.get('page_size'), 50), 200)
+        start = (page - 1) * page_size
+        payload['sessions'] = sessions[start:start + page_size]
+        payload['page'] = page
+        payload['page_size'] = page_size
+        payload['has_next'] = start + page_size < total_sessions
+    return Response(payload)
+
+
+def _rating_customer_names(ratings):
+    """Customer display names for ChatRating rows, one query per platform."""
+    by_platform = {}
+    for r in ratings:
+        by_platform.setdefault(r.platform, []).append(r)
+    names = {}
+
+    def latest_by(qs, key_field, value_fields):
+        return {
+            row[key_field]: row
+            for row in qs.order_by(key_field, '-timestamp').distinct(key_field).values(key_field, *value_fields)
+        }
+
+    if 'facebook' in by_platform:
+        keys = {r.conversation_id for r in by_platform['facebook']}
+        found = latest_by(FacebookMessage.objects.filter(sender_id__in=keys, is_from_page=False),
+                          'sender_id', ['sender_name'])
+        for r in by_platform['facebook']:
+            row = found.get(r.conversation_id)
+            if row and row['sender_name']:
+                names[r.id] = row['sender_name']
+    if 'instagram' in by_platform:
+        keys = {r.conversation_id for r in by_platform['instagram']}
+        found = latest_by(InstagramMessage.objects.filter(sender_id__in=keys, is_from_business=False),
+                          'sender_id', ['sender_username', 'sender_name'])
+        for r in by_platform['instagram']:
+            row = found.get(r.conversation_id)
+            if row and (row['sender_username'] or row['sender_name']):
+                names[r.id] = row['sender_username'] or row['sender_name']
+    if 'whatsapp' in by_platform:
+        keys = set()
+        for r in by_platform['whatsapp']:
+            keys.update({r.conversation_id, r.conversation_id.lstrip('+'), '+' + r.conversation_id.lstrip('+')})
+        found = latest_by(WhatsAppMessage.objects.filter(from_number__in=keys, is_from_business=False),
+                          'from_number', ['contact_name'])
+        for r in by_platform['whatsapp']:
+            row = found.get(r.conversation_id) or found.get(r.conversation_id.lstrip('+')) \
+                or found.get('+' + r.conversation_id.lstrip('+'))
+            if row and row['contact_name']:
+                names[r.id] = row['contact_name']
+    if 'telegram' in by_platform:
+        peers = {int(r.conversation_id) for r in by_platform['telegram'] if str(r.conversation_id).isdigit()}
+        found = latest_by(TelegramMessage.objects.filter(peer_id__in=peers, is_from_business=False),
+                          'peer_id', ['peer_name', 'peer_username'])
+        for r in by_platform['telegram']:
+            row = found.get(int(r.conversation_id)) if str(r.conversation_id).isdigit() else None
+            if row and (row['peer_name'] or row['peer_username']):
+                names[r.id] = row['peer_name'] or row['peer_username']
+    if 'widget' in by_platform:
+        # Widget ratings may carry the list id, the session id or the visitor id.
+        keys = {}
+        for r in by_platform['widget']:
+            raw = r.conversation_id or ''
+            match = re.match(r'^widget_\d+_(.+)$', raw)
+            keys[r.id] = match.group(1) if match else raw
+        sessions = WidgetSession.objects.filter(
+            Q(session_id__in=set(keys.values())) | Q(visitor_id__in=set(keys.values()))
+        ).order_by('-last_seen_at')
+        by_key = {}
+        for ws in sessions:
+            by_key.setdefault(ws.session_id, ws)
+            by_key.setdefault(ws.visitor_id, ws)
+        for r in by_platform['widget']:
+            ws = by_key.get(keys[r.id])
+            if ws:
+                names[r.id] = ws.visitor_name or f"Website visitor {ws.visitor_id[:6]}"
+    return names
+
+
+def _rating_archived_keys(ratings):
+    """ids of ChatRating rows whose conversation is archived (one query)."""
+    if not ratings:
+        return set()
+    q = Q()
+    for r in ratings:
+        q |= Q(platform=r.platform, conversation_id=r.conversation_id, account_id=r.account_id)
+    archived = set(ConversationArchive.objects.filter(q).values_list('platform', 'conversation_id', 'account_id'))
+    return {r.id for r in ratings if (r.platform, r.conversation_id, r.account_id) in archived}
 
 
 # Backward-compatible alias
@@ -5832,807 +6031,48 @@ def unified_conversations(request):
     """
     # Parse query parameters
     platforms_param = request.query_params.get('platforms', 'facebook,instagram,whatsapp,email,widget,telegram')
-    enabled_platforms = [p.strip().lower() for p in platforms_param.split(',')]
+    enabled_platforms = [p.strip().lower() for p in platforms_param.split(',') if p.strip()]
     search_query = request.query_params.get('search', '').strip().lower()
-    page = int(request.query_params.get('page', 1))
-    page_size = min(int(request.query_params.get('page_size', 50)), 200)
+    page = _positive_int_param(request.query_params.get('page'), 1)
+    page_size = min(_positive_int_param(request.query_params.get('page_size'), 50), 200)
     email_folder = request.query_params.get('folder', 'INBOX')
     assigned_only = request.query_params.get('assigned', '').lower() == 'true'
     archived_only = request.query_params.get('archived', '').lower() == 'true'
     # Email connection filter (for switching between email accounts)
     connection_id_param = request.query_params.get('connection_id')
-    email_connection_id = int(connection_id_param) if connection_id_param else None
+    try:
+        email_connection_id = int(connection_id_param) if connection_id_param else None
+    except (TypeError, ValueError):
+        return Response({'error': 'connection_id must be an integer'}, status=status.HTTP_400_BAD_REQUEST)
 
-    all_conversations = []
-
-    # Check assignment settings
     settings_obj = get_social_settings(request)
-    hide_assigned = settings_obj and settings_obj.hide_assigned_chats
     is_admin = request.user.is_superuser or request.user.is_staff
 
-    # Load archived conversation keys for filtering — bound to the platforms
-    # actually being aggregated so we don't pull every archive row in the
-    # tenant on each request.
-    archived_conversations = set(
-        ConversationArchive.objects
-        .filter(platform__in=enabled_platforms)
-        .values_list('platform', 'conversation_id', 'account_id')
-    )
-
-    # Helper to check if conversation is archived
-    def is_conversation_archived(platform, account_id, conversation_id):
-        return (platform, conversation_id, account_id) in archived_conversations
-
-    # Get all assignments for current user if filtering by assigned
-    user_assignments = set()
-    if assigned_only:
-        assignments = ChatAssignment.objects.filter(
-            assigned_user=request.user,
-            status__in=['active', 'in_session']
-        )
-        for a in assignments:
-            # Create a tuple key: (platform, account_id, conversation_id)
-            user_assignments.add((a.platform, a.account_id, a.conversation_id))
-
-    # Helper to check if conversation is assigned to current user
-    def is_assigned_to_user(platform, account_id, conversation_id):
-        return (platform, account_id, conversation_id) in user_assignments
-
-    # Pre-load all active assignments for hide_assigned visibility check
-    # Maps (platform, account_id, conversation_id) -> assigned_user_id.
-    # Narrowed to visible platforms so the scan is bounded.
-    _active_assignment_map = {}
-    if hide_assigned and not is_admin:
-        for a in ChatAssignment.objects.filter(
-            status__in=['active', 'in_session'],
-            platform__in=enabled_platforms,
-        ).values_list('platform', 'account_id', 'conversation_id', 'assigned_user_id'):
-            _active_assignment_map[(a[0], a[1], a[2])] = a[3]
-
-    # Helper to check if conversation should be visible based on assignment and archive status
-    def is_conversation_visible(platform, account_id, conversation_id):
-        # Check archive status first
-        is_archived = is_conversation_archived(platform, account_id, conversation_id)
-        if archived_only:
-            # Only show archived conversations
-            if not is_archived:
-                return False
-        else:
-            # Hide archived conversations from main list
-            if is_archived:
-                return False
-        # If filtering by assigned, only show assigned conversations
-        if assigned_only:
-            return is_assigned_to_user(platform, account_id, conversation_id)
-
-        if not hide_assigned or is_admin:
+    # Users can only see email connections they are assigned to (a
+    # connection without assignments is a shared inbox). Uses the
+    # prefetched user_assignments to avoid N+1 queries.
+    def can_access_email_connection(conn):
+        assignments = list(conn.user_assignments.all())
+        if not assignments or is_admin:
             return True
-
-        # Check pre-loaded assignment map
-        key = (platform, account_id, conversation_id)
-        assigned_user_id = _active_assignment_map.get(key)
-
-        if assigned_user_id is None:
-            return True  # Not assigned, visible to all
-
-        return assigned_user_id == request.user.id  # Only visible if assigned to current user
-
-    # Load Facebook conversations (optimized - single DISTINCT ON query)
-    if 'facebook' in enabled_platforms:
-        try:
-            pages = FacebookPageConnection.objects.all()
-            for page_conn in pages:
-                base_filter = {
-                    'page_connection': page_conn,
-                    'is_deleted': False,
-                }
-
-                # Get latest message per sender using DISTINCT ON (single efficient query)
-                latest_messages_qs = FacebookMessage.objects.filter(
-                    **base_filter
-                ).order_by('sender_id', '-timestamp').distinct('sender_id')
-
-                # Apply search filter if provided
-                if search_query:
-                    # Get sender_ids that match search
-                    matching_sender_ids = FacebookMessage.objects.filter(
-                        **base_filter
-                    ).filter(
-                        Q(sender_name__icontains=search_query) |
-                        Q(message_text__icontains=search_query)
-                    ).values_list('sender_id', flat=True).distinct()
-                    latest_messages_qs = latest_messages_qs.filter(sender_id__in=matching_sender_ids)
-
-                # Get all latest messages (these are already unique per sender)
-                latest_messages = list(latest_messages_qs)
-                if not latest_messages:
-                    continue
-
-                sender_ids = [msg.sender_id for msg in latest_messages]
-
-                # Batch fetch unread counts only (skip msg_count for speed)
-                unread_counts = {
-                    item['sender_id']: item['unread_count']
-                    for item in FacebookMessage.objects.filter(
-                        **base_filter,
-                        sender_id__in=sender_ids,
-                        is_from_page=False,
-                        is_read_by_staff=False
-                    ).values('sender_id').annotate(unread_count=Count('id'))
-                }
-
-                # Batch fetch customer info (latest incoming message for name/avatar)
-                customer_messages = FacebookMessage.objects.filter(
-                    **base_filter,
-                    sender_id__in=sender_ids,
-                    is_from_page=False
-                ).order_by('sender_id', '-timestamp').distinct('sender_id')
-                customer_msg_map = {msg.sender_id: msg for msg in customer_messages}
-
-                # Batch fetch SocialAccount info for customers without incoming messages
-                social_accounts = SocialAccount.objects.filter(
-                    platform='facebook',
-                    platform_id__in=sender_ids,
-                    account_connection_id=page_conn.page_id
-                )
-                social_account_map = {sa.platform_id: sa for sa in social_accounts}
-
-                # Build conversations
-                for msg in latest_messages:
-                    sender_id = msg.sender_id
-                    if not is_conversation_visible('facebook', page_conn.page_id, sender_id):
-                        continue
-
-                    customer_msg = customer_msg_map.get(sender_id)
-                    social_account = social_account_map.get(sender_id)
-
-                    # Get customer name: prefer incoming message, then social account, then fallback
-                    if customer_msg and customer_msg.sender_name:
-                        customer_name = customer_msg.sender_name
-                        customer_pic = customer_msg.profile_pic_url
-                    elif social_account and social_account.display_name:
-                        customer_name = social_account.display_name
-                        customer_pic = social_account.profile_pic_url
-                    else:
-                        customer_name = f"Facebook User {sender_id}"
-                        customer_pic = None
-
-                    conversation = {
-                        'conversation_id': f"fb_{page_conn.page_id}_{sender_id}",
-                        'platform': 'facebook',
-                        'sender_id': sender_id,
-                        'sender_name': customer_name,
-                        'profile_pic_url': customer_pic,
-                        'last_message': {
-                            'id': str(msg.id),
-                            'text': msg.message_text,
-                            'timestamp': msg.timestamp,
-                            'is_from_business': msg.is_from_page,
-                            'attachment_type': msg.attachment_type,
-                            'platform_message_id': msg.message_id,
-                        },
-                        'message_count': 0,  # Skip for performance (not needed for list view)
-                        'unread_count': unread_counts.get(sender_id, 0),
-                        'account_name': page_conn.page_name,
-                        'account_id': page_conn.page_id,
-                    }
-                    all_conversations.append(conversation)
-        except Exception as e:
-            logger.error(f"Error loading Facebook conversations: {e}")
-
-    # Load Instagram conversations (optimized - single DISTINCT ON query)
-    if 'instagram' in enabled_platforms:
-        try:
-            accounts = InstagramAccountConnection.objects.all()
-            for account in accounts:
-                base_filter = {
-                    'account_connection': account,
-                    'is_deleted': False,
-                }
-
-                # Get latest message per sender using DISTINCT ON
-                latest_messages_qs = InstagramMessage.objects.filter(
-                    **base_filter
-                ).order_by('sender_id', '-timestamp').distinct('sender_id')
-
-                # Apply search filter if provided
-                if search_query:
-                    matching_sender_ids = InstagramMessage.objects.filter(
-                        **base_filter
-                    ).filter(
-                        Q(sender_name__icontains=search_query) |
-                        Q(sender_username__icontains=search_query) |
-                        Q(message_text__icontains=search_query)
-                    ).values_list('sender_id', flat=True).distinct()
-                    latest_messages_qs = latest_messages_qs.filter(sender_id__in=matching_sender_ids)
-
-                latest_messages = list(latest_messages_qs)
-                if not latest_messages:
-                    continue
-
-                sender_ids = [msg.sender_id for msg in latest_messages]
-
-                # Batch fetch unread counts only
-                unread_counts = {
-                    item['sender_id']: item['unread_count']
-                    for item in InstagramMessage.objects.filter(
-                        **base_filter,
-                        sender_id__in=sender_ids,
-                        is_from_business=False,
-                        is_read_by_staff=False
-                    ).values('sender_id').annotate(unread_count=Count('id'))
-                }
-
-                # Batch fetch customer info
-                customer_messages = InstagramMessage.objects.filter(
-                    **base_filter,
-                    sender_id__in=sender_ids,
-                    is_from_business=False
-                ).order_by('sender_id', '-timestamp').distinct('sender_id')
-                customer_msg_map = {msg.sender_id: msg for msg in customer_messages}
-
-                # Batch fetch SocialAccount info for customers without incoming messages
-                social_accounts = SocialAccount.objects.filter(
-                    platform='instagram',
-                    platform_id__in=sender_ids,
-                    account_connection_id=account.instagram_account_id
-                )
-                social_account_map = {sa.platform_id: sa for sa in social_accounts}
-
-                # Build conversations
-                for msg in latest_messages:
-                    sender_id = msg.sender_id
-                    if not is_conversation_visible('instagram', account.instagram_account_id, sender_id):
-                        continue
-
-                    customer_msg = customer_msg_map.get(sender_id)
-                    social_account = social_account_map.get(sender_id)
-
-                    # Get customer name: prefer incoming message, then social account, then fallback
-                    if customer_msg and (customer_msg.sender_name or customer_msg.sender_username):
-                        customer_name = customer_msg.sender_name or customer_msg.sender_username
-                        customer_pic = customer_msg.sender_profile_pic
-                    elif social_account and social_account.display_name:
-                        customer_name = social_account.display_name
-                        customer_pic = social_account.profile_pic_url
-                    else:
-                        customer_name = f"Instagram User {sender_id}"
-                        customer_pic = None
-
-                    conversation = {
-                        'conversation_id': f"ig_{account.instagram_account_id}_{sender_id}",
-                        'platform': 'instagram',
-                        'sender_id': sender_id,
-                        'sender_name': customer_name,
-                        'profile_pic_url': customer_pic,
-                        'last_message': {
-                            'id': str(msg.id),
-                            'text': msg.message_text,
-                            'timestamp': msg.timestamp,
-                            'is_from_business': msg.is_from_business,
-                            'attachment_type': msg.attachment_type,
-                            'platform_message_id': msg.message_id,
-                        },
-                        'message_count': 0,
-                        'unread_count': unread_counts.get(sender_id, 0),
-                        'account_name': f"@{account.username}",
-                        'account_id': account.instagram_account_id,
-                    }
-                    all_conversations.append(conversation)
-        except Exception as e:
-            logger.error(f"Error loading Instagram conversations: {e}")
-
-    # Load WhatsApp conversations (optimized - single DISTINCT ON query)
-    if 'whatsapp' in enabled_platforms:
-        try:
-            accounts = WhatsAppBusinessAccount.objects.all()
-            for account in accounts:
-                base_filter = {
-                    'business_account': account,
-                    'is_deleted': False,
-                }
-
-                # Split into two index-backed DISTINCT ON queries instead of using
-                # a Case/When annotation (which can't use an index). Customer-sent
-                # messages group by from_number; business-sent messages group by
-                # to_number. The indexes (business_account, from_number, -timestamp)
-                # and (business_account, to_number, -timestamp) make both scans
-                # cheap — Postgres uses an Index Scan and emits one row per key.
-                customer_sent = WhatsAppMessage.objects.filter(
-                    **base_filter, is_from_business=False
-                ).order_by('from_number', '-timestamp').distinct('from_number')
-
-                business_sent = WhatsAppMessage.objects.filter(
-                    **base_filter, is_from_business=True
-                ).order_by('to_number', '-timestamp').distinct('to_number')
-
-                # Merge in Python: pick whichever side has the newer message per
-                # customer_number. Each side already has at most one row per key.
-                latest_by_customer = {}
-                for m in customer_sent:
-                    latest_by_customer[m.from_number] = m
-                for m in business_sent:
-                    existing = latest_by_customer.get(m.to_number)
-                    if not existing or m.timestamp > existing.timestamp:
-                        latest_by_customer[m.to_number] = m
-
-                # Apply search filter if provided. We still use the annotated
-                # queryset here only to collect matching customer_numbers — this
-                # path is fine because it's only hit when search_query is set.
-                if search_query:
-                    from django.db.models import Case, When, CharField
-                    matching_numbers = set(
-                        WhatsAppMessage.objects.filter(
-                            **base_filter
-                        ).annotate(
-                            customer_number=Case(
-                                When(is_from_business=True, then='to_number'),
-                                default='from_number',
-                                output_field=CharField()
-                            )
-                        ).filter(
-                            Q(contact_name__icontains=search_query) |
-                            Q(message_text__icontains=search_query) |
-                            Q(from_number__icontains=search_query) |
-                            Q(to_number__icontains=search_query)
-                        ).values_list('customer_number', flat=True).distinct()
-                    )
-                    latest_by_customer = {
-                        k: v for k, v in latest_by_customer.items() if k in matching_numbers
-                    }
-
-                if not latest_by_customer:
-                    continue
-
-                # Synthesize customer_number on each message object so the rest of
-                # the loop (which reads msg.customer_number) keeps working without
-                # changes. This is pure in-memory assignment — no query cost.
-                latest_messages = []
-                for customer_number, msg in latest_by_customer.items():
-                    msg.customer_number = customer_number
-                    latest_messages.append(msg)
-
-                customer_numbers = list(latest_by_customer.keys())
-
-                # Batch fetch unread counts only (messages FROM customer, not from business)
-                unread_counts = {}
-                for item in WhatsAppMessage.objects.filter(
-                    **base_filter,
-                    from_number__in=customer_numbers,
-                    is_from_business=False,
-                    is_read_by_staff=False
-                ).values('from_number').annotate(unread_count=Count('id')):
-                    unread_counts[item['from_number']] = item['unread_count']
-
-                # Batch fetch customer info (messages FROM customer for name)
-                customer_messages = WhatsAppMessage.objects.filter(
-                    **base_filter,
-                    from_number__in=customer_numbers,
-                    is_from_business=False
-                ).order_by('from_number', '-timestamp').distinct('from_number')
-                customer_msg_map = {msg.from_number: msg for msg in customer_messages}
-
-                # Build conversations
-                for msg in latest_messages:
-                    customer_number = msg.customer_number
-                    normalized_phone = customer_number.lstrip('+')
-
-                    if not is_conversation_visible('whatsapp', account.waba_id, normalized_phone):
-                        continue
-
-                    customer_msg = customer_msg_map.get(customer_number)
-                    msg_type = msg.message_type
-                    attachment_type = msg_type if msg_type and msg_type != 'text' else None
-
-                    conversation = {
-                        'conversation_id': f"wa_{account.waba_id}_{normalized_phone}",
-                        'platform': 'whatsapp',
-                        'sender_id': customer_number,
-                        'sender_name': customer_msg.contact_name if customer_msg and customer_msg.contact_name else customer_number,
-                        'profile_pic_url': None,
-                        'last_message': {
-                            'id': str(msg.id),
-                            'text': msg.message_text,
-                            'timestamp': msg.timestamp,
-                            'is_from_business': msg.is_from_business,
-                            'attachment_type': attachment_type,
-                            'platform_message_id': msg.message_id,
-                        },
-                        'message_count': 0,
-                        'unread_count': unread_counts.get(customer_number, 0),
-                        'account_name': account.business_name or account.display_phone_number,
-                        'account_id': account.waba_id,
-                    }
-                    all_conversations.append(conversation)
-        except Exception as e:
-            logger.error(f"Error loading WhatsApp conversations: {e}")
-
-    # Load Email conversations (optimized - single DISTINCT ON query)
-    if 'email' in enabled_platforms:
-        try:
-            connections = EmailConnection.objects.filter(is_active=True).prefetch_related('user_assignments')
-            # Filter by specific email connection if provided
-            if email_connection_id:
-                connections = connections.filter(id=email_connection_id)
-
-            # Helper to check if user can access an email connection. Uses the
-            # already-prefetched user_assignments to avoid N+1 queries — calling
-            # .exists() or .filter() on the related manager bypasses Django's
-            # prefetch cache and fires new SQL, so we iterate in Python instead.
-            def can_access_email_connection(conn):
-                assignments = list(conn.user_assignments.all())
-                if not assignments:
-                    return True
-                if is_admin:
-                    return True
-                user_id = request.user.id
-                return any(a.user_id == user_id for a in assignments)
-
-            for conn in connections:
-                # Skip connections the user cannot access
-                if not can_access_email_connection(conn):
-                    continue
-                # Build base filter
-                base_filter = {'connection': conn}
-                if email_folder and email_folder.lower() not in ('all', 'all folders'):
-                    base_filter['folder'] = email_folder
-
-                # Get latest message per thread using DISTINCT ON
-                latest_messages_qs = EmailMessage.objects.filter(
-                    **base_filter
-                ).order_by('thread_id', '-timestamp').distinct('thread_id')
-
-                # Apply search filter if provided
-                if search_query:
-                    matching_threads = EmailMessage.objects.filter(
-                        **base_filter
-                    ).filter(
-                        Q(from_name__icontains=search_query) |
-                        Q(from_email__icontains=search_query) |
-                        Q(subject__icontains=search_query) |
-                        Q(body_text__icontains=search_query)
-                    ).values_list('thread_id', flat=True).distinct()
-                    latest_messages_qs = latest_messages_qs.filter(thread_id__in=matching_threads)
-
-                latest_messages = list(latest_messages_qs)
-                if not latest_messages:
-                    continue
-
-                thread_ids = [msg.thread_id for msg in latest_messages]
-
-                # Batch fetch unread counts only
-                unread_counts = {
-                    item['thread_id']: item['unread_count']
-                    for item in EmailMessage.objects.filter(
-                        **base_filter,
-                        thread_id__in=thread_ids,
-                        is_from_business=False,
-                        is_read=False
-                    ).values('thread_id').annotate(unread_count=Count('id'))
-                }
-
-                # Batch fetch customer info
-                customer_messages = EmailMessage.objects.filter(
-                    **base_filter,
-                    thread_id__in=thread_ids,
-                    is_from_business=False
-                ).order_by('thread_id', '-timestamp').distinct('thread_id')
-                customer_msg_map = {msg.thread_id: msg for msg in customer_messages}
-
-                # Build conversations
-                is_inbox = email_folder and email_folder.upper() == 'INBOX'
-                for msg in latest_messages:
-                    thread_id = msg.thread_id
-                    # Only apply archive/assignment filtering for INBOX
-                    if is_inbox or email_folder.lower() in ('all', 'all folders'):
-                        if not is_conversation_visible('email', str(conn.id), thread_id):
-                            continue
-
-                    customer_msg = customer_msg_map.get(thread_id)
-                    customer_email = customer_msg.from_email if customer_msg else (msg.from_email if not msg.is_from_business else '')
-                    customer_name = (customer_msg.from_name or customer_msg.from_email) if customer_msg else (msg.from_name or msg.from_email if not msg.is_from_business else '')
-
-                    # Truncate body text
-                    body_text = msg.body_text or ''
-                    truncated_text = body_text[:200] if body_text else ''
-
-                    conversation = {
-                        'conversation_id': f"email_{conn.id}_{thread_id}",
-                        'platform': 'email',
-                        'sender_id': customer_email,
-                        'sender_name': customer_name or customer_email,
-                        'profile_pic_url': None,
-                        'last_message': {
-                            'id': str(msg.id),
-                            'text': truncated_text,
-                            'timestamp': msg.timestamp,
-                            'is_from_business': msg.is_from_business,
-                            'attachment_type': 'attachment' if msg.attachments else None,
-                            'platform_message_id': msg.message_id,
-                        },
-                        'message_count': 0,
-                        'unread_count': unread_counts.get(thread_id, 0),
-                        'account_name': conn.email_address,
-                        'account_id': str(conn.id),
-                        'subject': msg.subject,
-                    }
-                    all_conversations.append(conversation)
-        except Exception as e:
-            logger.error(f"Error loading Email conversations: {e}")
-
-    # Load Widget (embeddable chat) conversations
-    if 'widget' in enabled_platforms:
-        try:
-            from widget_registry.models import WidgetConnection
-            from .models import WidgetSession, WidgetMessage
-
-            tenant_schema = request.tenant.schema_name
-            with schema_context('public'):
-                connections = list(
-                    WidgetConnection.objects.filter(tenant_schema=tenant_schema)
-                )
-
-            for wconn in connections:
-                sessions = list(
-                    WidgetSession.objects.filter(connection_id=wconn.id)
-                    .order_by('-last_seen_at')
-                )
-                if not sessions:
-                    continue
-                session_pks = [s.pk for s in sessions]
-
-                # Latest message per session via DISTINCT ON.
-                latest_by_session = {}
-                for m in (
-                    WidgetMessage.objects
-                    .filter(session_id__in=session_pks, is_deleted=False)
-                    .order_by('session_id', '-timestamp')
-                    .distinct('session_id')
-                ):
-                    latest_by_session[m.session_id] = m
-
-                # Unread counts (visitor messages not yet read by staff).
-                unread_counts = {
-                    item['session_id']: item['cnt']
-                    for item in (
-                        WidgetMessage.objects
-                        .filter(
-                            session_id__in=session_pks,
-                            is_from_visitor=True,
-                            is_read_by_staff=False,
-                            is_deleted=False,
-                        )
-                        .values('session_id')
-                        .annotate(cnt=Count('id'))
-                    )
-                }
-
-                for session in sessions:
-                    last = latest_by_session.get(session.pk)
-                    if not last:
-                        continue
-                    account_id = str(wconn.id)
-                    conversation_id = session.session_id
-                    if not is_conversation_visible('widget', account_id, conversation_id):
-                        continue
-
-                    sender_name = (
-                        session.visitor_name
-                        or f"Website visitor {session.visitor_id[:6]}"
-                    )
-
-                    # Best-effort search filter: match visitor name or last
-                    # message text. Cheap enough to do in Python here.
-                    if search_query:
-                        haystack = (
-                            (sender_name or '') + ' ' + (last.message_text or '')
-                        ).lower()
-                        if search_query not in haystack:
-                            continue
-
-                    all_conversations.append({
-                        'conversation_id': f"widget_{wconn.id}_{session.session_id}",
-                        'platform': 'widget',
-                        'sender_id': session.visitor_id,
-                        'sender_name': sender_name,
-                        'profile_pic_url': None,
-                        'last_message': {
-                            'id': str(last.id),
-                            'text': last.message_text,
-                            'timestamp': last.timestamp,
-                            'is_from_business': not last.is_from_visitor,
-                            'attachment_type': 'attachment' if last.attachments else None,
-                            'platform_message_id': last.message_id,
-                        },
-                        'message_count': 0,
-                        'unread_count': unread_counts.get(session.pk, 0),
-                        'account_name': wconn.label,
-                        'account_id': account_id,
-                        # Widget-only: surface the session's close state so the
-                        # agent UI can disable the composer (and show a banner)
-                        # when the visitor or another agent has ended the chat.
-                        'session_ended_at': session.ended_at.isoformat() if session.ended_at else None,
-                        'session_ended_by': session.ended_by,
-                    })
-        except Exception as e:
-            logger.error(f"Error loading Widget conversations: {e}")
-
-    # Get Telegram conversations
-    if 'telegram' in enabled_platforms:
-        try:
-            from .models import TelegramAccount, TelegramMessage
-
-            for tg_account in TelegramAccount.objects.filter(is_active=True):
-                account_id = str(tg_account.telegram_user_id)
-
-                # Latest message per peer via index-backed DISTINCT ON.
-                latest_messages = (
-                    TelegramMessage.objects
-                    .filter(account=tg_account, is_deleted=False)
-                    .order_by('peer_id', '-timestamp')
-                    .distinct('peer_id')
-                )
-
-                # Search filter: match peers by name/username/text.
-                if search_query:
-                    matching_peers = set(
-                        TelegramMessage.objects.filter(account=tg_account, is_deleted=False)
-                        .filter(
-                            Q(peer_name__icontains=search_query)
-                            | Q(peer_username__icontains=search_query)
-                            | Q(message_text__icontains=search_query)
-                        )
-                        .values_list('peer_id', flat=True)
-                    )
-                    latest_messages = [m for m in latest_messages if m.peer_id in matching_peers]
-
-                # Batch unread counts (customer messages unread by staff).
-                unread_counts = {
-                    item['peer_id']: item['cnt']
-                    for item in (
-                        TelegramMessage.objects
-                        .filter(
-                            account=tg_account,
-                            is_from_business=False,
-                            is_read_by_staff=False,
-                            is_deleted=False,
-                        )
-                        .values('peer_id')
-                        .annotate(cnt=Count('id'))
-                    )
-                }
-
-                # Batch customer info from the latest incoming message per peer.
-                customer_info = {
-                    m.peer_id: m
-                    for m in (
-                        TelegramMessage.objects
-                        .filter(account=tg_account, is_from_business=False, is_deleted=False)
-                        .order_by('peer_id', '-timestamp')
-                        .distinct('peer_id')
-                    )
-                }
-
-                for last in latest_messages:
-                    peer_key = str(last.peer_id)
-                    if not is_conversation_visible('telegram', account_id, peer_key):
-                        continue
-
-                    info = customer_info.get(last.peer_id)
-                    sender_name = (
-                        (info.peer_name if info else '')
-                        or (info.peer_username if info else '')
-                        or last.peer_name or last.peer_username
-                        or f"Telegram User {last.peer_id}"
-                    )
-
-                    all_conversations.append({
-                        'conversation_id': f"tg_{account_id}_{last.peer_id}",
-                        'platform': 'telegram',
-                        'sender_id': peer_key,
-                        'sender_name': sender_name,
-                        'profile_pic_url': (info.profile_pic_url if info else None) or last.profile_pic_url,
-                        'last_message': {
-                            'id': str(last.id),
-                            'text': last.message_text,
-                            'timestamp': last.timestamp,
-                            'is_from_business': last.is_from_business,
-                            'attachment_type': last.message_type if last.message_type != 'text' else None,
-                            'platform_message_id': last.message_id,
-                        },
-                        'message_count': 0,
-                        'unread_count': unread_counts.get(last.peer_id, 0),
-                        'account_name': tg_account.username or tg_account.first_name or tg_account.phone_number,
-                        'account_id': account_id,
-                    })
-        except Exception as e:
-            logger.error(f"Error loading Telegram conversations: {e}")
-
-    # Sort all conversations by last message timestamp (most recent first)
-    all_conversations.sort(
-        key=lambda x: x['last_message']['timestamp'],
-        reverse=True
+        return any(a.user_id == request.user.id for a in assignments)
+
+    from .inbox_list import build_unified_conversations
+    total_count, paginated_conversations = build_unified_conversations(
+        request,
+        enabled_platforms=enabled_platforms,
+        search=search_query,
+        page=page,
+        page_size=page_size,
+        email_folder=email_folder,
+        assigned_only=assigned_only,
+        archived_only=archived_only,
+        email_connection_id=email_connection_id,
+        settings_obj=settings_obj,
+        is_admin=is_admin,
+        email_access_check=can_access_email_connection,
     )
-
-    # Paginate
-    total_count = len(all_conversations)
-    start_idx = (page - 1) * page_size
-    end_idx = start_idx + page_size
-    paginated_conversations = all_conversations[start_idx:end_idx]
-
-    # Per-page assignment + archive enrichment.
-    #
-    # Added for /messages-beta: the beta page can't make a second round-trip
-    # for these slices, and the legacy page doesn't depend on them being on
-    # this payload — so we attach them here, bounded to the visible page
-    # only (two extra queries scoped by the 50-row tuple set, not the whole
-    # tenant). Keys are (platform, account_id, conversation_id) so the
-    # platform-prefixed dict slugs we built above match the lookup.
-    if paginated_conversations:
-        page_keys = [
-            (c['platform'], c['account_id'], c['sender_id'])
-            for c in paginated_conversations
-        ]
-        # Assignment lookup — only fetches rows for chats on this page.
-        from django.db.models import Q as _Q
-        _assignment_q = _Q()
-        for plat, acct, sid in page_keys:
-            _assignment_q |= _Q(platform=plat, account_id=acct, conversation_id=sid)
-        assignment_lookup = {}
-        if page_keys:
-            for a in ChatAssignment.objects.filter(_assignment_q).select_related('assigned_user'):
-                assignment_lookup[(a.platform, a.account_id, a.conversation_id)] = a
-
-        # Archive lookup — same tuple key. ConversationArchive doesn't have
-        # a composite index, so we pre-filter by the platform set.
-        archive_lookup = {}
-        if page_keys:
-            page_platforms = {plat for plat, _, _ in page_keys}
-            for ar in ConversationArchive.objects.filter(platform__in=page_platforms):
-                archive_lookup[(ar.platform, ar.account_id, ar.conversation_id)] = ar
-
-        # AI companion state lookup — only non-default modes matter
-        # (no row / mode 'ai' both render as "no badge").
-        ai_state_lookup = {}
-        if page_keys:
-            from .models import AIConversationState
-            for st in AIConversationState.objects.filter(
-                platform__in={plat for plat, _, _ in page_keys},
-            ).exclude(mode='ai'):
-                ai_state_lookup[(st.platform, st.account_id, st.conversation_id)] = st.mode
-
-        for c in paginated_conversations:
-            key = (c['platform'], c['account_id'], c['sender_id'])
-            assignment = assignment_lookup.get(key)
-            if assignment and assignment.assigned_user:
-                full_name = (
-                    assignment.assigned_user.get_full_name()
-                    or assignment.assigned_user.email
-                )
-                c['assigned_user_id'] = assignment.assigned_user_id
-                c['assigned_user_name'] = full_name
-                c['assignment_status'] = assignment.status
-                c['session_started_at'] = assignment.session_started_at
-                c['session_ended_at'] = assignment.session_ended_at
-            else:
-                # Always emit the keys (even when null) so the frontend's
-                # serializer-defined shape matches its TypeScript interface
-                # without `?` everywhere.
-                c['assigned_user_id'] = None
-                c['assigned_user_name'] = None
-                c['assignment_status'] = None
-                c['session_started_at'] = None
-                c['session_ended_at'] = None
-
-            archive = archive_lookup.get(key)
-            if archive:
-                c['is_archived'] = True
-                c['archived_at'] = archive.archived_at
-            else:
-                c['is_archived'] = False
-                c['archived_at'] = None
-
-            c['ai_state'] = ai_state_lookup.get(key)
+    end_idx = page * page_size
 
     # Build pagination URLs
     base_url = request.build_absolute_uri().split('?')[0]
@@ -6945,6 +6385,13 @@ def unread_messages_count(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Mark a conversation read',
+    description='Marks the customer messages of the chat read by staff, clears the caller\'s matching message_received notifications and broadcasts read_state_update. Pass account_id to touch only one page/account.',
+    request=ConversationKeySerializer,
+    responses={200: MarkReadResponseSerializer, 400: SocialErrorSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Conversations'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def mark_conversation_read(request):
@@ -6962,6 +6409,12 @@ def mark_conversation_read(request):
     try:
         platform = request.data.get('platform')
         conversation_id = request.data.get('conversation_id')
+        # Optional: scope to one page/account (the same customer id can
+        # exist on two pages). Without it every account is affected.
+        account_id = request.data.get('account_id') or None
+        acct = _account_scope(platform, account_id)
+        if platform == 'widget' and conversation_id:
+            conversation_id = session_conversation_id('widget', conversation_id, account_id)
 
         if not platform or not conversation_id:
             return Response({
@@ -6974,7 +6427,7 @@ def mark_conversation_read(request):
         if platform == 'facebook':
             # Mark all incoming messages from this sender as read by staff
             updated_count = FacebookMessage.objects.filter(
-                sender_id=conversation_id,
+                sender_id=conversation_id, **acct,
                 is_from_page=False,
                 is_read_by_staff=False
             ).update(
@@ -6985,7 +6438,7 @@ def mark_conversation_read(request):
         elif platform == 'instagram':
             # Mark all incoming messages from this sender as read by staff
             updated_count = InstagramMessage.objects.filter(
-                sender_id=conversation_id,
+                sender_id=conversation_id, **acct,
                 is_from_business=False,
                 is_read_by_staff=False
             ).update(
@@ -6996,7 +6449,7 @@ def mark_conversation_read(request):
         elif platform == 'whatsapp':
             # Mark all incoming messages from this phone number as read by staff
             updated_count = WhatsAppMessage.objects.filter(
-                from_number=conversation_id,
+                from_number=conversation_id, **acct,
                 is_from_business=False,
                 is_read_by_staff=False
             ).update(
@@ -7007,7 +6460,7 @@ def mark_conversation_read(request):
         elif platform == 'email':
             # Mark all incoming messages in this thread as read by staff
             updated_count = EmailMessage.objects.filter(
-                thread_id=conversation_id,
+                thread_id=conversation_id, **acct,
                 is_from_business=False,
                 is_read_by_staff=False,
                 is_deleted=False
@@ -7018,7 +6471,7 @@ def mark_conversation_read(request):
             )
         elif platform == 'widget':
             updated_count = WidgetMessage.objects.filter(
-                session__session_id=conversation_id,
+                session__session_id=conversation_id, **acct,
                 is_from_visitor=True,
                 is_read_by_staff=False,
             ).update(
@@ -7027,7 +6480,7 @@ def mark_conversation_read(request):
             )
         elif platform == 'telegram':
             updated_count = TelegramMessage.objects.filter(
-                peer_id=conversation_id,
+                peer_id=conversation_id, **acct,
                 is_from_business=False,
                 is_read_by_staff=False,
             ).update(
@@ -7087,7 +6540,7 @@ def mark_conversation_read(request):
             request,
             platform=platform,
             conversation_id=conversation_id,
-            account_id=None,
+            account_id=account_id,
             unread_count=0,
             last_read_at=now,
         )
@@ -7104,6 +6557,13 @@ def mark_conversation_read(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Mark a conversation unread',
+    description='Flips the last incoming message back to unread and broadcasts read_state_update (unread_count 0/1).',
+    request=ConversationKeySerializer,
+    responses={200: MarkUnreadResponseSerializer, 400: SocialErrorSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Conversations'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def mark_conversation_unread(request):
@@ -7122,6 +6582,12 @@ def mark_conversation_unread(request):
     try:
         platform = request.data.get('platform')
         conversation_id = request.data.get('conversation_id')
+        # Optional: scope to one page/account (the same customer id can
+        # exist on two pages). Without it every account is affected.
+        account_id = request.data.get('account_id') or None
+        acct = _account_scope(platform, account_id)
+        if platform == 'widget' and conversation_id:
+            conversation_id = session_conversation_id('widget', conversation_id, account_id)
 
         if not platform or not conversation_id:
             return Response({
@@ -7133,7 +6599,7 @@ def mark_conversation_unread(request):
         if platform == 'facebook':
             # Mark the last incoming message as unread
             last_message = FacebookMessage.objects.filter(
-                sender_id=conversation_id,
+                sender_id=conversation_id, **acct,
                 is_from_page=False,
                 is_read_by_staff=True
             ).order_by('-timestamp').first()
@@ -7147,7 +6613,7 @@ def mark_conversation_unread(request):
         elif platform == 'instagram':
             # Mark the last incoming message as unread
             last_message = InstagramMessage.objects.filter(
-                sender_id=conversation_id,
+                sender_id=conversation_id, **acct,
                 is_from_business=False,
                 is_read_by_staff=True
             ).order_by('-timestamp').first()
@@ -7161,7 +6627,7 @@ def mark_conversation_unread(request):
         elif platform == 'whatsapp':
             # Mark the last incoming message as unread
             last_message = WhatsAppMessage.objects.filter(
-                from_number=conversation_id,
+                from_number=conversation_id, **acct,
                 is_from_business=False,
                 is_read_by_staff=True
             ).order_by('-timestamp').first()
@@ -7175,7 +6641,7 @@ def mark_conversation_unread(request):
         elif platform == 'email':
             # Mark the last incoming message in this thread as unread
             last_message = EmailMessage.objects.filter(
-                thread_id=conversation_id,
+                thread_id=conversation_id, **acct,
                 is_from_business=False,
                 is_read_by_staff=True,
                 is_deleted=False
@@ -7189,7 +6655,7 @@ def mark_conversation_unread(request):
                 updated_count = 1
         elif platform == 'widget':
             last_message = WidgetMessage.objects.filter(
-                session__session_id=conversation_id,
+                session__session_id=conversation_id, **acct,
                 is_from_visitor=True,
                 is_read_by_staff=True,
             ).order_by('-timestamp').first()
@@ -7200,7 +6666,7 @@ def mark_conversation_unread(request):
                 updated_count = 1
         elif platform == 'telegram':
             last_message = TelegramMessage.objects.filter(
-                peer_id=conversation_id,
+                peer_id=conversation_id, **acct,
                 is_from_business=False,
                 is_read_by_staff=True,
             ).order_by('-timestamp').first()
@@ -7225,7 +6691,7 @@ def mark_conversation_unread(request):
             request,
             platform=platform,
             conversation_id=conversation_id,
-            account_id=None,
+            account_id=account_id,
             unread_count=updated_count,
             last_read_at=None,
         )
@@ -7266,6 +6732,22 @@ def widget_session_ids(conversation_id):
     return ids or [raw]
 
 
+@extend_schema(
+    summary='Soft-delete a conversation (staff only)',
+    description=(
+        'Pass platform + conversation_id as query params (or, as the web does, a JSON body). '
+        'Both are required; the view returns 400 without them. Broadcasts conversation_deleted.'
+    ),
+    parameters=[
+        OpenApiParameter(name='platform', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False,
+                         enum=['facebook', 'instagram', 'whatsapp', 'email', 'widget', 'telegram']),
+        OpenApiParameter(name='conversation_id', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False,
+                         description='Unprefixed key (widget: session id, visitor id or list id)'),
+    ],
+    request=ConversationKeySerializer,
+    responses={200: DeleteConversationResponseSerializer, 400: SocialErrorSerializer, 403: SocialErrorSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Conversations'],
+)
 @api_view(['DELETE'])
 @permission_classes([IsAuthenticated, IsStaffUser])
 def delete_conversation(request):
@@ -7282,8 +6764,8 @@ def delete_conversation(request):
     logger = logging.getLogger(__name__)
 
     try:
-        platform = request.data.get('platform')
-        conversation_id = request.data.get('conversation_id')
+        platform = request.data.get('platform') or request.query_params.get('platform')
+        conversation_id = request.data.get('conversation_id') or request.query_params.get('conversation_id')
 
         if not platform or not conversation_id:
             return Response({
@@ -7426,6 +6908,11 @@ class WhatsAppBusinessAccountViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save()  # No user assignment needed in multi-tenant setup
 
+    @extend_schema(
+        summary='Request a WhatsApp Business App contacts sync (coexistence)',
+        request=None,
+        responses={200: SyncRequestedResponseSerializer, 400: SocialErrorWithDetailsSerializer},
+    )
     @action(detail=True, methods=['post'], url_path='sync-contacts')
     def sync_contacts(self, request, pk=None):
         """
@@ -7491,6 +6978,11 @@ class WhatsAppBusinessAccountViewSet(viewsets.ModelViewSet):
                 'error': str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @extend_schema(
+        summary='Request a WhatsApp Business App history sync (coexistence)',
+        request=SyncHistorySerializer,
+        responses={200: SyncRequestedResponseSerializer, 400: SocialErrorWithDetailsSerializer},
+    )
     @action(detail=True, methods=['post'], url_path='sync-history')
     def sync_history(self, request, pk=None):
         """
@@ -7575,6 +7067,13 @@ class WhatsAppBusinessAccountViewSet(viewsets.ModelViewSet):
                 'error': str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @extend_schema(
+        summary='WhatsApp coexistence status',
+        parameters=[
+            OpenApiParameter(name='refresh', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY, required=False, description='Also fetch fresh status from Meta'),
+        ],
+        responses={200: CoexStatusResponseSerializer},
+    )
     @action(detail=True, methods=['get'], url_path='coex-status')
     def coex_status(self, request, pk=None):
         """
@@ -7647,7 +7146,20 @@ class WhatsAppBusinessAccountViewSet(viewsets.ModelViewSet):
         })
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='WhatsApp message history (newest first)',
+        description='Filter one chat with waba_id + from_number (customer number, both directions); page=2.. for older messages. Media URLs go through /api/social/whatsapp-media/<media_id>/.',
+        parameters=[
+        OpenApiParameter(name='waba_id', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description='WhatsApp Business Account id'),
+        OpenApiParameter(name='from_number', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description='Customer number (with or without +)'),
+        OpenApiParameter(name='phone_number_id', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description='Business phone number id'),
+        OpenApiParameter(name='initial_load', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY, required=False, description='With the conversation filter: return the unread messages + the 10 newest only'),
+        ],
+    ),
+)
 class WhatsAppMessageViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = WhatsAppMessage.objects.none()  # schema typing; get_queryset() is used
     serializer_class = WhatsAppMessageSerializer
     permission_classes = [IsAuthenticated, CanViewSocialMessages]
     pagination_class = SocialMessagePagination
@@ -7756,6 +7268,18 @@ class WhatsAppContactViewSet(viewsets.ReadOnlyModelViewSet):
         return queryset.order_by('-last_message_at', '-synced_at')
 
 
+@extend_schema(
+    summary='Start the WhatsApp embedded-signup OAuth',
+    parameters=[
+        OpenApiParameter(
+            name='return_to', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+            enum=['app'], required=False,
+            description="'app' → the callback finally redirects to echodesk://social/connections?platform=<p>&status=<ok|error>&message=… instead of the web page",
+        ),
+    ],
+    responses={200: OAuthStartResponseSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Connections'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def whatsapp_oauth_start(request):
@@ -7787,11 +7311,13 @@ def whatsapp_oauth_start(request):
         else:
             tenant_name = "amanati"  # Default fallback
 
-        # Simplified state parameter with just tenant schema
-        state_raw = f'tenant={tenant_name}'
-        state = quote(state_raw)  # URL encode the state
+        # Signed state: tenant + nonce + initiating user (+ return_to=app).
+        state = quote(make_oauth_state(
+            tenant_name,
+            user_id=request.user.id,
+            return_to=return_to_from_request(request),
+        ))
         logger.info(f"WhatsApp OAuth - Tenant: {tenant_name}")
-        logger.info(f"WhatsApp OAuth - State parameter: {state}")
 
         # WhatsApp Business App Coexistence extras parameter
         # This enables linking both Business App and Cloud API on the same number
@@ -7841,6 +7367,7 @@ def whatsapp_embedded_signup_callback(request):
     logger.info("📱 WhatsApp Embedded Signup callback received")
 
     try:
+        oauth_state = None
         # Handle both GET (OAuth redirect) and POST (API call)
         if request.method == 'GET':
             # OAuth redirect from Facebook
@@ -7849,47 +7376,46 @@ def whatsapp_embedded_signup_callback(request):
             error = request.GET.get('error')
             error_description = request.GET.get('error_description')
 
-            # Parse tenant from state
-            tenant_name = None
-            if state:
-                from urllib.parse import unquote
-                decoded_state = unquote(state)
-                # State format: "tenant=amanati"
-                try:
-                    for param in decoded_state.split('&'):
-                        if param.startswith('tenant='):
-                            tenant_name = param.split('=', 1)[1]
-                except (ValueError, IndexError):
-                    pass
+            # The state is signed by whatsapp_oauth_start; a forged, expired,
+            # replayed or legacy "tenant=x" state is rejected.
+            oauth_state = read_oauth_state(state)
+            tenant_name = oauth_state['tenant'] if oauth_state else None
         else:
-            # POST request from API
+            # POST from the dashboard (FB JS SDK code exchange): the caller
+            # must be signed in to THIS tenant and allowed to manage
+            # connections; a body 'tenant' can no longer point elsewhere.
+            if not request.user or not request.user.is_authenticated:
+                return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
+            if not CanManageSocialConnections().has_permission(request, None):
+                return Response({'error': CanManageSocialConnections.message}, status=status.HTTP_403_FORBIDDEN)
             code = request.data.get('code')
-            tenant_name = request.data.get('tenant')
+            tenant_name = getattr(getattr(request, 'tenant', None), 'schema_name', None)
+            body_tenant = request.data.get('tenant')
+            if body_tenant and body_tenant != tenant_name:
+                return Response({'error': 'Tenant mismatch'}, status=status.HTTP_400_BAD_REQUEST)
+
+        def _wa_redirect(ok, message='', **extra):
+            return oauth_result_redirect(
+                platform='whatsapp', ok=ok, message=message, state=oauth_state,
+                tenant_schema=tenant_name, extra=extra or None,
+            )
+
+        def _wa_error(message, http_status=status.HTTP_400_BAD_REQUEST):
+            if request.method == 'GET':
+                return _wa_redirect(False, message)
+            return Response({'error': message}, status=http_status)
 
         # Handle Facebook errors
         if request.method == 'GET' and error:
             error_msg = error_description or error
             logger.error(f"Facebook OAuth error: {error_msg}")
-            # Redirect to frontend with error
-            frontend_url = f"https://{tenant_name}.{settings.MAIN_DOMAIN}" if tenant_name else f"https://amanati.{settings.MAIN_DOMAIN}"
-            from urllib.parse import quote_plus
-            return redirect(f"{frontend_url}/social/connections?whatsapp_status=error&message={quote_plus(error_msg)}")
-
-        if not code:
-            error_msg = 'Authorization code is required'
-            if request.method == 'GET':
-                frontend_url = f"https://{tenant_name}.{settings.MAIN_DOMAIN}" if tenant_name else f"https://amanati.{settings.MAIN_DOMAIN}"
-                from urllib.parse import quote_plus
-                return redirect(f"{frontend_url}/social/connections?whatsapp_status=error&message={quote_plus(error_msg)}")
-            return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
+            return _wa_redirect(False, error_msg)
 
         if not tenant_name:
-            error_msg = 'Tenant name is required'
-            if request.method == 'GET':
-                frontend_url = f"https://amanati.{settings.MAIN_DOMAIN}"
-                from urllib.parse import quote_plus
-                return redirect(f"{frontend_url}/social/connections?whatsapp_status=error&message={quote_plus(error_msg)}")
-            return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
+            return _wa_error('Invalid or expired connection request. Please start again.')
+
+        if not code:
+            return _wa_error('Authorization code is required')
 
         logger.info(f"Processing WhatsApp signup for tenant: {tenant_name}")
 
@@ -7921,15 +7447,11 @@ def whatsapp_embedded_signup_callback(request):
         if 'error' in token_data:
             error_msg = token_data.get('error', {}).get('message', 'Unknown error')
             logger.error(f"Token exchange failed: {error_msg}")
-            return Response({
-                'error': f'Token exchange failed: {error_msg}'
-            }, status=status.HTTP_400_BAD_REQUEST)
+            return _wa_error(f'Token exchange failed: {error_msg}', status.HTTP_400_BAD_REQUEST)
 
         access_token = token_data.get('access_token')
         if not access_token:
-            return Response({
-                'error': 'No access token received from Facebook'
-            }, status=status.HTTP_400_BAD_REQUEST)
+            return _wa_error('No access token received from Facebook', status.HTTP_400_BAD_REQUEST)
 
         logger.info("✅ Successfully obtained access token")
 
@@ -7967,9 +7489,7 @@ def whatsapp_embedded_signup_callback(request):
             logger.error(f"Failed to debug token: {str(e)}")
 
         if not waba_ids:
-            return Response({
-                'error': 'No WhatsApp Business Account IDs found in token'
-            }, status=status.HTTP_404_NOT_FOUND)
+            return _wa_error('No WhatsApp Business Account IDs found in token', status.HTTP_404_NOT_FOUND)
 
         # Fetch details for each WABA directly
         whatsapp_accounts = []
@@ -7993,9 +7513,7 @@ def whatsapp_embedded_signup_callback(request):
             logger.info(f"✅ Successfully fetched WABA: {waba_data.get('name', waba_id)}")
 
         if not whatsapp_accounts:
-            return Response({
-                'error': 'No WhatsApp Business Accounts found'
-            }, status=status.HTTP_404_NOT_FOUND)
+            return _wa_error('No WhatsApp Business Accounts found', status.HTTP_404_NOT_FOUND)
 
         # Process WhatsApp accounts and save to tenant database
         from tenant_schemas.utils import schema_context
@@ -8129,18 +7647,13 @@ def whatsapp_embedded_signup_callback(request):
 
         if not saved_accounts:
             error_msg = 'No WhatsApp phone numbers could be configured'
-            if request.method == 'GET':
-                frontend_url = f"https://{tenant_name}.{settings.MAIN_DOMAIN}"
-                from urllib.parse import quote_plus
-                return redirect(f"{frontend_url}/social/connections?whatsapp_status=error&message={quote_plus(error_msg)}")
-            return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
+            return _wa_error(error_msg)
 
         # Success! Redirect back to frontend
         if request.method == 'GET':
-            frontend_url = f"https://{tenant_name}.{settings.MAIN_DOMAIN}"
             from urllib.parse import quote_plus
             success_msg = f'Successfully connected {len(saved_accounts)} WhatsApp Business Account(s)'
-            return redirect(f"{frontend_url}/social/connections?whatsapp_status=connected&accounts={len(saved_accounts)}&message={quote_plus(success_msg)}")
+            return _wa_redirect(True, success_msg, accounts=len(saved_accounts))
 
         return Response({
             'status': 'success',
@@ -8152,14 +7665,20 @@ def whatsapp_embedded_signup_callback(request):
         logger.error(f"WhatsApp embedded signup callback failed: {e}")
         error_msg = f'Failed to process WhatsApp signup: {str(e)}'
         if request.method == 'GET':
-            frontend_url = f"https://{tenant_name if 'tenant_name' in locals() else 'amanati'}.{settings.MAIN_DOMAIN}"
-            from urllib.parse import quote_plus
-            return redirect(f"{frontend_url}/social/connections?whatsapp_status=error&message={quote_plus(error_msg)}")
+            return oauth_result_redirect(
+                platform='whatsapp', ok=False, message=error_msg,
+                state=locals().get('oauth_state'), tenant_schema=locals().get('tenant_name'),
+            )
         return Response({
             'error': error_msg
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='WhatsApp connection status',
+    responses={200: WhatsAppStatusResponseSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Connections'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def whatsapp_connection_status(request):
@@ -8191,6 +7710,12 @@ def whatsapp_connection_status(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Disconnect WhatsApp (one WABA or all)',
+    request=WhatsAppDisconnectSerializer,
+    responses={200: WhatsAppDisconnectResponseSerializer, 404: SocialErrorSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Connections'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def whatsapp_disconnect(request):
@@ -8379,6 +7904,13 @@ def whatsapp_media_proxy(request, media_id):
         return Response({'error': 'Internal error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Send a WhatsApp message',
+    description='Free-form message (24h window). JSON, or multipart with one `media` file.',
+    request={'application/json': WhatsAppSendMessageSerializer, 'multipart/form-data': WhatsAppSendMultipartSerializer},
+    responses={200: WhatsAppSendResponseSerializer, 400: SocialErrorWithDetailsSerializer, 404: SocialErrorSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Messages'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanSendSocialMessages])
 def whatsapp_send_message(request):
@@ -8639,6 +8171,16 @@ def whatsapp_webhook(request):
             entry = data.get('entry', [{}])[0]
             changes = entry.get('changes', [{}])[0]
             value = changes.get('value', {})
+
+            # Template review results are WABA-level events: they carry the
+            # WABA id (entry.id) and no phone_number_id.
+            if changes.get('field') == 'message_template_status_update':
+                if not _valid_meta_signature(request):
+                    logger.warning("WhatsApp template status webhook with a bad signature — ignored")
+                    return JsonResponse({'status': 'ignored', 'message': 'invalid signature'}, status=403)
+                updated = handle_whatsapp_template_status_update(entry.get('id'), value)
+                return JsonResponse({'status': 'success', 'templates_updated': updated})
+
             metadata = value.get('metadata', {})
             phone_number_id = metadata.get('phone_number_id')
 
@@ -9224,10 +8766,87 @@ def whatsapp_webhook(request):
 
 # ==================== WHATSAPP TEMPLATE MANAGEMENT ====================
 
+def _valid_meta_signature(request):
+    """Check Meta's X-Hub-Signature-256 against the app secret.
+
+    Returns True when no app secret is configured (local/dev), so this can
+    only tighten behaviour where the secret exists.
+    """
+    import hashlib
+    import hmac
+
+    secret = getattr(settings, 'SOCIAL_INTEGRATIONS', {}).get('FACEBOOK_APP_SECRET')
+    if not secret:
+        return True
+    header = request.headers.get('X-Hub-Signature-256') or ''
+    if not header.startswith('sha256='):
+        return False
+    expected = hmac.new(secret.encode(), request.body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(header[len('sha256='):], expected)
+
+
+TEMPLATE_STATUS_EVENTS = {
+    'APPROVED', 'REJECTED', 'PENDING', 'PAUSED', 'DISABLED', 'FLAGGED',
+    'PENDING_DELETION', 'REINSTATED', 'IN_APPEAL', 'LIMIT_EXCEEDED',
+}
+
+
+def handle_whatsapp_template_status_update(waba_id, value):
+    """Apply a ``message_template_status_update`` webhook to every tenant
+    that has this WABA, and notify their admins. Returns rows updated.
+
+    Payload: {event, message_template_id, message_template_name,
+    message_template_language, reason}. REINSTATED means approved again.
+    """
+    from .notifications import notify_whatsapp_template_status
+    from tenants.models import Tenant
+
+    event = str(value.get('event') or '').upper()
+    if not waba_id or event not in TEMPLATE_STATUS_EVENTS:
+        return 0
+    new_status = 'APPROVED' if event == 'REINSTATED' else event
+    meta_id = str(value.get('message_template_id') or '')
+    name = value.get('message_template_name') or ''
+    language = value.get('message_template_language') or ''
+    reason = str(value.get('reason') or '')
+
+    from django.db import transaction
+
+    updated = 0
+    for tenant in Tenant.objects.exclude(schema_name='public'):
+        try:
+            with schema_context(tenant.schema_name), transaction.atomic():
+                templates = WhatsAppMessageTemplate.objects.filter(
+                    business_account__waba_id=str(waba_id),
+                ).select_related('business_account', 'created_by')
+                match = Q(template_id=meta_id) if meta_id else Q(pk__in=[])
+                if name:
+                    name_q = Q(name=name)
+                    if language:
+                        name_q &= Q(language=language)
+                    match |= name_q
+                for template in templates.filter(match):
+                    previous = template.status
+                    if previous == new_status:
+                        continue
+                    template.status = new_status
+                    if meta_id and not template.template_id:
+                        template.template_id = meta_id
+                    template.save(update_fields=['status', 'template_id', 'updated_at'])
+                    updated += 1
+                    notify_whatsapp_template_status(template, previous, reason)
+        except ProgrammingError:
+            continue  # tenant schema without the tables yet
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Template status update failed for {tenant.schema_name}: {exc}")
+    return updated
+
+
 @extend_schema(
-    summary="List WhatsApp message templates",
-    description="Fetch all message templates for a WhatsApp Business Account from the database and optionally sync from Meta",
-    responses={200: WhatsAppMessageTemplateSerializer(many=True)}
+    summary='List WhatsApp message templates',
+    description='Every template of the WABA whatever its status — only APPROVED ones can be sent.',
+    responses={200: WhatsAppMessageTemplateSerializer(many=True), 404: SocialErrorSerializer},
+    tags=['WhatsApp Templates'],
 )
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
@@ -9259,8 +8878,16 @@ def whatsapp_list_templates(request, waba_id):
 
 @extend_schema(
     summary="Sync WhatsApp templates from Meta",
-    description="Fetch all templates from Meta's API and sync them to the database",
-    responses={200: WhatsAppMessageTemplateSerializer(many=True)}
+    description=(
+        "Fetch all templates from Meta's API (following paging) and upsert them; "
+        "returns how many were synced plus the WABA's full template list."
+    ),
+    request=None,
+    responses={
+        200: WhatsAppTemplateSyncResponseSerializer,
+        404: SocialErrorSerializer,
+    },
+    tags=['WhatsApp Templates'],
 )
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
@@ -9282,15 +8909,26 @@ def whatsapp_sync_templates(request, waba_id):
                 'limit': 100
             }
 
-            response = requests.get(templates_url, params=params, timeout=30)
-
-            if response.status_code != 200:
-                return Response({
-                    'error': 'Failed to fetch templates from Meta',
-                    'details': response.json()
-                }, status=response.status_code)
-
-            meta_templates = response.json().get('data', [])
+            # Follow Meta's cursor paging (100 per page, capped at 20 pages).
+            meta_templates = []
+            next_url, next_params = templates_url, params
+            for _page in range(20):
+                response = requests.get(next_url, params=next_params, timeout=30)
+                if response.status_code != 200:
+                    try:
+                        details = response.json()
+                    except ValueError:
+                        details = {'raw': response.text[:300]}
+                    return Response({
+                        'error': 'Failed to fetch templates from Meta',
+                        'details': details
+                    }, status=response.status_code)
+                body = response.json()
+                meta_templates.extend(body.get('data', []))
+                next_url = (body.get('paging') or {}).get('next')
+                if not next_url:
+                    break
+                next_params = None  # the next URL already carries the query
 
             # Sync to database
             synced_count = 0
@@ -9403,9 +9041,11 @@ def whatsapp_create_template(request):
 
 
 @extend_schema(
-    summary="Delete WhatsApp message template",
-    description="Delete a message template from both Meta and database",
-    responses={200: {'description': 'Template deleted successfully'}}
+    summary='Delete a WhatsApp message template',
+    description='Deletes the row even when the Meta delete fails.',
+    request=None,
+    responses={200: SocialMessageResponseSerializer, 404: SocialErrorSerializer, 500: SocialErrorSerializer},
+    tags=['WhatsApp Templates'],
 )
 @api_view(['DELETE'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
@@ -11311,6 +10951,18 @@ def find_tenant_by_tiktok_shop_id(shop_id):
     return resolve_tenant("tiktok", shop_id)
 
 
+@extend_schema(
+    summary='Start the TikTok Shop OAuth',
+    parameters=[
+        OpenApiParameter(
+            name='return_to', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+            enum=['app'], required=False,
+            description="'app' → the callback finally redirects to echodesk://social/connections?platform=<p>&status=<ok|error>&message=… instead of the web page",
+        ),
+    ],
+    responses={200: OAuthStartResponseSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Connections'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def tiktok_oauth_start(request):
@@ -11324,8 +10976,12 @@ def tiktok_oauth_start(request):
         # Get current tenant for state parameter
         current_schema = request.tenant.schema_name
 
-        # Build state with tenant info
-        state = f"tenant={current_schema}"
+        # Signed state: tenant + nonce + initiating user (+ return_to=app).
+        state = quote_plus(make_oauth_state(
+            current_schema,
+            user_id=request.user.id,
+            return_to=return_to_from_request(request),
+        ))
 
         oauth_url = get_oauth_url(state)
 
@@ -11369,29 +11025,26 @@ def tiktok_oauth_callback(request):
     error = request.GET.get('error')
     error_description = request.GET.get('error_description', '')
 
-    # Parse tenant from state
-    tenant_schema = None
-    for param in state.split('&'):
-        if param.startswith('tenant='):
-            tenant_schema = param.split('=', 1)[1]
-            break
+    # Verify the signed state (tenant + nonce, optional return_to=app).
+    oauth_state = read_oauth_state(state)
+    tenant_schema = oauth_state['tenant'] if oauth_state else None
 
-    # Build frontend URL from tenant schema
-    if tenant_schema:
-        frontend_url = f"https://{tenant_schema}.{settings.MAIN_DOMAIN}"
-    else:
-        frontend_url = f"https://{settings.MAIN_DOMAIN}"
+    def _tt_redirect(ok, message=''):
+        return oauth_result_redirect(
+            platform='tiktok', ok=ok, message=message, state=oauth_state,
+            tenant_schema=tenant_schema,
+        )
+
+    if not tenant_schema:
+        return _tt_redirect(False, 'Invalid state parameter')
 
     # Handle OAuth errors
     if error:
         logger.error(f"TikTok Shop OAuth error: {error} - {error_description}")
-        return redirect(f'{frontend_url}/social/connections?tiktok_status=error&message={quote_plus(error_description)}')
+        return _tt_redirect(False, error_description)
 
     if not code:
-        return redirect(f'{frontend_url}/social/connections?tiktok_status=error&message=No+authorization+code+received')
-
-    if not tenant_schema:
-        return redirect(f'{frontend_url}/social/connections?tiktok_status=error&message=Invalid+state+parameter')
+        return _tt_redirect(False, 'No authorization code received')
 
     try:
         # Exchange code for tokens (TikTok Shop uses auth_code param name)
@@ -11435,11 +11088,11 @@ def tiktok_oauth_callback(request):
 
             logger.info(f"TikTok Shop account {'created' if created else 'updated'}: {account.seller_name}")
 
-        return redirect(f'{frontend_url}/social/connections?tiktok_status=connected')
+        return _tt_redirect(True)
 
     except Exception as e:
         logger.error(f"TikTok Shop OAuth callback error: {e}")
-        return redirect(f'{frontend_url}/social/connections?tiktok_status=error&message={quote_plus(str(e))}')
+        return _tt_redirect(False, str(e))
 
 
 @csrf_exempt
@@ -11608,6 +11261,11 @@ def process_tiktok_message_event(webhook_data, shop_id):
         logger.info(f"TikTok Shop message saved: {message_id}")
 
 
+@extend_schema(
+    summary='TikTok Shop connection status',
+    responses={200: TikTokStatusResponseSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Connections'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def tiktok_status(request):
@@ -11642,6 +11300,12 @@ def tiktok_status(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Disconnect TikTok Shop',
+    request=None,
+    responses={200: StatusMessageResponseSerializer, 404: SocialErrorSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Connections'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def tiktok_disconnect(request):
@@ -11677,6 +11341,12 @@ def tiktok_disconnect(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Send a TikTok Shop message',
+    request=TikTokSendMessageSerializer,
+    responses={200: TikTokSendResponseSerializer, 400: SocialErrorSerializer, 401: SocialErrorSerializer, 404: SocialErrorSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Messages'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanSendSocialMessages])
 def tiktok_send_message(request):
@@ -11756,6 +11426,14 @@ def tiktok_send_message(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema_view(
+    list=extend_schema(
+        parameters=[
+        OpenApiParameter(name='account_id', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description='TikTok shop account id'),
+        OpenApiParameter(name='conversation_id', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description='TikTok conversation id'),
+        ],
+    ),
+)
 class TikTokMessageViewSet(viewsets.ReadOnlyModelViewSet):
     """ViewSet for viewing TikTok Shop messages"""
     serializer_class = TikTokMessageSerializer
@@ -11869,6 +11547,16 @@ def email_signature_view(request):
 # Quick Reply Views
 # =============================================================================
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='Quick replies (whole library, unpaginated)',
+        parameters=[
+        OpenApiParameter(name='platform', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description="Only replies for this platform (or 'all')"),
+        OpenApiParameter(name='category', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description=''),
+        OpenApiParameter(name='shortcut', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description=''),
+        ],
+    ),
+)
 class QuickReplyViewSet(viewsets.ModelViewSet):
     """ViewSet for managing quick reply templates.
 
@@ -11919,6 +11607,11 @@ class QuickReplyViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
+    @extend_schema(
+        summary='Use a quick reply (fills variables, bumps use_count)',
+        request=QuickReplyUseSerializer,
+        responses={200: QuickReplyUseResponseSerializer},
+    )
     @action(detail=True, methods=['post'])
     def use(self, request, pk=None):
         """
@@ -11953,6 +11646,11 @@ class QuickReplyViewSet(viewsets.ModelViewSet):
             'use_count': quick_reply.use_count
         })
 
+    @extend_schema(
+        summary='Variables usable in quick replies',
+        operation_id='social_quick_replies_variables_retrieve',
+        responses={200: QuickReplyVariablesSerializer(many=True)},
+    )
     @action(detail=False, methods=['get'])
     def variables(self, request):
         """Get the list of available variables for quick replies"""
@@ -11960,6 +11658,10 @@ class QuickReplyViewSet(viewsets.ModelViewSet):
         serializer = QuickReplyVariablesSerializer(variables, many=True)
         return Response(serializer.data)
 
+    @extend_schema(
+        summary='Distinct quick-reply categories',
+        responses={200: {'type': 'array', 'items': {'type': 'string'}}},
+    )
     @action(detail=False, methods=['get'])
     def categories(self, request):
         """Get the list of distinct categories"""
@@ -11968,6 +11670,11 @@ class QuickReplyViewSet(viewsets.ModelViewSet):
         ).values_list('category', flat=True).distinct()
         return Response(list(categories))
 
+    @extend_schema(
+        summary='Reorder quick replies',
+        request=ReorderSerializer,
+        responses={200: ReorderResponseSerializer, 400: SocialErrorSerializer},
+    )
     @action(detail=False, methods=['post'])
     def reorder(self, request):
         """
@@ -11994,9 +11701,21 @@ class QuickReplyViewSet(viewsets.ModelViewSet):
 # Social Client ViewSets
 # =============================================================================
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='Social clients',
+        parameters=[
+        OpenApiParameter(name='platform', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, description='Has a linked account on this platform'),
+        OpenApiParameter(name='client_type', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, enum=['booking', 'social'], description=''),
+        OpenApiParameter(name='is_booking_enabled', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY, required=False, description=''),
+        ],
+    ),
+    create=extend_schema(summary='Create a social client (response includes id)'),
+    destroy=extend_schema(summary='Delete a client (staff / admin / manage_social_settings)'),
+)
 class SocialClientViewSet(viewsets.ModelViewSet):
     """ViewSet for managing social clients"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, CanAccessSocialClients]
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -12063,6 +11782,16 @@ class SocialClientViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
+    @extend_schema(
+        summary='Find the client linked to a chat account',
+        description='Widget: platform_id is the visitor id, account_connection_id the widget connection id.',
+        parameters=[
+            OpenApiParameter(name='platform', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=True),
+            OpenApiParameter(name='platform_id', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=True, description='sender id / number / visitor id'),
+            OpenApiParameter(name='account_connection_id', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=True, description='page / account / WABA / widget connection id'),
+        ],
+        responses={200: ClientByAccountResponseSerializer, 400: SocialErrorSerializer},
+    )
     @action(detail=False, methods=['get'])
     def by_account(self, request):
         """
@@ -12094,7 +11823,8 @@ class SocialClientViewSet(viewsets.ModelViewSet):
             return Response({
                 'found': True,
                 'client': SocialClientSerializer(social_account.client).data,
-                'social_account': SocialAccountSerializer(social_account).data
+                'social_account': SocialAccountSerializer(social_account).data,
+                'prefill': None,
             })
         except SocialAccount.DoesNotExist:
             prefill = None
@@ -12124,6 +11854,11 @@ class SocialClientViewSet(viewsets.ModelViewSet):
                 'prefill': prefill,
             })
 
+    @extend_schema(
+        summary='Link a chat account to this client',
+        request=SocialAccountLinkSerializer,
+        responses={200: LinkAccountResponseSerializer, 400: SocialErrorSerializer},
+    )
     @action(detail=True, methods=['post'])
     def link_account(self, request, pk=None):
         """Link a social account to this client"""
@@ -12170,6 +11905,11 @@ class SocialClientViewSet(viewsets.ModelViewSet):
             'social_account': SocialAccountSerializer(social_account).data
         })
 
+    @extend_schema(
+        summary='Unlink a chat account from this client',
+        request=SocialAccountLinkSerializer,
+        responses={200: UnlinkAccountResponseSerializer, 404: SocialErrorSerializer},
+    )
     @action(detail=True, methods=['post'])
     def unlink_account(self, request, pk=None):
         """Unlink a social account from this client"""
@@ -12194,6 +11934,14 @@ class SocialClientViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
+    @extend_schema(
+        summary='Client booking history',
+        parameters=[
+            OpenApiParameter(name='page', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False),
+            OpenApiParameter(name='page_size', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False, description='default 10'),
+        ],
+        responses={200: ClientBookingHistoryResponseSerializer},
+    )
     @action(detail=True, methods=['get'])
     def booking_history(self, request, pk=None):
         """Get booking history for a client (only for booking-enabled clients)"""
@@ -12213,8 +11961,8 @@ class SocialClientViewSet(viewsets.ModelViewSet):
             bookings = Booking.objects.filter(client=client).order_by('-date', '-start_time')
 
             # Pagination support
-            page_size = int(request.query_params.get('page_size', 10))
-            page = int(request.query_params.get('page', 1))
+            page_size = min(_positive_int_param(request.query_params.get('page_size'), 10), 100)
+            page = _positive_int_param(request.query_params.get('page'), 1)
             offset = (page - 1) * page_size
 
             total = bookings.count()
@@ -12232,6 +11980,10 @@ class SocialClientViewSet(viewsets.ModelViewSet):
                 'bookings': []
             })
 
+    @extend_schema(
+        summary='Client booking statistics',
+        responses={200: ClientBookingStatsResponseSerializer},
+    )
     @action(detail=True, methods=['get'])
     def booking_stats(self, request, pk=None):
         """Get booking statistics for a client"""
@@ -12272,10 +12024,18 @@ class SocialClientViewSet(viewsets.ModelViewSet):
             })
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='Client custom-field definitions',
+        parameters=[
+        OpenApiParameter(name='is_active', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY, required=False, description=''),
+        ],
+    ),
+)
 class SocialClientCustomFieldViewSet(viewsets.ModelViewSet):
     """ViewSet for managing custom field definitions"""
     serializer_class = SocialClientCustomFieldSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, CanManageSocialClientFields]
 
     def get_queryset(self):
         queryset = SocialClientCustomField.objects.select_related('created_by').all()
@@ -12290,6 +12050,11 @@ class SocialClientCustomFieldViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
+    @extend_schema(
+        summary='Reorder client custom fields',
+        request=ReorderSerializer,
+        responses={200: ReorderResponseSerializer, 400: SocialErrorSerializer},
+    )
     @action(detail=False, methods=['post'])
     def reorder(self, request):
         """
@@ -12312,6 +12077,13 @@ class SocialClientCustomFieldViewSet(viewsets.ModelViewSet):
         return Response({'status': 'reordered'})
 
 
+@extend_schema(
+    summary='Mark every conversation read',
+    description="Not scoped by assignment. platform 'all' also marks EMAIL read — send an explicit CSV (e.g. 'facebook,instagram,whatsapp,widget,telegram') to leave email alone.",
+    request=PlatformsSerializer,
+    responses={200: MarkAllReadResponseSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Conversations'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def mark_all_conversations_read(request):
@@ -12439,6 +12211,13 @@ def mark_all_conversations_read(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Archive conversations (move to History)',
+    description='Also marks their incoming messages read; for widget chats ends the WidgetSession (session_ended). Broadcasts archive_update.',
+    request=ConversationsSerializer,
+    responses={200: ArchiveResponseSerializer, 400: SocialErrorSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Conversations'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def archive_conversation(request):
@@ -12619,6 +12398,12 @@ def archive_conversation(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Restore conversations from History',
+    request=ConversationsSerializer,
+    responses={200: UnarchiveResponseSerializer, 400: SocialErrorSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Conversations'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def unarchive_conversation(request):
@@ -12704,6 +12489,13 @@ def unarchive_conversation(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Archive every conversation',
+    description="Not scoped by assignment. platform 'all' includes EMAIL.",
+    request=PlatformsSerializer,
+    responses={200: ArchiveAllResponseSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Conversations'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def archive_all_conversations(request):
@@ -12944,6 +12736,18 @@ def archive_all_conversations(request):
 # Auto-Posting Endpoints
 # ===========================
 
+@extend_schema(
+    summary='Start the Facebook publishing-permission OAuth',
+    parameters=[
+        OpenApiParameter(
+            name='return_to', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+            enum=['app'], required=False,
+            description="'app' → the callback finally redirects to echodesk://social/connections?platform=<p>&status=<ok|error>&message=… instead of the web page",
+        ),
+    ],
+    responses={200: OAuthStartResponseSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Connections'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanManageSocialConnections])
 def facebook_oauth_start_publishing(request):
@@ -12967,9 +12771,14 @@ def facebook_oauth_start_publishing(request):
         else:
             tenant_name = "amanati"
 
-        # Include publishing flag in state so callback knows to set has_publishing_permission
-        state_raw = f'tenant={tenant_name}&publishing=true'
-        state = quote(state_raw)
+        # Signed state with the publishing flag so the callback knows to set
+        # has_publishing_permission.
+        state = quote(make_oauth_state(
+            tenant_name,
+            user_id=request.user.id,
+            return_to=return_to_from_request(request),
+            publishing=True,
+        ))
 
         # Request all existing scopes PLUS publishing scopes
         scopes = (
@@ -12998,6 +12807,11 @@ def facebook_oauth_start_publishing(request):
         return Response({'error': f'Failed to generate OAuth URL: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Which pages/accounts may publish posts',
+    responses={200: PublishingStatusResponseSerializer},
+    tags=['Social - Auto-posting'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def auto_post_publishing_status(request):
@@ -13024,6 +12838,12 @@ def auto_post_publishing_status(request):
     })
 
 
+@extend_schema(
+    summary='Get or update auto-post settings',
+    request=AutoPostSettingsSerializer,
+    responses={200: AutoPostSettingsSerializer, 400: OpenApiTypes.OBJECT},
+    tags=['Social - Auto-posting'],
+)
 @api_view(['GET', 'PUT'])
 @permission_classes([IsAuthenticated, CanManageSocialSettings])
 def auto_post_settings(request):
@@ -13040,6 +12860,16 @@ def auto_post_settings(request):
     return Response(serializer.data)
 
 
+@extend_schema(
+    summary='List auto-posts',
+    parameters=[
+        OpenApiParameter(name='status', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False, enum=['draft', 'approved', 'published', 'failed', 'rejected']),
+        OpenApiParameter(name='page', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False),
+        OpenApiParameter(name='page_size', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False, description='default 20, max 100'),
+    ],
+    responses={200: AutoPostListResponseSerializer},
+    tags=['Social - Auto-posting'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def auto_post_list(request):
@@ -13049,8 +12879,8 @@ def auto_post_list(request):
     if status_filter:
         queryset = queryset.filter(status=status_filter)
 
-    page = int(request.GET.get('page', 1))
-    page_size = int(request.GET.get('page_size', 20))
+    page = _positive_int_param(request.GET.get('page'), 1)
+    page_size = min(_positive_int_param(request.GET.get('page_size'), 20), 100)
     start = (page - 1) * page_size
     end = start + page_size
     total = queryset.count()
@@ -13064,6 +12894,11 @@ def auto_post_list(request):
     })
 
 
+@extend_schema(
+    summary='Get an auto-post',
+    responses={200: AutoPostContentSerializer, 404: SocialErrorSerializer},
+    tags=['Social - Auto-posting'],
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def auto_post_detail(request, pk):
@@ -13076,6 +12911,12 @@ def auto_post_detail(request, pk):
     return Response(serializer.data)
 
 
+@extend_schema(
+    summary='Approve a draft auto-post',
+    request=None,
+    responses={200: AutoPostContentSerializer, 400: SocialErrorSerializer, 404: SocialErrorSerializer},
+    tags=['Social - Auto-posting'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialSettings])
 def auto_post_approve(request, pk):
@@ -13096,6 +12937,12 @@ def auto_post_approve(request, pk):
     return Response(serializer.data)
 
 
+@extend_schema(
+    summary='Reject a draft auto-post',
+    request=AutoPostRejectSerializer,
+    responses={200: AutoPostContentSerializer, 400: SocialErrorSerializer, 404: SocialErrorSerializer},
+    tags=['Social - Auto-posting'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialSettings])
 def auto_post_reject(request, pk):
@@ -13117,6 +12964,12 @@ def auto_post_reject(request, pk):
     return Response(serializer.data)
 
 
+@extend_schema(
+    summary='Edit a draft/rejected auto-post (rejected → draft)',
+    request=AutoPostEditSerializer,
+    responses={200: AutoPostContentSerializer, 400: SocialErrorSerializer, 404: SocialErrorSerializer},
+    tags=['Social - Auto-posting'],
+)
 @api_view(['PUT'])
 @permission_classes([IsAuthenticated, CanManageSocialSettings])
 def auto_post_edit(request, pk):
@@ -13146,6 +12999,12 @@ def auto_post_edit(request, pk):
     return Response(serializer.data)
 
 
+@extend_schema(
+    summary='Generate an auto-post now',
+    request=None,
+    responses={201: AutoPostContentSerializer, 500: SocialErrorSerializer},
+    tags=['Social - Auto-posting'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialSettings])
 def auto_post_generate(request):
@@ -13165,6 +13024,12 @@ def auto_post_generate(request):
         return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary='Publish an approved (or failed) auto-post now',
+    request=None,
+    responses={200: AutoPostContentSerializer, 400: SocialErrorSerializer, 404: SocialErrorSerializer},
+    tags=['Social - Auto-posting'],
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated, CanManageSocialSettings])
 def auto_post_publish(request, pk):

@@ -187,3 +187,51 @@ class CanManageAICompanion(permissions.BasePermission):
             request.user.role == 'admin' or
             request.user.has_permission('manage_social_settings')
         )
+
+
+def _is_social_admin(user, permission='manage_social_settings'):
+    return bool(
+        user.is_staff or user.is_superuser or user.role == 'admin'
+        or user.has_permission(permission)
+    )
+
+
+class CanAccessSocialClients(permissions.BasePermission):
+    """
+    Social clients (CRM contacts behind the inbox).
+
+    - Read / create / update / link / unlink: the social_integrations feature
+      (same audience as the inbox, which creates and links clients from chats).
+    - Delete: the feature + staff, superuser, admin role or
+      manage_social_settings.
+    """
+    message = "You do not have permission to manage social clients."
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if not user.has_feature('social_integrations'):
+            return False
+        if request.method == 'DELETE':
+            return _is_social_admin(user)
+        return True
+
+
+class CanManageSocialClientFields(permissions.BasePermission):
+    """
+    Client custom-field definitions: reads need the social_integrations
+    feature; writes (create/update/delete/reorder) also need staff,
+    superuser, admin role or manage_social_settings.
+    """
+    message = "You do not have permission to manage client custom fields."
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if not user.has_feature('social_integrations'):
+            return False
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        return _is_social_admin(user)

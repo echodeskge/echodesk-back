@@ -342,6 +342,13 @@ SPECTACULAR_SETTINGS = {
     ],
     'COMPONENT_SPLIT_REQUEST': True,
     'SCHEMA_PATH_PREFIX': '/api',
+    # Keep these enum component names stable for the generated clients when
+    # the same choice set appears in several components.
+    'ENUM_NAME_OVERRIDES': {
+        'UnifiedConversationPlatformEnum': ['facebook', 'instagram', 'whatsapp', 'email', 'widget', 'telegram'],
+        'ModeEnum': ['ai', 'off'],
+        'DeactivationReasonEnum': 'social_integrations.models.TelegramAccount.DEACTIVATION_REASONS',
+    },
 }
 
 # CORS settings - Allow wildcard subdomains for multi-tenant frontend

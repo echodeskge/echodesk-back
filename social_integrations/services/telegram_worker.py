@@ -129,6 +129,12 @@ def _disable_account(account_id, reason, error_text):
                     f'The Telegram account {label} was disconnected '
                     f'({reason}). Reconnect it from Settings → Social → Telegram.'
                 ),
+                metadata={
+                    'platform_key': 'telegram',
+                    'telegram_account_id': str(account.telegram_user_id),
+                    'reason': reason,
+                },
+                link_url='/settings/social/connections?tab=telegram',
             )
     except Exception:  # noqa: BLE001
         logger.exception('failed to notify admins about disabled telegram account')

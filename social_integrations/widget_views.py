@@ -9,13 +9,16 @@ conversation transcripts.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import timedelta
 
 from django.utils import timezone
 from django_ratelimit.decorators import ratelimit
-from drf_spectacular.utils import OpenApiResponse, extend_schema
-from rest_framework import status, viewsets
+from drf_spectacular.utils import (
+    OpenApiParameter, OpenApiResponse, OpenApiTypes, extend_schema, extend_schema_view,
+)
+from rest_framework import filters as drf_filters, status, viewsets
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -23,7 +26,10 @@ from tenant_schemas.utils import schema_context
 
 from widget_registry.models import WidgetConnection
 from .models import ChatRating, ConversationArchive, WidgetMessage, WidgetSession
+from .permissions import CanManageSocialConnections, CanSendSocialMessages, CanViewSocialMessages
+from .pagination import SocialMessagePagination
 from .widget_serializers import (
+    WidgetAdminSendMessageSerializer,
     WidgetConnectionSerializer,
     WidgetMessageSerializer,
     WidgetSessionSerializer,
@@ -227,6 +233,11 @@ def widget_public_messages(request):
         session.last_seen_at = now
         session.save(update_fields=['last_seen_at'])
         response_data = WidgetMessageSerializer(msg).data
+        from .notifications import widget_assigned_user_id
+        try:
+            assigned_user_id = widget_assigned_user_id(session)
+        except Exception:  # noqa: BLE001
+            assigned_user_id = None
 
     # Single broadcast to the tenant group — agents AND visitor iframes
     # both listen there. Frontend dedupes by message_id if the same frame
@@ -252,6 +263,7 @@ def widget_public_messages(request):
             'message': msg_payload,
             'conversation_id': conversation_id,
             'timestamp': msg_payload['timestamp'],
+            'assigned_user_id': assigned_user_id,
         })
 
     # Auto-unarchive: a new visitor message should always pop the conversation
@@ -271,6 +283,8 @@ def widget_public_messages(request):
             )
         except Exception:  # noqa: BLE001
             logger.exception('widget ai companion hook failed')
+        from .notifications import notify_widget_visitor_message
+        notify_widget_visitor_message(session, msg, assigned_user_id)
 
     return Response(response_data, status=status.HTTP_201_CREATED)
 
@@ -402,8 +416,18 @@ def widget_public_upload(request):
     }, status=status.HTTP_201_CREATED)
 
 
+@extend_schema(
+    request=WidgetAdminSendMessageSerializer,
+    responses={
+        201: WidgetMessageSerializer,
+        400: OpenApiResponse(description='invalid_connection_id | missing_session_id | empty_message | message_too_long'),
+        404: OpenApiResponse(description='Connection or session not found.'),
+    },
+    summary='Send an agent reply to a website-chat visitor',
+    tags=['Widget'],
+)
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, CanSendSocialMessages])
 def widget_admin_send_message(request):
     """Agent-side: send a reply into a widget conversation.
 
@@ -789,7 +813,7 @@ def widget_public_rate_session(request):
     summary='Close widget session (agent)',
 )
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, CanViewSocialMessages])
 def widget_admin_close_session(request):
     """Agent ends a widget session from the tenant dashboard."""
     body = request.data or {}
@@ -902,10 +926,23 @@ def widget_admin_close_session(request):
     })
 
 
+@extend_schema_view(
+    list=extend_schema(summary='List widget connections', tags=['Widget']),
+    retrieve=extend_schema(summary='Get a widget connection', tags=['Widget']),
+    create=extend_schema(summary='Create a widget connection', tags=['Widget']),
+    update=extend_schema(summary='Update a widget connection', tags=['Widget']),
+    partial_update=extend_schema(summary='Update a widget connection', tags=['Widget']),
+    destroy=extend_schema(summary='Delete a widget connection', tags=['Widget']),
+)
 class WidgetConnectionViewSet(viewsets.ModelViewSet):
-    """Tenant-scoped admin CRUD for widget connections (lives in public schema)."""
+    """Tenant-scoped admin CRUD for widget connections (lives in public schema).
+
+    Reads need the social_integrations feature; writes also need the admin
+    role or manage_social_connections (same as the other social connections).
+    """
+    queryset = WidgetConnection.objects.none()  # schema typing; get_queryset() is used
     serializer_class = WidgetConnectionSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, CanManageSocialConnections]
 
     def get_queryset(self):
         schema = getattr(self.request.tenant, 'schema_name', None)
@@ -931,11 +968,40 @@ class WidgetConnectionViewSet(viewsets.ModelViewSet):
             instance.delete()
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary='Website-chat transcript',
+        tags=['Widget'],
+        description=(
+            'Messages of one website chat (pass session_id). Default order is '
+            'oldest first (dashboard). Pass ordering=-timestamp to page newest '
+            'first: page=1 is the latest messages, page=2.. older ones. '
+            'page_size up to 500. hide_assigned_chats hides chats assigned to '
+            'other agents from non-staff users.'
+        ),
+        parameters=[
+            OpenApiParameter(
+                'session_id', OpenApiTypes.STR,
+                description='Widget session id; the list id widget_<conn>_<session> is accepted too',
+            ),
+            OpenApiParameter(
+                'ordering', OpenApiTypes.STR, enum=['timestamp', '-timestamp', 'id', '-id'],
+                description="'timestamp' (default, oldest first) or '-timestamp' (newest first)",
+            ),
+        ],
+    ),
+    retrieve=extend_schema(summary='Get one website-chat message', tags=['Widget']),
+)
 class WidgetMessageViewSet(viewsets.ReadOnlyModelViewSet):
     """Tenant-scoped read-only view of widget messages. Agents use this when
     surfing a single visitor's transcript."""
+    queryset = WidgetMessage.objects.none()  # schema typing; get_queryset() is used
     serializer_class = WidgetMessageSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, CanViewSocialMessages]
+    pagination_class = SocialMessagePagination
+    filter_backends = [drf_filters.OrderingFilter]
+    ordering_fields = ['timestamp', 'id']
+    ordering = ['timestamp', 'id']
 
     def get_queryset(self):
         schema = getattr(self.request.tenant, 'schema_name', None)
@@ -943,8 +1009,24 @@ class WidgetMessageViewSet(viewsets.ReadOnlyModelViewSet):
             return WidgetMessage.objects.none()
         # WidgetMessage lives in the tenant schema already — the tenant middleware
         # set the connection. Filter by session_id query param when provided.
-        qs = WidgetMessage.objects.filter(is_deleted=False).order_by('timestamp')
-        session_id = self.request.query_params.get('session_id')
+        qs = WidgetMessage.objects.filter(is_deleted=False).select_related('session')
+        session_id = (self.request.query_params.get('session_id') or '').strip()
         if session_id:
+            match = re.match(r'^widget_\d+_(.+)$', session_id)
+            if match:
+                session_id = match.group(1)
             qs = qs.filter(session__session_id=session_id)
+
+        from .inbox_list import exclude_chats_assigned_to_others, hide_assigned_applies
+        if hide_assigned_applies(self.request):
+            from django.db.models import CharField, F
+            from django.db.models.functions import Cast
+            qs = exclude_chats_assigned_to_others(
+                qs.annotate(
+                    _acct=Cast('session__connection_id', output_field=CharField()),
+                    _visitor=F('session__visitor_id'),
+                    _session=F('session__session_id'),
+                ),
+                'widget', self.request.user, assignment_keys=('_visitor', '_session'),
+            )
         return qs

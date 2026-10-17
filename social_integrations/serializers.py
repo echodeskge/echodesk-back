@@ -244,6 +244,7 @@ class InstagramSendMessageSerializer(serializers.Serializer):
     recipient_id = serializers.CharField(max_length=255, help_text="Instagram user ID to send message to")
     message = serializers.CharField(required=False, allow_blank=True, default='', help_text="Message text to send (optional when sending media)")
     instagram_account_id = serializers.CharField(max_length=255, help_text="Instagram account ID to send from")
+    reply_to_message_id = serializers.CharField(max_length=255, required=False, allow_blank=True, help_text="Instagram message id (mid) to reply to (optional)")
 
 
 class WhatsAppBusinessAccountSerializer(serializers.ModelSerializer):
@@ -525,12 +526,12 @@ class ChatAssignmentSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'assigned_at', 'updated_at', 'full_conversation_id']
 
-    def get_assigned_user_name(self, obj):
+    def get_assigned_user_name(self, obj) -> Optional[str]:
         if obj.assigned_user is None:
             return None
         return obj.assigned_user.get_full_name() or obj.assigned_user.email
 
-    def get_assigned_user_email(self, obj):
+    def get_assigned_user_email(self, obj) -> Optional[str]:
         if obj.assigned_user is None:
             return None
         return obj.assigned_user.email
@@ -1580,16 +1581,20 @@ class SocialClientCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = SocialClient
         fields = [
+            'id',
             'name', 'email', 'phone', 'notes', 'profile_picture', 'custom_fields',
             # Booking fields
             'first_name', 'last_name', 'is_booking_enabled', 'password'
         ]
+        read_only_fields = ['id']
 
     def validate(self, attrs):
         # If enabling booking, require email and password
         is_booking_enabled = attrs.get('is_booking_enabled', False)
         if is_booking_enabled:
-            if not attrs.get('email'):
+            # A PATCH may omit email when the client already has one.
+            email = attrs.get('email', getattr(self.instance, 'email', None))
+            if not email:
                 raise serializers.ValidationError({
                     'email': 'Email is required for booking-enabled clients'
                 })
@@ -1705,7 +1710,14 @@ class UnifiedConversationSerializer(serializers.Serializer):
     assigned_user_name = serializers.CharField(allow_null=True, allow_blank=True, required=False)
     assignment_status = serializers.CharField(allow_null=True, allow_blank=True, required=False)
     session_started_at = serializers.DateTimeField(allow_null=True, required=False)
-    session_ended_at = serializers.DateTimeField(allow_null=True, required=False)
+    session_ended_at = serializers.DateTimeField(
+        allow_null=True, required=False,
+        help_text="Assignment session end; for widget chats the visitor/agent close time when set.",
+    )
+    session_ended_by = serializers.CharField(
+        allow_null=True, allow_blank=True, required=False,
+        help_text="Widget only: who closed the website chat ('visitor' | 'agent' | 'timeout'), null while open.",
+    )
     is_archived = serializers.BooleanField(required=False, default=False)
     archived_at = serializers.DateTimeField(allow_null=True, required=False)
     # AI companion mode: 'needs_human' | 'off' when escalated/paused,
@@ -1756,7 +1768,7 @@ class AutoPostContentSerializer(serializers.ModelSerializer):
             'rejected_by', 'rejected_at', 'created_at', 'updated_at',
         ]
 
-    def get_featured_product_name(self, obj):
+    def get_featured_product_name(self, obj) -> Optional[str]:
         if obj.featured_product:
             name = obj.featured_product.name
             if isinstance(name, dict):
@@ -1764,12 +1776,12 @@ class AutoPostContentSerializer(serializers.ModelSerializer):
             return str(name)
         return None
 
-    def get_approved_by_name(self, obj):
+    def get_approved_by_name(self, obj) -> Optional[str]:
         if obj.approved_by:
             return obj.approved_by.get_full_name() or obj.approved_by.email
         return None
 
-    def get_rejected_by_name(self, obj):
+    def get_rejected_by_name(self, obj) -> Optional[str]:
         if obj.rejected_by:
             return obj.rejected_by.get_full_name() or obj.rejected_by.email
         return None

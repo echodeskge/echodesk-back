@@ -16,8 +16,10 @@ router.register(r'email-drafts', views.EmailDraftViewSet, basename='email_drafts
 router.register(r'tiktok-messages', views.TikTokMessageViewSet, basename='tiktok_messages')
 router.register(r'telegram-messages', telegram_views.TelegramMessageViewSet, basename='telegram_messages')
 router.register(r'quick-replies', views.QuickReplyViewSet, basename='quick_replies')
-router.register(r'clients', views.SocialClientViewSet, basename='social_clients')
+# 'clients/custom-fields' must be registered BEFORE 'clients': otherwise the
+# clients detail route (pk='custom-fields') shadows the custom-field list.
 router.register(r'clients/custom-fields', views.SocialClientCustomFieldViewSet, basename='social_client_custom_fields')
+router.register(r'clients', views.SocialClientViewSet, basename='social_clients')
 
 # URL patterns for the social integrations app
 urlpatterns = [
