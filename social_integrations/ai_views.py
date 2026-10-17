@@ -136,7 +136,7 @@ class AISummaryListSerializer(drf_serializers.Serializer):
     results = ConversationSummarySerializer(many=True, help_text='At most 10, newest first')
 
 
-class AITestRequestSerializer(drf_serializers.Serializer):
+class AITestSerializer(drf_serializers.Serializer):
     message = drf_serializers.CharField()
     guidance_prompt = drf_serializers.CharField(required=False, allow_blank=True)
 
@@ -320,7 +320,7 @@ def ai_conversation_state(request):
 
 
 @extend_schema(
-    request=AITestRequestSerializer,
+    request=AITestSerializer,
     responses={200: AITestResponseSerializer, 400: AIErrorSerializer, 422: AIErrorSerializer},
     description="Dry-run one customer message against the companion prompt",
 )

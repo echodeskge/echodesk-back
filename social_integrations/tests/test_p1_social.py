@@ -166,9 +166,23 @@ class MarkReadScopeTests(SocialIntegrationTestCase):
         self.assertFalse(FacebookMessage.objects.get(page_connection=page_b).is_read_by_staff)
         self.assertEqual(broadcast.call_args.kwargs['account_id'], 'pa')
         # Without account_id both pages are marked (unchanged behaviour).
+        self.assertEqual(broadcast.call_count, 1)
         FacebookMessage.objects.update(is_read_by_staff=False)
         resp = self.api_post('/api/social/mark-read/', {'platform': 'facebook', 'conversation_id': 'same'}, user=agent)
         self.assertEqual(resp.data['messages_marked_read'], 2)
+
+    def test_delete_conversation_accepts_query_params_and_is_staff_only(self):
+        agent = self.create_user(email='p1-deleter@test.com')
+        staff = self.create_admin(email='p1-deleter-staff@test.com')
+        page = self.create_fb_connection(page_id='pdel')
+        self.create_fb_message(page_connection=page, sender_id='gone')
+        url = '/api/social/delete-conversation/?platform=facebook&conversation_id=gone'
+        self.assertEqual(self.api_delete(url, user=agent).status_code, 403)
+        with patch('social_integrations.consumers.send_conversation_deleted'):
+            resp = self.api_delete(url, user=staff)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data['messages_deleted'], 1)
+        self.assertTrue(FacebookMessage.objects.get(sender_id='gone').is_deleted)
 
 
 # ── Notifications ───────────────────────────────────────────────────────────

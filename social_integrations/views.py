@@ -1423,7 +1423,7 @@ def facebook_page_disconnect(request, page_id):
 @extend_schema(
     summary='Clear a platform\'s whole message history',
     description='Broadcasts conversation_deleted with conversation_id=null.',
-    request=ClearHistoryRequestSerializer,
+    request=ClearHistorySerializer,
     responses={200: ClearHistoryResponseSerializer, 400: SocialErrorSerializer, 500: SocialErrorSerializer},
     tags=['Social - Conversations'],
 )
@@ -4567,7 +4567,7 @@ def unassign_chat(request):
 @extend_schema(
     summary='Transfer a chat to another agent',
     description='Only the agent holding the chat (or staff) can transfer it; an unassigned chat can be routed by anyone with the inbox.',
-    request=ChatTransferRequestSerializer,
+    request=ChatTransferSerializer,
     responses={200: AssignmentMessageResponseSerializer, 400: SocialErrorSerializer, 403: SocialErrorSerializer, 404: SocialErrorSerializer},
     tags=['Social - Chat Assignment'],
 )
@@ -6388,7 +6388,7 @@ def unread_messages_count(request):
 @extend_schema(
     summary='Mark a conversation read',
     description='Marks the customer messages of the chat read by staff, clears the caller\'s matching message_received notifications and broadcasts read_state_update. Pass account_id to touch only one page/account.',
-    request=ConversationKeyRequestSerializer,
+    request=ConversationKeySerializer,
     responses={200: MarkReadResponseSerializer, 400: SocialErrorSerializer, 500: SocialErrorSerializer},
     tags=['Social - Conversations'],
 )
@@ -6560,7 +6560,7 @@ def mark_conversation_read(request):
 @extend_schema(
     summary='Mark a conversation unread',
     description='Flips the last incoming message back to unread and broadcasts read_state_update (unread_count 0/1).',
-    request=ConversationKeyRequestSerializer,
+    request=ConversationKeySerializer,
     responses={200: MarkUnreadResponseSerializer, 400: SocialErrorSerializer, 500: SocialErrorSerializer},
     tags=['Social - Conversations'],
 )
@@ -6734,8 +6734,17 @@ def widget_session_ids(conversation_id):
 
 @extend_schema(
     summary='Soft-delete a conversation (staff only)',
-    description='DELETE with a JSON body. Broadcasts conversation_deleted.',
-    request=ConversationKeyRequestSerializer,
+    description=(
+        'Pass platform + conversation_id as query params (or, as the web does, a JSON body). '
+        'Both are required; the view returns 400 without them. Broadcasts conversation_deleted.'
+    ),
+    parameters=[
+        OpenApiParameter(name='platform', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False,
+                         enum=['facebook', 'instagram', 'whatsapp', 'email', 'widget', 'telegram']),
+        OpenApiParameter(name='conversation_id', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY, required=False,
+                         description='Unprefixed key (widget: session id, visitor id or list id)'),
+    ],
+    request=ConversationKeySerializer,
     responses={200: DeleteConversationResponseSerializer, 400: SocialErrorSerializer, 403: SocialErrorSerializer, 500: SocialErrorSerializer},
     tags=['Social - Conversations'],
 )
@@ -6755,8 +6764,8 @@ def delete_conversation(request):
     logger = logging.getLogger(__name__)
 
     try:
-        platform = request.data.get('platform')
-        conversation_id = request.data.get('conversation_id')
+        platform = request.data.get('platform') or request.query_params.get('platform')
+        conversation_id = request.data.get('conversation_id') or request.query_params.get('conversation_id')
 
         if not platform or not conversation_id:
             return Response({
@@ -6971,7 +6980,7 @@ class WhatsAppBusinessAccountViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary='Request a WhatsApp Business App history sync (coexistence)',
-        request=SyncHistoryRequestSerializer,
+        request=SyncHistorySerializer,
         responses={200: SyncRequestedResponseSerializer, 400: SocialErrorWithDetailsSerializer},
     )
     @action(detail=True, methods=['post'], url_path='sync-history')
@@ -7703,7 +7712,7 @@ def whatsapp_connection_status(request):
 
 @extend_schema(
     summary='Disconnect WhatsApp (one WABA or all)',
-    request=WhatsAppDisconnectRequestSerializer,
+    request=WhatsAppDisconnectSerializer,
     responses={200: WhatsAppDisconnectResponseSerializer, 404: SocialErrorSerializer, 500: SocialErrorSerializer},
     tags=['Social - Connections'],
 )
@@ -11663,7 +11672,7 @@ class QuickReplyViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary='Reorder quick replies',
-        request=ReorderRequestSerializer,
+        request=ReorderSerializer,
         responses={200: ReorderResponseSerializer, 400: SocialErrorSerializer},
     )
     @action(detail=False, methods=['post'])
@@ -12043,7 +12052,7 @@ class SocialClientCustomFieldViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary='Reorder client custom fields',
-        request=ReorderRequestSerializer,
+        request=ReorderSerializer,
         responses={200: ReorderResponseSerializer, 400: SocialErrorSerializer},
     )
     @action(detail=False, methods=['post'])
@@ -12071,7 +12080,7 @@ class SocialClientCustomFieldViewSet(viewsets.ModelViewSet):
 @extend_schema(
     summary='Mark every conversation read',
     description="Not scoped by assignment. platform 'all' also marks EMAIL read — send an explicit CSV (e.g. 'facebook,instagram,whatsapp,widget,telegram') to leave email alone.",
-    request=PlatformsRequestSerializer,
+    request=PlatformsSerializer,
     responses={200: MarkAllReadResponseSerializer, 500: SocialErrorSerializer},
     tags=['Social - Conversations'],
 )
@@ -12205,7 +12214,7 @@ def mark_all_conversations_read(request):
 @extend_schema(
     summary='Archive conversations (move to History)',
     description='Also marks their incoming messages read; for widget chats ends the WidgetSession (session_ended). Broadcasts archive_update.',
-    request=ConversationsRequestSerializer,
+    request=ConversationsSerializer,
     responses={200: ArchiveResponseSerializer, 400: SocialErrorSerializer, 500: SocialErrorSerializer},
     tags=['Social - Conversations'],
 )
@@ -12391,7 +12400,7 @@ def archive_conversation(request):
 
 @extend_schema(
     summary='Restore conversations from History',
-    request=ConversationsRequestSerializer,
+    request=ConversationsSerializer,
     responses={200: UnarchiveResponseSerializer, 400: SocialErrorSerializer, 500: SocialErrorSerializer},
     tags=['Social - Conversations'],
 )
@@ -12483,7 +12492,7 @@ def unarchive_conversation(request):
 @extend_schema(
     summary='Archive every conversation',
     description="Not scoped by assignment. platform 'all' includes EMAIL.",
-    request=PlatformsRequestSerializer,
+    request=PlatformsSerializer,
     responses={200: ArchiveAllResponseSerializer, 500: SocialErrorSerializer},
     tags=['Social - Conversations'],
 )
@@ -12930,7 +12939,7 @@ def auto_post_approve(request, pk):
 
 @extend_schema(
     summary='Reject a draft auto-post',
-    request=AutoPostRejectRequestSerializer,
+    request=AutoPostRejectSerializer,
     responses={200: AutoPostContentSerializer, 400: SocialErrorSerializer, 404: SocialErrorSerializer},
     tags=['Social - Auto-posting'],
 )
@@ -12957,7 +12966,7 @@ def auto_post_reject(request, pk):
 
 @extend_schema(
     summary='Edit a draft/rejected auto-post (rejected → draft)',
-    request=AutoPostEditRequestSerializer,
+    request=AutoPostEditSerializer,
     responses={200: AutoPostContentSerializer, 400: SocialErrorSerializer, 404: SocialErrorSerializer},
     tags=['Social - Auto-posting'],
 )

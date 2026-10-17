@@ -32,7 +32,7 @@ class SocialMessageResponseSerializer(serializers.Serializer):
 
 # ── Read state / archive / delete ──────────────────────────────────────────
 
-class ConversationKeyRequestSerializer(serializers.Serializer):
+class ConversationKeySerializer(serializers.Serializer):
     platform = serializers.ChoiceField(choices=INBOX_PLATFORMS)
     conversation_id = serializers.CharField(
         help_text=(
@@ -57,7 +57,7 @@ class MarkUnreadResponseSerializer(serializers.Serializer):
     messages_marked_unread = serializers.IntegerField()
 
 
-class PlatformsRequestSerializer(serializers.Serializer):
+class PlatformsSerializer(serializers.Serializer):
     platform = serializers.CharField(
         required=False, default='all',
         help_text="'all' (includes EMAIL) or a comma-separated list, e.g. 'facebook,instagram,whatsapp,widget,telegram'.",
@@ -76,7 +76,7 @@ class ConversationRefSerializer(serializers.Serializer):
     account_id = serializers.CharField()
 
 
-class ConversationsRequestSerializer(serializers.Serializer):
+class ConversationsSerializer(serializers.Serializer):
     conversations = ConversationRefSerializer(many=True)
 
 
@@ -111,7 +111,7 @@ class DeleteConversationResponseSerializer(serializers.Serializer):
     messages_deleted = serializers.IntegerField()
 
 
-class ClearHistoryRequestSerializer(serializers.Serializer):
+class ClearHistorySerializer(serializers.Serializer):
     platform = serializers.ChoiceField(choices=['facebook', 'instagram', 'whatsapp', 'email', 'widget', 'telegram', 'tiktok'])
 
 
@@ -138,7 +138,7 @@ class MessagingWindowResponseSerializer(serializers.Serializer):
 
 # ── Assignments ────────────────────────────────────────────────────────────
 
-class ChatTransferRequestSerializer(ConversationRefSerializer):
+class ChatTransferSerializer(ConversationRefSerializer):
     target_user_id = serializers.IntegerField()
 
 
@@ -306,7 +306,7 @@ class InstagramDisconnectResponseSerializer(serializers.Serializer):
     instagram_accounts_deactivated = serializers.IntegerField(required=False)
 
 
-class WhatsAppDisconnectRequestSerializer(serializers.Serializer):
+class WhatsAppDisconnectSerializer(serializers.Serializer):
     waba_id = serializers.CharField(required=False, help_text='Disconnect only this WABA (all when omitted)')
 
 
@@ -374,7 +374,7 @@ class ReorderItemSerializer(serializers.Serializer):
     position = serializers.IntegerField()
 
 
-class ReorderRequestSerializer(serializers.Serializer):
+class ReorderSerializer(serializers.Serializer):
     items = ReorderItemSerializer(many=True)
 
 
@@ -399,11 +399,11 @@ class AutoPostListResponseSerializer(serializers.Serializer):
     results = AutoPostContentSerializer(many=True)
 
 
-class AutoPostRejectRequestSerializer(serializers.Serializer):
+class AutoPostRejectSerializer(serializers.Serializer):
     reason = serializers.CharField(required=False, allow_blank=True)
 
 
-class AutoPostEditRequestSerializer(serializers.Serializer):
+class AutoPostEditSerializer(serializers.Serializer):
     facebook_text = serializers.CharField(required=False, allow_blank=True)
     instagram_text = serializers.CharField(required=False, allow_blank=True)
     image_url = serializers.CharField(required=False, allow_blank=True, allow_null=True)
@@ -530,7 +530,7 @@ class CoexStatusResponseSerializer(serializers.Serializer):
     api_status = CoexApiStatusSerializer(allow_null=True, help_text='Only with ?refresh=true')
 
 
-class SyncHistoryRequestSerializer(serializers.Serializer):
+class SyncHistorySerializer(serializers.Serializer):
     phase = serializers.ChoiceField(choices=['0-1', '1-90', '90-180'], required=False, default='0-1')
 
 
