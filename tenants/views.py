@@ -1409,13 +1409,16 @@ _SETTINGS_FORBIDDEN = {'error': 'You need the manage_settings permission (or sta
     description=(
         'Partial update of min_users_per_ticket, only_superadmin_can_delete_tickets '
         'and preferred_language. Needs staff, superuser or manage_settings. '
-        'Returns the full settings object.'
+        'Changing only_superadmin_can_delete_tickets to a value other than the '
+        'current one needs staff or superuser; otherwise the whole request is '
+        'rejected with 403 {error, only_superadmin_can_delete_tickets: [msg]} '
+        'and nothing is saved. Returns the full settings object.'
     ),
     request=TenantSettingsSerializer,
     responses={
         200: TenantSettingsSerializer,
         400: OpenApiResponse(description='Validation error'),
-        403: OpenApiResponse(description='Needs manage_settings or staff, or called from the main domain'),
+        403: OpenApiResponse(description='Needs manage_settings or staff (staff/superuser to change only_superadmin_can_delete_tickets), or called from the main domain'),
     },
     tags=['Tenant Settings'],
 )
@@ -1437,6 +1440,21 @@ def tenant_settings(request):
             tenant, data=request.data, partial=True, context={'request': request}
         )
         serializer.is_valid(raise_exception=True)
+        # The delete-restriction toggle exists to restrict non-staff users, so
+        # only staff/superusers may change it. Sending the current value is
+        # allowed (the web settings form always sends it); a different value
+        # from anyone else rejects the whole request.
+        guarded = 'only_superadmin_can_delete_tickets'
+        if (
+            guarded in serializer.validated_data
+            and serializer.validated_data[guarded] != getattr(tenant, guarded)
+            and not (request.user.is_staff or request.user.is_superuser)
+        ):
+            message = 'Only staff or superusers can change this setting.'
+            return Response(
+                {'error': message, guarded: [message]},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         changed = []
         for field, value in serializer.validated_data.items():
             setattr(tenant, field, value)

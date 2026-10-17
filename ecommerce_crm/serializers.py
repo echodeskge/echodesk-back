@@ -1551,6 +1551,13 @@ class ListItemSerializer(serializers.ModelSerializer):
         return ListItemSerializer(children, many=True).data if children else []
 
 
+# Type the recursive children as EcommerceListItem[] in the schema (the class
+# must exist before it can reference itself). Runtime output is unchanged.
+ListItemSerializer.get_children = extend_schema_field(
+    ListItemSerializer(many=True, read_only=True)
+)(ListItemSerializer.get_children)
+
+
 @extend_schema_serializer(component_name='EcommerceItemListMinimal')
 class ItemListMinimalSerializer(serializers.ModelSerializer):
     """Minimal serializer for public item lists"""

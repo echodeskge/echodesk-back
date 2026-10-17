@@ -165,15 +165,32 @@ class TestColumnReorderScoping(AdminPermissionMixin, TicketTestCase):
 
 class TestTagWritePermissions(AdminPermissionMixin, TicketTestCase):
 
-    def test_plain_agent_can_list_but_not_write(self):
+    def test_plain_agent_can_create_update_and_delete_tags(self):
+        # Same as before the parity work: the web LabelManagementDialog lets
+        # every user manage labels and swallows a 403 silently, so tags stay
+        # writable by any authenticated tenant user.
         agent = self.make_agent('tag-agent@test.com')
         tag = self.create_tag(name='Existing')
         self.assertEqual(self.api_get('/api/tags/', user=agent).status_code, 200)
         self.assertEqual(self.api_get(f'/api/tags/{tag.id}/', user=agent).status_code, 200)
-        self.assertEqual(self.api_post('/api/tags/', {'name': 'New', 'color': '#FF0000'}, user=agent).status_code, 403)
-        self.assertEqual(self.api_patch(f'/api/tags/{tag.id}/', {'name': 'Renamed'}, user=agent).status_code, 403)
-        self.assertEqual(self.api_delete(f'/api/tags/{tag.id}/', user=agent).status_code, 403)
-        self.assertTrue(Tag.objects.filter(id=tag.id, name='Existing').exists())
+        resp = self.api_post('/api/tags/', {'name': 'New', 'color': '#FF0000'}, user=agent)
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(Tag.objects.get(id=resp.data['id']).created_by, agent)
+        resp = self.api_patch(f'/api/tags/{tag.id}/', {'name': 'Renamed'}, user=agent)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertTrue(Tag.objects.filter(id=tag.id, name='Renamed').exists())
+        self.assertEqual(self.api_delete(f'/api/tags/{tag.id}/', user=agent).status_code, 204)
+        self.assertFalse(Tag.objects.filter(id=tag.id).exists())
+
+    def test_viewer_role_can_write_tags(self):
+        viewer = self.create_user(email='tag-viewer@test.com', role='viewer')
+        resp = self.api_post('/api/tags/', {'name': 'ViewerTag', 'color': '#00FF00'}, user=viewer)
+        self.assertEqual(resp.status_code, 201, resp.data)
+
+    def test_anonymous_cannot_write_tags(self):
+        resp = self.api_post('/api/tags/', {'name': 'Anon', 'color': '#00FF00'})
+        self.assertIn(resp.status_code, (401, 403))
+        self.assertFalse(Tag.objects.filter(name='Anon').exists())
 
     def test_manage_tags_flag_and_staff_can_write(self):
         flagged = self.make_agent('tag-flag@test.com', can_manage_tags=True)
