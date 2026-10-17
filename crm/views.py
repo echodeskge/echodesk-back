@@ -20,8 +20,16 @@ from .serializers import (
     CallLogDetailSerializer, CallEventSerializer, CallRecordingSerializer,
     UserPhoneAssignmentSerializer, UserPhoneAssignmentDetailSerializer,
     PbxSettingsSerializer, ConsultationInitiateSerializer, MergeConferenceSerializer,
-    CallRatingSerializer,
+    CallRatingSerializer, MySoftphoneConfigSerializer, SOFTPHONE_CONTEXT_KEY,
+    CallEndSerializer,
 )
+from .permissions import (
+    HasIpCallingFeature, IsPbxAdmin, IsPbxAdminOrReadOnly, CanViewCallStats,
+    is_pbx_admin,
+)
+from .filters import CallLogFilter, UserPhoneAssignmentFilter
+from .recording_hosts import is_allowed_recording_url
+from .call_status import ANSWERED_ELSEWHERE_STATUS, answered_q, missed_q, FINAL_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -165,37 +173,85 @@ def _ami_redirect_to_confbridge(host, channel, conference_room, username, passwo
         _ami_logoff(sock)
 
 
+def _softphone_credentials(user, sip_config):
+    """(username, password, assignment) the caller's softphone registers with
+    on ``sip_config``: their own active extension on it when they have one,
+    else the config's shared account (legacy single-account tenants)."""
+    assignment = UserPhoneAssignment.objects.filter(
+        user=user, sip_configuration=sip_config, is_active=True,
+    ).order_by('-is_primary', 'id').first()
+    if assignment:
+        return assignment.extension, assignment.extension_password, assignment
+    return sip_config.username, sip_config.password, None
+
+
+def _may_use_shared_account(user, sip_config):
+    """Whether ``user`` (who has no extension on ``sip_config``) may get the
+    configuration's shared SIP account. PBX admins may; everyone else only on
+    a legacy single-account tenant: the config is the default one and the
+    tenant has no extensions at all. Once extensions exist the shared
+    password is never handed to agents."""
+    if is_pbx_admin(user):
+        return True
+    return bool(sip_config.is_default) and not UserPhoneAssignment.objects.exists()
+
+
+def _softphone_config_data(sip_config, username, password, request):
+    return SipConfigurationDetailSerializer(
+        sip_config,
+        context={'request': request, SOFTPHONE_CONTEXT_KEY: {'username': username, 'password': password}},
+    ).data
+
+
 class SipConfigurationViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing SIP configurations.
-    
-    Allows tenants to configure their SIP settings for making and receiving calls.
+
+    Reads need the ``ip_calling`` feature; create/update/delete,
+    ``set_default`` and ``test_connection`` need a PBX admin (staff,
+    superuser or ``manage_settings``). Responses never contain the trunk /
+    TURN / extension passwords, except ``my_config`` and ``webrtc_config``,
+    which return the caller's own softphone credentials.
     """
     serializer_class = SipConfigurationSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    
+    permission_classes = [permissions.IsAuthenticated, HasIpCallingFeature, IsPbxAdminOrReadOnly]
+
+    def get_permissions(self):
+        perms = super().get_permissions()
+        if self.action in ('set_default', 'test_connection'):
+            perms.append(IsPbxAdmin())
+        return perms
+
     def get_queryset(self):
-        # Return configurations for current tenant - tenant schema isolation handles filtering
-        if hasattr(self.request, 'tenant'):
-            # In tenant schema, all records are for the current tenant
-            return SipConfiguration.objects.all()
-        else:
-            # Fallback for public schema or when tenant is not available
-            return SipConfiguration.objects.all()
-    
+        qs = SipConfiguration.objects.all()
+        if self.action == 'list':
+            from django.db.models import Count
+            qs = qs.annotate(assignment_count=Count('user_assignments'))
+        elif self.action in ('retrieve', 'update', 'partial_update', 'create'):
+            qs = qs.prefetch_related('user_assignments__user')
+        return qs.order_by('-is_default', 'name')
+
     def get_serializer_class(self):
         if self.action == 'list':
             return SipConfigurationListSerializer
-        elif self.action in ['retrieve', 'webrtc_config']:
+        elif self.action == 'retrieve':
             return SipConfigurationDetailSerializer
         return SipConfigurationSerializer
-    
+
     @extend_schema(
         summary="Get WebRTC configuration for calling",
-        description="Retrieve SIP configuration details needed for WebRTC calling in the frontend",
+        description=(
+            "The SIP / ICE settings a softphone needs for this configuration. "
+            "``username``/``password`` are the caller's own credentials: their "
+            "active extension on this configuration, or the configuration's "
+            "shared account when they have none (PBX admins, or on the default "
+            "configuration of a tenant that has no extensions at all; otherwise "
+            "both are ''). ``user_assignments`` is always []."
+        ),
         responses={
             200: SipConfigurationDetailSerializer,
-            404: "SIP configuration not found"
+            400: OpenApiTypes.OBJECT,
+            404: OpenApiTypes.OBJECT,
         }
     )
     @action(detail=True, methods=['get'])
@@ -204,59 +260,87 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
         sip_config = self.get_object()
         if not sip_config.is_active:
             return Response(
-                {'error': 'SIP configuration is not active'}, 
+                {'error': 'SIP configuration is not active'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        serializer = self.get_serializer(sip_config)
-        return Response(serializer.data)
-    
+
+        username, password, assignment = _softphone_credentials(request.user, sip_config)
+        if assignment is None and not _may_use_shared_account(request.user, sip_config):
+            # No extension of their own: do not hand the shared account
+            # to agents (see _may_use_shared_account).
+            username, password = '', ''
+        return Response(_softphone_config_data(sip_config, username, password, request))
+
     @extend_schema(
         summary="Set as default SIP configuration",
-        description="Set this SIP configuration as the default for outbound calls",
-        responses={200: "Configuration set as default"}
+        description="Set this SIP configuration as the default for outbound calls (PBX admin).",
+        responses={200: inline_serializer(
+            name='SipConfigurationMessageResponse',
+            fields={'message': drf_serializers.CharField()},
+        )},
     )
     @action(detail=True, methods=['post'])
     def set_default(self, request, pk=None):
         """Set this configuration as default"""
         sip_config = self.get_object()
-        
+
         # Remove default from other configs in current tenant
         SipConfiguration.objects.filter(is_default=True).exclude(id=sip_config.id).update(is_default=False)
-        
+
         # Set this as default
         sip_config.is_default = True
         sip_config.save()
-        
+
         return Response({'message': 'Configuration set as default'})
-    
+
     @extend_schema(
         summary="Test SIP configuration",
-        description="Test the SIP configuration connectivity",
+        description="Check the SIP configuration has the required fields (PBX admin).",
         responses={
-            200: "Configuration test successful",
-            400: "Configuration test failed"
+            200: inline_serializer(
+                name='SipConfigurationTestResponse',
+                fields={
+                    'message': drf_serializers.CharField(),
+                    'server': drf_serializers.CharField(),
+                    'port': drf_serializers.IntegerField(),
+                    'success': drf_serializers.BooleanField(),
+                },
+            ),
+            400: OpenApiTypes.OBJECT,
         }
     )
     @action(detail=True, methods=['post'])
     def test_connection(self, request, pk=None):
         """Test SIP configuration (placeholder for actual SIP testing)"""
         sip_config = self.get_object()
-        
+
         # In a real implementation, you would test SIP connectivity here
         # For now, just validate that required fields are present
         if not all([sip_config.sip_server, sip_config.username, sip_config.password]):
             return Response(
-                {'error': 'Incomplete SIP configuration'}, 
+                {'error': 'Incomplete SIP configuration'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+
         return Response({
             'message': 'SIP configuration test successful',
             'server': sip_config.sip_server,
-            'port': sip_config.sip_port
+            'port': sip_config.sip_port,
+            'success': True,
         })
 
+    @extend_schema(
+        summary="My softphone configuration",
+        description=(
+            "The caller's own primary active extension with the SIP / ICE "
+            "settings to register it. When the caller has no extension, the "
+            "tenant's default active configuration is returned with its shared "
+            "account as ``extension``/``extension_password`` and ``id: null``, "
+            "but only to PBX admins or on a tenant with no extensions at all. "
+            "404 otherwise. Never contains other users' credentials."
+        ),
+        responses={200: MySoftphoneConfigSerializer, 404: OpenApiTypes.OBJECT},
+    )
     @action(detail=False, methods=['get'])
     def my_config(self, request):
         """Get the current user's phone assignment with full SIP config.
@@ -266,15 +350,30 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
         ).select_related('sip_configuration').first()
 
         if assignment:
-            return Response(UserPhoneAssignmentDetailSerializer(assignment).data)
+            return Response({
+                'id': assignment.id,
+                'user': assignment.user_id,
+                'sip_configuration': _softphone_config_data(
+                    assignment.sip_configuration,
+                    assignment.extension, assignment.extension_password, request,
+                ),
+                'extension': assignment.extension,
+                'extension_password': assignment.extension_password,
+                'phone_number': assignment.phone_number,
+                'display_name': assignment.display_name,
+                'is_primary': assignment.is_primary,
+                'is_active': assignment.is_active,
+            })
 
         # Fallback: return default config without assignment
         default_config = SipConfiguration.objects.filter(is_default=True, is_active=True).first()
-        if default_config:
+        if default_config and _may_use_shared_account(request.user, default_config):
             return Response({
                 'id': None,
                 'user': request.user.id,
-                'sip_configuration': SipConfigurationDetailSerializer(default_config).data,
+                'sip_configuration': _softphone_config_data(
+                    default_config, default_config.username, default_config.password, request,
+                ),
                 'extension': default_config.username,
                 'extension_password': default_config.password,
                 'phone_number': default_config.phone_number or '',
@@ -283,16 +382,31 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
                 'is_active': True,
             })
 
+        if default_config:
+            return Response(
+                {'detail': 'No phone extension is assigned to you'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         return Response({'detail': 'No SIP configuration found'}, status=status.HTTP_404_NOT_FOUND)
 
 
 class UserPhoneAssignmentViewSet(viewsets.ModelViewSet):
-    """ViewSet for managing user phone number assignments."""
+    """User <-> extension assignments.
+
+    Readable by every ``ip_calling`` user (the web transfer picker lists
+    colleagues' extensions); writes need a PBX admin. ``extension_password``
+    is write-only. Filters: ``is_active``, ``is_primary``, ``user``,
+    ``sip_configuration``.
+    """
     serializer_class = UserPhoneAssignmentSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, HasIpCallingFeature, IsPbxAdminOrReadOnly]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['extension', 'phone_number', 'display_name', 'user__email', 'user__first_name', 'user__last_name']
+    ordering_fields = ['extension', 'id', 'created_at']
+    filterset_class = UserPhoneAssignmentFilter
 
     def get_queryset(self):
-        return UserPhoneAssignment.objects.select_related('user', 'sip_configuration').all()
+        return UserPhoneAssignment.objects.select_related('user', 'sip_configuration').order_by('id')
 
     def get_serializer_class(self):
         if self.action == 'retrieve':
@@ -305,36 +419,75 @@ class CallLogViewSet(viewsets.ModelViewSet):
     ViewSet for managing call logs with SIP integration.
 
     Handles both inbound and outbound calls, call status updates, and call history.
+    PUT/PATCH by a non-PBX-admin may change only ``notes`` (403 naming the
+    other fields otherwise).
     """
     serializer_class = CallLogSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    # Every agent with ip_calling sees the tenant's call log (web parity);
+    # deleting a call log and the tenant statistics need more (see
+    # get_permissions). Recordings stay staff-only (stream_recording).
+    permission_classes = [permissions.IsAuthenticated, HasIpCallingFeature]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'direction', 'call_type']
-    search_fields = ['caller_number', 'recipient_number', 'notes', 'client__name']
+    filterset_class = CallLogFilter
+    search_fields = ['caller_number', 'recipient_number', 'notes', 'client__name', 'social_client__name']
     ordering_fields = ['started_at', 'duration', 'status']
     ordering = ['-started_at']
 
+    def get_permissions(self):
+        perms = super().get_permissions()
+        if self.action == 'destroy':
+            perms.append(IsPbxAdmin())
+        elif self.action == 'statistics':
+            perms.append(CanViewCallStats())
+        return perms
+
     def get_queryset(self):
-        # Return calls for users in current tenant - use request.tenant instead of user.tenant
-        # Use select_related to avoid N+1 queries when serializer accesses client and sip_configuration
-        if hasattr(self.request, 'tenant'):
-            # Filter by tenant through the handled_by user's association with tenant tables
-            return CallLog.objects.select_related('client', 'social_client', 'transferred_to_user', 'sip_configuration', 'handled_by', 'recording').prefetch_related('events').all()
-        else:
-            # Fallback for public schema or when tenant is not available
-            return CallLog.objects.select_related('client', 'social_client', 'transferred_to_user', 'sip_configuration', 'handled_by', 'recording').prefetch_related('events').all()
-    
+        # Tenant isolation comes from the schema; select_related avoids N+1
+        # in the serializer. Only the detail view serializes the events.
+        qs = CallLog.objects.select_related(
+            'client', 'social_client', 'transferred_to_user', 'sip_configuration',
+            'handled_by', 'recording',
+        )
+        if self.action == 'retrieve':
+            qs = qs.prefetch_related('events__user')
+        return qs.all()
+
+    def _out(self, call_log):
+        """Serialize a call log for an action response, with the request in
+        the context so the admin-only fields resolve for admins."""
+        return CallLogSerializer(call_log, context=self.get_serializer_context()).data
+
     def get_serializer_class(self):
         if self.action == 'create':
             return CallLogCreateSerializer
         elif self.action == 'initiate_call':
             return CallInitiateSerializer
-        elif self.action in ['update_status', 'end_call']:
+        elif self.action == 'end_call':
+            return CallEndSerializer
+        elif self.action == 'update_status':
             return CallStatusUpdateSerializer
         elif self.action == 'retrieve':
             return CallLogDetailSerializer
         return CallLogSerializer
     
+    # Fields a non-PBX-admin may change with PUT/PATCH /api/call-logs/{id}/.
+    # Status, handler, timing etc. feed the call statistics, so agents change
+    # those only through the call actions (update_status, end_call, ...).
+    AGENT_EDITABLE_FIELDS = frozenset({'notes'})
+
+    def update(self, request, *args, **kwargs):
+        if not is_pbx_admin(request.user):
+            disallowed = sorted(set(request.data.keys()) - self.AGENT_EDITABLE_FIELDS)
+            if disallowed:
+                return Response(
+                    {
+                        'error': 'Only PBX administrators can change these fields.',
+                        'fields': disallowed,
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+        return super().update(request, *args, **kwargs)
+
     def perform_create(self, serializer):
         # Automatically set the current user as the handler if not specified
         if not serializer.validated_data.get('handled_by'):
@@ -384,7 +537,7 @@ class CallLogViewSet(viewsets.ModelViewSet):
         request=CallInitiateSerializer,
         responses={
             201: CallLogSerializer,
-            400: "Invalid call data"
+            400: OpenApiTypes.OBJECT
         }
     )
     @action(detail=False, methods=['post'])
@@ -460,8 +613,7 @@ class CallLogViewSet(viewsets.ModelViewSet):
             # In a real implementation, you would initiate the actual SIP call here
             # For now, just return the call log
             
-            response_serializer = CallLogSerializer(call_log)
-            return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+            return Response(self._out(call_log), status=status.HTTP_201_CREATED)
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
@@ -471,7 +623,7 @@ class CallLogViewSet(viewsets.ModelViewSet):
         request=CallLogCreateSerializer,
         responses={
             201: CallLogSerializer,
-            400: "Invalid call data"
+            400: OpenApiTypes.OBJECT
         }
     )
     @action(detail=False, methods=['post'])
@@ -523,16 +675,18 @@ class CallLogViewSet(viewsets.ModelViewSet):
             }
         )
         
-        response_serializer = CallLogSerializer(call_log)
-        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+        return Response(self._out(call_log), status=status.HTTP_201_CREATED)
     
     @extend_schema(
         summary="Update call status",
-        description="Update the status of an ongoing call",
+        description=(
+            "Update the status of an ongoing call. ``recording_url``, when "
+            "given, must be on one of the tenant's PBX hosts (400 otherwise)."
+        ),
         request=CallStatusUpdateSerializer,
         responses={
             200: CallLogSerializer,
-            404: "Call not found"
+            404: OpenApiTypes.OBJECT
         }
     )
     @action(detail=True, methods=['patch'])
@@ -542,6 +696,12 @@ class CallLogViewSet(viewsets.ModelViewSet):
         serializer = CallStatusUpdateSerializer(data=request.data)
         
         if serializer.is_valid():
+            recording_url = serializer.validated_data.get('recording_url')
+            if recording_url and not is_allowed_recording_url(recording_url):
+                return Response(
+                    {'recording_url': ['Recording URL must be on one of the tenant\'s PBX hosts.']},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             old_status = call_log.status
             new_status = serializer.validated_data['status']
             
@@ -583,57 +743,76 @@ class CallLogViewSet(viewsets.ModelViewSet):
             
             self._create_call_event(call_log, new_status, metadata=event_metadata)
             
-            response_serializer = CallLogSerializer(call_log)
-            return Response(response_serializer.data)
+            return Response(self._out(call_log))
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
     @extend_schema(
         summary="End a call",
-        description="End an ongoing call and update duration",
+        description=(
+            "End an ongoing call and set ``ended_at``/``duration``. No body. "
+            "An inbound call that was never answered ends as ``missed`` "
+            "(which fires the ``call_missed`` notification), unless another "
+            "agent's leg of the same ring-all call was answered, in which case "
+            "it ends as ``cancelled`` (answered elsewhere: counted neither as "
+            "answered nor as missed). 400 when the call is already over."
+        ),
+        request=CallEndSerializer,
         responses={
             200: CallLogSerializer,
-            404: "Call not found",
-            400: "Call already ended"
+            400: OpenApiTypes.OBJECT,
+            404: OpenApiTypes.OBJECT,
         }
     )
     @action(detail=True, methods=['post'])
     def end_call(self, request, pk=None):
         """End an ongoing call"""
+        from .call_notifications import find_answered_sibling
+
         call_log = self.get_object()
-        
-        if call_log.status in ['ended', 'missed', 'failed', 'cancelled']:
+
+        if call_log.status in FINAL_STATUSES:
             return Response(
-                {'error': 'Call has already ended'}, 
+                {'error': 'Call has already ended'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        call_log.status = 'ended'
+
         call_log.ended_at = timezone.now()
-        
+        outcome = 'ended'
         if call_log.answered_at:
             call_log.duration = call_log.ended_at - call_log.answered_at
         else:
             call_log.duration = timedelta(seconds=0)
-        
+            if call_log.direction == 'inbound':
+                outcome = 'answered_elsewhere' if find_answered_sibling(call_log) else 'missed'
+
+        if outcome == 'missed':
+            call_log.status = 'missed'
+        elif outcome == 'answered_elsewhere':
+            call_log.status = ANSWERED_ELSEWHERE_STATUS
+        else:
+            call_log.status = 'ended'
         call_log.save()
-        
+
         # Create call event for call end
-        self._create_call_event(
-            call_log,
-            'ended',
-            metadata={
-                'duration_seconds': call_log.duration.total_seconds() if call_log.duration else 0,
-                'ended_by': 'user'
-            }
-        )
-        
-        serializer = CallLogSerializer(call_log)
-        return Response(serializer.data)
-    
+        metadata = {
+            'duration_seconds': call_log.duration.total_seconds() if call_log.duration else 0,
+            'ended_by': 'user',
+        }
+        if outcome != 'ended':
+            metadata['outcome'] = outcome
+        self._create_call_event(call_log, 'ended', metadata=metadata)
+
+        return Response(self._out(call_log))
+
     @extend_schema(
         summary="Get call statistics",
-        description="Get call statistics for the current tenant",
+        description=(
+            "Legacy quick stats for the tenant (PBX admins and ``view_reports``). "
+            "Answered = answered/ended/transferred calls that were picked up; "
+            "missed = inbound calls nobody picked up. Prefer "
+            "``/api/call-stats/overview/``."
+        ),
         parameters=[
             OpenApiParameter(
                 name='period',
@@ -643,13 +822,27 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 enum=['today', 'week', 'month']
             )
         ],
-        responses={200: "Call statistics"}
+        responses={200: inline_serializer(
+            name='CallLogStatisticsResponse',
+            fields={
+                'period': drf_serializers.CharField(),
+                'total_calls': drf_serializers.IntegerField(),
+                'answered_calls': drf_serializers.IntegerField(),
+                'missed_calls': drf_serializers.IntegerField(),
+                'inbound_calls': drf_serializers.IntegerField(),
+                'outbound_calls': drf_serializers.IntegerField(),
+                'answer_rate': drf_serializers.FloatField(),
+                'average_duration_seconds': drf_serializers.IntegerField(),
+            },
+        )}
     )
     @action(detail=False, methods=['get'])
     def statistics(self, request):
         """Get call statistics"""
+        from django.db.models import Avg, Count, Q
+
         period = request.query_params.get('period', 'today')
-        
+
         # Calculate date range
         now = timezone.now()
         if period == 'today':
@@ -660,43 +853,38 @@ class CallLogViewSet(viewsets.ModelViewSet):
             start_date = now - timedelta(days=30)
         else:
             start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        queryset = self.get_queryset().filter(started_at__gte=start_date)
-        
-        # Calculate statistics
-        total_calls = queryset.count()
-        answered_calls = queryset.filter(status='answered').count()
-        missed_calls = queryset.filter(status='missed').count()
-        inbound_calls = queryset.filter(direction='inbound').count()
-        outbound_calls = queryset.filter(direction='outbound').count()
-        
-        # Calculate average duration for answered calls
-        answered_durations = queryset.filter(
-            status='answered', 
-            duration__isnull=False
-        ).values_list('duration', flat=True)
-        
-        avg_duration = None
-        if answered_durations:
-            total_seconds = sum(d.total_seconds() for d in answered_durations)
-            avg_duration = total_seconds / len(answered_durations)
-        
+
+        queryset = CallLog.objects.filter(started_at__gte=start_date)
+        answered = answered_q()
+        summary = queryset.aggregate(
+            total_calls=Count('id'),
+            answered_calls=Count('id', filter=answered),
+            missed_calls=Count('id', filter=missed_q()),
+            inbound_calls=Count('id', filter=Q(direction='inbound')),
+            outbound_calls=Count('id', filter=Q(direction='outbound')),
+            avg_duration=Avg('duration', filter=answered & Q(duration__isnull=False)),
+        )
+        total_calls = summary['total_calls'] or 0
+        answered_calls = summary['answered_calls'] or 0
+        avg = summary['avg_duration']
+        avg_seconds = round(avg.total_seconds()) if avg else 0
+
         return Response({
             'period': period,
             'total_calls': total_calls,
             'answered_calls': answered_calls,
-            'missed_calls': missed_calls,
-            'inbound_calls': inbound_calls,
-            'outbound_calls': outbound_calls,
+            'missed_calls': summary['missed_calls'] or 0,
+            'inbound_calls': summary['inbound_calls'] or 0,
+            'outbound_calls': summary['outbound_calls'] or 0,
             'answer_rate': round((answered_calls / total_calls * 100) if total_calls > 0 else 0, 1),
-            'average_duration_seconds': round(avg_duration) if avg_duration else 0
+            'average_duration_seconds': avg_seconds,
         })
-    
+
     @extend_schema(
         summary="Add call event",
         description="Add a specific event to a call (hold, mute, etc.)",
         request=CallEventSerializer,
-        responses={201: CallEventSerializer}
+        responses={201: CallEventSerializer, 400: OpenApiTypes.OBJECT}
     )
     @action(detail=True, methods=['post'])
     def add_event(self, request, pk=None):
@@ -708,7 +896,7 @@ class CallLogViewSet(viewsets.ModelViewSet):
         
         serializer = CallEventSerializer(data=event_data)
         if serializer.is_valid():
-            serializer.save(user=request.user)
+            serializer.save(call_log=call_log, user=request.user)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -756,6 +944,14 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 {'error': 'No recording on this call'},
                 status=status.HTTP_404_NOT_FOUND,
             )
+        if not is_allowed_recording_url(source_url):
+            logger.warning(
+                "Recording proxy refused non-PBX host for call %s (%s)", call_log.pk, source_url,
+            )
+            return Response(
+                {'error': 'Recording is not on an allowed recording host.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         # Forward a Range request so the audio element can seek.
         upstream_headers = {}
@@ -768,6 +964,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 headers=upstream_headers,
                 stream=True,
                 timeout=(5, 30),  # (connect, read)
+                # A redirect could point anywhere: do not follow it.
+                allow_redirects=False,
             )
         except _requests.RequestException as exc:
             logger.warning(
@@ -779,7 +977,7 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
-        if upstream.status_code >= 400:
+        if upstream.status_code >= 300:
             logger.warning(
                 "Recording proxy got upstream %s for call %s (%s)",
                 upstream.status_code, call_log.pk, source_url,
@@ -831,10 +1029,14 @@ class CallLogViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary="Start call recording",
-        description="Start recording for an active call",
+        description=(
+            "Bookkeeping only (creates the CallRecording row; nothing is "
+            "recorded on Asterisk). No body."
+        ),
+        request=None,
         responses={
             201: CallRecordingSerializer,
-            400: "Recording already exists or call not active"
+            400: OpenApiTypes.OBJECT,
         }
     )
     @action(detail=True, methods=['post'])
@@ -874,15 +1076,16 @@ class CallLogViewSet(viewsets.ModelViewSet):
         call_log.status = 'recording'
         call_log.save()
         
-        serializer = CallRecordingSerializer(recording)
+        serializer = CallRecordingSerializer(recording, context=self.get_serializer_context())
         return Response(serializer.data, status=status.HTTP_201_CREATED)
     
     @extend_schema(
         summary="Stop call recording",
-        description="Stop recording for an active call",
+        description="Bookkeeping only. No body.",
+        request=None,
         responses={
             200: CallRecordingSerializer,
-            400: "No active recording found"
+            400: OpenApiTypes.OBJECT,
         }
     )
     @action(detail=True, methods=['post'])
@@ -925,13 +1128,20 @@ class CallLogViewSet(viewsets.ModelViewSet):
         call_log.status = 'answered'
         call_log.save()
         
-        serializer = CallRecordingSerializer(recording)
+        serializer = CallRecordingSerializer(recording, context=self.get_serializer_context())
         return Response(serializer.data)
     
     @extend_schema(
         summary="Transfer call",
-        description="Transfer an active call to another number",
-        responses={200: CallLogSerializer}
+        description=(
+            "Bookkeeping for a blind transfer (the SIP REFER happens on the "
+            "softphone). Body: {transfer_to}."
+        ),
+        request=inline_serializer(
+            name='CallTransfer',
+            fields={'transfer_to': drf_serializers.CharField()},
+        ),
+        responses={200: CallLogSerializer, 400: OpenApiTypes.OBJECT}
     )
     @action(detail=True, methods=['post'])
     def transfer_call(self, request, pk=None):
@@ -973,17 +1183,23 @@ class CallLogViewSet(viewsets.ModelViewSet):
             metadata={'transfer_to': transfer_to}
         )
         
-        serializer = CallLogSerializer(call_log)
-        return Response(serializer.data)
+        return Response(self._out(call_log))
 
     @extend_schema(
         summary="Initiate consultation call for attended transfer",
         description="Start a consultation call to a target number before completing an attended transfer",
         request=ConsultationInitiateSerializer,
         responses={
-            201: "Consultation call initiated",
-            400: "Invalid request or call not in correct state",
-            404: "Call not found",
+            201: inline_serializer(
+                name='ConsultationInitiateResponse',
+                fields={
+                    'consultation_log_id': drf_serializers.IntegerField(),
+                    'consultation_call_id': drf_serializers.CharField(),
+                    'original_call_id': drf_serializers.CharField(),
+                },
+            ),
+            400: OpenApiTypes.OBJECT,
+            404: OpenApiTypes.OBJECT,
         },
     )
     @action(detail=True, methods=['post'])
@@ -1039,8 +1255,11 @@ class CallLogViewSet(viewsets.ModelViewSet):
         )
 
         # Put the original call on hold
+        # (transfer_type='attended' marks the consultation in progress, which
+        # merge_conference requires; cancel_consultation clears it again.)
         original_call.status = 'on_hold'
-        original_call.save(update_fields=['status'])
+        original_call.transfer_type = 'attended'
+        original_call.save(update_fields=['status', 'transfer_type'])
 
         return Response(
             {
@@ -1066,8 +1285,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
         },
         responses={
             200: CallLogSerializer,
-            400: "Invalid request or call not in correct state",
-            404: "Call or consultation log not found",
+            400: OpenApiTypes.OBJECT,
+            404: OpenApiTypes.OBJECT,
         },
     )
     @action(detail=True, methods=['post'])
@@ -1127,8 +1346,7 @@ class CallLogViewSet(viewsets.ModelViewSet):
             },
         )
 
-        serializer = CallLogSerializer(original_call)
-        return Response(serializer.data)
+        return Response(self._out(original_call))
 
     @extend_schema(
         summary="Cancel consultation call",
@@ -1144,8 +1362,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
         },
         responses={
             200: CallLogSerializer,
-            400: "Invalid request",
-            404: "Call or consultation log not found",
+            400: OpenApiTypes.OBJECT,
+            404: OpenApiTypes.OBJECT,
         },
     )
     @action(detail=True, methods=['post'])
@@ -1179,7 +1397,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
 
         # Resume the original call
         original_call.status = 'answered'
-        original_call.save(update_fields=['status'])
+        original_call.transfer_type = ''
+        original_call.save(update_fields=['status', 'transfer_type'])
 
         # Record the cancellation event
         self._create_call_event(
@@ -1188,8 +1407,7 @@ class CallLogViewSet(viewsets.ModelViewSet):
             metadata={'action': 'consultation_cancelled'},
         )
 
-        serializer = CallLogSerializer(original_call)
-        return Response(serializer.data)
+        return Response(self._out(original_call))
 
     @extend_schema(
         summary="Merge into 3-way conference",
@@ -1211,9 +1429,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
                     ),
                 },
             ),
-            400: "Invalid request or call not in correct state",
-            404: "Call or consultation log not found",
-            502: "AMI communication error",
+            400: OpenApiTypes.OBJECT,
+            404: OpenApiTypes.OBJECT,
+            502: OpenApiTypes.OBJECT,
         },
     )
     @action(detail=True, methods=["post"])
@@ -1402,8 +1620,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary="Hold/Unhold call",
-        description="Put call on hold or resume from hold",
-        responses={200: CallLogSerializer}
+        description="Bookkeeping for hold/resume (the SIP re-INVITE happens on the softphone). No body.",
+        request=None,
+        responses={200: CallLogSerializer, 400: OpenApiTypes.OBJECT}
     )
     @action(detail=True, methods=['post'])
     def toggle_hold(self, request, pk=None):
@@ -1427,12 +1646,15 @@ class CallLogViewSet(viewsets.ModelViewSet):
         
         self._create_call_event(call_log, event_type)
 
-        serializer = CallLogSerializer(call_log)
-        return Response(serializer.data)
+        return Response(self._out(call_log))
 
     @extend_schema(
         summary="Send SMS review request for a completed call",
-        description="Send an SMS with a rating link to the caller of a completed call.",
+        description=(
+            "Send an SMS with a rating link to the caller of a completed call. "
+            "No body. PBX admins only (staff, superuser or manage_settings)."
+        ),
+        request=None,
         responses={
             200: inline_serializer(
                 name='SmsReviewResponse',
@@ -1441,11 +1663,14 @@ class CallLogViewSet(viewsets.ModelViewSet):
                     'message_id': drf_serializers.CharField(allow_null=True),
                 }
             ),
-            400: "Bad request",
-            502: "SMS delivery failed",
+            400: OpenApiTypes.OBJECT,
+            403: OpenApiTypes.OBJECT,
+            502: OpenApiTypes.OBJECT,
         }
     )
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['post'], permission_classes=[
+        permissions.IsAuthenticated, HasIpCallingFeature, IsPbxAdmin,
+    ])
     def send_sms_review(self, request, pk=None):
         """Send SMS review request for a completed call."""
         import secrets
@@ -1519,25 +1744,35 @@ class ClientViewSet(viewsets.ModelViewSet):
     """
     serializer_class = ClientSerializer
     permission_classes = [permissions.IsAuthenticated]
-    
+
+    def get_permissions(self):
+        perms = super().get_permissions()
+        # Call history and caller-ID lookup are part of the calls surface.
+        if self.action in ('call_history', 'lookup_by_phone'):
+            perms.append(HasIpCallingFeature())
+        return perms
+
     def get_queryset(self):
         # In a multi-tenant setup, you might want to filter by tenant
         return Client.objects.all()
     
     @extend_schema(
         summary="Get client call history",
-        description="Get all calls associated with this client",
+        description="All calls linked to this CRM client, newest first (a bare, unpaginated list).",
         responses={200: CallLogSerializer(many=True)}
     )
-    @action(detail=True, methods=['get'])
+    @action(detail=True, methods=['get'], pagination_class=None, filter_backends=[])
     def call_history(self, request, pk=None):
         """Get call history for a specific client"""
         client = self.get_object()
         calls = CallLog.objects.filter(
             client=client
-        ).select_related('client', 'sip_configuration', 'handled_by').order_by('-started_at')
+        ).select_related(
+            'client', 'social_client', 'sip_configuration', 'handled_by',
+            'transferred_to_user', 'recording',
+        ).order_by('-started_at')
 
-        serializer = CallLogSerializer(calls, many=True)
+        serializer = CallLogSerializer(calls, many=True, context=self.get_serializer_context())
         return Response(serializer.data)
 
     @extend_schema(
@@ -1560,7 +1795,24 @@ class ClientViewSet(viewsets.ModelViewSet):
                 description='Phone number in any format (digits, spaces, dashes, leading +).',
             ),
         ],
-        responses={200: OpenApiTypes.OBJECT},
+        responses={200: inline_serializer(
+            name='ClientPhoneLookupResponse',
+            fields={
+                'count': drf_serializers.IntegerField(),
+                'results': inline_serializer(
+                    name='ClientPhoneLookupResult',
+                    many=True,
+                    fields={
+                        'id': drf_serializers.IntegerField(),
+                        'name': drf_serializers.CharField(),
+                        'email': drf_serializers.CharField(allow_blank=True),
+                        'phone': drf_serializers.CharField(allow_blank=True),
+                        'company': drf_serializers.CharField(allow_blank=True),
+                        'source': drf_serializers.CharField(help_text="'crm' or 'social'"),
+                    },
+                ),
+            },
+        )},
     )
     @action(detail=False, methods=['get'], url_path='lookup-by-phone')
     def lookup_by_phone(self, request):
@@ -2069,8 +2321,29 @@ def send_call_review_sms(request):
     )
 
 
+@extend_schema(
+    summary="Extension presence",
+    description=(
+        "Which extensions are registered on the tenant's PBX, proxied from the "
+        "PBX side API (cached 5 s). ``extensions`` is [] when the PBX is not "
+        "configured or unreachable. ``status`` is e.g. 'online' / 'offline'."
+    ),
+    responses={200: inline_serializer(
+        name='ExtensionStatusResponse',
+        fields={
+            'extensions': inline_serializer(
+                name='ExtensionStatusItem',
+                many=True,
+                fields={
+                    'extension': drf_serializers.CharField(),
+                    'status': drf_serializers.CharField(),
+                },
+            ),
+        },
+    )},
+)
 @api_view(['GET'])
-@permission_classes([permissions.IsAuthenticated])
+@permission_classes([permissions.IsAuthenticated, HasIpCallingFeature])
 def extension_status(request):
     """Proxy to PBX status API — returns which extensions are online.
 
@@ -2170,18 +2443,71 @@ def call_recording_url_webhook(request):
 # ============================================================================
 
 
-def _get_pbx_settings(sip_config_id):
+_PBX_SOUND_TYPES = [
+    'greeting', 'after_hours', 'queue_hold',
+    'voicemail_prompt', 'thank_you', 'transfer_hold',
+    'review_prompt', 'review_invalid', 'review_thanks',
+    'queue_position_1', 'queue_position_2', 'queue_position_3',
+    'queue_position_4', 'queue_position_5', 'queue_position_6',
+    'queue_position_7', 'queue_position_8', 'queue_position_9',
+    'queue_position_10',
+]
+
+
+def _pbx_admin_required(request):
+    """403 response for non-admin writes to the PBX settings, else None."""
+    if is_pbx_admin(request.user):
+        return None
+    return Response(
+        {'error': 'Only PBX administrators can change the PBX settings.'},
+        status=status.HTTP_403_FORBIDDEN,
+    )
+
+
+def _get_pbx_settings(sip_config_id, create=True):
+    """The PBX settings row of a SIP configuration. With ``create=False`` a
+    missing row comes back as an unsaved instance with the defaults, so a
+    read never writes."""
     sip_config = SipConfiguration.objects.get(id=sip_config_id)
+    if not create:
+        existing = PbxSettings.objects.filter(sip_configuration=sip_config).first()
+        return existing or PbxSettings(sip_configuration=sip_config)
     settings_obj, _ = PbxSettings.objects.get_or_create(sip_configuration=sip_config)
     return settings_obj
 
 
+@extend_schema(
+    methods=['GET'],
+    summary="PBX settings (working hours, review SMS, sounds)",
+    description=(
+        "Read the PBX settings of a SIP configuration. When none are stored "
+        "yet, a PBX admin's read creates them with the defaults; other users "
+        "get the defaults without anything being saved (``id`` is null)."
+    ),
+    responses={200: PbxSettingsSerializer, 404: OpenApiTypes.OBJECT},
+)
+@extend_schema(
+    methods=['PATCH'],
+    summary="Update PBX settings",
+    description="Partial update (PBX admins only). ``sms_api_key`` is write-only.",
+    request=PbxSettingsSerializer,
+    responses={200: PbxSettingsSerializer, 400: OpenApiTypes.OBJECT, 403: OpenApiTypes.OBJECT, 404: OpenApiTypes.OBJECT},
+)
 @api_view(['GET', 'PATCH'])
-@permission_classes([permissions.IsAuthenticated])
+@permission_classes([permissions.IsAuthenticated, HasIpCallingFeature])
 def pbx_settings_detail(request, sip_config_id):
     """Get or update PBX settings for a SIP configuration."""
+    if request.method != 'GET':
+        denied = _pbx_admin_required(request)
+        if denied is not None:
+            return denied
     try:
-        settings_obj = _get_pbx_settings(sip_config_id)
+        # Only a PBX admin's read may create the row (the web settings page
+        # reads before it writes); everyone else gets the defaults unsaved.
+        settings_obj = _get_pbx_settings(
+            sip_config_id,
+            create=request.method != 'GET' or is_pbx_admin(request.user),
+        )
     except SipConfiguration.DoesNotExist:
         return Response({'error': 'SIP configuration not found'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -2195,10 +2521,25 @@ def pbx_settings_detail(request, sip_config_id):
     return Response(serializer.data)
 
 
+@extend_schema(
+    summary="Upload a PBX sound",
+    description="multipart/form-data {sound_type, file (.wav/.mp3/.ogg, <10MB)}. PBX admins only.",
+    request={'multipart/form-data': inline_serializer(
+        name='PbxSoundUpload',
+        fields={
+            'sound_type': drf_serializers.ChoiceField(choices=_PBX_SOUND_TYPES),
+            'file': drf_serializers.FileField(),
+        },
+    )},
+    responses={200: PbxSettingsSerializer, 400: OpenApiTypes.OBJECT, 403: OpenApiTypes.OBJECT, 404: OpenApiTypes.OBJECT},
+)
 @api_view(['POST'])
-@permission_classes([permissions.IsAuthenticated])
+@permission_classes([permissions.IsAuthenticated, HasIpCallingFeature])
 def pbx_settings_upload_sound(request, sip_config_id):
     """Upload a sound file for a specific sound type."""
+    denied = _pbx_admin_required(request)
+    if denied is not None:
+        return denied
     try:
         settings_obj = _get_pbx_settings(sip_config_id)
     except SipConfiguration.DoesNotExist:
@@ -2245,10 +2586,22 @@ def pbx_settings_upload_sound(request, sip_config_id):
     return Response(PbxSettingsSerializer(settings_obj).data)
 
 
+@extend_schema(
+    summary="Remove a PBX sound",
+    description="Revert one sound to the default. PBX admins only.",
+    request=inline_serializer(
+        name='PbxSoundRemove',
+        fields={'sound_type': drf_serializers.ChoiceField(choices=_PBX_SOUND_TYPES)},
+    ),
+    responses={200: PbxSettingsSerializer, 400: OpenApiTypes.OBJECT, 403: OpenApiTypes.OBJECT, 404: OpenApiTypes.OBJECT},
+)
 @api_view(['POST'])
-@permission_classes([permissions.IsAuthenticated])
+@permission_classes([permissions.IsAuthenticated, HasIpCallingFeature])
 def pbx_settings_remove_sound(request, sip_config_id):
     """Remove a custom sound (revert to default)."""
+    denied = _pbx_admin_required(request)
+    if denied is not None:
+        return denied
     try:
         settings_obj = _get_pbx_settings(sip_config_id)
     except SipConfiguration.DoesNotExist:

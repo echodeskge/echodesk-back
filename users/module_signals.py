@@ -236,44 +236,37 @@ except ImportError:
 try:
     from crm.models import CallLog
 
-    @receiver(post_save, sender=CallLog)
-    def notify_call_events(sender, instance, created, **kwargs):
-        from users.notification_utils import create_notification
-
-        # Only notify on missed inbound calls
-        if instance.status != 'missed' or instance.direction != 'inbound':
-            return
-
-        if instance.handled_by:
-            # Notify the specific user who was supposed to handle the call
-            create_notification(
-                user=instance.handled_by,
-                notification_type='call_missed',
-                title='Missed call',
-                message=f'Missed inbound call from {instance.caller_number}',
-                metadata={
-                    'call_id': str(instance.call_id),
-                    'caller_number': instance.caller_number,
-                    'direction': instance.direction,
-                },
-                link_url='/calls',
+    @receiver(pre_save, sender=CallLog)
+    def track_call_status_change(sender, instance, **kwargs):
+        """Remember the old status so post_save only reacts to transitions."""
+        update_fields = kwargs.get('update_fields')
+        if update_fields is not None and 'status' not in update_fields:
+            # Status is not being written, so it cannot change.
+            instance._old_status = instance.status
+        elif instance.pk:
+            instance._old_status = (
+                CallLog.objects.filter(pk=instance.pk)
+                .values_list('status', flat=True).first()
             )
         else:
-            # Notify up to 10 active users
-            users = User.objects.filter(is_active=True)[:10]
-            for user in users:
-                create_notification(
-                    user=user,
-                    notification_type='call_missed',
-                    title='Missed call',
-                    message=f'Missed inbound call from {instance.caller_number}',
-                    metadata={
-                        'call_id': str(instance.call_id),
-                        'caller_number': instance.caller_number,
-                        'direction': instance.direction,
-                    },
-                    link_url='/calls',
-                )
+            instance._old_status = None
+
+    @receiver(post_save, sender=CallLog)
+    def notify_call_events(sender, instance, created, **kwargs):
+        """``call_missed`` fires once, when an inbound call *becomes*
+        missed/no_answer (created that way, or a status transition into it).
+        Later saves of the same row (notes, recording url, ...) do not
+        re-notify. Recipients and the ring-all "answered elsewhere" check
+        live in :mod:`crm.call_notifications`."""
+        from crm.call_notifications import schedule_missed_call_notification
+        from crm.call_status import MISSED_STATUSES
+
+        if instance.direction != 'inbound' or instance.status not in MISSED_STATUSES:
+            return
+        old_status = None if created else getattr(instance, '_old_status', None)
+        if old_status in MISSED_STATUSES:
+            return
+        schedule_missed_call_notification(instance.pk)
 
 except ImportError:
     pass

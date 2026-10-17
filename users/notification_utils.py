@@ -118,6 +118,9 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
     # and link moved to the second one).
     if metadata.get('conversation_id') is not None:
         recent_filter['metadata__conversation_id'] = metadata['conversation_id']
+    # Likewise two different missed calls must stay two notifications.
+    if metadata.get('call_log_id') is not None:
+        recent_filter['metadata__call_log_id'] = metadata['call_log_id']
     recent = Notification.objects.filter(**recent_filter).first()
 
     if recent:
@@ -195,6 +198,8 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
                 # thread + sender so a push tap can deep-link straight into it.
                 'conversation_id': notification.metadata.get('conversation_id'),
                 'sender_id': notification.metadata.get('sender_id'),
+                # Missed-call pushes open the call detail.
+                'call_log_id': notification.metadata.get('call_log_id'),
             },
             url=nav_url,
             tag=f'echodesk-{ticket_id or notification.id}',

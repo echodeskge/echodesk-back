@@ -3,7 +3,12 @@
 All aggregation is performed DB-side via ``annotate``/``aggregate`` plus
 ``TruncDate``/``Extract`` — there are no Python loops over large
 querysets. All endpoints are gated by the ``ip_calling`` subscription
-feature and require an authenticated user.
+feature and need a stats viewer (PBX admin or ``view_reports``, see
+``crm.permissions``); a user may always read their own timeline.
+
+"Answered" and "missed" come from ``crm.call_status`` so every stats
+surface agrees (an ``ended`` call only counts as answered when it was
+actually picked up).
 """
 
 from __future__ import annotations
@@ -16,15 +21,111 @@ from django.db.models import Avg, Count, F, Q, Sum
 from django.db.models.functions import ExtractHour, ExtractIsoWeekDay, TruncDate
 from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
-from drf_spectacular.utils import OpenApiParameter, extend_schema
-from rest_framework import status
+from drf_spectacular.utils import OpenApiParameter, extend_schema, inline_serializer
+from rest_framework import serializers, status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from tenants.permissions import require_subscription_feature
 
+from .call_status import answered_q, missed_q
 from .models import CallLog, InboundRoute
+from .permissions import CanViewCallStats, can_view_call_stats
+
+
+# ---------------------------------------------------------------------------
+# Response schemas (documentation only; the views build plain dicts)
+# ---------------------------------------------------------------------------
+
+_UserStatsRow = inline_serializer(
+    name="CallStatsUserRow",
+    many=True,
+    fields={
+        'user_id': serializers.IntegerField(),
+        'user_name': serializers.CharField(),
+        'user_email': serializers.CharField(),
+        'answered_count': serializers.IntegerField(),
+        'missed_count': serializers.IntegerField(),
+        'outbound_count': serializers.IntegerField(),
+        'total_talk_seconds': serializers.IntegerField(),
+        'avg_talk_seconds': serializers.IntegerField(),
+    },
+)
+UsersStatsResponse = inline_serializer(
+    name='CallStatsUsersResponse',
+    fields={
+        'month': serializers.CharField(),
+        'start': serializers.DateTimeField(),
+        'end': serializers.DateTimeField(),
+        'results': _UserStatsRow,
+    },
+)
+UserTimelineResponse = inline_serializer(
+    name='CallStatsUserTimelineResponse',
+    fields={
+        'user_id': serializers.IntegerField(),
+        'month': serializers.CharField(),
+        'start': serializers.DateTimeField(),
+        'end': serializers.DateTimeField(),
+        'results': inline_serializer(
+            name='CallStatsTimelineDay',
+            many=True,
+            fields={
+                'day': serializers.DateField(allow_null=True),
+                'total_calls': serializers.IntegerField(),
+                'answered_count': serializers.IntegerField(),
+                'missed_count': serializers.IntegerField(),
+                'outbound_count': serializers.IntegerField(),
+                'total_talk_seconds': serializers.IntegerField(),
+            },
+        ),
+    },
+)
+QueueStatsResponse = inline_serializer(
+    name='CallStatsQueueResponse',
+    fields={
+        'queue_id': serializers.IntegerField(),
+        'range': serializers.CharField(),
+        'start': serializers.DateTimeField(),
+        'end': serializers.DateTimeField(),
+        'matched_dids': serializers.ListField(child=serializers.CharField()),
+        'total_calls': serializers.IntegerField(),
+        'answered_count': serializers.IntegerField(),
+        'abandoned_count': serializers.IntegerField(),
+        'avg_wait_seconds': serializers.IntegerField(),
+        'peak_hour': serializers.IntegerField(allow_null=True),
+    },
+)
+OverviewStatsResponse = inline_serializer(
+    name='CallStatsOverviewResponse',
+    fields={
+        'range': serializers.CharField(),
+        'start': serializers.DateTimeField(),
+        'end': serializers.DateTimeField(),
+        'total_calls': serializers.IntegerField(),
+        'answered_calls': serializers.IntegerField(),
+        'missed_calls': serializers.IntegerField(),
+        'inbound_calls': serializers.IntegerField(),
+        'outbound_calls': serializers.IntegerField(),
+        'avg_talk_seconds': serializers.IntegerField(),
+        'busiest_hour': serializers.IntegerField(allow_null=True, help_text='0-23'),
+        'busiest_weekday': serializers.IntegerField(allow_null=True, help_text='0=Monday .. 6=Sunday'),
+        'top_5_users': inline_serializer(
+            name='CallStatsTopUser',
+            many=True,
+            fields={
+                'user_id': serializers.IntegerField(),
+                'user_name': serializers.CharField(),
+                'user_email': serializers.CharField(),
+                'answered_count': serializers.IntegerField(),
+                'outbound_count': serializers.IntegerField(),
+                'total_talk_seconds': serializers.IntegerField(),
+            },
+        ),
+    },
+)
+_ERRORS = {400: OpenApiTypes.OBJECT, 403: OpenApiTypes.OBJECT}
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +178,7 @@ def _parse_range(range_str: str | None) -> Tuple[datetime, datetime]:
 
 def _answered_durations_filter() -> Q:
     """Filter for answered calls with a non-null duration — used for talk time."""
-    return Q(status__in=['answered', 'ended', 'transferred']) & Q(duration__isnull=False)
+    return answered_q() & Q(duration__isnull=False)
 
 
 # ---------------------------------------------------------------------------
@@ -102,9 +203,10 @@ def _answered_durations_filter() -> Q:
             required=False,
         ),
     ],
+    responses={200: UsersStatsResponse, **_ERRORS},
 )
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, CanViewCallStats])
 @require_subscription_feature('ip_calling')
 def users_stats(request):
     """Per-user call rollup for a month."""
@@ -128,8 +230,8 @@ def users_stats(request):
         .filter(started_at__gte=start, started_at__lt=end, handled_by__isnull=False)
         .values('handled_by')
         .annotate(
-            answered_count=Count('id', filter=Q(status__in=['answered', 'ended', 'transferred']) & Q(direction='inbound')),
-            missed_count=Count('id', filter=Q(status__in=['missed', 'no_answer']) & Q(direction='inbound')),
+            answered_count=Count('id', filter=answered_q() & Q(direction='inbound')),
+            missed_count=Count('id', filter=missed_q()),
             outbound_count=Count('id', filter=Q(direction='outbound')),
             total_talk_seconds=Sum('duration', filter=_answered_durations_filter()),
             avg_talk_seconds=Avg('duration', filter=_answered_durations_filter()),
@@ -191,12 +293,18 @@ def users_stats(request):
             required=False,
         ),
     ],
+    responses={200: UserTimelineResponse, **_ERRORS},
 )
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 @require_subscription_feature('ip_calling')
 def user_timeline(request, user_id: int):
     """Day-bucketed call counts + talk time for a single user."""
+    if user_id != request.user.id and not can_view_call_stats(request.user):
+        return Response(
+            {'error': 'You can only view your own call timeline.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     month_str = request.query_params.get('month')
     if month_str:
         parsed = _parse_month(month_str)
@@ -219,8 +327,8 @@ def user_timeline(request, user_id: int):
         .values('day')
         .annotate(
             total_calls=Count('id'),
-            answered_count=Count('id', filter=Q(status__in=['answered', 'ended', 'transferred']) & Q(direction='inbound')),
-            missed_count=Count('id', filter=Q(status__in=['missed', 'no_answer']) & Q(direction='inbound')),
+            answered_count=Count('id', filter=answered_q() & Q(direction='inbound')),
+            missed_count=Count('id', filter=missed_q()),
             outbound_count=Count('id', filter=Q(direction='outbound')),
             total_talk_seconds=Sum('duration', filter=_answered_durations_filter()),
         )
@@ -284,9 +392,10 @@ def user_timeline(request, user_id: int):
             required=False,
         ),
     ],
+    responses={200: QueueStatsResponse, **_ERRORS},
 )
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, CanViewCallStats])
 @require_subscription_feature('ip_calling')
 def queue_stats(request):
     """Queue SLA metrics (answered/abandoned, avg wait, peak hour)."""
@@ -327,8 +436,8 @@ def queue_stats(request):
 
     summary = base_qs.aggregate(
         total_calls=Count('id'),
-        answered_count=Count('id', filter=Q(status__in=['answered', 'ended', 'transferred'])),
-        abandoned_count=Count('id', filter=Q(status__in=['missed', 'no_answer'])),
+        answered_count=Count('id', filter=answered_q()),
+        abandoned_count=Count('id', filter=missed_q()),
         avg_wait_interval=Avg(
             wait_seconds_expr,
             filter=Q(answered_at__isnull=False),
@@ -388,9 +497,10 @@ def queue_stats(request):
             required=False,
         ),
     ],
+    responses={200: OverviewStatsResponse, **_ERRORS},
 )
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, CanViewCallStats])
 @require_subscription_feature('ip_calling')
 def overview_stats(request):
     """Tenant-wide call overview (numbers + top 5 users)."""
@@ -401,8 +511,8 @@ def overview_stats(request):
 
     summary = base_qs.aggregate(
         total_calls=Count('id'),
-        answered_calls=Count('id', filter=Q(status__in=['answered', 'ended', 'transferred'])),
-        missed_calls=Count('id', filter=Q(status__in=['missed', 'no_answer'])),
+        answered_calls=Count('id', filter=answered_q()),
+        missed_calls=Count('id', filter=missed_q()),
         inbound_calls=Count('id', filter=Q(direction='inbound')),
         outbound_calls=Count('id', filter=Q(direction='outbound')),
         avg_talk_seconds_raw=Avg('duration', filter=_answered_durations_filter()),
@@ -444,7 +554,7 @@ def overview_stats(request):
         .values('handled_by')
         .annotate(
             total_talk_seconds=Sum('duration', filter=_answered_durations_filter()),
-            answered_count=Count('id', filter=Q(status__in=['answered', 'ended', 'transferred']) & Q(direction='inbound')),
+            answered_count=Count('id', filter=answered_q() & Q(direction='inbound')),
             outbound_count=Count('id', filter=Q(direction='outbound')),
             user_first_name=F('handled_by__first_name'),
             user_last_name=F('handled_by__last_name'),

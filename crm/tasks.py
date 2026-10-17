@@ -42,3 +42,15 @@ def rebuild_tenant_asterisk_state(tenant_schema: str) -> Dict[str, int]:
         "rebuild_tenant_asterisk_state: tenant=%s summary=%s", tenant_schema, summary
     )
     return summary
+
+
+@shared_task(name="crm.notify_missed_call")
+def notify_missed_call(call_log_id: int, tenant_schema: str) -> int:
+    """Send the ``call_missed`` notification for one call log (see
+    :mod:`crm.call_notifications`). Runs inside the tenant's schema."""
+    from tenant_schemas.utils import schema_context
+
+    from crm.call_notifications import send_missed_call_notifications
+
+    with schema_context(tenant_schema):
+        return send_missed_call_notifications(call_log_id)
