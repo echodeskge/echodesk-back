@@ -705,11 +705,16 @@ class UserViewSet(viewsets.ModelViewSet):
 
         if action_type == 'activate':
             User.objects.filter(id__in=target_ids).update(is_active=True, status='active')
+            # .update() skips save signals — refresh the billing user count.
+            from tenants.user_count import sync_current_schema_user_count
+            sync_current_schema_user_count()
             message = f'Activated {count} users'
 
         elif action_type == 'deactivate':
             User.objects.filter(id__in=target_ids).update(is_active=False, status='inactive')
             _revoke_tokens_for(target_ids)
+            from tenants.user_count import sync_current_schema_user_count
+            sync_current_schema_user_count()
             message = f'Deactivated {count} users'
 
         elif action_type == 'delete':

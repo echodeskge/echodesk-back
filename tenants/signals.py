@@ -50,3 +50,30 @@ def sync_subscription_features(sender, instance, created, **kwargs):
             )
         else:
             logger.error(f"Error syncing features for subscription {instance}: {e}", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Keep TenantSubscription.current_users in sync with the tenant's users.
+# Read paths recount live as well (tenants.permissions), so these signals are
+# about keeping the stored value (admin, raw serializers) fresh.
+# ---------------------------------------------------------------------------
+from django.conf import settings as _settings  # noqa: E402
+from django.db.models.signals import post_delete  # noqa: E402
+
+
+@receiver(post_save, sender=_settings.AUTH_USER_MODEL)
+def sync_user_count_on_user_save(sender, instance, created, raw=False, update_fields=None, **kwargs):
+    if raw:
+        return
+    # Logins save(update_fields=['last_login']); only recount when the
+    # billable state could have changed.
+    if not created and update_fields is not None and 'is_active' not in update_fields:
+        return
+    from .user_count import sync_current_schema_user_count
+    sync_current_schema_user_count()
+
+
+@receiver(post_delete, sender=_settings.AUTH_USER_MODEL)
+def sync_user_count_on_user_delete(sender, instance, **kwargs):
+    from .user_count import sync_current_schema_user_count
+    sync_current_schema_user_count()
