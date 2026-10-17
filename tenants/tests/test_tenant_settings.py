@@ -82,10 +82,66 @@ class TestTenantSettings(EchoDeskTenantTestCase):
         self.assertEqual(after.only_superadmin_can_delete_tickets, before.only_superadmin_can_delete_tickets)
         self.assertEqual(after.preferred_language, before.preferred_language)
 
-    def test_admin_role_can_patch(self):
+    def _set_delete_restriction(self, value, min_users=0):
+        Tenant.objects.filter(schema_name='test').update(
+            only_superadmin_can_delete_tickets=value, min_users_per_ticket=min_users,
+        )
+
+    def test_admin_role_can_patch_other_fields(self):
+        self._set_delete_restriction(True)
         admin_role = self.create_user(email='ts-adminrole@test.com', role='admin')
+        resp = self.api_patch(SETTINGS_URL, {'min_users_per_ticket': 4}, user=admin_role)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(current_tenant().min_users_per_ticket, 4)
+
+    def test_admin_role_cannot_turn_off_delete_restriction(self):
+        # Review repro: a non-staff manage_settings user PATCHes the toggle
+        # off. The whole request is rejected and nothing is saved.
+        self._set_delete_restriction(True, min_users=1)
+        for user in (self.create_user(email='ts-adminrole-off@test.com', role='admin'),
+                     self.create_user(email='ts-flag-off@test.com', can_manage_settings=True)):
+            resp = self.api_patch(SETTINGS_URL, {
+                'min_users_per_ticket': 5,
+                'only_superadmin_can_delete_tickets': False,
+            }, user=user)
+            self.assertEqual(resp.status_code, 403, resp.data)
+            self.assertIn('only_superadmin_can_delete_tickets', resp.data)
+            self.assertIn('error', resp.data)
+            tenant = current_tenant()
+            self.assertTrue(tenant.only_superadmin_can_delete_tickets)
+            self.assertEqual(tenant.min_users_per_ticket, 1)
+
+    def test_admin_role_cannot_turn_on_delete_restriction(self):
+        self._set_delete_restriction(False)
+        admin_role = self.create_user(email='ts-adminrole-on@test.com', role='admin')
         resp = self.api_patch(SETTINGS_URL, {'only_superadmin_can_delete_tickets': True}, user=admin_role)
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(current_tenant().only_superadmin_can_delete_tickets)
+
+    def test_admin_role_may_resend_current_delete_restriction(self):
+        # The web general-settings form always sends the toggle with
+        # min_users_per_ticket; an unchanged value must not block the save.
+        self._set_delete_restriction(True)
+        admin_role = self.create_user(email='ts-adminrole-same@test.com', role='admin')
+        resp = self.api_patch(SETTINGS_URL, {
+            'min_users_per_ticket': 2,
+            'only_superadmin_can_delete_tickets': True,
+        }, user=admin_role)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        tenant = current_tenant()
+        self.assertEqual(tenant.min_users_per_ticket, 2)
+        self.assertTrue(tenant.only_superadmin_can_delete_tickets)
+
+    def test_staff_and_superuser_can_change_delete_restriction(self):
+        self._set_delete_restriction(True)
+        staff = self.create_user(email='ts-staff-off@test.com', is_staff=True)
+        resp = self.api_patch(SETTINGS_URL, {'only_superadmin_can_delete_tickets': False}, user=staff)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertFalse(current_tenant().only_superadmin_can_delete_tickets)
+        su = self.create_user(email='ts-su-on@test.com', is_superuser=True)
+        resp = self.api_patch(SETTINGS_URL, {'only_superadmin_can_delete_tickets': True}, user=su)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertTrue(current_tenant().only_superadmin_can_delete_tickets)
 
     def test_agent_and_manager_cannot_patch(self):
         before = current_tenant().min_users_per_ticket
