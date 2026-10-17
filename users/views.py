@@ -97,12 +97,12 @@ def _outranks_or_equals(actor, target):
     """
     True when ``actor`` holds every privilege ``target`` has.
 
-    Superusers hold them all. Everyone else needs a role at least as high as
-    the target's (so a staff user who is not role=admin still cannot take
-    over a role=admin account), and a staff target needs a staff actor.
-    Staff actors skip the per-permission comparison (staff already bypasses
-    those checks); anyone else must hold every permission the target has
-    (``can_*`` flags plus the ones their role grants).
+    Superusers hold them all, and nobody else outranks a superuser. A staff
+    target needs a staff actor. Staff actors are otherwise exempt from the
+    comparison, except that a role=admin target still needs a role=admin
+    actor (the rule from before the per-permission check). Everyone else
+    needs a role at least as high as the target's and every permission the
+    target has (``can_*`` flags plus the ones their role grants).
     """
     if actor.is_superuser:
         return True
@@ -110,10 +110,10 @@ def _outranks_or_equals(actor, target):
         return False
     if target.is_staff and not actor.is_staff:
         return False
+    if actor.is_staff:
+        return not (target.role == 'admin' and actor.role != 'admin')
     if _role_rank(target) > _role_rank(actor):
         return False
-    if actor.is_staff:
-        return True
     return set(target.get_all_permissions()) <= set(actor.get_all_permissions())
 
 
@@ -149,10 +149,10 @@ def _may_disable(actor, target):
     return _outranks_or_equals(actor, target)
 
 
-def _guard_disable(actor, target):
+def _guard_disable(actor, target, verb='deactivate, suspend or delete'):
     if actor.pk != target.pk and not _may_disable(actor, target):
         raise PermissionDenied(
-            'You cannot deactivate, suspend or delete this user: staff and administrator '
+            f'You cannot {verb} this user: staff and administrator '
             'accounts need a staff caller, and other accounts need at least their privileges.'
         )
 
@@ -173,12 +173,35 @@ class SelfLockoutError(APIException):
         super().__init__({'detail': message, 'error': message, 'code': 'self_lockout'})
 
 
-def _guard_role_change(actor, current_role, new_role):
-    """Granting or removing the admin role is reserved to superusers."""
+def _guard_role_change(actor, target, new_role):
+    """
+    Who may set ``new_role`` on ``target`` (``None`` for a new user).
+
+    - Granting or removing the admin role is reserved to superusers.
+    - Nobody but a superuser may raise their own role.
+    - A non-staff caller may not give a role above their own, and may only
+      change the role of a user they ``_outranks_or_equals`` (otherwise
+      demote -> reset password -> promote back is a takeover in three
+      requests).
+    """
+    current_role = target.role if target is not None else None
     if not new_role or new_role == current_role:
         return
     if 'admin' in (current_role, new_role) and not actor.is_superuser:
         raise PermissionDenied('Only a superuser can grant or remove the admin role.')
+    if actor.is_superuser:
+        return
+    new_rank = ROLE_RANK.get(new_role, 0)
+    if target is not None and target.pk == actor.pk:
+        if new_rank > _role_rank(actor):
+            raise PermissionDenied('You cannot raise your own role.')
+        return
+    if actor.is_staff:
+        return
+    if new_rank > _role_rank(actor):
+        raise PermissionDenied('You cannot give a role above your own.')
+    if target is not None and not _outranks_or_equals(actor, target):
+        raise PermissionDenied("You cannot change the role of a user who has privileges you lack.")
 
 
 def _revoke_tokens_for(user_ids):
@@ -535,7 +558,7 @@ class UserViewSet(viewsets.ModelViewSet):
         else:
             _guard_target(actor, user_being_updated)
             if 'role' in data:
-                _guard_role_change(actor, user_being_updated.role, data['role'])
+                _guard_role_change(actor, user_being_updated, data['role'])
             # Changing the email re-addresses the login and mails a fresh
             # password to the new address: a takeover unless the caller holds
             # the target's privileges.
@@ -551,6 +574,14 @@ class UserViewSet(viewsets.ModelViewSet):
                 raise SelfLockoutError('You cannot deactivate or suspend your own account.')
             if disabling:
                 _guard_disable(actor, user_being_updated)
+            # Reactivating undoes someone's decision to disable the account:
+            # same rule as disabling it.
+            enabling = (
+                (data.get('is_active') is True and not user_being_updated.is_active)
+                or (data.get('status') == 'active' and user_being_updated.status in REVOKING_STATUSES)
+            )
+            if enabling:
+                _guard_disable(actor, user_being_updated, verb='reactivate')
             # The dashboard resends the current groups on every edit, so only
             # an actual change needs the groups permission.
             if 'tenant_group_ids' in data and not _can_manage_groups(actor):
@@ -600,6 +631,9 @@ class UserViewSet(viewsets.ModelViewSet):
             'bulk action, and non-superusers cannot touch superusers; such ids come back '
             'in `skipped_user_ids`. Granting the admin role (or changing an admin\'s role) '
             'needs a superuser: granting returns 403, admins in a role change are skipped. '
+            'Non-staff callers also get 403 for a `role` above their own, and a role '
+            'change skips users with privileges you lack; nobody but a superuser can raise '
+            'their own role (you are skipped). `activate` skips the same users as `deactivate`. '
             '`reset_password` also skips users with privileges you lack (a higher role, a '
             'permission you do not have, staff). `deactivate` / `delete` skip staff and '
             'admin-role users unless you are staff, and users with privileges you lack. '
@@ -640,8 +674,17 @@ class UserViewSet(viewsets.ModelViewSet):
         skipped = set()
         if not actor.is_superuser:
             skipped.update(users.filter(is_superuser=True).values_list('id', flat=True))
-            if action_type == 'change_role':
-                skipped.update(users.filter(role='admin').values_list('id', flat=True))
+        if action_type == 'change_role':
+            # Same rule as a single role change (admins, users with
+            # privileges you lack, raising your own role).
+            for u in users:
+                try:
+                    _guard_role_change(actor, u, role)
+                except PermissionDenied:
+                    skipped.add(u.id)
+        if action_type == 'activate':
+            # Reactivating: same rule as deactivating.
+            skipped.update(u.id for u in users if u.id != actor.id and not _may_disable(actor, u))
         if action_type in ('deactivate', 'delete', 'reset_password'):
             if actor.id in user_ids:
                 skipped.add(actor.id)
@@ -704,8 +747,9 @@ class UserViewSet(viewsets.ModelViewSet):
         summary="Change a user's password",
         description=(
             'Set a new password. Your own, or another user\'s with `manage_users`/staff '
-            '(superuser accounts only by a superuser; staff or admin-role accounts only '
-            'by a caller who is also staff / admin, or a superuser). `old_password` is always YOUR '
+            '(superuser accounts only by a superuser; staff accounts only by staff; '
+            'admin-role accounts only by an admin-role caller; non-staff callers also need '
+            'a role and permissions covering the target\'s). `old_password` is always YOUR '
             'current password (re-authentication). Changing someone else\'s password '
             'signs them out of every session; changing your own signs out every session '
             'except the one making the request.'
@@ -748,8 +792,9 @@ class UserViewSet(viewsets.ModelViewSet):
         description=(
             'Generate a temporary password, require a change at next sign-in, email it '
             'to the user and sign them out of every session (web and devices). Needs '
-            '`manage_users`/staff; superuser accounts only by a superuser; staff or '
-            'admin-role accounts only by a caller who is also staff / admin, or a superuser.'
+            '`manage_users`/staff; superuser accounts only by a superuser; staff accounts '
+            'only by staff; admin-role accounts only by an admin-role caller; non-staff '
+            'callers also need a role and permissions covering the target\'s.'
         ),
         request=None,
         responses={

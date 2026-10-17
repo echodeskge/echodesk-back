@@ -20,8 +20,12 @@ except ImportError:
     DJANGO_TOKEN_AVAILABLE = False
 
 
-@database_sync_to_async
-def get_user_from_token(token_string, tenant_schema=None):
+def _can_sign_in(user):
+    """Disabled and suspended accounts (suspension keeps is_active) are refused."""
+    return user.is_active and getattr(user, 'status', None) != 'suspended'
+
+
+def _user_for_token(token_string, tenant_schema=None):
     """
     Get user from token - supports both JWT and Django Token authentication
     Queries within the tenant schema context for multi-tenant support
@@ -50,18 +54,21 @@ def get_user_from_token(token_string, tenant_schema=None):
             try:
                 token_obj = DjangoToken.objects.select_related('user').get(key=token_string)
                 user = token_obj.user
-                print(f"[WebSocket Auth] Django Token authentication successful for user: {user.email}")
-                return user
+                if _can_sign_in(user):
+                    print(f"[WebSocket Auth] Django Token authentication successful for user: {user.email}")
+                    return user
+                print(f"[WebSocket Auth] Django Token rejected (inactive or suspended user)")
+                return AnonymousUser()
             except (DjangoToken.DoesNotExist, Exception) as e:
                 print(f"[WebSocket Auth] Django Token validation failed: {e}")
 
         # Mobile apps authenticate with per-device tokens (same per-schema scoping).
         try:
             device_token = AuthDeviceToken.objects.select_related('user').get(key=token_string)
-            if device_token.user.is_active and not device_token.is_expired:
+            if _can_sign_in(device_token.user) and not device_token.is_expired:
                 print(f"[WebSocket Auth] Device token authentication successful for user: {device_token.user.email}")
                 return device_token.user
-            print(f"[WebSocket Auth] Device token rejected (inactive user or expired)")
+            print(f"[WebSocket Auth] Device token rejected (inactive/suspended user or expired)")
         except AuthDeviceToken.DoesNotExist:
             pass
         except Exception as e:
@@ -69,6 +76,9 @@ def get_user_from_token(token_string, tenant_schema=None):
 
         print(f"[WebSocket Auth] No valid authentication found for token")
         return AnonymousUser()
+
+
+get_user_from_token = database_sync_to_async(_user_for_token)
 
 
 class JWTAuthMiddleware(BaseMiddleware):

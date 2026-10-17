@@ -378,3 +378,204 @@ class TestOwnPasswordChangeRevokesOthers(GuardTestCase):
         self.give_sessions(self.user_manager)
         self.change_own(self.web.key)
         self.assert_signed_in(self.user_manager)
+
+
+# ---------------------------------------------------------------------------
+# 2 (review round 2). Role changes cannot be used to get around the guard
+# ---------------------------------------------------------------------------
+
+class TestRoleChangeTakeover(GuardTestCase):
+    """
+    demote -> set password -> promote back was a takeover in three requests,
+    and raising your own role defeated every rank / permission comparison.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.manager_target = self.create_user(email='fx-mgr@test.com', role='manager')
+        self.give_sessions(self.manager_target)
+
+    def test_review_repro_demote_reset_promote(self):
+        old_hash = self.manager_target.password
+        resp = self.api_patch(detail_url(self.manager_target.id), {'role': 'agent'}, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        resp = self.api_post(change_password_url(self.manager_target.id), {
+            'old_password': 'testpass123', **NEW_PASSWORD,
+        }, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.manager_target.refresh_from_db()
+        self.assertEqual(self.manager_target.role, 'manager')
+        self.assertEqual(self.manager_target.password, old_hash)
+        self.assert_signed_in(self.manager_target)
+
+    def test_review_repro_demote_then_disable(self):
+        resp = self.api_patch(detail_url(self.manager_target.id), {'role': 'viewer'}, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        resp = self.api_patch(detail_url(self.manager_target.id), {'is_active': False}, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.manager_target.refresh_from_db()
+        self.assertTrue(self.manager_target.is_active)
+
+    def test_review_repro_cannot_raise_own_role(self):
+        resp = self.api_patch(detail_url(self.user_manager.id), {'role': 'manager'}, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.user_manager.refresh_from_db()
+        self.assertEqual(self.user_manager.role, 'agent')
+        # So the takeover guard still holds afterwards.
+        resp = self.api_post(change_password_url(self.manager_target.id), {
+            'old_password': 'testpass123', **NEW_PASSWORD,
+        }, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_staff_cannot_raise_own_role_either(self):
+        staff = self.create_user(email='fx-staff-agent@test.com', is_staff=True)
+        resp = self.api_patch(detail_url(staff.id), {'role': 'manager'}, user=staff)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        # Lowering your own role is fine.
+        resp = self.api_patch(detail_url(staff.id), {'role': 'viewer'}, user=staff)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_cannot_give_a_role_above_your_own(self):
+        resp = self.api_patch(detail_url(self.agent.id), {'role': 'manager'}, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.agent.refresh_from_db()
+        self.assertEqual(self.agent.role, 'agent')
+
+    @patch('users.views.send_user_invitation_email_task')
+    def test_cannot_create_a_user_above_your_own_role(self, mock_invite):
+        resp = self.api_post(USERS_URL, {
+            'email': 'fx-new-mgr@test.com', 'first_name': 'N', 'last_name': 'M', 'role': 'manager',
+        }, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(User.objects.filter(email='fx-new-mgr@test.com').exists())
+        mock_invite.delay.assert_not_called()
+
+    def test_cannot_change_role_of_wider_permission_target(self):
+        holder = self.create_user(email='fx-holder@test.com', can_manage_groups=True)
+        resp = self.api_patch(detail_url(holder.id), {'role': 'viewer'}, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_allowed_role_changes(self):
+        # Within your own rank, on a target you outrank.
+        resp = self.api_patch(detail_url(self.agent.id), {'role': 'viewer'}, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        manager_caller = self.create_user(email='fx-mgr-caller@test.com', role='manager', can_manage_users=True)
+        resp = self.api_patch(detail_url(self.agent.id), {'role': 'manager'}, user=manager_caller)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        # Staff are exempt from the rank comparison (admin still needs a superuser).
+        staff = self.create_user(email='fx-staff-r@test.com', is_staff=True)
+        resp = self.api_patch(detail_url(self.manager_target.id), {'role': 'agent'}, user=staff)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_bulk_change_role_same_rules(self):
+        resp = self.api_post(BULK_URL, {
+            'action': 'change_role', 'role': 'manager', 'user_ids': [self.agent.id],
+        }, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+        ids = [self.agent.id, self.manager_target.id, self.user_manager.id]
+        resp = self.api_post(BULK_URL, {
+            'action': 'change_role', 'role': 'viewer', 'user_ids': ids,
+        }, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        # Lowering your own role is allowed; the manager is out of reach.
+        self.assertEqual(resp.data['skipped_user_ids'], [self.manager_target.id])
+        self.manager_target.refresh_from_db()
+        self.assertEqual(self.manager_target.role, 'manager')
+        self.agent.refresh_from_db()
+        self.assertEqual(self.agent.role, 'viewer')
+
+    def test_bulk_change_role_cannot_raise_own_role(self):
+        staff_agent = self.create_user(email='fx-staff-b@test.com', is_staff=True)
+        resp = self.api_post(BULK_URL, {
+            'action': 'change_role', 'role': 'manager', 'user_ids': [staff_agent.id, self.agent.id],
+        }, user=staff_agent)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['skipped_user_ids'], [staff_agent.id])
+        staff_agent.refresh_from_db()
+        self.assertEqual(staff_agent.role, 'agent')
+        self.agent.refresh_from_db()
+        self.assertEqual(self.agent.role, 'manager')
+
+
+class TestStaffCallerRoleRank(GuardTestCase):
+    """Staff callers are exempt from the comparison, except for admin-role targets."""
+
+    def setUp(self):
+        super().setUp()
+        self.staff_agent = self.create_user(email='fx-staff-agent2@test.com', is_staff=True)
+        self.manager_target = self.create_user(email='fx-mgr2@test.com', role='manager')
+        self.admin_target = self.create_user(email='fx-adm2@test.com', role='admin')
+
+    def _set_password(self, target):
+        return self.api_post(change_password_url(target.id), {
+            'old_password': 'testpass123', **NEW_PASSWORD,
+        }, user=self.staff_agent)
+
+    @patch('users.views.send_new_password_email_task')
+    def test_staff_agent_may_reset_a_manager(self, _mock_email):
+        self.assertEqual(self._set_password(self.manager_target).status_code, status.HTTP_200_OK)
+        resp = self.api_post(send_password_url(self.manager_target.id), {}, user=self.staff_agent)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_staff_agent_still_cannot_reset_an_admin(self):
+        self.assertEqual(self._set_password(self.admin_target).status_code, status.HTTP_403_FORBIDDEN)
+
+
+class TestReactivateGuard(GuardTestCase):
+    """Reactivating a staff / admin account undoes a staff decision."""
+
+    def setUp(self):
+        super().setUp()
+        self.staff_off = self.create_user(email='fx-staff-off@test.com', is_staff=True,
+                                          is_active=False, status='inactive')
+        self.admin_off = self.create_user(email='fx-admin-off@test.com', role='admin', status='suspended')
+        self.agent_off = self.create_user(email='fx-agent-off@test.com', is_active=False, status='inactive')
+
+    def test_user_manager_cannot_reactivate_staff_or_admin(self):
+        resp = self.api_patch(detail_url(self.staff_off.id), {'is_active': True, 'status': 'active'},
+                              user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        resp = self.api_patch(detail_url(self.admin_off.id), {'status': 'active'}, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.staff_off.refresh_from_db()
+        self.admin_off.refresh_from_db()
+        self.assertFalse(self.staff_off.is_active)
+        self.assertEqual(self.admin_off.status, 'suspended')
+
+    def test_user_manager_may_reactivate_plain_agent(self):
+        resp = self.api_patch(detail_url(self.agent_off.id), {'is_active': True, 'status': 'active'},
+                              user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_bulk_activate_skips_staff_and_admin(self):
+        ids = [self.staff_off.id, self.admin_off.id, self.agent_off.id]
+        resp = self.api_post(BULK_URL, {'action': 'activate', 'user_ids': ids}, user=self.user_manager)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['affected'], 1)
+        self.assertEqual(sorted(resp.data['skipped_user_ids']), sorted([self.staff_off.id, self.admin_off.id]))
+        self.agent_off.refresh_from_db()
+        self.assertTrue(self.agent_off.is_active)
+        self.staff_off.refresh_from_db()
+        self.assertFalse(self.staff_off.is_active)
+
+    def test_staff_may_reactivate(self):
+        resp = self.api_post(BULK_URL, {
+            'action': 'activate', 'user_ids': [self.staff_off.id, self.admin_off.id],
+        }, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['affected'], 2)
+
+
+class TestWebSocketRefusesSuspended(GuardTestCase):
+
+    def test_suspended_or_inactive_tokens_refused(self):
+        from amanati_crm.websocket_auth import _user_for_token
+        schema = self.tenant.schema_name
+        self.assertEqual(_user_for_token(Token.objects.create(user=self.agent).key, schema), self.agent)
+        for i, kwargs in enumerate(({'status': 'suspended'}, {'is_active': False})):
+            user = self.create_user(email=f'fx-ws-{i}@test.com', **kwargs)
+            web = Token.objects.create(user=user)
+            device = AuthDeviceToken.issue(user, 'ios', device_id=f'ws-{user.pk}')
+            for key in (web.key, device.key):
+                self.assertFalse(_user_for_token(key, schema).is_authenticated, (kwargs, key))
