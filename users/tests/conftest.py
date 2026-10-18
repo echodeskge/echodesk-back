@@ -114,6 +114,11 @@ class EchoDeskTenantTestCase(TenantTestCase):
     def setUp(self):
         super().setUp()
         self.client = APIClient()
+        # The storefront response cache lives in Redis, which TestCase's
+        # rollback doesn't reset; start every test from a fresh version so
+        # one test's cached responses can't leak into the next.
+        from ecommerce_crm.caching import bump_version
+        bump_version(self.tenant.schema_name)
         # Apply test middleware for the duration of the test
         self._middleware_override = self.__class__.setup_test_middleware()
         self._middleware_override.enable()

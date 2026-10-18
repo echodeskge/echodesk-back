@@ -14,8 +14,8 @@ from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiParamet
 from drf_spectacular.openapi import AutoSchema
 from django_filters.rest_framework import DjangoFilterBackend
 from django.views.decorators.cache import cache_page
-from django.utils.decorators import method_decorator
 from .authentication import EcommerceClientJWTAuthentication
+from .caching import cache_public_response
 from .models import (
     EcommerceClient,
     Product,
@@ -436,7 +436,6 @@ class ClientProductViewSet(viewsets.ReadOnlyModelViewSet):
     ).prefetch_related(
         'images',
         'attribute_values__attribute',
-        'variants__attribute_values__attribute'
     )
     authentication_classes = []
     permission_classes = [AllowAny]
@@ -453,9 +452,34 @@ class ClientProductViewSet(viewsets.ReadOnlyModelViewSet):
         Also supports price range: ?min_price=10&max_price=100
         And on_sale filter: ?on_sale=true
         """
-        from django.db.models import Q, F
+        from django.db.models import Q, F, Avg, Count, FloatField, IntegerField, OuterRef, Subquery
+        from django.db.models.functions import Coalesce
 
         queryset = super().get_queryset()
+
+        # Rating aggregates as correlated subqueries (read by the serializers'
+        # ``_avg_rating`` / ``_review_count`` fast path). Subqueries rather
+        # than a JOIN + GROUP BY so the attribute filters below, which join
+        # attribute_values, can't multiply the review rows.
+        approved_reviews = ProductReview.objects.filter(
+            product=OuterRef('pk'), is_approved=True,
+        ).order_by().values('product')
+        queryset = queryset.annotate(
+            _avg_rating=Subquery(
+                approved_reviews.annotate(avg=Avg('rating')).values('avg'),
+                output_field=FloatField(),
+            ),
+            _review_count=Coalesce(
+                Subquery(
+                    approved_reviews.annotate(cnt=Count('pk')).values('cnt'),
+                    output_field=IntegerField(),
+                ),
+                0,
+            ),
+        )
+        # Only the detail serializer renders variants.
+        if self.action != 'list':
+            queryset = queryset.prefetch_related('variants__attribute_values__attribute')
 
         # Price range filtering
         min_price = self.request.query_params.get('min_price')
@@ -645,7 +669,7 @@ class ClientProductViewSet(viewsets.ReadOnlyModelViewSet):
             # Dynamic attribute parameters are added via ClientProductAutoSchema
         ]
     )
-    @method_decorator(cache_page(60 * 5))  # Cache for 5 minutes
+    @cache_public_response
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
 
@@ -654,7 +678,7 @@ class ClientProductViewSet(viewsets.ReadOnlyModelViewSet):
         summary='Get product details',
         description='View detailed product information'
     )
-    @method_decorator(cache_page(60 * 5))  # Cache for 5 minutes
+    @cache_public_response
     def retrieve(self, request, *args, **kwargs):
         return super().retrieve(request, *args, **kwargs)
 
@@ -1576,6 +1600,7 @@ def get_homepage_config(request):
 @api_view(['GET'])
 @permission_classes([AllowAny])
 @authentication_classes([])
+@cache_public_response
 def get_store_theme(request):
     """
     Get the theme configuration for the storefront.
@@ -1765,6 +1790,7 @@ class ClientShippingMethodViewSet(viewsets.ReadOnlyModelViewSet):
         summary='List available shipping methods',
         description='Get all active shipping methods for checkout'
     )
+    @cache_public_response
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
 
@@ -1772,6 +1798,7 @@ class ClientShippingMethodViewSet(viewsets.ReadOnlyModelViewSet):
         tags=['Ecommerce Client - Shipping'],
         summary='Get shipping method details'
     )
+    @cache_public_response
     def retrieve(self, request, *args, **kwargs):
         return super().retrieve(request, *args, **kwargs)
 
@@ -1888,6 +1915,7 @@ class ClientProductReviewViewSet(viewsets.ModelViewSet):
         summary='List product reviews',
         description='Get all approved reviews for a product'
     )
+    @cache_public_response
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
 
