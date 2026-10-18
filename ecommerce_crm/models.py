@@ -1033,6 +1033,10 @@ class Order(models.Model):
                         Product.objects.filter(pk=product.pk).update(
                             quantity=F('quantity') + item.quantity
                         )
+                # QuerySet.update() skips post_save; refresh the storefront
+                # cache so the restocked quantity shows up.
+                from .caching import schedule_version_bump
+                schedule_version_bump()
                 # Free the promo usage this order had consumed.
                 if order.promo_code_id:
                     PromoCode.objects.filter(

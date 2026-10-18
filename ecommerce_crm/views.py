@@ -507,6 +507,9 @@ class ProductViewSet(NoCacheMixin, viewsets.ModelViewSet):
             return Response({'error': 'product_ids and status are required'}, status=status.HTTP_400_BAD_REQUEST)
 
         updated = Product.objects.filter(id__in=product_ids).update(status=status_value)
+        # QuerySet.update() skips post_save; invalidate the storefront cache.
+        from .caching import schedule_version_bump
+        schedule_version_bump()
         return Response({'updated': updated})
 
 

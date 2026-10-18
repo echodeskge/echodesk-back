@@ -607,6 +607,10 @@ CACHES = {
         'LOCATION': cache_redis_url,
         'OPTIONS': {
             'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            # Fail fast if Redis hangs: cache errors are swallowed, but an
+            # unbounded wait would stall requests (incl. checkout saves).
+            'SOCKET_CONNECT_TIMEOUT': 1,
+            'SOCKET_TIMEOUT': 2,
         },
         'KEY_PREFIX': 'ecommerce',
         'TIMEOUT': 300,  # 5 minutes default
