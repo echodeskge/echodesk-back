@@ -748,6 +748,9 @@ class ProductViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMix
         from django.utils import timezone
         updates['updated_at'] = timezone.now()
         updated = Product.objects.filter(id__in=product_ids).update(**updates)
+        # QuerySet.update() skips post_save; invalidate the storefront cache.
+        from .caching import schedule_version_bump
+        schedule_version_bump()
         return Response({'updated': updated})
 
     @extend_schema(
@@ -787,6 +790,8 @@ class ProductViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMix
         Product.objects.filter(pk=product.pk).update(
             quantity=F('quantity') + delta, updated_by=request.user,
         )
+        from .caching import schedule_version_bump
+        schedule_version_bump()  # update() skips post_save
         product.refresh_from_db(fields=['quantity', 'low_stock_threshold', 'track_inventory'])
         _log_stock_adjustment('product', product.pk, delta, product.quantity, reason, request.user)
         return Response({
@@ -868,6 +873,8 @@ class ProductVariantViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDes
         if error:
             return error
         ProductVariant.objects.filter(pk=variant.pk).update(quantity=F('quantity') + delta)
+        from .caching import schedule_version_bump
+        schedule_version_bump()  # update() skips post_save
         variant.refresh_from_db(fields=['quantity'])
         _log_stock_adjustment('variant', variant.pk, delta, variant.quantity, reason, request.user)
         return Response({
@@ -1963,6 +1970,9 @@ def _refund_order(order):
             PromoCode.objects.filter(
                 pk=locked.promo_code_id, times_used__gt=0
             ).update(times_used=F('times_used') - 1)
+        # Restock went through update(), which skips post_save.
+        from .caching import schedule_version_bump
+        schedule_version_bump()
         locked.status = 'refunded'
         locked.payment_status = 'refunded'
         locked.save(update_fields=['status', 'payment_status', 'updated_at'])

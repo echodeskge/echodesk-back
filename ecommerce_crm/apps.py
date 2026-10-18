@@ -8,3 +8,4 @@ class EcommerceCrmConfig(AppConfig):
     def ready(self):
         """Import schema extensions after app registry is ready"""
         from . import schema  # noqa
+        from . import signals  # noqa: F401 - storefront cache invalidation
