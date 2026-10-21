@@ -939,7 +939,7 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return only orders belonging to the authenticated client"""
-        return Order.objects.filter(client=self.request.user).select_related('client', 'delivery_address').prefetch_related('items', 'items__product', 'items__variant')
+        return Order.objects.filter(client=self.request.user).select_related('client', 'delivery_address').prefetch_related('items', 'items__product', 'items__variant__attribute_values__attribute')
 
     def get_serializer_class(self):
         if self.action == 'create':

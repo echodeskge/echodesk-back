@@ -822,15 +822,58 @@ class CartItemCreateSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'price_at_add']
 
 
+def _option_label(attribute, value):
+    """Map a stored option value (e.g. 'brown') to its multilingual label."""
+    for option in attribute.options or []:
+        if isinstance(option, dict) and option.get('value') == value:
+            return option.get('label') or value
+    return value
+
+
+class OrderItemVariantDetailsSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    sku = serializers.CharField()
+    name = serializers.JSONField(help_text='Multilingual variant name, e.g. {"en": "Brown", "ka": "ყავისფერი"}')
+    image = serializers.CharField(allow_null=True)
+    attributes = serializers.ListField(
+        child=serializers.DictField(),
+        help_text='[{"key", "name": {en, ka}, "value": label (multilingual dict or plain value)}]',
+    )
+
+
 class OrderItemSerializer(serializers.ModelSerializer):
     """Serializer for order items"""
     subtotal = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     product_image = serializers.CharField(source='product.image', read_only=True, allow_null=True)
+    variant_details = serializers.SerializerMethodField()
 
     class Meta:
         model = OrderItem
-        fields = ['id', 'order', 'product', 'variant', 'product_name', 'product_image', 'quantity', 'price', 'subtotal', 'created_at']
+        fields = ['id', 'order', 'product', 'variant', 'variant_details', 'product_name', 'product_image', 'quantity', 'price', 'subtotal', 'created_at']
         read_only_fields = ['id', 'created_at']
+
+    @extend_schema_field(OrderItemVariantDetailsSerializer(allow_null=True))
+    def get_variant_details(self, obj):
+        """Readable variant info so orders show "Brown · Colour: Brown" instead of an id."""
+        variant = obj.variant
+        if variant is None:
+            return None
+        attributes = []
+        for av in variant.attribute_values.all():
+            attribute = av.attribute
+            value = av.value_json
+            if isinstance(value, list):
+                value = [_option_label(attribute, v) for v in value]
+            else:
+                value = _option_label(attribute, value)
+            attributes.append({'key': attribute.key, 'name': attribute.name, 'value': value})
+        return {
+            'id': variant.id,
+            'sku': variant.sku,
+            'name': variant.name,
+            'image': variant.image or None,
+            'attributes': attributes,
+        }
 
 
 class OrderListSerializer(serializers.ModelSerializer):

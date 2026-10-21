@@ -2191,7 +2191,7 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
         else:
             queryset = queryset.prefetch_related(
                 'items__product',
-                'items__variant'
+                'items__variant__attribute_values__attribute',
             )
         return queryset
 
