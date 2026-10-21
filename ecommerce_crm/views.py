@@ -509,7 +509,16 @@ class ProductViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMix
 
     @_destroy_schema('Ecommerce Admin - Products', 'Delete product (managers only; 409 when it has orders)')
     def destroy(self, request, *args, **kwargs):
-        return super().destroy(request, *args, **kwargs)
+        from django.db.models import ProtectedError
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            # Orders keep PROTECT foreign keys to their products.
+            return Response(
+                {'error': 'This product is used by existing orders and cannot be deleted. '
+                          'Archive it instead.'},
+                status=status.HTTP_409_CONFLICT,
+            )
 
     def _paginated_list(self, products):
         page = self.paginate_queryset(products)

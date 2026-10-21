@@ -25,6 +25,24 @@ from .models import (
 from tickets.models import ItemList, ListItem
 
 
+
+def _set_attribute_value(attr_value, attr_data):
+    """Copy the one value_* key from the request onto attr_value.
+
+    The admin form sends empty strings for untouched number/date inputs;
+    those are "no value" (skip the row) rather than a 500 from the model's
+    DecimalField/DateField validation. Returns False when there is nothing
+    to store.
+    """
+    for key in ('value_text', 'value_number', 'value_boolean', 'value_date', 'value_json'):
+        if key in attr_data:
+            value = attr_data[key]
+            if key in ('value_number', 'value_date') and (value is None or str(value).strip() == ''):
+                return False
+            setattr(attr_value, key, value)
+            return True
+    return False
+
 class LanguageSerializer(serializers.ModelSerializer):
     """Serializer for languages"""
     class Meta:
@@ -498,17 +516,8 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
                     attribute_id=attribute_id
                 )
                 # Set appropriate value field based on attribute type
-                if 'value_text' in attr_data:
-                    attr_value.value_text = attr_data['value_text']
-                elif 'value_number' in attr_data:
-                    attr_value.value_number = attr_data['value_number']
-                elif 'value_boolean' in attr_data:
-                    attr_value.value_boolean = attr_data['value_boolean']
-                elif 'value_date' in attr_data:
-                    attr_value.value_date = attr_data['value_date']
-                elif 'value_json' in attr_data:
-                    attr_value.value_json = attr_data['value_json']
-                attr_value.save()
+                if _set_attribute_value(attr_value, attr_data):
+                    attr_value.save()
 
         # Create additional images
         for img_data in images_data:
@@ -562,17 +571,8 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
                         product=product,
                         attribute_id=attribute_id
                     )
-                    if 'value_text' in attr_data:
-                        attr_value.value_text = attr_data['value_text']
-                    elif 'value_number' in attr_data:
-                        attr_value.value_number = attr_data['value_number']
-                    elif 'value_boolean' in attr_data:
-                        attr_value.value_boolean = attr_data['value_boolean']
-                    elif 'value_date' in attr_data:
-                        attr_value.value_date = attr_data['value_date']
-                    elif 'value_json' in attr_data:
-                        attr_value.value_json = attr_data['value_json']
-                    attr_value.save()
+                    if _set_attribute_value(attr_value, attr_data):
+                        attr_value.save()
 
         # Update images if provided
         if images_data is not None:
