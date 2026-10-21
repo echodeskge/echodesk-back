@@ -500,3 +500,44 @@ class TestDataDeletionAndDeauthorize(SocialIntegrationTestCase):
         self.assertEqual(resp.status_code, 400)
         self.mine.refresh_from_db()
         self.assertTrue(self.mine.is_active)
+
+
+class TestDisconnectDeletesTokens(SocialIntegrationTestCase):
+    """The privacy policy promises tokens are deleted on disconnect."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='tok-wipe-admin@test.com')
+
+    def test_facebook_disconnect_all_wipes_page_tokens_keeps_messages(self):
+        conn = self.create_fb_connection(page_id='wipe_all_page', page_access_token='secret-page-token')
+        self.create_fb_message(page_connection=conn)
+        resp = self.api_post('/api/social/facebook/disconnect/', {}, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        conn.refresh_from_db()
+        self.assertFalse(conn.is_active)
+        self.assertEqual(conn.page_access_token, '')
+        self.assertEqual(conn.deactivation_reason, 'manual')
+        self.assertEqual(FacebookMessage.objects.filter(page_connection=conn).count(), 1)
+
+    def test_facebook_page_disconnect_wipes_that_page_token_only(self):
+        target = self.create_fb_connection(page_id='wipe_one_page', page_access_token='tok-a')
+        other = self.create_fb_connection(page_id='keep_page', page_access_token='tok-b')
+        resp = self.api_post(f'/api/social/facebook/pages/{target.page_id}/disconnect/', {}, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        target.refresh_from_db()
+        other.refresh_from_db()
+        self.assertFalse(target.is_active)
+        self.assertEqual(target.page_access_token, '')
+        self.assertTrue(other.is_active)
+        self.assertEqual(other.page_access_token, 'tok-b')
+
+    def test_instagram_disconnect_wipes_tokens_keeps_messages(self):
+        conn = self.create_ig_connection(username='wipe_ig', access_token='secret-ig-token')
+        self.create_ig_message(account_connection=conn)
+        resp = self.api_post('/api/social/instagram/disconnect/', {}, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        conn.refresh_from_db()
+        self.assertFalse(conn.is_active)
+        self.assertEqual(conn.access_token, '')
+        self.assertEqual(InstagramMessage.objects.filter(account_connection=conn).count(), 1)

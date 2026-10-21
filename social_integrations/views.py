@@ -1324,6 +1324,7 @@ def facebook_oauth_callback(request):
                 ).exclude(page_id__in=returned_page_ids)
                 stale_count = stale_pages.update(
                     is_active=False,
+                    page_access_token='',  # access revoked: don't keep the token
                     deactivated_at=timezone.now(),
                     deactivation_reason='permission_revoked',
                 )
@@ -1426,10 +1427,13 @@ def facebook_disconnect(request):
                 'message': 'No Facebook pages found to disconnect'
             })
 
-        # SOFT DELETE: Deactivate pages, keep data for audit trail
+        # SOFT DELETE: Deactivate pages, keep messages for audit trail, but
+        # delete the stored Page access tokens (the privacy policy promises
+        # tokens are deleted on disconnect; reconnecting stores a fresh one).
         now = timezone.now()
         deactivated_count = pages_to_disconnect.update(
             is_active=False,
+            page_access_token='',
             deactivated_at=now,
             deactivation_reason='manual',
             updated_at=now
@@ -1487,6 +1491,7 @@ def facebook_page_disconnect(request, page_id):
         # SOFT DELETE: Deactivate page, keep data
         now = timezone.now()
         page.is_active = False
+        page.page_access_token = ''  # delete the stored token on disconnect
         page.deactivated_at = now
         page.deactivation_reason = 'manual'
         page.updated_at = now
@@ -3386,8 +3391,9 @@ def instagram_disconnect(request):
                 'message': 'No Instagram accounts found to disconnect'
             })
 
-        # Single UPDATE — fast, no cascade traversal, no message loss.
-        deactivated_count = accounts.update(is_active=False)
+        # Single UPDATE — fast, no cascade traversal, no message loss. The
+        # stored access tokens are deleted (privacy policy promise).
+        deactivated_count = accounts.update(is_active=False, access_token='')
 
         logger.info(
             "✅ Instagram soft disconnect completed: %d account(s) deactivated, messages preserved",
