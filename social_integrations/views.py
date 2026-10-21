@@ -306,24 +306,114 @@ HUMAN_AGENT_WINDOW = timedelta(days=7)
 HUMAN_AGENT_TAG_SCHEMAS = {'groot'}
 
 
+def human_agent_tag_allowed():
+    """True when the current tenant schema may send HUMAN_AGENT-tagged replies."""
+    if HUMAN_AGENT_TAG_SCHEMAS is None:
+        return True
+    from django.db import connection as db_connection
+    return getattr(db_connection, 'schema_name', None) in HUMAN_AGENT_TAG_SCHEMAS
+
+
 def choose_messaging_params(last_incoming_timestamp):
     """
-    Pick Send API params for an agent reply.
+    Pick Send API params for a HUMAN agent reply, or None when Meta would
+    refuse the reply (so the caller must not call the Send API at all).
 
-    Within 24 hours of the customer's last message a plain RESPONSE is
-    allowed. Beyond that, Meta requires a message tag — we use HUMAN_AGENT
-    (Human Agent feature), which permits agent replies for up to 7 days.
-    Past 7 days the tag is still sent and Meta's own error is surfaced to
-    the agent. Gated per tenant schema until Advanced access is approved
-    (see HUMAN_AGENT_TAG_SCHEMAS).
+    * Within 24 hours of the customer's last message: plain RESPONSE.
+    * 24 h – 7 days: MESSAGE_TAG + HUMAN_AGENT (Human Agent feature), but only
+      for tenants in HUMAN_AGENT_TAG_SCHEMAS; elsewhere -> None (closed).
+    * Older than 7 days: None (closed) for everyone.
+
+    Never use this for automated sends (auto-replies, AI companion, rating
+    requests) — the HUMAN_AGENT tag is reserved for replies typed by a human.
     """
-    if HUMAN_AGENT_TAG_SCHEMAS is not None:
-        from django.db import connection as db_connection
-        if getattr(db_connection, 'schema_name', None) not in HUMAN_AGENT_TAG_SCHEMAS:
-            return {'messaging_type': 'RESPONSE'}
-    if last_incoming_timestamp and timezone.now() - last_incoming_timestamp > STANDARD_MESSAGING_WINDOW:
-        return {'messaging_type': 'MESSAGE_TAG', 'tag': 'HUMAN_AGENT'}
-    return {'messaging_type': 'RESPONSE'}
+    if not last_incoming_timestamp:
+        return {'messaging_type': 'RESPONSE'}
+    age = timezone.now() - last_incoming_timestamp
+    if age <= STANDARD_MESSAGING_WINDOW:
+        return {'messaging_type': 'RESPONSE'}
+    if age > HUMAN_AGENT_WINDOW or not human_agent_tag_allowed():
+        return None
+    return {'messaging_type': 'MESSAGE_TAG', 'tag': 'HUMAN_AGENT'}
+
+
+OUTSIDE_MESSAGING_WINDOW_CODE = 'outside_messaging_window'
+
+OUTSIDE_7_DAY_WINDOW_ERROR = (
+    "This conversation can no longer be replied to: Meta only allows a human "
+    "agent to reply within 7 days of the customer's last message. The customer "
+    "needs to message the page again before you can reply."
+)
+OUTSIDE_24H_WINDOW_ERROR = (
+    "This conversation can no longer be replied to: Meta only allows replies "
+    "within 24 hours of the customer's last message. The customer needs to "
+    "message the page again before you can reply."
+)
+META_REFUSED_WINDOW_ERROR = (
+    "Meta did not allow this reply because the conversation is outside the "
+    "allowed messaging window. The customer needs to message the page again "
+    "before you can reply."
+)
+
+
+def outside_window_response(last_incoming_timestamp):
+    """Structured 400 returned instead of calling Meta when the window is closed."""
+    hours_passed = None
+    if last_incoming_timestamp:
+        hours_passed = round((timezone.now() - last_incoming_timestamp).total_seconds() / 3600, 1)
+    # Tenants that may use the HUMAN_AGENT tag only get here past 7 days;
+    # everyone else is limited to the standard 24h window.
+    return Response({
+        'code': OUTSIDE_MESSAGING_WINDOW_CODE,
+        'error': OUTSIDE_7_DAY_WINDOW_ERROR if human_agent_tag_allowed() else OUTSIDE_24H_WINDOW_ERROR,
+        'window': 'closed',
+        'last_user_message_at': last_incoming_timestamp.isoformat() if last_incoming_timestamp else None,
+        'hours_passed': hours_passed,
+    }, status=status.HTTP_400_BAD_REQUEST)
+
+
+# Meta Send API errors that mean "outside the allowed messaging window" /
+# "this message is not allowed now". Code 10 = permission (subcode 2018278:
+# sent outside the allowed window); 551 = person unavailable.
+META_OUTSIDE_WINDOW_CODES = {10, 551}
+META_OUTSIDE_WINDOW_SUBCODES = {2018278, 2018108, 2018109, 551}
+
+
+def _safe_response_json(response):
+    try:
+        return response.json() if response.content else {}
+    except ValueError:
+        return {}
+
+
+def meta_error_details(error_data):
+    """Normalised {code, error_subcode, message} from a Graph API error body."""
+    err = (error_data or {}).get('error') or {}
+    if not isinstance(err, dict):
+        err = {}
+    return {
+        'code': err.get('code'),
+        'error_subcode': err.get('error_subcode'),
+        'message': err.get('message') or 'Unknown error',
+    }
+
+
+def is_meta_outside_window_error(error_data):
+    details = meta_error_details(error_data)
+    return (
+        details['code'] in META_OUTSIDE_WINDOW_CODES
+        or details['error_subcode'] in META_OUTSIDE_WINDOW_SUBCODES
+    )
+
+
+def meta_outside_window_payload(error_data, **extra):
+    return {
+        'code': OUTSIDE_MESSAGING_WINDOW_CODE,
+        'error': META_REFUSED_WINDOW_ERROR,
+        'window': 'closed',
+        'meta_error': meta_error_details(error_data),
+        **extra,
+    }
 
 
 # ============================================================================
@@ -1563,6 +1653,8 @@ def check_messaging_window(request):
             'human_agent_window_open': False,
             'human_agent_hours_remaining': None,
             'can_reply': False,
+            'reply_mode': 'closed',
+            'human_agent_tag_enabled': human_agent_tag_allowed() and platform in ('facebook', 'instagram'),
             'message': 'No messages from user found'
         })
 
@@ -1579,11 +1671,7 @@ def check_messaging_window(request):
     human_agent_hours = HUMAN_AGENT_WINDOW.total_seconds() / 3600
     # The HUMAN_AGENT tag (replies for 7 days) is only sent for allowlisted
     # tenants; elsewhere a reply after 24h fails, so don't report it open.
-    from django.db import connection as db_connection
-    human_agent_allowed = (
-        HUMAN_AGENT_TAG_SCHEMAS is None
-        or getattr(db_connection, 'schema_name', None) in HUMAN_AGENT_TAG_SCHEMAS
-    )
+    human_agent_allowed = human_agent_tag_allowed()
     human_agent_window_open = (
         human_agent_allowed
         and platform in ('facebook', 'instagram') and hours_passed <= human_agent_hours
@@ -1598,6 +1686,10 @@ def check_messaging_window(request):
         'human_agent_window_open': human_agent_window_open,
         'human_agent_hours_remaining': human_agent_hours_remaining,
         'can_reply': window_open or human_agent_window_open,
+        # How the next human reply would be sent: 'response' (24h window),
+        # 'human_agent' (MESSAGE_TAG + HUMAN_AGENT, 24h-7d) or 'closed'.
+        'reply_mode': 'response' if window_open else ('human_agent' if human_agent_window_open else 'closed'),
+        'human_agent_tag_enabled': human_agent_allowed and platform in ('facebook', 'instagram'),
         'last_user_message_at': last_user_message.timestamp.isoformat(),
         'hours_passed': round(hours_passed, 1)
     })
@@ -1661,9 +1753,14 @@ def facebook_send_message(request):
                 'error_code': 'no_conversation',
                 'details': 'Facebook requires the user to initiate the conversation before you can send messages.'
             }, status=status.HTTP_400_BAD_REQUEST)
-        # Inside the 24h window we send a plain RESPONSE; beyond it we use
-        # the HUMAN_AGENT tag (7-day window for human agent replies).
+        # Inside the 24h window we send a plain RESPONSE; 24h-7d we use the
+        # HUMAN_AGENT tag (allowlisted tenants only). Past that Meta would
+        # refuse the reply, so don't call it at all.
         messaging_params = choose_messaging_params(last_user_message.timestamp)
+        if messaging_params is None:
+            return outside_window_response(last_user_message.timestamp)
+        sent_messaging_type = messaging_params['messaging_type']
+        sent_message_tag = messaging_params.get('tag', '')
 
         send_url = f"https://graph.facebook.com/v23.0/me/messages"
         params = {'access_token': page_connection.page_access_token}
@@ -1678,6 +1775,9 @@ def facebook_send_message(request):
         # with just the text — the duplicate the user is seeing in the UI.
         text_message_id: str | None = None
         text_sent_separately = False
+        # Set when the text half of a text+media submit was rejected by Meta
+        # (the media is still attempted and the failure reported back).
+        text_part_error = None
 
         if media_file:
             # Upload media as attachment via Facebook Send API
@@ -1713,12 +1813,23 @@ def facebook_send_message(request):
                     headers={'Content-Type': 'application/json'},
                     params=params, timeout=30,
                 )
-                text_sent_separately = True
                 if text_response.status_code == 200:
-                    try:
-                        text_message_id = text_response.json().get('message_id')
-                    except ValueError:
-                        text_message_id = None
+                    # Only a delivered text half gets its own local row.
+                    text_sent_separately = True
+                    text_message_id = _safe_response_json(text_response).get('message_id')
+                else:
+                    text_error_data = _safe_response_json(text_response)
+                    if is_meta_outside_window_error(text_error_data):
+                        # The attachment would be refused for the same reason.
+                        return Response(
+                            meta_outside_window_payload(text_error_data, facebook_error=text_error_data),
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    text_part_error = meta_error_details(text_error_data)
+                    logger.error(
+                        'Failed to send text part of FB text+media reply: %s - %s',
+                        text_response.status_code, text_part_error.get('message'),
+                    )
 
             # Send media attachment using form data upload
             response = requests.post(
@@ -1810,6 +1921,8 @@ def facebook_send_message(request):
                         source='echodesk',
                         is_echo=False,
                         sent_by=request.user,
+                        messaging_type=sent_messaging_type,
+                        message_tag=sent_message_tag,
                     )
                     try:
                         sent_rows.append(FacebookMessage.objects.create(**text_row_kwargs))
@@ -1831,7 +1944,7 @@ def facebook_send_message(request):
                     message_id=message_id or f"sent_{timestamp.timestamp()}",
                     sender_id=recipient_id,
                     sender_name=page_connection.page_name,
-                    message_text='' if text_sent_separately else message_text,
+                    message_text='' if (text_sent_separately or text_part_error) else message_text,
                     timestamp=timestamp,
                     is_from_page=True,
                     reply_to_message_id=reply_to_message_id if reply_to_message_id else None,
@@ -1839,6 +1952,8 @@ def facebook_send_message(request):
                     source='echodesk',
                     is_echo=False,
                     sent_by=request.user,
+                    messaging_type=sent_messaging_type,
+                    message_tag=sent_message_tag,
                 )
                 if attachments_meta:
                     primary_kwargs['attachments'] = attachments_meta
@@ -1853,6 +1968,12 @@ def facebook_send_message(request):
                     ).first()
                     if existing:
                         fb_message = existing
+                        # The echo webhook may have created the row first;
+                        # record how we sent it.
+                        if not existing.messaging_type:
+                            existing.messaging_type = sent_messaging_type
+                            existing.message_tag = sent_message_tag
+                            existing.save(update_fields=['messaging_type', 'message_tag'])
                         sent_rows.append(existing)
                     else:
                         raise
@@ -1900,13 +2021,26 @@ def facebook_send_message(request):
             except Exception as e:
                 logger.warning(f"Failed to save/broadcast sent message: {e}")
 
-            return Response({
+            response_body = {
                 'status': 'sent',
                 'message_id': message_id,
-                'recipient_id': recipient_id
-            })
+                'recipient_id': recipient_id,
+                'messaging_type': sent_messaging_type,
+                'message_tag': sent_message_tag,
+            }
+            if text_part_error:
+                response_body['text_part_failed'] = True
+                response_body['text_error'] = text_part_error
+            return Response(response_body)
         else:
-            error_data = response.json() if response.content else {}
+            error_data = _safe_response_json(response)
+            if is_meta_outside_window_error(error_data):
+                return Response(
+                    meta_outside_window_payload(
+                        error_data, facebook_error=error_data, text_part_sent=text_sent_separately,
+                    ),
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             error_info = error_data.get('error', {})
             error_message = error_info.get('message', 'Unknown error')
             error_code = error_info.get('code')
@@ -1919,7 +2053,9 @@ def facebook_send_message(request):
 
             return Response({
                 'error': f'Failed to send message: {error_message}',
-                'facebook_error': error_data
+                'facebook_error': error_data,
+                'meta_error': meta_error_details(error_data),
+                'text_part_sent': text_sent_separately,
             }, status=status.HTTP_400_BAD_REQUEST)
 
     except Exception as e:
@@ -1952,13 +2088,14 @@ def facebook_webhook(request):
             }, status=403)
     
     elif request.method == 'POST':
+        if not verify_meta_webhook_signature(request):
+            logger.warning("Facebook webhook rejected: invalid X-Hub-Signature-256")
+            return JsonResponse({'error': 'invalid signature'}, status=403)
         # Handle webhook events
         try:
             import json
-            import logging
             from datetime import datetime
             from tenant_schemas.utils import schema_context
-            logger = logging.getLogger(__name__)
             
             # Parse webhook data
             data = json.loads(request.body)
@@ -3342,9 +3479,15 @@ def instagram_send_message(request):
                 'error': 'Cannot send message: No conversation found with this user. The user must message you first on Instagram.',
                 'details': 'Instagram requires the user to initiate the conversation before you can send messages.'
             }, status=status.HTTP_400_BAD_REQUEST)
-        # Inside the 24h window we send a plain RESPONSE; beyond it we use
-        # the HUMAN_AGENT tag (7-day window for human agent replies).
-        messaging_params = choose_messaging_params(recent_messages.first().timestamp)
+        # Inside the 24h window we send a plain RESPONSE; 24h-7d we use the
+        # HUMAN_AGENT tag (allowlisted tenants only). Past that Meta would
+        # refuse the reply, so don't call it at all.
+        last_incoming_at = recent_messages.first().timestamp
+        messaging_params = choose_messaging_params(last_incoming_at)
+        if messaging_params is None:
+            return outside_window_response(last_incoming_at)
+        sent_messaging_type = messaging_params['messaging_type']
+        sent_message_tag = messaging_params.get('tag', '')
 
         # Instagram messaging through Messenger Platform API
         # Use Page ID in URL and specify platform=instagram in params
@@ -3360,6 +3503,8 @@ def instagram_send_message(request):
         }
 
         attachments_meta = []
+        text_sent_separately = False
+        text_part_error = None
 
         logger.info(f"Sending Instagram message to {recipient_id} via @{account_connection.username}")
 
@@ -3390,7 +3535,16 @@ def instagram_send_message(request):
                 text_resp = requests.post(send_url, json=text_payload,
                               headers={'Content-Type': 'application/json'}, params=params, timeout=30)
                 # Don't silently drop the text half of a text+media reply.
-                if text_resp.status_code >= 400:
+                if text_resp.status_code == 200:
+                    text_sent_separately = True
+                else:
+                    text_error_data = _safe_response_json(text_resp)
+                    if is_meta_outside_window_error(text_error_data):
+                        return Response(
+                            meta_outside_window_payload(text_error_data, instagram_error=text_error_data),
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    text_part_error = meta_error_details(text_error_data)
                     logger.error(
                         'Failed to send text part of text+media reply: %s - %s',
                         text_resp.status_code, text_resp.text[:300]
@@ -3451,7 +3605,8 @@ def instagram_send_message(request):
                     message_id=message_id or f"sent_{timestamp.timestamp()}",
                     sender_id=recipient_id,  # Use recipient_id for conversation grouping (same as incoming messages)
                     sender_username=account_connection.username,
-                    message_text=message_text,
+                    # A rejected text half was never delivered — don't show it.
+                    message_text='' if text_part_error else message_text,
                     timestamp=timestamp,
                     is_from_business=True,
                     source='echodesk',
@@ -3459,6 +3614,8 @@ def instagram_send_message(request):
                     sent_by=request.user,
                     reply_to_message_id=reply_to_message_id or None,
                     reply_to=reply_to_obj,
+                    messaging_type=sent_messaging_type,
+                    message_tag=sent_message_tag,
                 )
                 if attachments_meta:
                     create_kwargs['attachments'] = attachments_meta
@@ -3507,7 +3664,7 @@ def instagram_send_message(request):
                     'sender_username': account_connection.username,
                     'recipient_id': recipient_id,  # The user we're messaging
                     'recipient_name': recipient_name,  # The user's name (for new conversations in frontend)
-                    'message_text': message_text,
+                    'message_text': ig_message.message_text,
                     'attachments': attachments_meta,
                     'timestamp': timestamp.isoformat(),
                     'is_from_business': True,
@@ -3520,18 +3677,33 @@ def instagram_send_message(request):
             except Exception as e:
                 print(f"⚠️ Failed to save/broadcast sent message to database: {e}")
 
-            return Response({
+            response_body = {
                 'status': 'sent',
                 'message_id': message_id,
-                'recipient_id': recipient_id
-            })
+                'recipient_id': recipient_id,
+                'messaging_type': sent_messaging_type,
+                'message_tag': sent_message_tag,
+            }
+            if text_part_error:
+                response_body['text_part_failed'] = True
+                response_body['text_error'] = text_part_error
+            return Response(response_body)
         else:
-            error_data = response.json() if response.content else {}
-            error_message = error_data.get('error', {}).get('message', 'Unknown error')
+            error_data = _safe_response_json(response)
+            if is_meta_outside_window_error(error_data):
+                return Response(
+                    meta_outside_window_payload(
+                        error_data, instagram_error=error_data, text_part_sent=text_sent_separately,
+                    ),
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            error_message = meta_error_details(error_data)['message']
 
             return Response({
                 'error': f'Failed to send message: {error_message}',
-                'instagram_error': error_data
+                'instagram_error': error_data,
+                'meta_error': meta_error_details(error_data),
+                'text_part_sent': text_sent_separately,
             }, status=status.HTTP_400_BAD_REQUEST)
 
     except Exception as e:
@@ -3572,6 +3744,9 @@ def instagram_webhook(request):
             }, status=403)
 
     elif request.method == 'POST':
+        if not verify_meta_webhook_signature(request):
+            logger.warning("Instagram webhook rejected: invalid X-Hub-Signature-256")
+            return JsonResponse({'error': 'invalid signature'}, status=403)
         # Handle webhook events
         try:
             import json
@@ -5002,8 +5177,17 @@ def get_assignment_status(request):
         })
 
 
+def _standard_window_open(last_incoming):
+    """True when the customer's last message is inside Meta's 24h window."""
+    return bool(last_incoming) and timezone.now() - last_incoming.timestamp <= STANDARD_MESSAGING_WINDOW
+
+
 def send_rating_request_facebook(conversation_id, page_id, message):
-    """Send a rating request via Facebook Messenger and store locally"""
+    """Send a rating request via Facebook Messenger and store locally.
+
+    Automated message: only sent inside the 24h window as RESPONSE — never
+    with the HUMAN_AGENT tag. Skipped (returns None) once the window closed.
+    """
     from .consumers import send_new_message_notification
     from django.db import connection
 
@@ -5015,10 +5199,20 @@ def send_rating_request_facebook(conversation_id, page_id, message):
         if not page:
             logger.warning(f"No FacebookPageConnection found for page_id={page_id}, skipping rating request")
             return None
+        last_incoming = FacebookMessage.objects.filter(
+            page_connection=page, sender_id=conversation_id, is_from_page=False,
+        ).order_by('-timestamp').first()
+        if not _standard_window_open(last_incoming):
+            logger.info(
+                "Skipping FB rating request for %s/%s: 24h messaging window closed",
+                page_id, conversation_id,
+            )
+            return None
         url = f"https://graph.facebook.com/v21.0/{page_id}/messages"
         payload = {
             "recipient": {"id": conversation_id},
-            "message": {"text": message}
+            "message": {"text": message},
+            "messaging_type": "RESPONSE",
         }
         headers = {"Authorization": f"Bearer {page.page_access_token}"}
         response = requests.post(url, json=payload, headers=headers, timeout=30)
@@ -5036,6 +5230,7 @@ def send_rating_request_facebook(conversation_id, page_id, message):
                     timestamp=timestamp,
                     is_from_page=True,
                     is_echo=False,
+                    messaging_type='RESPONSE',
                 )
                 # Broadcast via WebSocket
                 tenant_schema = connection.schema_name
@@ -5060,7 +5255,11 @@ def send_rating_request_facebook(conversation_id, page_id, message):
 
 
 def send_rating_request_instagram(conversation_id, account_id, message):
-    """Send a rating request via Instagram DM and store locally"""
+    """Send a rating request via Instagram DM and store locally.
+
+    Automated message: only sent inside the 24h window as RESPONSE — never
+    with the HUMAN_AGENT tag. Skipped (returns None) once the window closed.
+    """
     from .consumers import send_new_message_notification
     from django.db import connection
 
@@ -5068,6 +5267,15 @@ def send_rating_request_instagram(conversation_id, account_id, message):
         account = InstagramAccountConnection.objects.get(instagram_account_id=account_id, is_active=True)
         if not account.facebook_page:
             logger.error(f"Instagram account {account_id} is not linked to a Facebook Page")
+            return None
+        last_incoming = InstagramMessage.objects.filter(
+            account_connection=account, sender_id=conversation_id, is_from_business=False,
+        ).order_by('-timestamp').first()
+        if not _standard_window_open(last_incoming):
+            logger.info(
+                "Skipping IG rating request for %s/%s: 24h messaging window closed",
+                account_id, conversation_id,
+            )
             return None
         # Instagram messages must be sent through the Facebook Page's Messenger Platform API
         url = f"https://graph.facebook.com/v23.0/me/messages"
@@ -5094,7 +5302,8 @@ def send_rating_request_instagram(conversation_id, account_id, message):
                     sender_username=account.username or account.instagram_account_id,
                     message_text=message,
                     timestamp=timestamp,
-                    is_from_business=True
+                    is_from_business=True,
+                    messaging_type='RESPONSE',
                 )
                 # Broadcast via WebSocket
                 tenant_schema = connection.schema_name
@@ -8841,6 +9050,48 @@ def _valid_meta_signature(request):
         return False
     expected = hmac.new(secret.encode(), request.body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(header[len('sha256='):], expected)
+
+
+def meta_app_secrets():
+    """Configured Meta app secrets (Facebook app first, then a separate
+    Instagram app if one is configured). Empty strings are dropped."""
+    cfg = getattr(settings, 'SOCIAL_INTEGRATIONS', {}) or {}
+    secrets = []
+    for key in ('FACEBOOK_APP_SECRET', 'INSTAGRAM_APP_SECRET'):
+        value = cfg.get(key) or getattr(settings, key, '') or ''
+        if value and value not in secrets:
+            secrets.append(value)
+    return secrets
+
+
+def verify_meta_webhook_signature(request):
+    """Verify Meta's X-Hub-Signature-256 for Messenger / Instagram webhooks.
+
+    Meta signs the raw POST body with HMAC-SHA256 using the secret of the app
+    the webhook is subscribed under. Instagram messaging via Facebook Login is
+    delivered by the Facebook app (FACEBOOK_APP_SECRET); a separate Instagram
+    app secret (INSTAGRAM_APP_SECRET) is also accepted when configured.
+
+    When no secret is configured (local/dev) a warning is logged and the
+    request is accepted so development webhooks keep working.
+    """
+    import hashlib
+    import hmac
+
+    secrets = meta_app_secrets()
+    if not secrets:
+        logger.warning("No Meta app secret configured — accepting webhook without signature verification")
+        return True
+    header = request.headers.get('X-Hub-Signature-256') or ''
+    if not header.startswith('sha256='):
+        return False
+    received = header[len('sha256='):].strip().lower()
+    body = request.body
+    for secret in secrets:
+        expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(received, expected):
+            return True
+    return False
 
 
 TEMPLATE_STATUS_EVENTS = {

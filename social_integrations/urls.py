@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from . import views, admin_views, ai_views, telegram_views
+from . import views, admin_views, ai_views, telegram_views, legal_views
 
 # Create a router and register our viewsets with it
 router = DefaultRouter()
@@ -40,6 +40,11 @@ urlpatterns = [
     path('facebook/pages/<str:page_id>/disconnect/', views.facebook_page_disconnect, name='facebook_page_disconnect'),
     path('facebook/send-message/', views.facebook_send_message, name='facebook_send_message'),
     path('facebook/webhook/', views.facebook_webhook, name='facebook_webhook'),
+    # Meta compliance callbacks (Data Deletion Request + Deauthorize)
+    path('facebook/data-deletion/', legal_views.user_data_deletion, name='facebook_data_deletion'),
+    path('facebook/data-deletion/status/<str:confirmation_code>/', legal_views.data_deletion_status_by_code,
+         name='facebook_data_deletion_status'),
+    path('facebook/deauthorize/', legal_views.deauthorize_callback, name='facebook_deauthorize'),
 
     # Platform-wide endpoints
     path('clear-history/', views.clear_platform_history, name='clear_platform_history'),

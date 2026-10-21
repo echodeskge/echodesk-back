@@ -2,7 +2,8 @@
 Tests for Human Agent messaging support and OAuth sweep scoping.
 
 Covers:
-- choose_messaging_params: RESPONSE inside 24h, HUMAN_AGENT tag beyond
+- choose_messaging_params: RESPONSE inside 24h, HUMAN_AGENT tag 24h-7d,
+  None (closed) past 7 days or after 24h on non-allowlisted tenants
 - facebook_send_message actually sends the tag for >24h conversations
 - check_messaging_window exposes the 7-day human-agent window
 - the OAuth stale-page sweep only touches pages granted by the same FB user
@@ -41,6 +42,10 @@ class TestChooseMessagingParams(SocialIntegrationTestCase):
             {'messaging_type': 'MESSAGE_TAG', 'tag': 'HUMAN_AGENT'},
         )
 
+    def test_beyond_7_days_is_closed(self):
+        ts = timezone.now() - timedelta(days=7, minutes=1)
+        self.assertIsNone(choose_messaging_params(ts))
+
     def test_missing_timestamp_defaults_to_response(self):
         self.assertEqual(choose_messaging_params(None), {'messaging_type': 'RESPONSE'})
 
@@ -50,10 +55,16 @@ class TestHumanAgentTenantGate(SocialIntegrationTestCase):
     the HUMAN_AGENT tag — everyone else stays on RESPONSE even beyond 24h
     (a tagged send would be rejected outright at Standard access)."""
 
-    def test_non_allowlisted_schema_stays_on_response(self):
+    def test_non_allowlisted_schema_is_closed_after_24h(self):
         ts = timezone.now() - timedelta(hours=30)
         with patch.object(social_views, 'HUMAN_AGENT_TAG_SCHEMAS', {'groot'}):
-            # current schema is 'test', not in the allowlist
+            # current schema is 'test', not in the allowlist: a reply would be
+            # refused by Meta, so no params (the send view returns a 400).
+            self.assertIsNone(choose_messaging_params(ts))
+
+    def test_non_allowlisted_schema_within_24h_uses_response(self):
+        ts = timezone.now() - timedelta(hours=3)
+        with patch.object(social_views, 'HUMAN_AGENT_TAG_SCHEMAS', {'groot'}):
             self.assertEqual(choose_messaging_params(ts), {'messaging_type': 'RESPONSE'})
 
     def test_allowlisted_schema_gets_the_tag(self):

@@ -162,6 +162,11 @@ class FacebookMessage(models.Model):
         related_name='sent_facebook_messages',
         help_text='Staff member who sent this message via EchoDesk'
     )
+    # How an outgoing human reply was sent through Meta's Send API:
+    # messaging_type RESPONSE (inside 24h) or MESSAGE_TAG with
+    # message_tag HUMAN_AGENT (24h-7d). Null for inbound/legacy rows.
+    messaging_type = models.CharField(max_length=32, null=True, blank=True)
+    message_tag = models.CharField(max_length=32, null=True, blank=True)
 
     class Meta:
         ordering = ['-timestamp']
@@ -325,6 +330,11 @@ class InstagramMessage(models.Model):
         related_name='sent_instagram_messages',
         help_text='Staff member who sent this message via EchoDesk'
     )
+    # How an outgoing human reply was sent through Meta's Send API:
+    # messaging_type RESPONSE (inside 24h) or MESSAGE_TAG with
+    # message_tag HUMAN_AGENT (24h-7d). Null for inbound/legacy rows.
+    messaging_type = models.CharField(max_length=32, null=True, blank=True)
+    message_tag = models.CharField(max_length=32, null=True, blank=True)
 
     # Reply fields (for message replies) — Instagram sends reply_to.mid in the
     # webhook, same shape as Facebook.

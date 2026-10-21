@@ -5,63 +5,53 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Data Deletion Status - EchoDesk</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; line-height: 1.6; }
-        h1 { color: #333; }
-        .success { background-color: #d4edda; border: 1px solid #c3e6cb; padding: 15px; border-radius: 4px; margin-bottom: 20px; color: #155724; }
-        .confirmation-code { font-family: monospace; font-size: 18px; font-weight: bold; background-color: #f8f9fa; padding: 10px; border-radius: 4px; }
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; line-height: 1.6; color: #222; background: #fff; }
+        h1, h2 { color: #333; }
+        .box { padding: 15px; border-radius: 4px; margin-bottom: 20px; border: 1px solid; }
+        .completed { background-color: #d4edda; border-color: #c3e6cb; color: #155724; }
+        .pending { background-color: #fff3cd; border-color: #ffeeba; color: #856404; }
+        .failed, .unknown { background-color: #f8d7da; border-color: #f5c6cb; color: #721c24; }
+        .code { font-family: monospace; font-size: 18px; font-weight: bold; background-color: #f8f9fa; color: #222; padding: 10px; border-radius: 4px; display: inline-block; }
     </style>
 </head>
 <body>
     <h1>Data Deletion Status</h1>
-    
-    {% if confirmation_code %}
-        <div class="success">
-            <h2>✅ Data Deletion Request Received</h2>
-            <p>Your data deletion request has been successfully submitted and is being processed.</p>
-            
-            <p><strong>Confirmation Code:</strong></p>
-            <div class="confirmation_code">{{ confirmation_code }}</div>
-            
-            <p><strong>What happens next:</strong></p>
-            <ul>
-                <li>We will process your deletion request within 30 days</li>
-                <li>You will receive an email confirmation when the deletion is complete</li>
-                <li>All your personal data will be permanently removed from our systems</li>
-            </ul>
-            
-            <p><strong>Please save this confirmation code for your records.</strong></p>
+
+    {% if record %}
+        <div class="box {{ record.status }}">
+            {% if record.status == 'completed' %}
+                <h2>Deletion completed</h2>
+                <p>Your Facebook data deletion request was processed on {{ record.completed_at|date:"F j, Y H:i" }} UTC. The Facebook Page connections and access tokens linked to your Facebook account have been removed from EchoDesk.</p>
+            {% elif record.status == 'failed' %}
+                <h2>Deletion needs attention</h2>
+                <p>We received your request on {{ record.created_at|date:"F j, Y" }} but could not finish it automatically. Our team has been notified and will complete it within 30 days. You can also contact <a href="mailto:support@echodesk.ge">support@echodesk.ge</a> with your confirmation code.</p>
+            {% else %}
+                <h2>Deletion in progress</h2>
+                <p>We received your request on {{ record.created_at|date:"F j, Y" }} and are processing it. Requests are completed within 30 days.</p>
+            {% endif %}
+            <p><strong>Confirmation code:</strong></p>
+            <div class="code">{{ record.confirmation_code }}</div>
+        </div>
+    {% elif confirmation_code %}
+        <div class="box unknown">
+            <h2>Unknown confirmation code</h2>
+            <p>We could not find a deletion request with the code <span class="code">{{ confirmation_code }}</span>. Please check the code or contact <a href="mailto:support@echodesk.ge">support@echodesk.ge</a>.</p>
         </div>
     {% else %}
-        <div class="success">
-            <h2>✅ Data Deletion</h2>
-            <p>Your data deletion request is being processed. We will remove all your personal data within 30 days as required by privacy regulations.</p>
-            
-            <p>If you have any questions about the deletion process, please contact us at <a href="mailto:support@echodesk.ge">support@echodesk.ge</a></p>
+        <div class="box pending">
+            <h2>Check a deletion request</h2>
+            <p>Open the status link you received after requesting deletion through Facebook, or contact <a href="mailto:support@echodesk.ge">support@echodesk.ge</a>.</p>
         </div>
     {% endif %}
-    
-    <h2>What Data is Being Deleted</h2>
+
+    <h2>What is deleted</h2>
     <ul>
-        <li>Your user account and profile information</li>
-        <li>All Facebook page connections and tokens</li>
-        <li>All messages and conversation history</li>
-        <li>All tickets and customer service records</li>
-        <li>All settings and preferences</li>
-        <li>All usage analytics and logs containing your data</li>
+        <li>Facebook Page and Instagram account connections granted by your Facebook account</li>
+        <li>The access tokens Meta issued for those connections, and your app-scoped Facebook user ID</li>
     </ul>
-    
-    <h2>Data Retention</h2>
-    <p>Some data may be retained for legal or security purposes:</p>
-    <ul>
-        <li>Transaction records (for accounting purposes) - 7 years</li>
-        <li>Security logs (for fraud prevention) - 1 year</li>
-        <li>Aggregated, anonymized analytics data</li>
-    </ul>
-    
-    <p>This retained data cannot be used to identify you personally.</p>
-    
+    <p>If you messaged a business that uses EchoDesk and want those conversations removed, email <a href="mailto:support@echodesk.ge">support@echodesk.ge</a> with the Page or Instagram account you wrote to.</p>
+
     <h2>Contact Us</h2>
-    <p>If you have any questions about your data deletion request:</p>
     <ul>
         <li>Email: <a href="mailto:support@echodesk.ge">support@echodesk.ge</a></li>
         <li>Website: <a href="https://echodesk.ge">https://echodesk.ge</a></li>

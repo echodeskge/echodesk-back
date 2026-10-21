@@ -516,6 +516,10 @@ VERCEL_PROJECT_ID = config('VERCEL_PROJECT_ID', default='')
 FACEBOOK_APP_ID = config('FACEBOOK_APP_ID', default='')
 FACEBOOK_APP_SECRET = config('FACEBOOK_APP_SECRET', default='')
 FACEBOOK_APP_VERSION = config('FACEBOOK_APP_VERSION', default='v23.0')
+# Optional: secret of a separate Instagram app. Instagram messaging via
+# Facebook Login is signed with FACEBOOK_APP_SECRET; webhook + signed_request
+# verification accept either secret when both are set.
+INSTAGRAM_APP_SECRET = config('INSTAGRAM_APP_SECRET', default='')
 
 # OpenAI Configuration (for AI Auto-Posting)
 OPENAI_API_KEY = config('OPENAI_API_KEY', default='')
@@ -548,6 +552,7 @@ TIKTOK_SHOP_REDIRECT_URI = config('TIKTOK_SHOP_REDIRECT_URI', default='https://a
 SOCIAL_INTEGRATIONS = {
     'FACEBOOK_APP_ID': FACEBOOK_APP_ID,
     'FACEBOOK_APP_SECRET': FACEBOOK_APP_SECRET,
+    'INSTAGRAM_APP_SECRET': INSTAGRAM_APP_SECRET,
     'FACEBOOK_API_VERSION': FACEBOOK_APP_VERSION,
     'FACEBOOK_VERIFY_TOKEN': config('FACEBOOK_WEBHOOK_VERIFY_TOKEN', default=''),
     'FACEBOOK_SCOPES': [

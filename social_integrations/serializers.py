@@ -79,11 +79,14 @@ class FacebookMessageSerializer(serializers.ModelSerializer):
             'source', 'is_echo', 'sent_by', 'sent_by_name',
             # Recipient tracking for outgoing messages
             'recipient_name',
+            # How a human reply was sent (RESPONSE / MESSAGE_TAG + HUMAN_AGENT)
+            'messaging_type', 'message_tag',
         ]
         read_only_fields = ['id', 'is_delivered', 'delivered_at', 'is_read', 'read_at', 'created_at',
                            'reaction', 'reaction_emoji', 'reacted_by', 'reacted_at',
                            'reply_to_message_id', 'reply_to_id', 'reply_to_text', 'reply_to_sender_name',
-                           'source', 'is_echo', 'sent_by', 'sent_by_name', 'recipient_name']
+                           'source', 'is_echo', 'sent_by', 'sent_by_name', 'recipient_name',
+                           'messaging_type', 'message_tag']
 
     def get_sent_by_name(self, obj):
         if obj.sent_by:
@@ -184,10 +187,13 @@ class InstagramMessageSerializer(serializers.ModelSerializer):
             'source', 'is_echo', 'sent_by', 'sent_by_name',
             # Recipient tracking for outgoing messages
             'recipient_name',
+            # How a human reply was sent (RESPONSE / MESSAGE_TAG + HUMAN_AGENT)
+            'messaging_type', 'message_tag',
         ]
         read_only_fields = ['id', 'is_delivered', 'delivered_at', 'is_read', 'read_at', 'created_at',
                            'reply_to_message_id', 'reply_to_id', 'reply_to_text', 'reply_to_sender_name',
-                           'source', 'is_echo', 'sent_by', 'sent_by_name', 'recipient_name']
+                           'source', 'is_echo', 'sent_by', 'sent_by_name', 'recipient_name',
+                           'messaging_type', 'message_tag']
 
     def get_sent_by_name(self, obj):
         if obj.sent_by:

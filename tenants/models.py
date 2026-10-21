@@ -1302,3 +1302,39 @@ class SocialPlatformRoute(models.Model):
 
     def __str__(self):
         return f"{self.platform}:{self.external_id} → {self.tenant_schema}"
+
+
+class FacebookDataDeletionRequest(models.Model):
+    """Public-schema record of a Meta "Data Deletion Request Callback".
+
+    Created when Meta POSTs a verified ``signed_request`` to the data-deletion
+    callback. ``confirmation_code`` is returned to Meta together with the
+    status URL users can open to see the request's progress; ``details``
+    summarises what was found/removed per tenant schema.
+    """
+
+    STATUS_PENDING = 'pending'
+    STATUS_COMPLETED = 'completed'
+    STATUS_FAILED = 'failed'
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'Pending'),
+        (STATUS_COMPLETED, 'Completed'),
+        (STATUS_FAILED, 'Failed'),
+    ]
+
+    confirmation_code = models.CharField(max_length=64, unique=True)
+    user_id = models.CharField(
+        max_length=64, db_index=True,
+        help_text='App-scoped Facebook user id from the signed_request',
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    details = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'tenants_facebook_data_deletion_request'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.confirmation_code} ({self.status})"

@@ -18,121 +18,144 @@ def terms_of_service(request):
     return render(request, 'legal/terms_of_service.html')
 
 
+def _signed_request_from(request):
+    if (request.content_type or '').startswith('application/json'):
+        try:
+            data = json.loads(request.body or b'{}')
+        except ValueError:
+            data = {}
+    else:
+        data = request.POST.dict()
+    return (data or {}).get('signed_request')
+
+
+def _verified_user_id(request):
+    """Return (user_id, error_response) for a Meta signed_request POST."""
+    from .meta_compliance import (
+        SignedRequestError, SignedRequestUnverifiable, parse_signed_request,
+    )
+
+    signed_request = _signed_request_from(request)
+    if not signed_request:
+        return None, JsonResponse({'error': 'Missing signed_request parameter'}, status=400)
+    try:
+        payload = parse_signed_request(signed_request)
+    except SignedRequestUnverifiable:
+        logger.error('Meta signed_request received but no app secret is configured')
+        return None, JsonResponse({'error': 'signed_request verification is not configured'}, status=503)
+    except SignedRequestError as exc:
+        logger.warning('Rejected Meta signed_request: %s', exc)
+        return None, JsonResponse({'error': 'Invalid signed_request'}, status=400)
+    user_id = str(payload.get('user_id') or '').strip()
+    if not user_id:
+        return None, JsonResponse({'error': 'signed_request has no user_id'}, status=400)
+    return user_id, None
+
+
 @csrf_exempt
 @require_http_methods(["GET", "POST"])
 def user_data_deletion(request):
-    """Handle Facebook user data deletion requests"""
+    """Meta "Data Deletion Request Callback".
+
+    GET renders the human-readable deletion instructions page. POST is Meta's
+    callback: verify the signed_request, record a FacebookDataDeletionRequest,
+    remove what can be mapped to the app-scoped user id (see
+    ``social_integrations.meta_compliance`` for the PSID vs ASID limits) and
+    answer ``{"url": <status page>, "confirmation_code": <code>}``.
+    """
     if request.method == 'GET':
-        # Show information page about data deletion
         return render(request, 'legal/data_deletion.html')
-    
-    elif request.method == 'POST':
-        # Handle Facebook data deletion callback
-        try:
-            if request.content_type == 'application/json':
-                data = json.loads(request.body)
-            else:
-                data = request.POST.dict()
-            
-            signed_request = data.get('signed_request')
-            if not signed_request:
-                return JsonResponse({
-                    'error': 'Missing signed_request parameter'
-                }, status=400)
-            
-            # Parse the signed request (you would normally verify the signature)
-            # For now, we'll just log the deletion request
-            
-            # In a real implementation, you would:
-            # 1. Verify the signed_request signature using your app secret
-            # 2. Extract the user_id from the signed_request
-            # 3. Delete all user data from your database
-            # 4. Return a confirmation URL
-            
-            confirmation_code = f"DEL_{signed_request[:10]}"
-            deletion_url = request.build_absolute_uri(f'/legal/data-deletion-status/?code={confirmation_code}')
-            
-            return JsonResponse({
-                'url': deletion_url,
-                'confirmation_code': confirmation_code
-            })
-            
-        except Exception as e:
-            return JsonResponse({
-                'error': f'Failed to process deletion request: {str(e)}'
-            }, status=500)
+
+    from django.utils import timezone
+    from tenant_schemas.utils import schema_context
+    from tenants.models import FacebookDataDeletionRequest
+    from .meta_compliance import delete_user_data, deletion_status_url, new_confirmation_code
+
+    user_id, error = _verified_user_id(request)
+    if error:
+        return error
+
+    with schema_context('public'):
+        record = FacebookDataDeletionRequest.objects.create(
+            confirmation_code=new_confirmation_code(), user_id=user_id,
+        )
+    try:
+        ok, details = delete_user_data(user_id)
+    except Exception as exc:
+        logger.exception('Data deletion for a Meta user failed')
+        ok, details = False, {'errors': {'_': str(exc)}}
+    with schema_context('public'):
+        record.status = (
+            FacebookDataDeletionRequest.STATUS_COMPLETED if ok else FacebookDataDeletionRequest.STATUS_FAILED
+        )
+        record.completed_at = timezone.now() if ok else None
+        record.details = details
+        record.save(update_fields=['status', 'completed_at', 'details'])
+
+    return JsonResponse({
+        'url': deletion_status_url(record.confirmation_code),
+        'confirmation_code': record.confirmation_code,
+    })
+
+
+def _deletion_status_response(request, confirmation_code):
+    from tenant_schemas.utils import schema_context
+    from tenants.models import FacebookDataDeletionRequest
+
+    record = None
+    if confirmation_code:
+        with schema_context('public'):
+            record = FacebookDataDeletionRequest.objects.filter(confirmation_code=confirmation_code).first()
+
+    wants_json = (
+        request.GET.get('format') == 'json'
+        or 'application/json' in (request.headers.get('Accept') or '')
+    )
+    if wants_json:
+        if not record:
+            return JsonResponse({'error': 'Unknown confirmation code'}, status=404)
+        return JsonResponse({
+            'confirmation_code': record.confirmation_code,
+            'status': record.status,
+            'created_at': record.created_at.isoformat(),
+            'completed_at': record.completed_at.isoformat() if record.completed_at else None,
+        })
+    return render(request, 'legal/data_deletion_status.html', {
+        'confirmation_code': confirmation_code,
+        'record': record,
+    }, status=200 if record or not confirmation_code else 404)
 
 
 def data_deletion_status(request):
-    """Show data deletion status"""
-    confirmation_code = request.GET.get('code')
-    return render(request, 'legal/data_deletion_status.html', {
-        'confirmation_code': confirmation_code
-    })
+    """Legacy status page: /legal/data-deletion-status/?code=<code>"""
+    return _deletion_status_response(request, request.GET.get('code'))
+
+
+@require_http_methods(["GET"])
+def data_deletion_status_by_code(request, confirmation_code):
+    """Status page linked from the data-deletion callback response:
+    /api/social/facebook/data-deletion/status/<code>/ (HTML; JSON with
+    ?format=json or Accept: application/json)."""
+    return _deletion_status_response(request, confirmation_code)
 
 
 @csrf_exempt
 @require_http_methods(["POST"])
 def deauthorize_callback(request):
-    """Handle Facebook/Instagram app deauthorization callback
-    
-    This endpoint handles when users remove your app from their Facebook/Instagram account.
-    Since Instagram uses Facebook's infrastructure, this single endpoint handles both platforms.
+    """Meta "Deauthorize Callback": the user removed the app.
+
+    Verifies the signed_request and deactivates the Page / Instagram
+    connections that app-scoped user granted (tokens wiped) in every tenant.
     """
+    from .meta_compliance import deauthorize_user
+
+    user_id, error = _verified_user_id(request)
+    if error:
+        return error
     try:
-        if request.content_type == 'application/json':
-            data = json.loads(request.body)
-        else:
-            data = request.POST.dict()
-        
-        signed_request = data.get('signed_request')
-        if not signed_request:
-            logger.warning("Deauthorize callback received without signed_request")
-            return JsonResponse({
-                'error': 'Missing signed_request parameter'
-            }, status=400)
-        
-        # In a real implementation, you would:
-        # 1. Verify the signed_request signature using your app secret
-        # 2. Extract the user_id from the signed_request
-        # 3. Revoke access tokens and remove connection data
-        # 4. Log the deauthorization event
-        
-        # For now, we'll just log the deauthorization request
-        logger.info(f"App deauthorization request received: {signed_request[:20]}...")
-        
-        # Parse signed request to get user ID (simplified - you should verify signature)
-        try:
-            import base64
-            # This is a simplified parsing - in production, verify the signature first
-            payload = signed_request.split('.')[1]
-            # Add padding if needed
-            payload += '=' * (4 - len(payload) % 4)
-            decoded = base64.b64decode(payload)
-            parsed_data = json.loads(decoded)
-            user_id = parsed_data.get('user_id')
-            
-            if user_id:
-                # Here you would remove the user's connections from your database
-                # For both Facebook and Instagram connections
-                logger.info(f"Processing deauthorization for user: {user_id}")
-                
-                # TODO: Implement actual deauthorization logic:
-                # - Remove FacebookPageConnection records for this user
-                # - Remove InstagramAccountConnection records for this user  
-                # - Revoke any stored access tokens
-                # - Clean up related data
-        
-        except Exception as parse_error:
-            logger.error(f"Failed to parse signed_request: {parse_error}")
-        
-        return JsonResponse({
-            'status': 'success',
-            'message': 'Deauthorization processed'
-        })
-        
-    except Exception as e:
-        logger.error(f"Failed to process deauthorization: {e}")
-        return JsonResponse({
-            'error': f'Failed to process deauthorization: {str(e)}'
-        }, status=500)
+        summary = deauthorize_user(user_id)
+    except Exception:
+        logger.exception('Deauthorize callback processing failed')
+        return JsonResponse({'error': 'Failed to process deauthorization'}, status=500)
+    logger.info('Meta deauthorize processed; affected schemas: %s', list(summary))
+    return JsonResponse({'status': 'success'})

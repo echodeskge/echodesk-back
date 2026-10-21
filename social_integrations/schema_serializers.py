@@ -24,6 +24,14 @@ class SocialErrorSerializer(serializers.Serializer):
 class SocialErrorWithDetailsSerializer(serializers.Serializer):
     error = serializers.CharField()
     details = serializers.JSONField(required=False)
+    code = serializers.CharField(
+        required=False,
+        help_text="'outside_messaging_window' when Meta's messaging window is closed",
+    )
+    window = serializers.CharField(required=False, help_text="'closed' with code=outside_messaging_window")
+    meta_error = serializers.JSONField(
+        required=False, help_text='{code, error_subcode, message} when Meta refused the send',
+    )
 
 
 class SocialMessageResponseSerializer(serializers.Serializer):
@@ -131,6 +139,13 @@ class MessagingWindowResponseSerializer(serializers.Serializer):
     )
     human_agent_hours_remaining = serializers.FloatField(allow_null=True)
     can_reply = serializers.BooleanField()
+    reply_mode = serializers.ChoiceField(
+        choices=['response', 'human_agent', 'closed'],
+        help_text='How the next human reply is sent: RESPONSE, MESSAGE_TAG+HUMAN_AGENT, or refused',
+    )
+    human_agent_tag_enabled = serializers.BooleanField(
+        help_text='FB/IG only: this tenant may send HUMAN_AGENT-tagged replies (24h-7d)',
+    )
     last_user_message_at = serializers.DateTimeField(required=False)
     hours_passed = serializers.FloatField(required=False)
     message = serializers.CharField(required=False, help_text='Set when the customer never wrote')
@@ -165,6 +180,12 @@ class MetaSendResponseSerializer(serializers.Serializer):
     status = serializers.CharField(help_text="'sent'")
     message_id = serializers.CharField(allow_null=True)
     recipient_id = serializers.CharField(allow_null=True, required=False)
+    messaging_type = serializers.CharField(required=False, help_text="'RESPONSE' or 'MESSAGE_TAG'")
+    message_tag = serializers.CharField(required=False, allow_blank=True, help_text="'HUMAN_AGENT' or ''")
+    text_part_failed = serializers.BooleanField(
+        required=False, help_text='text+media send: the text half was rejected by Meta (media was sent)',
+    )
+    text_error = serializers.JSONField(required=False, help_text='{code, error_subcode, message} for the failed text half')
 
 
 class WhatsAppSendResponseSerializer(serializers.Serializer):
