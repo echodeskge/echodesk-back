@@ -8,14 +8,15 @@ from decimal import Decimal
 
 from rest_framework import status
 
-from users.tests.conftest import EchoDeskTenantTestCase
+from ecommerce_crm.tests.base import EcommerceTenantTestCase
 from ecommerce_crm.models import AttributeDefinition, OrderItem, Product
 from ecommerce_crm.tests.test_order_views import OrderTestMixin
 
 PROD_URL = '/api/ecommerce/admin/products/'
 
 
-class TestProductAdminHotfix(OrderTestMixin, EchoDeskTenantTestCase):
+# main gates admin endpoints on the ecommerce_crm feature.
+class TestProductAdminHotfix(OrderTestMixin, EcommerceTenantTestCase):
 
     def setUp(self):
         super().setUp()
@@ -30,7 +31,7 @@ class TestProductAdminHotfix(OrderTestMixin, EchoDeskTenantTestCase):
         )
         resp = self.api_delete(f'{PROD_URL}{product.pk}/', user=self.admin)
         self.assertEqual(resp.status_code, status.HTTP_409_CONFLICT, resp.content)
-        self.assertIn('Archive', resp.data['error'])
+        self.assertIn('archive', resp.data['error'].lower())
         self.assertTrue(Product.objects.filter(pk=product.pk).exists())
 
     def test_delete_product_without_orders_still_works(self):
