@@ -366,7 +366,16 @@ class ProductViewSet(NoCacheMixin, viewsets.ModelViewSet):
         summary='Delete product'
     )
     def destroy(self, request, *args, **kwargs):
-        return super().destroy(request, *args, **kwargs)
+        from django.db.models import ProtectedError
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            # Orders keep PROTECT foreign keys to their products.
+            return Response(
+                {'error': 'This product is used by existing orders and cannot be deleted. '
+                          'Archive it instead.'},
+                status=status.HTTP_409_CONFLICT,
+            )
 
     @extend_schema(
         tags=['Ecommerce Admin - Products'],
