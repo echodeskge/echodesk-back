@@ -830,6 +830,26 @@ def _option_label(attribute, value):
     return value
 
 
+def order_item_variant_details(variant):
+    """Readable details of a variant as shown on an order line."""
+    attributes = []
+    for av in variant.attribute_values.all():
+        attribute = av.attribute
+        value = av.value_json
+        if isinstance(value, list):
+            value = [_option_label(attribute, v) for v in value]
+        else:
+            value = _option_label(attribute, value)
+        attributes.append({'key': attribute.key, 'name': attribute.name, 'value': value})
+    return {
+        'id': variant.id,
+        'sku': variant.sku,
+        'name': variant.name,
+        'image': variant.image or None,
+        'attributes': attributes,
+    }
+
+
 class OrderItemVariantDetailsSerializer(serializers.Serializer):
     id = serializers.IntegerField()
     sku = serializers.CharField()
@@ -857,23 +877,9 @@ class OrderItemSerializer(serializers.ModelSerializer):
         """Readable variant info so orders show "Brown · Colour: Brown" instead of an id."""
         variant = obj.variant
         if variant is None:
-            return None
-        attributes = []
-        for av in variant.attribute_values.all():
-            attribute = av.attribute
-            value = av.value_json
-            if isinstance(value, list):
-                value = [_option_label(attribute, v) for v in value]
-            else:
-                value = _option_label(attribute, value)
-            attributes.append({'key': attribute.key, 'name': attribute.name, 'value': value})
-        return {
-            'id': variant.id,
-            'sku': variant.sku,
-            'name': variant.name,
-            'image': variant.image or None,
-            'attributes': attributes,
-        }
+            # Deleted variant: the details captured on delete (see signals).
+            return obj.variant_snapshot or None
+        return order_item_variant_details(variant)
 
 
 class OrderListSerializer(serializers.ModelSerializer):
