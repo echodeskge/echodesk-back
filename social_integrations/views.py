@@ -1189,6 +1189,7 @@ def facebook_oauth_callback(request):
             saved_instagram_accounts = 0
             returned_page_ids: set[str] = set()
             unsubscribed_pages: list[str] = []
+            messaging_disabled_ig: list[str] = []
             for page in pages:
                 page_id = page.get('id')
                 page_name = page.get('name')
@@ -1289,7 +1290,7 @@ def facebook_oauth_callback(request):
                                     ig_details = ig_details_response.json()
 
                                     # Create or update Instagram account connection
-                                    InstagramAccountConnection.objects.update_or_create(
+                                    ig_connection, _ = InstagramAccountConnection.objects.update_or_create(
                                         instagram_account_id=ig_details.get('id'),
                                         defaults={
                                             'username': ig_details.get('username', ''),
@@ -1302,6 +1303,18 @@ def facebook_oauth_callback(request):
 
                                     logger.info(f"✅ Connected Instagram account: @{ig_details.get('username')} to page {page_name}")
                                     saved_instagram_accounts += 1
+
+                                    # Reconnecting does not fix a disabled
+                                    # "Allow access to messages" toggle — probe
+                                    # it now so the warning shows immediately.
+                                    from .services import instagram_health
+                                    if instagram_health.check_instagram_messaging(ig_connection) == instagram_health.STATUS_MESSAGING_DISABLED:
+                                        messaging_disabled_ig.append(ig_connection.username)
+                                else:
+                                    logger.warning(
+                                        f"⚠️ Could not fetch Instagram account {instagram_account_id} details for page {page_name}: "
+                                        f"{_safe_response_json(ig_details_response)}"
+                                    )
                     except Exception as e:
                         logger.warning(f"⚠️ Could not fetch Instagram account for page {page_name}: {e}")
                         # Continue processing other pages even if Instagram fetch fails
@@ -1345,6 +1358,13 @@ def facebook_oauth_callback(request):
             success_msg += (
                 f". WARNING: webhook subscription failed for: {', '.join(unsubscribed_pages)}"
                 " — incoming messages will NOT arrive for these pages. Reconnect to retry."
+            )
+        if messaging_disabled_ig:
+            success_msg += (
+                f". WARNING: Instagram message access is turned off for: "
+                f"{', '.join('@' + u for u in messaging_disabled_ig)}"
+                " — turn on Instagram Settings > Messages and story replies > Message controls"
+                " > Connected tools > Allow access to messages."
             )
         logger.info(f"Facebook OAuth completed successfully: {saved_pages} pages and {saved_instagram_accounts} Instagram accounts saved")
         
@@ -1438,6 +1458,11 @@ def facebook_disconnect(request):
             deactivation_reason='manual',
             updated_at=now
         )
+        # Instagram accounts are reached through these Pages and keep a copy
+        # of the Page token — disconnect them too (reconnecting reactivates).
+        InstagramAccountConnection.objects.filter(facebook_page__in=pages_to_disconnect).update(
+            is_active=False, access_token='', updated_at=now,
+        )
 
         logger.info(f"✅ Facebook soft disconnect completed:")
         logger.info(f"   - Facebook pages deactivated: {deactivated_count}")
@@ -1496,6 +1521,10 @@ def facebook_page_disconnect(request, page_id):
         page.deactivation_reason = 'manual'
         page.updated_at = now
         page.save()
+        # Linked Instagram accounts can't work without the Page token.
+        InstagramAccountConnection.objects.filter(facebook_page=page).update(
+            is_active=False, access_token='', updated_at=now,
+        )
 
         logger.info(f"✅ Soft disconnected Facebook page: {page_name} (ID: {page_id})")
         logger.info(f"   - Messages preserved for audit trail")
@@ -3328,25 +3357,48 @@ class InstagramMessageViewSet(viewsets.ReadOnlyModelViewSet):
 
 @extend_schema(
     summary='Instagram connection status',
+    parameters=[
+        OpenApiParameter(name='check', type=OpenApiTypes.BOOL, location=OpenApiParameter.QUERY, required=False,
+                         description='Re-check messaging access with Meta now instead of using the cached result'),
+    ],
     responses={200: InstagramStatusResponseSerializer, 500: SocialErrorSerializer},
     tags=['Social - Connections'],
 )
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, CanViewSocialMessages])
 def instagram_connection_status(request):
-    """Check Instagram connection status for current tenant"""
+    """Check Instagram connection status for current tenant.
+
+    Active accounts also report messaging health (see
+    services/instagram_health.py). It is re-probed against Meta when stale or
+    when ``?check=true`` is passed.
+    """
+    from .services import instagram_health
+
     try:
-        accounts = InstagramAccountConnection.objects.all()  # All accounts for this tenant
+        accounts = InstagramAccountConnection.objects.select_related('facebook_page').all()
+        force_check = request.query_params.get('check', '').lower() in ('1', 'true', 'yes')
         accounts_data = []
 
         for account in accounts:
+            if account.is_active and (force_check or instagram_health.needs_check(account)):
+                try:
+                    instagram_health.check_instagram_messaging(account)
+                except Exception as check_error:  # never break the status page
+                    logger.warning(f"Instagram messaging check failed for @{account.username}: {check_error}")
             accounts_data.append({
                 'id': account.id,
                 'instagram_account_id': account.instagram_account_id,
                 'username': account.username,
                 'profile_picture_url': account.profile_picture_url,
                 'is_active': account.is_active,
-                'connected_at': account.created_at.isoformat()
+                'connected_at': account.created_at.isoformat(),
+                'messaging_status': account.messaging_status,
+                'messaging_error': account.messaging_error,
+                'messaging_error_code': account.messaging_error_code,
+                'messaging_checked_at': (
+                    account.messaging_checked_at.isoformat() if account.messaging_checked_at else None
+                ),
             })
 
         return Response({
@@ -3430,6 +3482,7 @@ def instagram_disconnect(request):
 def instagram_send_message(request):
     """Send a message (text and/or media) to an Instagram user"""
     from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+    from .services import instagram_health
     request.parsers = [MultiPartParser(), FormParser(), JSONParser()]
 
     try:
@@ -3596,6 +3649,11 @@ def instagram_send_message(request):
             response_data = response.json()
             message_id = response_data.get('message_id')
 
+            try:
+                instagram_health.mark_messaging_ok(account_connection)
+            except Exception as health_error:
+                logger.warning(f"Could not update Instagram messaging status: {health_error}")
+
             # Optionally save the sent message to our database
             try:
                 from .consumers import send_new_message_notification
@@ -3704,13 +3762,16 @@ def instagram_send_message(request):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             error_message = meta_error_details(error_data)['message']
-
-            return Response({
+            body = {
                 'error': f'Failed to send message: {error_message}',
                 'instagram_error': error_data,
                 'meta_error': meta_error_details(error_data),
                 'text_part_sent': text_sent_separately,
-            }, status=status.HTTP_400_BAD_REQUEST)
+            }
+            if instagram_health.record_messaging_error(account_connection, error_data):
+                body['code'] = 'INSTAGRAM_MESSAGING_DISABLED'
+
+            return Response(body, status=status.HTTP_400_BAD_REQUEST)
 
     except Exception as e:
         print(f"❌ Exception in instagram_send_message: {e}")
@@ -4094,6 +4155,11 @@ def instagram_webhook(request):
                                             reply_to=ig_reply_obj,
                                         )
                                         logger.info(f"✅ Saved Instagram message from {sender_username}: {message_text[:50] if message_text else f'[{attachment_type}]'}")
+
+                                        # A delivered DM proves messaging access is on.
+                                        if account_connection.messaging_status != 'ok':
+                                            from .services.instagram_health import mark_messaging_ok
+                                            mark_messaging_ok(account_connection)
 
                                         # Check if this is a rating response
                                         process_potential_rating_response(

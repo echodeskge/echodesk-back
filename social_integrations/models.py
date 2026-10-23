@@ -249,6 +249,39 @@ class InstagramAccountConnection(models.Model):
     )
     is_active = models.BooleanField(default=True)
 
+    # Messaging health — see services/instagram_health.py. Meta silently stops
+    # delivering DMs (and refuses sends with #200 / subcode 2534041) when the
+    # account owner turns off Instagram's "Allow access to messages" toggle;
+    # the connection itself still looks fine, so we track it separately.
+    MESSAGING_STATUS_CHOICES = [
+        ('unknown', 'Unknown'),
+        ('ok', 'OK'),
+        ('messaging_disabled', 'Messaging access disabled'),
+        ('error', 'Error'),
+    ]
+    messaging_status = models.CharField(
+        max_length=32,
+        choices=MESSAGING_STATUS_CHOICES,
+        default='unknown',
+        help_text='Result of the last Instagram messaging health check',
+    )
+    messaging_error = models.TextField(
+        blank=True,
+        default='',
+        help_text='Graph API error message from the last failed check/send',
+    )
+    messaging_error_code = models.CharField(
+        max_length=32,
+        blank=True,
+        default='',
+        help_text='Graph API "code/subcode" from the last failed check/send',
+    )
+    messaging_checked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text='When messaging_status was last updated',
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
