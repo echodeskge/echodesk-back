@@ -118,3 +118,13 @@ class WidgetAdminCloseTests(WidgetPublicTestCase):
         )
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
         self.assertTrue(WidgetMessage.objects.filter(session=self.session, message_text='hello').exists())
+
+    def test_visitor_close_releases_visitor_keyed_assignment(self):
+        # The visitor ending the chat from the widget must free the agent too
+        resp = self.widget_post(
+            '/api/widget/public/sessions/close/',
+            {'token': self.conn.widget_token, 'session_id': self.session.session_id},
+            HTTP_ORIGIN='https://foo.ge',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self._assert_released()

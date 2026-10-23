@@ -586,24 +586,9 @@ def widget_public_close_session(request):
         # ChatAssignment as completed and unassign the agent — otherwise
         # the agent's "Assigned to me" tab keeps showing a phantom chat
         # for a session that no longer exists. Mirrors the same cleanup
-        # the assignment-end view does. Idempotent.
-        try:
-            from .models import ChatAssignment
-            ChatAssignment.objects.filter(
-                platform='widget',
-                conversation_id=session_id,
-                account_id=str(conn.id),
-                status__in=['active', 'in_session'],
-            ).update(
-                status='completed',
-                assigned_user=None,
-                session_ended_at=session.ended_at,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Failed to complete ChatAssignment on visitor close: %s",
-                exc,
-            )
+        # the assignment-end view does. Assignments are keyed by visitor
+        # id, so match every id form of the chat. Idempotent.
+        _complete_widget_assignments(request, session_id, conn.id, session.ended_at)
 
         # When the visitor explicitly says "I'm done", also move the
         # conversation to the agent's history. Best-effort — any failure
