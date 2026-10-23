@@ -267,6 +267,13 @@ class InstagramAccountStatusSerializer(serializers.Serializer):
     profile_picture_url = serializers.CharField(allow_null=True, allow_blank=True)
     is_active = serializers.BooleanField()
     connected_at = serializers.DateTimeField()
+    messaging_status = serializers.ChoiceField(
+        choices=['unknown', 'ok', 'messaging_disabled', 'error'],
+        help_text='messaging_disabled = the owner turned off "Allow access to messages" in Instagram',
+    )
+    messaging_error = serializers.CharField(allow_blank=True)
+    messaging_error_code = serializers.CharField(allow_blank=True)
+    messaging_checked_at = serializers.DateTimeField(allow_null=True)
 
 
 class InstagramStatusResponseSerializer(serializers.Serializer):
