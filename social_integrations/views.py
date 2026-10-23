@@ -12111,6 +12111,17 @@ class SocialClientViewSet(viewsets.ModelViewSet):
     """ViewSet for managing social clients"""
     permission_classes = [IsAuthenticated, CanAccessSocialClients]
 
+    def destroy(self, request, *args, **kwargs):
+        from django.db.models import ProtectedError
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            # Bookings, orders and invoices keep PROTECT foreign keys to the client.
+            return Response(
+                {'error': 'This client has bookings, orders or invoices and cannot be deleted.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
     def get_serializer_class(self):
         if self.action == 'list':
             return SocialClientListSerializer

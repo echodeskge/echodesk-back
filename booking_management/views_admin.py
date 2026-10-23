@@ -6,7 +6,7 @@ from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.response import Response
 from django.db import transaction
 from django.utils import timezone
-from django.db.models import Q, Count, Sum, Avg, Prefetch
+from django.db.models import Q, Count, Sum, Avg, Prefetch, ProtectedError
 from datetime import datetime, timedelta, date
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema, extend_schema_view
@@ -406,6 +406,16 @@ class AdminServiceViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         service = serializer.save()
         return Response(self._detail(service))
+
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            # Bookings and recurring bookings keep PROTECT foreign keys to the service.
+            return Response(
+                {'error': 'This service has bookings and cannot be deleted. Deactivate it instead.'},
+                status=status.HTTP_409_CONFLICT,
+            )
 
     @extend_schema(
         tags=['Booking Admin - Services'], description='Admins/managers only.',

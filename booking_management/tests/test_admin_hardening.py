@@ -696,3 +696,28 @@ class TestStaffReminders(HardeningBase):
             total = tasks.send_staff_booking_reminders()
         self.assertGreaterEqual(inner.call_count, 1)
         self.assertEqual(total, 2 * inner.call_count)
+
+
+# ============================================================================
+# Deleting rows that bookings still reference
+# ============================================================================
+
+class TestProtectedDeletes(HardeningBase):
+
+    def test_service_with_bookings_answers_409(self):
+        self.booking()
+        resp = self.api_delete(f'{ADMIN_SERVICE_URL}{self.service.id}/', user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn('error', resp.json())
+        self.assertTrue(Service.objects.filter(pk=self.service.pk).exists())
+
+    def test_service_without_bookings_is_deleted(self):
+        resp = self.api_delete(f'{ADMIN_SERVICE_URL}{self.service.id}/', user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Service.objects.filter(pk=self.service.pk).exists())
+
+    def test_social_client_with_bookings_answers_409(self):
+        booking = self.booking()
+        resp = self.api_delete(f'/api/social/clients/{booking.client_id}/', user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_409_CONFLICT)
+        self.assertTrue(Booking.objects.filter(pk=booking.pk).exists())
