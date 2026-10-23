@@ -1074,19 +1074,30 @@ class OrderItem(models.Model):
         related_name='items',
         help_text="Order this item belongs to"
     )
+    # SET_NULL, not PROTECT: the line keeps its own snapshot (name, price,
+    # variant_snapshot), so a shop can remove a product from its catalogue
+    # without losing order history. Deleting a product that is still in an
+    # open order is refused by the admin API (see ProductViewSet.destroy).
     product = models.ForeignKey(
         Product,
-        on_delete=models.PROTECT,
-        related_name='order_items',
-        help_text="Product ordered"
-    )
-    variant = models.ForeignKey(
-        ProductVariant,
-        on_delete=models.PROTECT,
+        on_delete=models.SET_NULL,
         null=True,
         blank=True,
         related_name='order_items',
-        help_text="Product variant (if applicable)"
+        help_text="Product ordered (null once the product is deleted)"
+    )
+    variant = models.ForeignKey(
+        ProductVariant,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='order_items',
+        help_text="Product variant (if applicable; null once deleted)"
+    )
+    variant_snapshot = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Readable variant details captured when the variant is deleted"
     )
     product_name = models.JSONField(
         help_text="Product name at time of order (multilingual)"
@@ -1111,7 +1122,8 @@ class OrderItem(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.product.sku} x{self.quantity} in {self.order.order_number}"
+        sku = self.product.sku if self.product_id else '(deleted product)'
+        return f"{sku} x{self.quantity} in {self.order.order_number}"
 
     @property
     def subtotal(self):

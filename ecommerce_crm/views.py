@@ -45,7 +45,35 @@ class ProtectedDestroyMixin:
 
 # Defined once: building a new inline_serializer per decorated destroy made
 # drf-spectacular warn about several components named EcommerceDeleteConflict.
-_DELETE_CONFLICT = inline_serializer('EcommerceDeleteConflict', fields={'error': serializers.CharField()})
+_DELETE_CONFLICT = inline_serializer('EcommerceDeleteConflict', fields={
+    'error': serializers.CharField(),
+    'orders': serializers.ListField(
+        child=serializers.CharField(), required=False,
+        help_text='Order numbers of the open orders that block the delete (products and variants)',
+    ),
+})
+
+# Orders still being worked on. A product or variant in one of these can't be
+# deleted; once every order using it is delivered, cancelled or refunded the
+# order lines keep their snapshot and simply lose the link (SET_NULL).
+OPEN_ORDER_STATUSES = ('pending', 'confirmed', 'processing', 'shipped')
+
+
+def _open_orders_conflict(**item_filter):
+    """409 response listing the open orders whose lines match ``item_filter``
+    (e.g. ``product=p``), or None when nothing blocks the delete."""
+    numbers = list(
+        Order.objects.filter(status__in=OPEN_ORDER_STATUSES, **{f'items__{k}': v for k, v in item_filter.items()})
+        .order_by('created_at').values_list('order_number', flat=True).distinct()[:20]
+    )
+    if not numbers:
+        return None
+    return Response(
+        {'error': 'This item is in open orders and cannot be deleted until they are '
+                  'delivered, cancelled or refunded. Deactivate it instead to hide it from the shop.',
+         'orders': numbers},
+        status=status.HTTP_409_CONFLICT,
+    )
 
 
 def _destroy_schema(tag, summary):
@@ -507,18 +535,14 @@ class ProductViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMix
     def partial_update(self, request, *args, **kwargs):
         return super().partial_update(request, *args, **kwargs)
 
-    @_destroy_schema('Ecommerce Admin - Products', 'Delete product (managers only; 409 when it has orders)')
+    @_destroy_schema('Ecommerce Admin - Products', 'Delete product (managers only; 409 while it is in open orders)')
     def destroy(self, request, *args, **kwargs):
-        from django.db.models import ProtectedError
-        try:
-            return super().destroy(request, *args, **kwargs)
-        except ProtectedError:
-            # Orders keep PROTECT foreign keys to their products.
-            return Response(
-                {'error': 'This product is used by existing orders and cannot be deleted. '
-                          'Archive it instead.'},
-                status=status.HTTP_409_CONFLICT,
-            )
+        # Finished orders keep their snapshot lines (OrderItem.product is
+        # SET_NULL); only orders still in progress block the delete.
+        conflict = _open_orders_conflict(product=self.get_object())
+        if conflict is not None:
+            return conflict
+        return super().destroy(request, *args, **kwargs)
 
     def _paginated_list(self, products):
         page = self.paginate_queryset(products)
@@ -847,8 +871,11 @@ class ProductVariantViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDes
             'attribute_values__attribute'
         )
 
-    @_destroy_schema('Ecommerce Admin - Products', 'Delete variant (managers only; 409 when it has orders)')
+    @_destroy_schema('Ecommerce Admin - Products', 'Delete variant (managers only; 409 while it is in open orders)')
     def destroy(self, request, *args, **kwargs):
+        conflict = _open_orders_conflict(variant=self.get_object())
+        if conflict is not None:
+            return conflict
         return super().destroy(request, *args, **kwargs)
 
     @extend_schema(
@@ -2676,7 +2703,8 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
 
         # Top products
         top_products = list(
-            OrderItem.objects.values('product__name').annotate(
+            # Lines of deleted products have no product row to group by.
+            OrderItem.objects.filter(product__isnull=False).values('product__name').annotate(
                 sold=Sum('quantity'),
                 revenue=Sum(F('price') * F('quantity'))
             ).order_by('-sold')[:10]

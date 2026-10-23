@@ -31,7 +31,8 @@ class TestProductAdminHotfix(OrderTestMixin, EcommerceTenantTestCase):
         )
         resp = self.api_delete(f'{PROD_URL}{product.pk}/', user=self.admin)
         self.assertEqual(resp.status_code, status.HTTP_409_CONFLICT, resp.content)
-        self.assertIn('archive', resp.data['error'].lower())
+        self.assertIn('deactivate', resp.data['error'].lower())
+        self.assertEqual(resp.data['orders'], [order.order_number])
         self.assertTrue(Product.objects.filter(pk=product.pk).exists())
 
     def test_delete_product_without_orders_still_works(self):
