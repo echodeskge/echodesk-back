@@ -27,6 +27,7 @@ from rest_framework.response import Response
 from tenant_schemas.utils import schema_context
 
 from widget_registry.models import WidgetConnection
+from .conversation_keys import assignment_lookup_ids, widget_session_id
 from .models import ChatRating, ConversationArchive, WidgetMessage, WidgetSession
 from .permissions import CanManageWidgetConnections, CanSendSocialMessages, CanViewSocialMessages
 from .pagination import WidgetTranscriptPagination
@@ -462,6 +463,8 @@ def widget_admin_send_message(request):
             return _error('not_found', status.HTTP_404_NOT_FOUND)
 
     with schema_context(schema):
+        # Accept the visitor id / list id the inbox may send as well.
+        session_id = widget_session_id(session_id, connection_id)
         try:
             session = WidgetSession.objects.get(session_id=session_id, connection_id=connection_id)
         except WidgetSession.DoesNotExist:
@@ -583,24 +586,9 @@ def widget_public_close_session(request):
         # ChatAssignment as completed and unassign the agent — otherwise
         # the agent's "Assigned to me" tab keeps showing a phantom chat
         # for a session that no longer exists. Mirrors the same cleanup
-        # the assignment-end view does. Idempotent.
-        try:
-            from .models import ChatAssignment
-            ChatAssignment.objects.filter(
-                platform='widget',
-                conversation_id=session_id,
-                account_id=str(conn.id),
-                status__in=['active', 'in_session'],
-            ).update(
-                status='completed',
-                assigned_user=None,
-                session_ended_at=session.ended_at,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Failed to complete ChatAssignment on visitor close: %s",
-                exc,
-            )
+        # the assignment-end view does. Assignments are keyed by visitor
+        # id, so match every id form of the chat. Idempotent.
+        _complete_widget_assignments(request, session_id, conn.id, session.ended_at)
 
         # When the visitor explicitly says "I'm done", also move the
         # conversation to the agent's history. Best-effort — any failure
@@ -781,6 +769,35 @@ def widget_public_rate_session(request):
     return Response({'status': 'ok', 'rating': rating})
 
 
+def _complete_widget_assignments(request, raw_id, connection_id, ended_at):
+    """Complete open ChatAssignments of a widget chat; returns how many.
+
+    Assignments may be keyed by visitor id or (legacy) session id, so every
+    id form of the chat is matched. Each completed row is broadcast so the
+    chat leaves the agents' Assigned tab without a reload.
+    """
+    from .models import ChatAssignment
+    from .views import _broadcast_assignment_change
+
+    try:
+        assignments = list(ChatAssignment.objects.filter(
+            platform='widget',
+            conversation_id__in=assignment_lookup_ids('widget', raw_id, connection_id),
+            account_id=str(connection_id),
+            status__in=['active', 'in_session'],
+        ))
+        for assignment in assignments:
+            assignment.status = 'completed'
+            assignment.assigned_user = None
+            assignment.session_ended_at = ended_at
+            assignment.save(update_fields=['status', 'assigned_user', 'session_ended_at', 'updated_at'])
+            _broadcast_assignment_change(request, assignment)
+        return len(assignments)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to complete ChatAssignment on agent close: %s", exc)
+        return 0
+
+
 @extend_schema(
     request={
         'application/json': {
@@ -840,56 +857,53 @@ def widget_admin_close_session(request):
 
     already_ended = False
     with schema_context(schema):
-        try:
-            session = WidgetSession.objects.get(session_id=session_id, connection_id=connection_id)
-        except WidgetSession.DoesNotExist:
-            return _error('session_not_found', status.HTTP_404_NOT_FOUND)
+        # The inbox names a widget chat by visitor id (the list row's
+        # sender_id), by session id or by "widget_<conn>_<session>" — and
+        # ChatAssignment rows are keyed by visitor id. Resolve whatever was
+        # sent to the chat's newest session (bug #236: ending an assigned
+        # chat sent the visitor id and got session_not_found).
+        raw_id = session_id
+        session_id = widget_session_id(raw_id, connection_id)
+        session = WidgetSession.objects.filter(
+            session_id=session_id, connection_id=connection_id,
+        ).first()
+
+        if session is None:
+            # No chat session behind this id. Still release any assignment
+            # left on it so the chat can leave the Assigned tab.
+            if not _complete_widget_assignments(request, raw_id, connection_id, timezone.now()):
+                return _error('session_not_found', status.HTTP_404_NOT_FOUND)
+            return Response({'status': 'already_ended', 'ended_at': None, 'ended_by': None})
 
         if session.ended_at is not None:
             already_ended = True
-            ended_at_iso = session.ended_at.isoformat()
             ended_by_value = session.ended_by or 'agent'
         else:
             session.ended_at = timezone.now()
             session.ended_by = 'agent'
             session.save(update_fields=['ended_at', 'ended_by'])
-            ended_at_iso = session.ended_at.isoformat()
             ended_by_value = 'agent'
+        ended_at_iso = session.ended_at.isoformat()
 
-            # An agent-initiated end implies the chat is done — clear any
-            # active ChatAssignment and move the conversation to history
-            # so the agent inbox stays tidy. Both are idempotent and
-            # best-effort: failures log a warning, don't swallow the
-            # broadcast below.
-            try:
-                from .models import ChatAssignment
-                ChatAssignment.objects.filter(
-                    platform='widget',
-                    conversation_id=session_id,
-                    account_id=str(connection_id),
-                    status__in=['active', 'in_session'],
-                ).update(
-                    status='completed',
-                    assigned_user=None,
-                    session_ended_at=session.ended_at,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to complete ChatAssignment on agent close: %s",
-                    exc,
-                )
-            try:
-                ConversationArchive.objects.get_or_create(
-                    platform='widget',
-                    conversation_id=session_id,
-                    account_id=str(connection_id),
-                    defaults={'archived_by': request.user},
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to archive widget conversation on agent close: %s",
-                    exc,
-                )
+        # An agent-initiated end implies the chat is done — complete any
+        # open ChatAssignment and move the conversation to history so the
+        # agent inbox stays tidy. Done on repeat calls too, so an
+        # assignment left open by an earlier close (or a visitor close)
+        # is released. Both are idempotent and best-effort: failures log
+        # a warning, don't swallow the broadcast below.
+        _complete_widget_assignments(request, raw_id, connection_id, session.ended_at)
+        try:
+            ConversationArchive.objects.get_or_create(
+                platform='widget',
+                conversation_id=session_id,
+                account_id=str(connection_id),
+                defaults={'archived_by': request.user},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to archive widget conversation on agent close: %s",
+                exc,
+            )
 
     # Broadcast every time — even if the session was already ended on the
     # backend, the visitor's iframe might have missed the original event
