@@ -276,3 +276,41 @@ class TestFacebookReconnectInstagram(SocialIntegrationTestCase):
         self.assertFalse(mine.is_active)
         self.assertTrue(theirs.is_active)
         self.assertTrue(FacebookPageConnection.objects.get(page_id='page_o').is_active)
+
+
+class TestInstagramWebhookClearsFlag(SocialIntegrationTestCase):
+    """An inbound DM proves message access is back on — the warning clears."""
+
+    def setUp(self):
+        super().setUp()
+        self.page = self.create_fb_connection(page_id='page_w')
+        self.account = self.create_ig_connection(instagram_account_id='ig_w', fb_page=self.page)
+        self.account.messaging_status = 'messaging_disabled'
+        self.account.messaging_error = 'not allowed'
+        self.account.save()
+
+    def test_incoming_dm_marks_account_ok(self):
+        import json
+        from django.test import override_settings
+        from django.conf import settings
+        from social_integrations.models import InstagramMessage
+
+        body = json.dumps({'object': 'instagram', 'entry': [{
+            'id': 'ig_w', 'time': 1,
+            'messaging': [{
+                'sender': {'id': 'cust_w'}, 'recipient': {'id': 'ig_w'},
+                'timestamp': int(timezone.now().timestamp() * 1000),
+                'message': {'mid': 'mid_w1', 'text': 'hello'},
+            }],
+        }]}).encode()
+        cfg = dict(getattr(settings, 'SOCIAL_INTEGRATIONS', {}), FACEBOOK_APP_SECRET='', INSTAGRAM_APP_SECRET='')
+        with override_settings(SOCIAL_INTEGRATIONS=cfg, FACEBOOK_APP_SECRET='', INSTAGRAM_APP_SECRET=''), \
+                patch('social_integrations.views.requests.get', return_value=_resp(200, {'username': 'cust'})), \
+                patch('social_integrations.views.requests.post', return_value=_resp(200, {})):
+            resp = self.client.generic('POST', '/api/social/instagram/webhook/', body,
+                                       content_type='application/json', HTTP_HOST='tenant.test.com')
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(InstagramMessage.objects.filter(message_id='mid_w1').exists())
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.messaging_status, 'ok')
+        self.assertEqual(self.account.messaging_error, '')
