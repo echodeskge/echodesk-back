@@ -2,7 +2,9 @@
 WebSocket consumers for real-time messaging functionality.
 """
 
+import hashlib
 import json
+import re
 import asyncio
 import time
 from channels.generic.websocket import AsyncWebsocketConsumer
@@ -801,7 +803,14 @@ class TypingConsumer(AsyncWebsocketConsumer):
             return
 
         # Join the typing group for this conversation
-        self.typing_group_name = f'typing_{self.tenant_schema}_{self.conversation_id}'
+        # Channels group names allow only ASCII alphanumerics, "-", "_" and "."
+        # under 100 chars; email/widget conversation ids can contain "@", "<"
+        # or be long, so those are hashed (every participant hashes the same).
+        group_name = f'typing_{self.tenant_schema}_{self.conversation_id}'
+        if len(group_name) >= 100 or not re.fullmatch(r'[A-Za-z0-9_.\-]+', group_name):
+            digest = hashlib.sha1(str(self.conversation_id).encode('utf-8')).hexdigest()
+            group_name = f'typing_{self.tenant_schema}_{digest}'
+        self.typing_group_name = group_name
 
         await self.channel_layer.group_add(
             self.typing_group_name,

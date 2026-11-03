@@ -336,6 +336,29 @@ class TypingConsumerIsolationTests(SocialIntegrationTestCase):
                 override_settings(CHANNEL_LAYERS=IN_MEMORY_LAYERS):
             return async_to_sync(scenario)()
 
+    def test_long_or_non_ascii_conversation_id_connects(self):
+        """Channels rejects group names >=100 chars or non-ASCII; these ids are hashed."""
+        from channels.testing import WebsocketCommunicator
+        from social_integrations.consumers import TypingConsumer
+
+        user = self.create_user(email='fx-typing3@test.com')
+        for conversation_id in ('x' * 120, 'ჩატი_1'):
+            comm = WebsocketCommunicator(TypingConsumer.as_asgi(), '/ws/typing/test/c/')
+            comm.scope['user'] = user
+            comm.scope['url_route'] = {'kwargs': {'tenant_schema': 'test', 'conversation_id': conversation_id}}
+
+            async def scenario():
+                connected, _ = await comm.connect()
+                await comm.disconnect()
+                return connected
+
+            async def not_hidden(consumer_self):
+                return False
+
+            with patch.object(TypingConsumer, '_hidden_for_me', not_hidden), \
+                    override_settings(CHANNEL_LAYERS=IN_MEMORY_LAYERS):
+                self.assertTrue(async_to_sync(scenario)())
+
     def test_hidden_chat_gets_no_typing_frames(self):
         user = self.create_user(email='fx-typing@test.com')
         hello, received = self._run(user, hidden=True)

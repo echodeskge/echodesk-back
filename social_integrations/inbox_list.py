@@ -667,6 +667,16 @@ def _enrich(conversations):
         )
 
 
+def _tenant_schema(request):
+    """The tenant schema for this request; falls back to the active DB schema
+    when the request object carries no tenant (e.g. a re-wrapped request)."""
+    tenant = getattr(request, 'tenant', None)
+    if tenant is not None:
+        return tenant.schema_name
+    from django.db import connection
+    return connection.schema_name
+
+
 def build_unified_conversations(request, *, enabled_platforms, search, page, page_size,
                                 email_folder, assigned_only, archived_only,
                                 email_connection_id, settings_obj, is_admin,
@@ -725,7 +735,7 @@ def build_unified_conversations(request, *, enabled_platforms, search, page, pag
             with schema_context('public'):
                 widget_labels = dict(
                     WidgetConnection.objects.filter(
-                        tenant_schema=request.tenant.schema_name,
+                        tenant_schema=_tenant_schema(request),
                     ).values_list('id', 'label')
                 )
         except Exception as e:  # noqa: BLE001
