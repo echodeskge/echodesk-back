@@ -11,6 +11,9 @@ gunicorn>=21.2.0
 whitenoise>=6.5.0
 requests>=2.31.0
 celery>=5.3.0
+# kombu 5.7 requires redis-py>=6.1, which conflicts with the redis<6 pin below;
+# unpinned, a rebuild pulls 5.7 and the celery worker crash-loops on start.
+kombu>=5.3.0,<5.7
 # Pin to 5.x: redis-py 8.x breaks channels_redis 4.3.0's blocking bzpopmin read
 # (causes "Timeout reading from redis" on WebSockets). channels_redis declares
 # only redis>=4.6 with no upper bound, so an unpinned build pulls an incompatible 8.x.
