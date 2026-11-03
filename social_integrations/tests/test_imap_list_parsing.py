@@ -94,3 +94,20 @@ class TestSyncWithAtomFolderNames(SocialIntegrationTestCase):
 
         synced = [(c.args[2], c.args[3]) for c in sync_folder.call_args_list]
         assert synced == [('Gesendete Objekte', 'Sent')]
+
+
+class TestOutgoingMessageIdDomain(SocialIntegrationTestCase):
+
+    def test_message_id_uses_sender_domain_not_host_name(self):
+        from social_integrations.email_utils import send_email_smtp
+        conn = self.create_email_connection(email_address='contact@amanati.ge')
+        conn.smtp_use_ssl = False
+        conn.smtp_use_tls = False
+        conn.save()
+
+        with mock.patch('social_integrations.email_utils.smtplib.SMTP') as smtp_cls:
+            send_email_smtp(conn, ['client@example.com'], subject='Hi', body_text='Hello')
+
+        raw = smtp_cls.return_value.sendmail.call_args.args[2]
+        message_id = next(line for line in raw.splitlines() if line.lower().startswith('message-id:'))
+        assert message_id.rstrip().endswith('@amanati.ge>')

@@ -738,7 +738,10 @@ def send_email_smtp(connection, to_emails: List[str], cc_emails: List[str] = Non
         msg = body_part
 
     # Set headers
-    msg['Message-ID'] = make_msgid()
+    # Default make_msgid() uses the host name, which is the container id in
+    # production; spam filters score a non-resolving domain negatively.
+    sender_domain = connection.email_address.rpartition('@')[2] or None
+    msg['Message-ID'] = make_msgid(domain=sender_domain)
     msg['From'] = formataddr((connection.display_name or '', connection.email_address))
     msg['To'] = ', '.join(to_emails)
     if cc_emails:
