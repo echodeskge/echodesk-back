@@ -21,6 +21,8 @@ from .models import (
     ShippingMethod,
     PromoCode,
     ProductReview,
+    InsufficientStock,
+    reserve_stock,
 )
 from tickets.models import ItemList, ListItem
 
@@ -1421,16 +1423,11 @@ class OrderCreateSerializer(serializers.Serializer):
 
         with transaction.atomic():
             # Stock validation and decrement
-            for cart_item in cart.items.select_for_update().select_related('product'):
-                product = cart_item.product
-                if product.track_inventory:
-                    if product.quantity < cart_item.quantity:
-                        raise serializers.ValidationError(
-                            f'Insufficient stock for {product.get_name("en")}. '
-                            f'Available: {product.quantity}, Requested: {cart_item.quantity}'
-                        )
-                    product.quantity -= cart_item.quantity
-                    product.save(update_fields=['quantity'])
+            for cart_item in cart.items.select_for_update().select_related('product', 'variant'):
+                try:
+                    reserve_stock(cart_item.product, cart_item.variant, cart_item.quantity)
+                except InsufficientStock as exc:
+                    raise serializers.ValidationError(str(exc))
 
             # Create order
             order = Order.objects.create(

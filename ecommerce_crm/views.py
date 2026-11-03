@@ -108,6 +108,7 @@ from .models import (
     ShippingMethod,
     PromoCode,
     ProductReview,
+    release_stock,
 )
 from .serializers import (
     LanguageSerializer,
@@ -1997,11 +1998,7 @@ def _refund_order(order):
         if locked.status in ORDER_TERMINAL_STATUSES:
             raise OrderStatusError('Order already refunded or cancelled')
         for item in locked.items.select_related('product'):
-            product = item.product
-            if product and product.track_inventory:
-                Product.objects.filter(pk=product.pk).update(
-                    quantity=F('quantity') + item.quantity
-                )
+            release_stock(item)
         if locked.promo_code_id:
             PromoCode.objects.filter(
                 pk=locked.promo_code_id, times_used__gt=0

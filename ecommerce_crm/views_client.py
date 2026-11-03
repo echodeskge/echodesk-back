@@ -33,6 +33,8 @@ from .models import (
     ShippingMethod,
     PromoCode,
     ProductReview,
+    InsufficientStock,
+    reserve_stock,
 )
 from tickets.models import ItemList, ListItem
 from .serializers import (
@@ -2282,18 +2284,10 @@ def guest_checkout(request):
         with transaction.atomic():
             # Stock validation & decrement
             for item_info in order_items_to_create:
-                product = item_info['product']
-                qty = item_info['quantity']
-                if product.track_inventory:
-                    # Re-fetch with lock
-                    locked_product = Product.objects.select_for_update().get(pk=product.pk)
-                    if locked_product.quantity < qty:
-                        raise serializers.ValidationError(
-                            f'Insufficient stock for {product.get_name("en")}. '
-                            f'Available: {locked_product.quantity}, Requested: {qty}'
-                        )
-                    locked_product.quantity -= qty
-                    locked_product.save(update_fields=['quantity'])
+                try:
+                    reserve_stock(item_info['product'], item_info['variant'], item_info['quantity'])
+                except InsufficientStock as exc:
+                    raise serializers.ValidationError(str(exc))
 
             order = Order.objects.create(
                 order_number=Order.generate_order_number(),

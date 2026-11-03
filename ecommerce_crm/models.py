@@ -446,6 +446,57 @@ class ProductVariant(models.Model):
         return self.price if self.price else self.product.price
 
 
+class InsufficientStock(Exception):
+    """Raised by reserve_stock when a product or variant can't cover a sale."""
+
+    def __init__(self, label, available, requested):
+        self.label = label
+        self.available = available
+        self.requested = requested
+        super().__init__(
+            f'Insufficient stock for {label}. '
+            f'Available: {available}, Requested: {requested}'
+        )
+
+
+def reserve_stock(product, variant, quantity):
+    """
+    Lock and decrement stock for one order line. Must run inside
+    transaction.atomic(). The product quantity is the total across variants,
+    so a variant sale decrements both the variant and the product.
+    """
+    if not product.track_inventory:
+        return
+    locked_product = Product.objects.select_for_update().get(pk=product.pk)
+    if locked_product.quantity < quantity:
+        raise InsufficientStock(product.get_name('en'), locked_product.quantity, quantity)
+    if variant is not None:
+        locked_variant = ProductVariant.objects.select_for_update().get(pk=variant.pk)
+        if locked_variant.quantity < quantity:
+            raise InsufficientStock(
+                f"{product.get_name('en')} ({locked_variant.sku})",
+                locked_variant.quantity, quantity,
+            )
+        locked_variant.quantity -= quantity
+        locked_variant.save(update_fields=['quantity', 'updated_at'])
+    locked_product.quantity -= quantity
+    locked_product.save(update_fields=['quantity'])
+
+
+def release_stock(order_item):
+    """Return one order line's quantity to its product and variant (cancel/refund)."""
+    from django.db.models import F
+
+    product = order_item.product
+    if not product or not product.track_inventory:
+        return
+    Product.objects.filter(pk=product.pk).update(quantity=F('quantity') + order_item.quantity)
+    if order_item.variant_id:
+        ProductVariant.objects.filter(pk=order_item.variant_id).update(
+            quantity=F('quantity') + order_item.quantity
+        )
+
+
 class ProductVariantAttributeValue(models.Model):
     """
     Store attribute values for product variants
@@ -1033,11 +1084,7 @@ class Order(models.Model):
 
             if restock:
                 for item in order.items.select_related('product'):
-                    product = item.product
-                    if product and product.track_inventory:
-                        Product.objects.filter(pk=product.pk).update(
-                            quantity=F('quantity') + item.quantity
-                        )
+                    release_stock(item)
                 # QuerySet.update() skips post_save; refresh the storefront
                 # cache so the restocked quantity shows up.
                 from .caching import schedule_version_bump
