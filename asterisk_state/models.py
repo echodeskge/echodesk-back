@@ -65,6 +65,7 @@ class PsEndpoint(models.Model):
     from_user = models.CharField(max_length=40, null=True, blank=True)
     from_domain = models.CharField(max_length=40, null=True, blank=True)
     trust_id_inbound = models.CharField(max_length=3, null=True, blank=True)
+    trust_id_outbound = models.CharField(max_length=3, null=True, blank=True)
     webrtc = models.CharField(max_length=3, null=True, blank=True)
     media_encryption_optimistic = models.CharField(max_length=3, null=True, blank=True)
     dtls_auto_generate_cert = models.CharField(max_length=3, null=True, blank=True)
@@ -304,6 +305,7 @@ class AsteriskQueueMember(models.Model):
     state_interface = models.CharField(max_length=128, null=True, blank=True)
     penalty = models.IntegerField(null=True, blank=True)
     paused = models.IntegerField(null=True, blank=True)
+    reason_paused = models.CharField(max_length=80, null=True, blank=True)
     wrapuptime = models.IntegerField(null=True, blank=True)
 
     class Meta:

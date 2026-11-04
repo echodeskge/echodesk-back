@@ -14,7 +14,8 @@ Requires: pip3 install requests
 
 Environment variables (set in /etc/default/asterisk or /etc/asterisk/asterisk.conf):
   ECHODESK_API_URL - Base URL of EchoDesk API (e.g., https://api.echodesk.ge)
-  PBX_SHARED_SECRET - Authentication token for API access
+  ECHODESK_PBX_TOKEN - This PBX's EchoDesk token (sent as X-PBX-Token; picks the tenant)
+  PBX_SHARED_SECRET - Legacy shared secret (only for servers without ECHODESK_PBX_TOKEN)
 """
 
 import os
@@ -67,10 +68,13 @@ def query_echodesk_api(did):
     import requests
 
     api_url = os.environ.get('ECHODESK_API_URL', 'https://api.echodesk.ge')
+    pbx_token = os.environ.get('ECHODESK_PBX_TOKEN', '')
     secret = os.environ.get('PBX_SHARED_SECRET', '')
 
     url = f'{api_url}/api/pbx/call-routing/'
     headers = {}
+    if pbx_token:
+        headers['X-PBX-Token'] = pbx_token
     if secret:
         headers['Authorization'] = f'Bearer {secret}'
 

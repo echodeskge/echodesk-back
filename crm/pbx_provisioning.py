@@ -54,8 +54,8 @@ def _admin_dsn() -> dict:
     """
     default = settings.DATABASES["default"]
     return {
-        "host": default["HOST"],
-        "port": int(default["PORT"] or 5432),
+        "host": getattr(settings, "ASTERISK_ADMIN_DB_HOST", "") or default["HOST"],
+        "port": int(getattr(settings, "ASTERISK_ADMIN_DB_PORT", "") or default["PORT"] or 5432),
         "dbname": "defaultdb",  # connect to maintenance DB for CREATE
         "user": default["USER"],
         "password": default["PASSWORD"],

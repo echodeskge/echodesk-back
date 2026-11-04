@@ -915,5 +915,6 @@ class PbxServerSerializer(serializers.ModelSerializer):
         if request is None:
             base = ''
         else:
-            base = request.build_absolute_uri('/').rstrip('/')
+            from crm.views_pbx_install import public_api_base
+            base = public_api_base(request)
         return f"curl -sSL {base}/api/pbx/install/{obj.enrollment_token}/ | sudo bash"

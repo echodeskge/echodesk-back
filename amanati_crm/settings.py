@@ -793,6 +793,18 @@ CRON_SECRET_TOKEN = config('CRON_SECRET_TOKEN', default='')
 # PBX shared secret (Asterisk AGI authentication)
 PBX_SHARED_SECRET = config('PBX_SHARED_SECRET', default='')
 
+# BYO Asterisk realtime DBs. The app reaches Postgres through PgBouncer, which
+# can't run CREATE DATABASE/ROLE and isn't reachable from a tenant's PBX, so
+# provisioning connects to ASTERISK_ADMIN_DB_HOST and the install script hands
+# the PBX ASTERISK_PUBLIC_DB_HOST (blank = use the stored realtime_db_host).
+ASTERISK_ADMIN_DB_HOST = config('ASTERISK_ADMIN_DB_HOST', default='')
+ASTERISK_ADMIN_DB_PORT = config('ASTERISK_ADMIN_DB_PORT', default='')
+ASTERISK_PUBLIC_DB_HOST = config('ASTERISK_PUBLIC_DB_HOST', default='')
+ASTERISK_PUBLIC_DB_PORT = config('ASTERISK_PUBLIC_DB_PORT', default='')
+# Addresses EchoDesk calls the PBX's AMI from (comma separated, CIDR allowed);
+# written into the AMI user's permit= lines. Blank = allow any (firewall it).
+PBX_AMI_PERMIT = config('PBX_AMI_PERMIT', default='')
+
 # Telegram Bot Configuration (for subscription notifications)
 TELEGRAM_BOT_TOKEN = config('TELEGRAM_BOT_TOKEN', default='')
 TELEGRAM_CHAT_ID = config('TELEGRAM_CHAT_ID', default='')
