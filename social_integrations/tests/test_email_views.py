@@ -588,7 +588,7 @@ class TestEmailAction(SocialIntegrationTestCase):
         self.assertFalse(msg.is_starred)
 
     def test_delete_email(self):
-        """delete action soft-deletes by setting is_deleted=True."""
+        """delete moves to Trash; delete again (in Trash) soft-deletes permanently."""
         msg = self.create_email_message(
             connection=self.conn, message_id='<delete-action@test.com>',
         )
@@ -596,6 +596,13 @@ class TestEmailAction(SocialIntegrationTestCase):
             'message_ids': [msg.id],
             'action': 'delete',
         }
+        resp = self.api_post(self.url, data, user=self.agent)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        msg.refresh_from_db()
+        self.assertFalse(msg.is_deleted)
+        self.assertEqual(msg.folder, 'Trash')
+        self.assertEqual(msg.previous_folder, 'INBOX')
+
         resp = self.api_post(self.url, data, user=self.agent)
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         msg.refresh_from_db()

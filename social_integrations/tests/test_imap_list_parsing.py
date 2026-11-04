@@ -69,13 +69,16 @@ class TestSyncWithAtomFolderNames(SocialIntegrationTestCase):
             total = sync_imap_messages(conn)
 
         synced = [(c.args[2], c.args[3]) for c in sync_folder.call_args_list]
+        # Trash and Junk are synced too (C4); Drafts is still skipped.
         assert synced == [
             ('&ENgQ3BDVEN0Q2BDhENQQ0RDY-', 'ინვოისები'),
             ('Archive', 'Archive'),
+            ('Junk', 'Junk'),
+            ('Trash', 'Trash'),
             ('Sent', 'Sent'),
             ('INBOX', 'INBOX'),
         ]
-        assert total == 8
+        assert total == 12
         conn.refresh_from_db()
         assert conn.last_sync_error == ''
 
@@ -93,7 +96,7 @@ class TestSyncWithAtomFolderNames(SocialIntegrationTestCase):
             sync_imap_messages(conn)
 
         synced = [(c.args[2], c.args[3]) for c in sync_folder.call_args_list]
-        assert synced == [('Gesendete Objekte', 'Sent')]
+        assert synced == [('Gesendete Objekte', 'Sent'), ('Papierkorb', 'Trash')]
 
 
 class TestOutgoingMessageIdDomain(SocialIntegrationTestCase):

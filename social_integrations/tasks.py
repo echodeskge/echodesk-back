@@ -144,6 +144,38 @@ def sync_tenant_emails(schema_name):
 
 
 
+@shared_task(bind=True, max_retries=3, soft_time_limit=120, time_limit=180)
+def email_post_send_task(self, schema_name, connection_id, sent_message_id, eml_b64, flag_targets=None):
+    """After an SMTP send: APPEND the sent MIME to the server's Sent folder
+    and set \\Answered / $Forwarded on the originals.
+
+    Best-effort: the mail is already delivered. An APPEND failure is retried
+    with backoff, then logged and dropped.
+    """
+    import base64
+    from tenant_schemas.utils import schema_context
+
+    with schema_context(schema_name):
+        from social_integrations.models import EmailConnection
+        from social_integrations.email_utils import perform_post_send_imap
+
+        connection = EmailConnection.objects.filter(pk=connection_id).first()
+        if connection is None:
+            return None
+        message_bytes = base64.b64decode(eml_b64) if eml_b64 else None
+        try:
+            return perform_post_send_imap(connection, message_bytes, sent_message_id, flag_targets or [])
+        except Exception as exc:
+            logger.warning(
+                "Post-send IMAP for %s/%s failed (attempt %s): %s",
+                schema_name, connection.email_address, self.request.retries + 1, exc,
+            )
+            if self.request.retries >= self.max_retries:
+                logger.error("Giving up on Sent APPEND for %s/%s: %s", schema_name, connection.email_address, exc)
+                return None
+            raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
+
+
 @shared_task(bind=True, soft_time_limit=90, time_limit=120)
 def ai_companion_reply_task(self, schema_name, platform, account_id,
                             conversation_id, trigger_message_pk):
@@ -276,3 +308,30 @@ def ai_companion_reply_task(self, schema_name, platform, account_id,
             return 'done:reply'
 
         return f'error:unknown_action_{action}'
+
+
+@shared_task(bind=True, max_retries=2, soft_time_limit=120, time_limit=180)
+def email_mailbox_operation_task(self, schema_name, connection_id, operation, items, options=None):
+    """Server half of an email action (move to Trash / restore / move /
+    permanent delete / \\Seen / \\Flagged). The DB was already updated by the
+    view; this is best-effort: connection errors are retried a couple of
+    times, everything else is logged and dropped.
+    """
+    from tenant_schemas.utils import schema_context
+
+    with schema_context(schema_name):
+        from social_integrations.models import EmailConnection
+        from social_integrations.email_mailbox import perform_mailbox_operation
+
+        connection = EmailConnection.objects.filter(pk=connection_id, is_active=True).first()
+        if connection is None:
+            return None
+        try:
+            return perform_mailbox_operation(connection, operation, items, **(options or {}))
+        except (OSError, ConnectionError) as exc:
+            if self.request.retries < self.max_retries:
+                raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
+            logger.error("Email %s for %s/%s gave up: %s", operation, schema_name, connection.email_address, exc)
+        except Exception as exc:
+            logger.error("Email %s for %s/%s failed: %s", operation, schema_name, connection.email_address, exc)
+        return None

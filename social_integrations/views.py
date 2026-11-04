@@ -6797,17 +6797,16 @@ def mark_conversation_read(request):
             )
 
         elif platform == 'email':
-            # Mark all incoming messages in this thread as read by staff
-            updated_count = EmailMessage.objects.filter(
+            # Mark all incoming messages in this thread as read by staff.
+            # Through set_flag so \Seen is also STOREd on the server; a
+            # DB-only change would be undone by the next sync.
+            from .email_mailbox import set_flag
+            updated_count = set_flag(EmailMessage.objects.filter(
+                Q(is_read_by_staff=False) | Q(is_read=False),
                 thread_id=conversation_id, **acct,
                 is_from_business=False,
-                is_read_by_staff=False,
                 is_deleted=False
-            ).update(
-                is_read_by_staff=True,
-                read_by_staff_at=now,
-                is_read=True
-            )
+            ), 'mark_read')
         elif platform == 'widget':
             updated_count = WidgetMessage.objects.filter(
                 session__session_id=conversation_id, **acct,
@@ -6987,11 +6986,9 @@ def mark_conversation_unread(request):
             ).order_by('-timestamp').first()
 
             if last_message:
-                last_message.is_read_by_staff = False
-                last_message.read_by_staff_at = None
-                last_message.is_read = False
-                last_message.save()
-                updated_count = 1
+                # set_flag: DB now and -\Seen on the server (see mark read).
+                from .email_mailbox import set_flag
+                updated_count = set_flag(EmailMessage.objects.filter(pk=last_message.pk), 'mark_unread')
         elif platform == 'widget':
             last_message = WidgetMessage.objects.filter(
                 session__session_id=conversation_id, **acct,
@@ -7157,31 +7154,32 @@ def delete_conversation(request):
             deleted_count = deleted_from + deleted_to
 
         elif platform == 'email':
-            # Get messages to delete (need message_ids for IMAP deletion)
-            messages_to_delete = EmailMessage.objects.filter(
-                thread_id=conversation_id,
-                is_deleted=False
+            # Outlook semantics, same code path as email_action 'delete':
+            # every message of the thread (any folder, every mailbox the user
+            # may access) moves to that mailbox's Trash on the server; only
+            # when the whole thread is already in Trash is it purged
+            # (UID EXPUNGE of those uids only).
+            # Optional `folder` (the folder being viewed) limits it to the
+            # thread's messages in that folder, like Outlook: in Trash that
+            # purges them, elsewhere it trashes them. Optional `account_id`
+            # limits it to one mailbox.
+            from .email_mailbox import TRASH, canonical_db_folder, delete_messages, trash_messages
+            view_folder = request.data.get('folder') or request.query_params.get('folder')
+            account_id = request.data.get('account_id') or request.query_params.get('account_id')
+            messages_to_delete = _restrict_email_queryset(
+                EmailMessage.objects.filter(
+                    thread_id=conversation_id, is_deleted=False, **_account_scope('email', account_id),
+                ),
+                request.user,
             )
-            message_ids = list(messages_to_delete.values_list('message_id', flat=True))
-
-            # Try to delete from IMAP server first
-            if message_ids:
-                try:
-                    # Get the connection for these emails
-                    first_message = messages_to_delete.first()
-                    if first_message and first_message.connection:
-                        from .email_utils import delete_emails_from_imap
-                        delete_emails_from_imap(first_message.connection, message_ids)
-                except Exception as e:
-                    logger.warning(f"Failed to delete emails from IMAP server: {e}")
-                    # Continue with soft delete even if IMAP delete fails
-
-            # Soft delete all messages in this thread
-            deleted_count = messages_to_delete.update(
-                is_deleted=True,
-                deleted_at=now,
-                deleted_by=request.user
-            )
+            if view_folder and view_folder != 'All':
+                deleted_count = delete_messages(
+                    messages_to_delete.filter(folder=canonical_db_folder(view_folder)), user=request.user,
+                )
+            elif messages_to_delete.exclude(folder=TRASH).exists():
+                deleted_count = trash_messages(messages_to_delete)
+            else:
+                deleted_count = delete_messages(messages_to_delete, user=request.user)
 
         elif platform == 'widget':
             deleted_count = WidgetMessage.objects.filter(
@@ -9850,6 +9848,16 @@ def _can_access_email_connection(user, connection_id):
     return allowed is None or connection_id in allowed
 
 
+def _effective_signature_payload(conn):
+    """C2: the signature a new message from ``conn`` gets (same resolver as send)."""
+    from .email_utils import get_effective_signature
+    signature = get_effective_signature(conn, is_reply=False)
+    return {
+        key: signature[key]
+        for key in ('source', 'is_enabled', 'include_on_reply', 'signature_html', 'signature_text')
+    }
+
+
 @extend_schema(
     summary="Email connection status",
     description=(
@@ -9918,6 +9926,7 @@ def email_connection_status(request):
                 'signature_enabled': conn.signature_enabled,
                 'signature_html': conn.signature_html,
                 'signature_text': conn.signature_text,
+                'effective_signature': _effective_signature_payload(conn),
                 'assigned_users': assigned_users,
             })
 
@@ -10309,15 +10318,23 @@ def email_disconnect(request):
     summary="Send an email",
     description=(
         "Send a new message, a reply (`reply_to_message_id` = pk of the message "
-        "being answered; it must belong to the chosen connection) or a forward "
-        "(plain send with the quoted body). Accepts `application/json`, or "
+        "being answered, on any mailbox the user can access, else 400; the "
+        "original is marked answered) or a forward (`forward_message_id` = pk of "
+        "the forwarded message: its stored attachments are re-attached). Accepts "
+        "`application/json`, or "
         "`multipart/form-data` when attaching files: repeat the `attachments` "
         "form key once per file and repeat list keys (`to_emails`, `cc_emails`, "
         "`bcc_emails`) once per address. At least one of `body_text` / "
-        "`body_html` is required. The tenant / connection signature is appended "
-        "server-side. The sent copy is stored in folder 'Sent' and returned as `data`. "
+        "`body_html` is required. The effective signature (see `effective_signature` "
+        "on /email/status/) is appended server-side unless `signature_included` is "
+        "true. `draft_id` deletes that draft after a successful send. "
+        "The sent copy is stored in folder 'Sent' (exactly as delivered) and returned "
+        "as `data`; it is also APPENDed to the server's Sent folder in the "
+        "background. `refused_recipients` lists addresses the server refused when "
+        "others were accepted; `warnings` holds non-fatal problems. "
         "`connection_id` must be an active mailbox the user can access (404 "
-        "otherwise); when omitted the first accessible active mailbox is used. "
+        "otherwise); when omitted the original's mailbox (replies) or the first "
+        "accessible active mailbox is used. "
         + EMAIL_ACCESS_RULES_DOC
     ),
     request={
@@ -10329,6 +10346,8 @@ def email_disconnect(request):
         400: OpenApiTypes.OBJECT,
         404: EmailErrorResponseSerializer,
         500: EmailErrorResponseSerializer,
+        502: EmailErrorResponseSerializer,
+        504: EmailErrorResponseSerializer,
     },
 )
 @api_view(['POST'])
@@ -10336,47 +10355,68 @@ def email_disconnect(request):
 def email_send(request):
     """Send an email message (with optional file attachments)"""
     from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
-    from .email_utils import send_email_smtp
+    import smtplib
+    import socket
+    from .email_utils import send_email_smtp, load_message_attachments
     request.parsers = [MultiPartParser(), FormParser(), JSONParser()]
 
     serializer = EmailSendSerializer(data=request.data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    try:
-        # Support sending from a specific connection. Only mailboxes the
-        # user may access (EMAIL_ACCESS_RULES_DOC) are candidates.
-        connection_id = request.data.get('connection_id')
-        accessible = _accessible_email_connections(request.user, is_active=True)
-        if connection_id:
-            connection = accessible.filter(id=connection_id).first()
-        else:
-            connection = accessible.first()
-        if not connection:
+    data = serializer.validated_data
+    accessible = _accessible_email_connections(request.user, is_active=True)
+
+    # Reply / forward context: the original must be on a mailbox the user
+    # may access (any of them, so cross-mailbox replies stay threaded).
+    readable_messages = _restrict_email_queryset(EmailMessage.objects.all(), request.user)
+    reply_to_message = None
+    if data.get('reply_to_message_id'):
+        reply_to_message = readable_messages.filter(id=data['reply_to_message_id']).first()
+        if reply_to_message is None:
             return Response({
-                'error': 'No active email connection found'
-            }, status=status.HTTP_404_NOT_FOUND)
+                'error': 'The message being replied to was not found'
+            }, status=status.HTTP_400_BAD_REQUEST)
+    forward_message = None
+    if data.get('forward_message_id'):
+        forward_message = readable_messages.filter(id=data['forward_message_id']).first()
+        if forward_message is None:
+            return Response({
+                'error': 'The message being forwarded was not found'
+            }, status=status.HTTP_400_BAD_REQUEST)
 
-        data = serializer.validated_data
+    # Support sending from a specific connection. Only mailboxes the
+    # user may access (EMAIL_ACCESS_RULES_DOC) are candidates.
+    connection_id = request.data.get('connection_id')
+    if connection_id:
+        connection = accessible.filter(id=connection_id).first()
+    elif reply_to_message is not None:
+        # Reply from the mailbox the original arrived in when it's usable.
+        connection = (
+            accessible.filter(id=reply_to_message.connection_id).first()
+            or accessible.first()
+        )
+    else:
+        connection = accessible.first()
+    if not connection:
+        return Response({
+            'error': 'No active email connection found'
+        }, status=status.HTTP_404_NOT_FOUND)
 
-        # Get reply context if replying to a message
-        reply_to_message = None
-        if data.get('reply_to_message_id'):
-            reply_to_message = EmailMessage.objects.filter(
-                id=data['reply_to_message_id'],
-                connection=connection
-            ).first()
+    # Build attachment list from uploaded files
+    attachment_files = request.FILES.getlist('attachments')
+    attachments = []
+    for f in attachment_files:
+        attachments.append({
+            'filename': f.name,
+            'content': f.read(),
+            'content_type': f.content_type or 'application/octet-stream',
+        })
+    if forward_message is not None:
+        attachments.extend(load_message_attachments(forward_message))
 
-        # Build attachment list from uploaded files
-        attachment_files = request.FILES.getlist('attachments')
-        attachments = []
-        for f in attachment_files:
-            attachments.append({
-                'filename': f.name,
-                'content': f.read(),
-                'content_type': f.content_type or 'application/octet-stream',
-            })
-
+    report = {}
+    try:
         # Send the email
         result = send_email_smtp(
             connection=connection,
@@ -10388,21 +10428,73 @@ def email_send(request):
             bcc_emails=data.get('bcc_emails', []),
             reply_to_message_id=reply_to_message.message_id if reply_to_message else None,
             attachments=attachments,
+            signature_included=data.get('signature_included', False),
+            reply_to_message=reply_to_message,
+            forward_message=forward_message,
+            report=report,
         )
-
-        # send_email_smtp returns (message_id, sent_message) tuple
-        message_id, message = result
+    except smtplib.SMTPAuthenticationError as e:
+        logger.error(f"Failed to send email (auth): {e}")
         return Response({
-            'status': 'success',
-            'message_id': message.id if message else None,
-            'data': EmailMessageSerializer(message).data if message else None
-        })
-
+            'error': 'Mailbox login failed. Check the email password in the connection settings.',
+            'details': _smtp_error_text(e),
+        }, status=status.HTTP_400_BAD_REQUEST)
+    except smtplib.SMTPRecipientsRefused as e:
+        logger.error(f"Failed to send email (recipients refused): {e}")
+        refused = sorted(str(addr) for addr in (e.recipients or {}))
+        return Response({
+            'error': 'The mail server refused all recipients: ' + ', '.join(refused),
+            'refused_recipients': refused,
+        }, status=status.HTTP_400_BAD_REQUEST)
+    except (smtplib.SMTPSenderRefused, smtplib.SMTPDataError) as e:
+        logger.error(f"Failed to send email (rejected): {e}")
+        return Response({
+            'error': 'The mail server rejected the message.',
+            'details': _smtp_error_text(e),
+        }, status=status.HTTP_502_BAD_GATEWAY)
+    except (socket.timeout, TimeoutError) as e:
+        logger.error(f"Failed to send email (timeout): {e}")
+        return Response({
+            'error': 'The mail server did not respond in time. Please try again.',
+        }, status=status.HTTP_504_GATEWAY_TIMEOUT)
+    except (smtplib.SMTPException, OSError) as e:
+        logger.error(f"Failed to send email (smtp): {e}")
+        return Response({
+            'error': 'Could not reach the mail server. Please try again.',
+            'details': _smtp_error_text(e),
+        }, status=status.HTTP_502_BAD_GATEWAY)
     except Exception as e:
-        logger.error(f"Failed to send email: {e}")
+        logger.exception(f"Failed to send email: {e}")
         return Response({
             'error': f'Failed to send email: {str(e)}'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # send_email_smtp returns (message_id, sent_message) tuple
+    message_id, message = result
+
+    if data.get('draft_id'):
+        try:
+            EmailDraft.objects.filter(id=data['draft_id'], created_by=request.user).delete()
+        except Exception as e:
+            logger.warning(f"Sent, but deleting draft {data['draft_id']} failed: {e}")
+
+    return Response({
+        'status': 'success',
+        'message_id': message.id if message else None,
+        'data': EmailMessageSerializer(message).data if message else None,
+        'refused_recipients': report.get('refused_recipients', []),
+        'warnings': report.get('warnings', []),
+    })
+
+
+def _smtp_error_text(exc) -> str:
+    """Server reply text of an SMTP exception (no traceback)."""
+    error = getattr(exc, 'smtp_error', None)
+    if isinstance(error, bytes):
+        error = error.decode('utf-8', errors='replace')
+    code = getattr(exc, 'smtp_code', None)
+    text = error or str(exc)
+    return f'{code} {text}'.strip() if code else text
 
 
 @extend_schema(
@@ -10411,10 +10503,22 @@ def email_send(request):
         "Bulk action on messages selected by `message_ids` (pks) or by "
         "`thread_id`; one of the two is required. Actions: mark_read / "
         "mark_unread (also toggles is_read_by_staff), star / unstar, label / "
-        "unlabel (needs `label`), move (needs `folder`; updates the DB folder "
-        "only — use /email-messages/move/ for a real IMAP move), delete (soft) "
-        "/ restore. Messages on connections the user cannot access are "
-        "ignored; 404 when nothing matched. " + EMAIL_ACCESS_RULES_DOC
+        "unlabel (needs `label`), move (needs `folder`), delete, restore. "
+        "Optional `connection_id` limits a `thread_id` action to one mailbox. "
+        "For delete with `thread_id`, optional `folder` is the folder being "
+        "viewed: only the thread's messages there are deleted (purged when "
+        "it is Trash, else moved to Trash). "
+        "Outlook semantics: delete on a message outside Trash moves it to the "
+        "mailbox's Trash (folder='Trash', previous_folder=<old folder>); "
+        "delete on a message already in Trash removes it permanently "
+        "(is_deleted=true). restore moves a Trash message back to "
+        "previous_folder (default INBOX); rows soft-deleted by the old "
+        "DB-only delete are simply un-deleted. delete / restore / move need "
+        "send permission (403 otherwise). The DB changes immediately; the "
+        "server write (MOVE, \\Seen, \\Flagged, UID EXPUNGE) runs in a "
+        "background task and never fails the request. Messages on "
+        "connections the user cannot access are ignored; 404 when nothing "
+        "matched. " + EMAIL_ACCESS_RULES_DOC
     ),
     request=EmailMessageActionSerializer,
     responses={
@@ -10441,6 +10545,9 @@ def email_action(request):
             messages = EmailMessage.objects.filter(thread_id=data['thread_id'])
         else:
             messages = EmailMessage.objects.filter(id__in=data['message_ids'])
+        if data.get('connection_id'):
+            # One mailbox's copy of a thread (the same mail can reach two).
+            messages = messages.filter(connection_id=data['connection_id'])
 
         # Mailbox assignment enforcement (no-op for admins / unassigned users).
         messages = _restrict_email_queryset(messages, request.user)
@@ -10452,26 +10559,34 @@ def email_action(request):
                 'error': 'No messages found with the provided IDs'
             }, status=status.HTTP_404_NOT_FOUND)
 
-        if action == 'mark_read':
-            messages.update(is_read=True, is_read_by_staff=True, read_by_staff_at=timezone.now())
-        elif action == 'mark_unread':
-            messages.update(is_read=False, is_read_by_staff=False, read_by_staff_at=None)
-        elif action == 'star':
-            messages.update(is_starred=True)
-        elif action == 'unstar':
-            messages.update(is_starred=False)
+        from . import email_mailbox
+
+        if action in ('delete', 'restore', 'move') and not CanSendSocialMessages().has_permission(request, None):
+            # View-only users can read a shared mailbox but not change it.
+            return Response({
+                'error': 'You do not have permission to change these messages'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        if action in email_mailbox.FLAG_ACTIONS:
+            # DB now; \Seen / \Flagged on the server in a background task.
+            email_mailbox.set_flag(messages, action)
         elif action == 'delete':
-            messages.update(
-                is_deleted=True,
-                deleted_at=timezone.now(),
-                deleted_by=request.user
-            )
+            live = messages.filter(is_deleted=False)
+            view_folder = data.get('folder')
+            if data.get('thread_id') and view_folder and view_folder != 'All':
+                # Per-folder conversation delete (Outlook): only the thread's
+                # messages in the folder being viewed. From Trash that purges
+                # them; it never pulls INBOX / Sent copies into Trash.
+                email_mailbox.delete_messages(
+                    live.filter(folder=email_mailbox.canonical_db_folder(view_folder)), user=request.user,
+                )
+            elif data.get('thread_id') and live.exclude(folder=email_mailbox.TRASH).exists():
+                # Deleting a conversation from a folder view: to Trash only.
+                email_mailbox.trash_messages(live)
+            else:
+                email_mailbox.delete_messages(live, user=request.user)
         elif action == 'restore':
-            messages.update(
-                is_deleted=False,
-                deleted_at=None,
-                deleted_by=None
-            )
+            email_mailbox.restore_messages(messages)
         elif action == 'label':
             label = data['label']
             for msg in messages:
@@ -10485,8 +10600,9 @@ def email_action(request):
                     msg.labels.remove(label)
                     msg.save()
         elif action == 'move':
-            folder = data['folder']
-            messages.update(folder=folder)
+            email_mailbox.move_messages(
+                messages.filter(is_deleted=False), email_mailbox.canonical_db_folder(data['folder']),
+            )
 
         return Response({
             'status': 'success',
@@ -10505,8 +10621,15 @@ def email_action(request):
     summary="List IMAP folders",
     description=(
         "Live IMAP LIST (10s timeout per connection, serial — cache client-side). "
-        "With `connection_id`: `{connection_id, email, folders}`. Without: "
-        "`{connections: [{connection_id, email, folders, success, error?}]}` "
+        "With `connection_id`: `{connection_id, email, folders, folder_details}`. Without: "
+        "`{connections: [{connection_id, email, folders, folder_details, success, error?}]}` "
+        "`folders` is the bare decoded IMAP names (unchanged). `folder_details` "
+        "lists selectable folders as `{name, display_name, raw_name, role, "
+        "unread_count, total_count}`: `name` is the DB folder to filter "
+        "messages by (special folders are canonical: INBOX / Sent / Drafts / "
+        "Trash / Junk / Archive), `role` is inbox|sent|drafts|trash|junk|"
+        "archive|custom and the counts are non-deleted DB rows (unread = "
+        "is_read false). "
         "for every active connection the user can access. 404 when there is no "
         "accessible active connection (or `connection_id` is not one). "
         + EMAIL_ACCESS_RULES_DOC
@@ -10531,6 +10654,7 @@ def email_folders(request):
                        If not provided, returns folders for all active connections
     """
     from .email_utils import get_imap_folders
+    from . import email_mailbox
 
     try:
         connection_id = request.query_params.get('connection_id')
@@ -10549,10 +10673,14 @@ def email_folders(request):
             result = get_imap_folders(connection)
 
             if result['success']:
+                counts = email_mailbox.folder_counts([connection.id])
                 return Response({
                     'connection_id': connection.id,
                     'email': connection.email_address,
-                    'folders': result['folders']
+                    'folders': result['folders'],
+                    'folder_details': email_mailbox.folder_entries_with_counts(
+                        connection.id, result.get('details'), counts,
+                    ),
                 })
             else:
                 return Response({
@@ -10569,6 +10697,7 @@ def email_folders(request):
                 }, status=status.HTTP_404_NOT_FOUND)
 
             all_connections_folders = []
+            counts = email_mailbox.folder_counts([c.id for c in connections])
 
             for connection in connections:
                 result = get_imap_folders(connection)
@@ -10576,6 +10705,9 @@ def email_folders(request):
                     'connection_id': connection.id,
                     'email': connection.email_address,
                     'folders': result['folders'] if result['success'] else [],
+                    'folder_details': email_mailbox.folder_entries_with_counts(
+                        connection.id, result.get('details') if result['success'] else [], counts,
+                    ),
                     'success': result['success'],
                 }
                 if not result['success']:
@@ -10778,7 +10910,10 @@ def _truthy_param(value) -> bool:
             OpenApiParameter('label', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
                              description="Only messages carrying this label"),
             OpenApiParameter('thread_id', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
-                             description="All messages of one conversation"),
+                             description="All non-deleted messages of one conversation, across folders (Sent included)"),
+            OpenApiParameter('ordering', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+                             enum=['timestamp', '-timestamp'],
+                             description="`timestamp` → oldest first (conversation view; DRF OrderingFilter). Default `-timestamp`."),
             OpenApiParameter('connection_id', OpenApiTypes.INT, OpenApiParameter.QUERY, required=False,
                              description="Only this email account (pk)"),
             OpenApiParameter('search', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
@@ -10868,15 +11003,31 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
         if connection_id:
             queryset = queryset.filter(connection_id=connection_id)
 
-        # Filter by thread_id for conversation view
+        # Filter by thread_id for conversation view: every non-deleted
+        # message of the thread in any folder (Sent included) of the
+        # accessible mailboxes.
         thread_id = self.request.query_params.get('thread_id')
         if thread_id:
             queryset = queryset.filter(thread_id=thread_id)
+            if not connection_id:
+                # The same mail delivered to two accessible mailboxes is one
+                # message in the conversation: keep the first stored copy.
+                queryset = queryset.exclude(Exists(_restrict_email_queryset(
+                    EmailMessage.objects.filter(
+                        thread_id=thread_id, is_deleted=False,
+                        message_id=OuterRef('message_id'), id__lt=OuterRef('id'),
+                    ),
+                    self.request.user,
+                )))
 
-        # Filter by folder
+        # Filter by folder. Without one (or 'All') Trash and Junk stay out,
+        # like the unified inbox; a conversation (thread_id) shows every folder.
+        from .inbox_list import EMAIL_EXCLUDED_FROM_ALL
         folder = self.request.query_params.get('folder')
-        if folder:
+        if folder and folder != 'All':
             queryset = queryset.filter(folder=folder)
+        elif not thread_id:
+            queryset = queryset.exclude(folder__in=EMAIL_EXCLUDED_FROM_ALL)
 
         # Filter by starred
         starred = self.request.query_params.get('starred')
@@ -10947,10 +11098,13 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
         if connection_id:
             base_queryset = base_queryset.filter(connection_id=connection_id)
 
-        # Filter by folder if specified
+        # Filter by folder if specified; "all folders" leaves Trash / Junk out.
+        from .inbox_list import EMAIL_EXCLUDED_FROM_ALL
         folder = request.query_params.get('folder')
         if folder and folder != 'All':
             base_queryset = base_queryset.filter(folder=folder)
+        else:
+            base_queryset = base_queryset.exclude(folder__in=EMAIL_EXCLUDED_FROM_ALL)
 
         if assignment_enabled:
             # Get active assignments (not 'completed' - those return to everyone)
@@ -10972,10 +11126,14 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
             )
 
         # Get distinct thread_ids with their latest message
+        # Counted by Message-ID: a mail that reached two accessible mailboxes
+        # is one message of the conversation.
         threads = base_queryset.values('thread_id').annotate(
             latest_timestamp=Max('timestamp'),
-            message_count=Count('id'),
-            unread_count=Count('id', filter=Q(is_read_by_staff=False, is_from_business=False))
+            message_count=Count('message_id', distinct=True),
+            unread_count=Count(
+                'message_id', distinct=True, filter=Q(is_read_by_staff=False, is_from_business=False),
+            )
         ).order_by('-latest_timestamp')
 
         # Limit to 50 threads and collect thread IDs
@@ -10999,6 +11157,9 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
             thread_id__in=thread_ids,
             is_deleted=False,
         ), request.user).select_related('connection').order_by('thread_id', '-timestamp')
+        if not folder or folder == 'All':
+            # The row shown must not be the trashed / spam copy.
+            latest_msgs = latest_msgs.exclude(folder__in=EMAIL_EXCLUDED_FROM_ALL)
         if self._lite():
             latest_msgs = latest_msgs.defer('body_html')
 
@@ -11071,7 +11232,11 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
 
     @extend_schema(
         summary="IMAP folders of the first active connection (legacy)",
-        description="Prefer GET /api/social/email/folders/. Live IMAP LIST on the first active connection the user can access; returns [{name, delimiter, flags}].",
+        description=(
+            "Prefer GET /api/social/email/folders/. Live IMAP LIST on the first active connection "
+            "the user can access; returns every selectable folder as [{name, display_name, db_name, "
+            "raw_name, role, unread_count, total_count}] (counts over non-deleted DB rows in db_name)."
+        ),
         responses={200: EmailFolderSerializer(many=True), 400: EmailErrorResponseSerializer},
     )
     @action(detail=False, methods=['get'], pagination_class=None, filter_backends=[])
@@ -11085,7 +11250,13 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
         if not connection:
             return Response({'error': 'No active email connection'}, status=400)
 
+        from . import email_mailbox
         folders = get_available_folders(connection)
+        counts = email_mailbox.folder_counts([connection.id])
+        for folder in folders:
+            db_name = folder.get('db_name') or folder.get('name')
+            folder.setdefault('role', email_mailbox.role_for_db_folder(db_name))
+            folder.update(counts.get((connection.id, db_name), {'total_count': 0, 'unread_count': 0}))
         return Response(folders)
 
     @extend_schema(
@@ -11120,10 +11291,18 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
         if not all([message_id, source_folder, target_folder]):
             return Response({'error': 'message_id, source_folder, and target_folder are required'}, status=400)
 
+        if not CanSendSocialMessages().has_permission(request, self):
+            return Response({'error': 'You do not have permission to move messages'}, status=403)
+
         # Use the connection that owns the message — a tenant may have several
         # mailboxes, and the first active one is not necessarily the right one.
+        # The same Message-ID can live in two mailboxes; optional
+        # `connection_id` picks one.
+        candidates = EmailMessage.objects.filter(message_id=message_id)
+        if request.data.get('connection_id'):
+            candidates = candidates.filter(connection_id=request.data.get('connection_id'))
         message = _restrict_email_queryset(
-            EmailMessage.objects.filter(message_id=message_id), request.user,
+            candidates, request.user,
         ).select_related('connection').first()
         if not message:
             return Response({'error': 'Message not found'}, status=404)
@@ -11132,13 +11311,22 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
         if not connection.is_active:
             return Response({'error': 'No active email connection'}, status=400)
 
-        success = move_email_to_folder(connection, message_id, source_folder, target_folder)
+        move_result = {}
+        success = move_email_to_folder(connection, message_id, source_folder, target_folder, result=move_result)
 
         if success:
-            # Update the folder in our database
-            EmailMessage.objects.filter(
-                connection=connection, message_id=message_id,
-            ).update(folder=target_folder)
+            # Update the folder in our database: the DB name of the folder the
+            # server actually moved it to (so a move to "Deleted Items" lands
+            # in the Trash view), falling back to the canonical name.
+            from . import email_mailbox
+            db_target = move_result.get('db_folder') or email_mailbox.canonical_db_folder(target_folder)
+            rows = EmailMessage.objects.filter(connection=connection, message_id=message_id)
+            if db_target == email_mailbox.TRASH:
+                rows.exclude(folder=email_mailbox.TRASH).update(
+                    previous_folder=F('folder'), folder=db_target,
+                )
+            else:
+                rows.update(folder=db_target, previous_folder='')
             return Response({'success': True, 'message': f'Email moved to {target_folder}'})
         else:
             return Response({'error': 'Failed to move email'}, status=500)

@@ -1313,7 +1313,9 @@ class EmailMessage(models.Model):
     )
 
     # Email identifiers
-    message_id = models.CharField(max_length=500, unique=True, help_text="RFC 2822 Message-ID header")
+    # Unique per mailbox (see Meta.constraints): the same mail delivered to
+    # two connected mailboxes of one tenant is stored once for each.
+    message_id = models.CharField(max_length=500, db_index=True, help_text="RFC 2822 Message-ID header")
     thread_id = models.CharField(max_length=500, blank=True, db_index=True, help_text="Thread grouping identifier")
     in_reply_to = models.CharField(max_length=500, blank=True, help_text="In-Reply-To header for threading")
     references = models.TextField(blank=True, help_text="References header for threading")
@@ -1336,6 +1338,14 @@ class EmailMessage(models.Model):
     timestamp = models.DateTimeField(help_text="Email Date header")
     folder = models.CharField(max_length=100, default='INBOX', help_text="IMAP folder this email is in")
     uid = models.CharField(max_length=50, blank=True, help_text="IMAP UID for this message in folder")
+    uid_validity = models.CharField(
+        max_length=50, blank=True, default='',
+        help_text="UIDVALIDITY of the folder when `uid` was recorded",
+    )
+    previous_folder = models.CharField(
+        max_length=100, blank=True, default='',
+        help_text="Folder the message was in before it was moved to Trash (restore target)",
+    )
 
     # Status flags (from IMAP)
     is_from_business = models.BooleanField(default=False, help_text="True if sent by business")
@@ -1372,6 +1382,12 @@ class EmailMessage(models.Model):
             models.Index(fields=['connection', 'thread_id']),
             models.Index(fields=['connection', 'folder', 'timestamp']),
             models.Index(fields=['from_email', 'timestamp']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['connection', 'message_id'],
+                name='uniq_emailmessage_connection_message_id',
+            ),
         ]
         verbose_name = "Email Message"
         verbose_name_plural = "Email Messages"

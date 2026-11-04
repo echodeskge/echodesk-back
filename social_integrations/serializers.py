@@ -674,7 +674,7 @@ class EmailMessageSerializer(serializers.ModelSerializer):
             'id', 'message_id', 'thread_id', 'in_reply_to', 'references',
             'from_email', 'from_name', 'to_emails', 'cc_emails', 'bcc_emails', 'reply_to',
             'subject', 'body_text', 'body_html', 'attachments',
-            'timestamp', 'folder', 'uid',
+            'timestamp', 'folder', 'previous_folder', 'uid',
             'is_from_business', 'is_read', 'is_starred', 'is_answered', 'is_draft', 'labels',
             'has_business_reply',
             'is_read_by_staff', 'read_by_staff_at',
@@ -684,7 +684,7 @@ class EmailMessageSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             'id', 'message_id', 'thread_id', 'in_reply_to', 'references',
-            'timestamp', 'folder', 'uid',
+            'timestamp', 'folder', 'previous_folder', 'uid',
             'is_from_business', 'is_answered',
             'connection_id', 'connection_email', 'connection_display_name',
             'created_at', 'updated_at'
@@ -724,7 +724,7 @@ class EmailMessageListSerializer(EmailMessageSerializer):
             'id', 'message_id', 'thread_id', 'in_reply_to',
             'from_email', 'from_name', 'to_emails', 'cc_emails', 'bcc_emails', 'reply_to',
             'subject', 'snippet', 'attachments_count',
-            'timestamp', 'folder', 'uid',
+            'timestamp', 'folder', 'previous_folder', 'uid',
             'is_from_business', 'is_read', 'is_starred', 'is_answered', 'is_draft', 'labels',
             'has_business_reply',
             'is_read_by_staff', 'read_by_staff_at',
@@ -782,6 +782,18 @@ class EmailSendSerializer(serializers.Serializer):
         required=False, allow_null=True,
         help_text="Send from this email connection (pk). Defaults to the first active connection.",
     )
+    signature_included = serializers.BooleanField(
+        required=False, default=False,
+        help_text="True when the body already contains the signature; the server then appends none.",
+    )
+    forward_message_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text="pk of the message being forwarded; its stored attachments are re-attached.",
+    )
+    draft_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text="EmailDraft pk to delete after a successful send.",
+    )
 
     def validate(self, data):
         """Ensure at least one body is provided"""
@@ -808,6 +820,13 @@ class EmailSendResponseSerializer(serializers.Serializer):
     status = serializers.CharField(help_text="'success'")
     message_id = serializers.IntegerField(allow_null=True, help_text="pk of the stored sent EmailMessage")
     data = EmailMessageSerializer(allow_null=True)
+    refused_recipients = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="Recipients the SMTP server refused while accepting others ([] normally)",
+    )
+    warnings = serializers.ListField(
+        child=serializers.CharField(), help_text="Non-fatal problems (e.g. Sent copy not stored)",
+    )
 
 
 class EmailErrorResponseSerializer(serializers.Serializer):
@@ -830,6 +849,14 @@ class EmailConnectionStatusAssignedUserSerializer(serializers.Serializer):
     assigned_at = serializers.DateTimeField()
 
 
+class EmailEffectiveSignatureSerializer(serializers.Serializer):
+    source = serializers.ChoiceField(choices=['connection', 'tenant', 'none'])
+    is_enabled = serializers.BooleanField()
+    include_on_reply = serializers.BooleanField()
+    signature_html = serializers.CharField(allow_blank=True)
+    signature_text = serializers.CharField(allow_blank=True)
+
+
 class EmailConnectionStatusItemSerializer(serializers.Serializer):
     id = serializers.IntegerField()
     email_address = serializers.EmailField()
@@ -846,6 +873,9 @@ class EmailConnectionStatusItemSerializer(serializers.Serializer):
     signature_enabled = serializers.BooleanField()
     signature_html = serializers.CharField(allow_blank=True)
     signature_text = serializers.CharField(allow_blank=True)
+    effective_signature = EmailEffectiveSignatureSerializer(
+        help_text="Signature the server appends to a new message from this mailbox (same resolver as send)",
+    )
     assigned_users = EmailConnectionStatusAssignedUserSerializer(
         many=True, help_text="Only populated for staff/superusers; [] otherwise",
     )
@@ -930,10 +960,20 @@ class EmailDisconnectResponseSerializer(serializers.Serializer):
     deleted = EmailDisconnectDeletedSerializer()
 
 
+class EmailFolderDetailSerializer(serializers.Serializer):
+    name = serializers.CharField(help_text="DB folder name to filter messages by (INBOX/Sent/Drafts/Trash/Junk/Archive are canonical)")
+    display_name = serializers.CharField(help_text="Decoded IMAP folder name")
+    raw_name = serializers.CharField(help_text="Raw (modified UTF-7) IMAP name")
+    role = serializers.ChoiceField(choices=['inbox', 'sent', 'drafts', 'trash', 'junk', 'archive', 'custom'])
+    unread_count = serializers.IntegerField(help_text="Non-deleted DB messages with is_read=false")
+    total_count = serializers.IntegerField(help_text="Non-deleted DB messages")
+
+
 class EmailConnectionFoldersSerializer(serializers.Serializer):
     connection_id = serializers.IntegerField()
     email = serializers.EmailField()
     folders = serializers.ListField(child=serializers.CharField(), help_text="IMAP folder names")
+    folder_details = EmailFolderDetailSerializer(many=True, required=False)
     success = serializers.BooleanField(required=False, help_text="Only in the all-connections shape")
     error = serializers.CharField(required=False, help_text="Only when success is false")
 
@@ -944,6 +984,7 @@ class EmailFoldersResponseSerializer(serializers.Serializer):
     connection_id = serializers.IntegerField(required=False)
     email = serializers.EmailField(required=False)
     folders = serializers.ListField(child=serializers.CharField(), required=False)
+    folder_details = EmailFolderDetailSerializer(many=True, required=False)
     connections = EmailConnectionFoldersSerializer(many=True, required=False)
 
 
@@ -984,6 +1025,9 @@ class EmailMoveRequestSerializer(serializers.Serializer):
     message_id = serializers.CharField(help_text="RFC Message-ID header value (EmailMessage.message_id), NOT the pk")
     source_folder = serializers.CharField()
     target_folder = serializers.CharField()
+    connection_id = serializers.IntegerField(
+        required=False, help_text="Mailbox (pk) when the same Message-ID is stored in several",
+    )
 
 
 class EmailMoveResponseSerializer(serializers.Serializer):
@@ -1063,7 +1107,16 @@ class EmailMessageActionSerializer(serializers.Serializer):
     )
     # Optional parameters based on action
     label = serializers.CharField(max_length=100, required=False, help_text="Label name for label/unlabel actions")
-    folder = serializers.CharField(max_length=100, required=False, help_text="Folder name for move action")
+    folder = serializers.CharField(
+        max_length=100, required=False,
+        help_text=(
+            "move: target folder. delete with thread_id: the folder being viewed "
+            "(only the thread's messages in it are deleted; omit or 'All' for every folder)"
+        ),
+    )
+    connection_id = serializers.IntegerField(
+        required=False, help_text="Only messages of this email connection (pk), e.g. one mailbox's copy of a thread",
+    )
 
     def validate(self, data):
         action = data.get('action')
@@ -1080,8 +1133,16 @@ class EmailMessageActionSerializer(serializers.Serializer):
 class EmailFolderSerializer(serializers.Serializer):
     """Serializer for email folder information"""
     name = serializers.CharField(help_text="Folder name")
-    delimiter = serializers.CharField(help_text="Folder hierarchy delimiter")
-    flags = serializers.ListField(child=serializers.CharField(), help_text="IMAP folder flags")
+    delimiter = serializers.CharField(required=False, help_text="Folder hierarchy delimiter")
+    flags = serializers.ListField(child=serializers.CharField(), required=False, help_text="IMAP folder flags")
+    display_name = serializers.CharField(required=False)
+    db_name = serializers.CharField(required=False, help_text="DB folder name messages are stored under")
+    raw_name = serializers.CharField(required=False)
+    role = serializers.ChoiceField(
+        choices=['inbox', 'sent', 'drafts', 'trash', 'junk', 'archive', 'custom'], required=False,
+    )
+    unread_count = serializers.IntegerField(required=False)
+    total_count = serializers.IntegerField(required=False)
 
 
 class EmailConnectionUserAssignmentSerializer(serializers.ModelSerializer):

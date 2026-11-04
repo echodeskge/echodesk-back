@@ -10,11 +10,15 @@ import email
 import hashlib
 import logging
 import base64
+import copy
+import time
+import uuid
+from urllib.parse import unquote, urlparse
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-from email.utils import make_msgid, formataddr, parseaddr, getaddresses, parsedate_to_datetime
+from email.utils import make_msgid, formataddr, formatdate, parseaddr, getaddresses, parsedate_to_datetime
 from email.header import decode_header as email_decode_header
 from datetime import datetime, timedelta
 from typing import Tuple, Optional, List, Dict, Any
@@ -328,13 +332,20 @@ def get_imap_folders(connection) -> Dict:
         imap.logout()
 
         folders = []
+        details = []
         if result == 'OK':
+            from .email_mailbox import mailboxes_from_list_data
             for folder_data in folder_list:
                 raw_name = parse_imap_list_entry(folder_data)
                 if raw_name:
                     folders.append(decode_imap_utf7(raw_name))
+            # Selectable folders with role + the DB name messages are stored under.
+            details = [
+                {'name': e['db_name'], 'display_name': e['name'], 'raw_name': e['raw_name'], 'role': e['role']}
+                for e in mailboxes_from_list_data(folder_list)
+            ]
 
-        return {'success': True, 'folders': folders}
+        return {'success': True, 'folders': folders, 'details': details}
     except Exception as e:
         logger.error(f"Failed to get IMAP folders: {e}")
         return {'success': False, 'folders': [], 'error': str(e)}
@@ -620,10 +631,169 @@ def compute_thread_id(message_id: str, in_reply_to: str, references: str) -> str
         return hashlib.md5(message_id.strip('<>').strip().encode()).hexdigest()[:32]
 
 
+# Hosts whose servers file a copy of every SMTP-submitted message into the
+# Sent folder on their own; APPENDing there too would duplicate it.
+SELF_SAVING_SENT_HOST_MARKERS = (
+    'gmail.com', 'googlemail.com', 'office365.com', 'outlook.com',
+    'hotmail.com', 'live.com',
+)
+
+# References header cap (RFC 5322 suggests trimming long chains).
+MAX_REFERENCES = 20
+
+
+def provider_saves_sent_copy(connection) -> bool:
+    """True when the provider stores sent mail in Sent itself (Gmail, O365...).
+
+    Whole-domain match on the SMTP/IMAP host ("smtp.office365.com" yes,
+    "mail.olive.com" no).
+    """
+    for host in (getattr(connection, 'smtp_server', ''), getattr(connection, 'imap_server', '')):
+        host = (host or '').strip().lower().rstrip('.')
+        if host and any(host == d or host.endswith('.' + d) for d in SELF_SAVING_SENT_HOST_MARKERS):
+            return True
+    return False
+
+
+def _signature_html_to_text(html: str) -> str:
+    text = re.sub(r'<[^>]+>', '', html or '')
+    return text.replace('&nbsp;', ' ').replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&').strip()
+
+
+def get_effective_signature(connection, is_reply: bool = False) -> Dict[str, Any]:
+    """The signature send_email_smtp would use for ``connection``.
+
+    Priority: the connection's own signature when ``signature_enabled`` and
+    non-empty (always used, replies included), else the tenant EmailSignature
+    when ``is_enabled`` (honours ``include_on_reply``), else none.
+
+    Returns ``{source, is_enabled, include_on_reply, signature_html,
+    signature_text, applies}`` where ``applies`` says whether a message of the
+    given kind (``is_reply``) gets the signature appended. Shared by the send
+    path and ``email/status`` so the composer can't drift from what is sent.
+    """
+    from .models import EmailSignature
+
+    result = {
+        'source': 'none',
+        'is_enabled': False,
+        'include_on_reply': False,
+        'signature_html': '',
+        'signature_text': '',
+    }
+    try:
+        if connection.signature_enabled and (connection.signature_html or connection.signature_text):
+            result.update({
+                'source': 'connection',
+                'is_enabled': True,
+                'include_on_reply': True,
+                'signature_html': connection.signature_html or connection.signature_text.replace('\n', '<br>'),
+                'signature_text': connection.signature_text or _signature_html_to_text(connection.signature_html),
+            })
+        else:
+            signature = EmailSignature.objects.first()
+            if signature and signature.is_enabled:
+                html = signature.signature_html or (signature.signature_text or '').replace('\n', '<br>')
+                text = signature.signature_text or _signature_html_to_text(signature.signature_html)
+                result.update({
+                    'source': 'tenant',
+                    'is_enabled': True,
+                    'include_on_reply': bool(signature.include_on_reply),
+                    'signature_html': html or '',
+                    'signature_text': text or '',
+                })
+    except Exception as e:
+        logger.warning(f"Failed to get email signature: {e}")
+
+    result['applies'] = bool(result['is_enabled'] and (not is_reply or result['include_on_reply']))
+    return result
+
+
+def _store_outgoing_attachment(connection, filename: str, payload: bytes) -> str:
+    """Save an outgoing attachment to storage and return its URL.
+
+    Same layout as extract_attachments plus a random path segment, so sent
+    attachment URLs can't be guessed from the date and file name.
+    """
+    safe_name = (filename or 'file').replace('/', '_').replace('\\', '_')
+    file_path = (
+        f'email_attachments/{connection.id}/{timezone.now().strftime("%Y/%m/%d")}/'
+        f'{uuid.uuid4().hex}/{safe_name}'
+    )
+    saved_path = default_storage.save(file_path, ContentFile(payload))
+    return default_storage.url(saved_path)
+
+
+def _storage_name_from_url(url: str) -> Optional[str]:
+    """Map a default_storage URL (as stored in EmailMessage.attachments) back to its name."""
+    if not url:
+        return None
+    path = unquote(urlparse(url).path).lstrip('/')
+    media_prefix = urlparse(settings.MEDIA_URL or '').path.lstrip('/')
+    if media_prefix and path.startswith(media_prefix):
+        path = path[len(media_prefix):]
+    return path or None
+
+
+def load_message_attachments(message) -> List[Dict[str, Any]]:
+    """Read a stored message's attachments back from storage for re-sending.
+
+    Returns send_email_smtp-style dicts ``{filename, content, content_type}``.
+    Attachments whose file can't be read are skipped (logged), never fetched
+    from arbitrary URLs.
+    """
+    loaded = []
+    for att in (message.attachments or []):
+        if not isinstance(att, dict):
+            continue
+        name = _storage_name_from_url(att.get('url', ''))
+        if not name:
+            continue
+        try:
+            with default_storage.open(name, 'rb') as fh:
+                content = fh.read()
+        except Exception as e:
+            logger.warning(f"Could not load attachment {name} of message {message.pk}: {e}")
+            continue
+        loaded.append({
+            'filename': att.get('filename') or name.rsplit('/', 1)[-1],
+            'content': content,
+            'content_type': att.get('content_type') or 'application/octet-stream',
+        })
+    return loaded
+
+
+def build_references(original) -> str:
+    """References for a reply: parent chain + parent Message-ID, deduped, capped."""
+    chain = (original.references or original.in_reply_to or '').split()
+    chain.append(original.message_id or '')
+    ids = []
+    for ref in chain:
+        ref = ref.strip()
+        if ref and ref not in ids:
+            ids.append(ref)
+    if len(ids) > MAX_REFERENCES:
+        # Keep the thread root plus the most recent ids.
+        ids = ids[:1] + ids[-(MAX_REFERENCES - 1):]
+    return ' '.join(ids)
+
+
+def _dedupe_addresses(addresses: List[str], seen: set) -> List[str]:
+    out = []
+    for addr in addresses or []:
+        key = (addr or '').strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(addr.strip())
+    return out
+
+
 def send_email_smtp(connection, to_emails: List[str], cc_emails: List[str] = None,
                     bcc_emails: List[str] = None, subject: str = '',
                     body_text: str = '', body_html: str = '',
-                    reply_to_message_id: str = None, attachments: List[Dict] = None) -> Tuple[str, Any]:
+                    reply_to_message_id: str = None, attachments: List[Dict] = None,
+                    signature_included: bool = False, reply_to_message=None,
+                    forward_message=None, report: Optional[Dict[str, Any]] = None) -> Tuple[str, Any]:
     """
     Send an email via SMTP.
 
@@ -636,64 +806,50 @@ def send_email_smtp(connection, to_emails: List[str], cc_emails: List[str] = Non
         body_text: Plain text body
         body_html: HTML body
         reply_to_message_id: Message-ID of the email being replied to (for threading)
-        attachments: List of attachment dicts (not implemented yet)
+        attachments: List of {filename, content, content_type} dicts
+        signature_included: the composer already put the signature in the body;
+            don't append one.
+        reply_to_message: EmailMessage being replied to (preferred over the
+            Message-ID lookup). Marked answered after the send.
+        forward_message: EmailMessage being forwarded; gets $Forwarded on the
+            server after the send.
+        report: optional dict filled with ``refused_recipients`` (list) and
+            ``warnings`` (list of str).
 
     Returns:
-        Tuple of (message_id, saved_EmailMessage)
+        Tuple of (message_id, saved_EmailMessage). The saved row is None when
+        the mail went out but storing it failed (see ``report['warnings']``).
+
+    After a successful send the exact MIME (with Bcc) is IMAP-APPENDed to the
+    server's Sent folder and the original gets \\Answered / $Forwarded, in a
+    Celery task (best-effort; never fails the send).
     """
-    from .models import EmailMessage, EmailSignature
+    from .models import EmailMessage
+
+    if report is None:
+        report = {}
+    report.setdefault('refused_recipients', [])
+    report.setdefault('warnings', [])
 
     cc_emails = cc_emails or []
     bcc_emails = bcc_emails or []
     attachments = attachments or []
 
-    # Check if we should append email signature
-    # Priority: 1. Connection-specific signature, 2. Global EmailSignature
-    is_reply = reply_to_message_id is not None
+    original = reply_to_message
+    if original is None and reply_to_message_id:
+        original = (
+            EmailMessage.objects.filter(message_id=reply_to_message_id, connection=connection).first()
+            or EmailMessage.objects.filter(message_id=reply_to_message_id).first()
+        )
+    is_reply = original is not None or reply_to_message_id is not None
+
     signature_html_content = None
     signature_text_content = None
-
-    try:
-        # First, check if the connection has its own signature explicitly enabled
-        if connection.signature_enabled and (connection.signature_html or connection.signature_text):
-            # Use connection-specific signature
-            if connection.signature_html:
-                signature_html_content = connection.signature_html
-            elif connection.signature_text:
-                signature_html_content = connection.signature_text.replace('\n', '<br>')
-
-            if connection.signature_text:
-                signature_text_content = connection.signature_text
-            elif connection.signature_html:
-                import re
-                sig_text = re.sub(r'<[^>]+>', '', connection.signature_html)
-                sig_text = sig_text.replace('&nbsp;', ' ').replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&').strip()
-                signature_text_content = sig_text
-        else:
-            # Fall back to global EmailSignature
-            signature = EmailSignature.objects.first()
-            if signature and signature.is_enabled:
-                # Check if signature should be included (always for new emails, conditional for replies)
-                should_include = not is_reply or signature.include_on_reply
-                if should_include:
-                    # Get signature content
-                    if signature.signature_html:
-                        signature_html_content = signature.signature_html
-                    elif signature.signature_text:
-                        # Convert plain text signature to HTML
-                        signature_html_content = signature.signature_text.replace('\n', '<br>')
-
-                    # Get plain text signature
-                    if signature.signature_text:
-                        signature_text_content = signature.signature_text
-                    elif signature.signature_html:
-                        # Simple HTML to text fallback - strip tags
-                        import re
-                        sig_text = re.sub(r'<[^>]+>', '', signature.signature_html)
-                        sig_text = sig_text.replace('&nbsp;', ' ').replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&').strip()
-                        signature_text_content = sig_text
-    except Exception as e:
-        logger.warning(f"Failed to get email signature: {e}")
+    if not signature_included:
+        signature = get_effective_signature(connection, is_reply=is_reply)
+        if signature['applies']:
+            signature_html_content = signature['signature_html'] or None
+            signature_text_content = signature['signature_text'] or None
 
     # Append signature to plain text body
     final_body_text = body_text
@@ -716,7 +872,6 @@ def send_email_smtp(connection, to_emails: List[str], cc_emails: List[str] = Non
         body_part = MIMEText(final_body_text or '', 'plain', 'utf-8')
 
     # Wrap in 'mixed' if there are attachments, otherwise use body directly
-    attachment_metadata = []
     if attachments:
         msg = MIMEMultipart('mixed')
         msg.attach(body_part)
@@ -724,16 +879,15 @@ def send_email_smtp(connection, to_emails: List[str], cc_emails: List[str] = Non
             maintype, _, subtype = (att.get('content_type') or 'application/octet-stream').partition('/')
             if not subtype:
                 subtype = 'octet-stream'
+            filename = att.get('filename', 'file')
             mime_att = MIMEBase(maintype, subtype)
             mime_att.set_payload(att['content'])
             encoders.encode_base64(mime_att)
-            mime_att.add_header('Content-Disposition', 'attachment', filename=att.get('filename', 'file'))
+            # name= on Content-Type too: some Outlook versions ignore the
+            # Content-Disposition filename and show ATT00001.bin.
+            mime_att.set_param('name', filename)
+            mime_att.add_header('Content-Disposition', 'attachment', filename=filename)
             msg.attach(mime_att)
-            attachment_metadata.append({
-                'filename': att.get('filename', 'file'),
-                'content_type': att.get('content_type', 'application/octet-stream'),
-                'size': len(att.get('content', b'')),
-            })
     else:
         msg = body_part
 
@@ -747,23 +901,26 @@ def send_email_smtp(connection, to_emails: List[str], cc_emails: List[str] = Non
     if cc_emails:
         msg['Cc'] = ', '.join(cc_emails)
     msg['Subject'] = subject
-    msg['Date'] = timezone.now().strftime('%a, %d %b %Y %H:%M:%S %z')
+    msg['Date'] = formatdate(localtime=True)
 
     # Handle reply threading
     thread_id = None
-    original = None
-    if reply_to_message_id:
-        original = EmailMessage.objects.filter(message_id=reply_to_message_id).first()
-        if original:
-            msg['In-Reply-To'] = original.message_id
-            refs = f"{original.references} {original.message_id}".strip()
-            msg['References'] = refs
-            thread_id = original.thread_id
+    if original is not None:
+        msg['In-Reply-To'] = original.message_id
+        msg['References'] = build_references(original)
+        thread_id = original.thread_id
 
     if not thread_id:
         thread_id = compute_thread_id(msg['Message-ID'], '', '')
 
-    # Send via SMTP
+    # Send via SMTP. Bcc stays out of the headers (only the envelope).
+    seen = set()
+    all_recipients = (
+        _dedupe_addresses(to_emails, seen)
+        + _dedupe_addresses(cc_emails, seen)
+        + _dedupe_addresses(bcc_emails, seen)
+    )
+    smtp = None
     try:
         if connection.smtp_use_ssl:
             smtp = smtplib.SMTP_SSL(connection.smtp_server, connection.smtp_port, timeout=30)
@@ -773,295 +930,666 @@ def send_email_smtp(connection, to_emails: List[str], cc_emails: List[str] = Non
                 smtp.starttls()
 
         smtp.login(connection.username, connection.get_password())
-
-        all_recipients = to_emails + cc_emails + bcc_emails
-        smtp.sendmail(connection.email_address, all_recipients, msg.as_string())
-        smtp.quit()
-
+        refused = smtp.sendmail(connection.email_address, all_recipients, msg.as_string())
     except Exception as e:
         logger.error(f"Failed to send email: {e}")
         raise
+    finally:
+        if smtp is not None:
+            try:
+                smtp.quit()
+            except Exception:
+                try:
+                    smtp.close()
+                except Exception:
+                    pass
 
-    # Save sent message to database
-    sent_message = EmailMessage.objects.create(
-        connection=connection,
-        message_id=msg['Message-ID'],
-        thread_id=thread_id,
-        in_reply_to=msg.get('In-Reply-To', ''),
-        references=msg.get('References', ''),
-        from_email=connection.email_address,
-        from_name=connection.display_name or '',
-        to_emails=[{'email': e, 'name': ''} for e in to_emails],
-        cc_emails=[{'email': e, 'name': ''} for e in cc_emails],
-        bcc_emails=[{'email': e, 'name': ''} for e in bcc_emails],
-        subject=subject,
-        body_text=body_text,
-        body_html=body_html,
-        timestamp=timezone.now(),
-        folder='Sent',
-        is_from_business=True,
-        is_read=True,
-        attachments=attachment_metadata,
+    if isinstance(refused, dict) and refused:
+        report['refused_recipients'] = sorted(str(addr) for addr in refused)
+        report['warnings'].append(
+            'The server refused some recipients: ' + ', '.join(report['refused_recipients'])
+        )
+        logger.warning(f"SMTP refused recipients {report['refused_recipients']} for {msg['Message-ID']}")
+
+    # The Sent copy is the delivered MIME plus Bcc (as Outlook keeps it);
+    # the SMTP payload above never carries Bcc.
+    sent_copy = copy.deepcopy(msg)
+    if bcc_emails:
+        sent_copy['Bcc'] = ', '.join(bcc_emails)
+    try:
+        sent_bytes = sent_copy.as_bytes()
+    except Exception:
+        sent_bytes = msg.as_string().encode('utf-8')
+
+    # Store outgoing attachments so the Sent row can link to them.
+    attachment_metadata = []
+    for att in attachments:
+        filename = att.get('filename', 'file')
+        content = att.get('content', b'') or b''
+        meta = {
+            'filename': filename,
+            'content_type': att.get('content_type', 'application/octet-stream'),
+            'size': len(content),
+        }
+        try:
+            meta['url'] = _store_outgoing_attachment(connection, filename, content)
+        except Exception as e:
+            logger.error(f"Failed to store sent attachment {filename}: {e}")
+        attachment_metadata.append(meta)
+
+    # Save sent message to database: exactly what was delivered.
+    sent_message = None
+    try:
+        sent_message = EmailMessage.objects.create(
+            connection=connection,
+            message_id=msg['Message-ID'],
+            thread_id=thread_id,
+            in_reply_to=msg.get('In-Reply-To', ''),
+            references=msg.get('References', ''),
+            from_email=connection.email_address,
+            from_name=connection.display_name or '',
+            to_emails=[{'email': e, 'name': ''} for e in to_emails],
+            cc_emails=[{'email': e, 'name': ''} for e in cc_emails],
+            bcc_emails=[{'email': e, 'name': ''} for e in bcc_emails],
+            reply_to='',
+            subject=subject,
+            body_text=final_body_text or '',
+            body_html=final_body_html or '',
+            timestamp=timezone.now(),
+            folder='Sent',
+            is_from_business=True,
+            is_read=True,
+            attachments=attachment_metadata,
+        )
+    except Exception as e:
+        # The mail is already out; never tell the user it failed (they'd resend).
+        logger.error(f"Email {msg['Message-ID']} sent but saving the Sent copy failed: {e}")
+        report['warnings'].append('The email was sent but could not be saved to the Sent folder in EchoDesk.')
+
+    flag_targets = []
+    other_mailbox_flags = []  # originals that live in another mailbox
+    if original is not None and getattr(original, 'pk', None):
+        try:
+            EmailMessage.objects.filter(pk=original.pk).update(is_answered=True)
+            original.is_answered = True
+        except Exception as e:
+            logger.warning(f"Failed to mark message {original.pk} answered: {e}")
+        if original.connection_id == connection.pk:
+            flag_targets.append([original.pk, '\\Answered'])
+        else:
+            other_mailbox_flags.append((original, '\\Answered'))
+    if forward_message is not None and getattr(forward_message, 'pk', None):
+        if forward_message.connection_id == connection.pk:
+            flag_targets.append([forward_message.pk, '$Forwarded'])
+        else:
+            other_mailbox_flags.append((forward_message, '$Forwarded'))
+
+    # A uid is only meaningful in its own mailbox: flag those originals in a
+    # session of their own connection, never the sender's.
+    for message, flag in other_mailbox_flags:
+        try:
+            from . import email_mailbox
+            email_mailbox.schedule_mailbox_operation(
+                message.connection, 'flag', [email_mailbox.message_item(message)], flag=flag, value=True,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to queue {flag} for message {message.pk}: {e}")
+
+    schedule_post_send_imap(
+        connection,
+        None if provider_saves_sent_copy(connection) else sent_bytes,
+        sent_message.pk if sent_message else None,
+        flag_targets,
     )
 
     return msg['Message-ID'], sent_message
 
 
+def _quote_mailbox(name: str) -> str:
+    """Quote a (raw, modified-UTF-7) mailbox name for an IMAP command."""
+    return '"' + (name or '').replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
 def _find_sent_folder(imap) -> Optional[str]:
     """
-    Find the Sent folder name for this IMAP server.
-    Different providers use different names.
+    Find the Sent folder on this IMAP server and return its RAW
+    (modified UTF-7) name, ready for APPEND/SELECT after quoting.
+
+    Same choice as sync (``email_mailbox.list_mailboxes``): the RFC 6154
+    \\Sent special-use folder, else the first well-known Sent name in LIST
+    order. None when the server has no such folder.
     """
-    # Common sent folder names across providers
-    sent_folder_names = [
-        'Sent',
-        'INBOX.Sent',
-        'Sent Items',
-        'Sent Messages',
-        '[Gmail]/Sent Mail',
-        'INBOX/Sent',
-    ]
-
+    from . import email_mailbox
     try:
-        result, folders = imap.list()
-        if result != 'OK':
-            return None
-
-        available_folders = []
-        for folder_data in folders:
-            raw_name = parse_imap_list_entry(folder_data)
-            folder_name = decode_imap_utf7(raw_name) if raw_name else None
-            if folder_name:
-                available_folders.append(folder_name)
-
-        # Try to find a matching sent folder
-        for sent_name in sent_folder_names:
-            if sent_name in available_folders:
-                return sent_name
-            # Case-insensitive match
-            for folder in available_folders:
-                if folder.lower() == sent_name.lower():
-                    return folder
-
-        # Try partial match for 'sent' keyword
-        for folder in available_folders:
-            if 'sent' in folder.lower():
-                return folder
-
+        for entry in email_mailbox.list_mailboxes(imap) or []:
+            if entry['db_name'] == email_mailbox.CANONICAL_FOLDERS['sent']:
+                return entry['raw_name']
     except Exception as e:
         logger.warning(f"Error finding sent folder: {e}")
-
     return None
 
 
-def _sync_folder(imap, connection, imap_folder_name: str, db_folder_name: str, max_messages: int) -> int:
+_APPENDUID_RE = re.compile(rb'APPENDUID\s+(\d+)\s+(\d+)', re.IGNORECASE)
+
+
+def append_to_sent_folder(connection, message_bytes: bytes, imap=None) -> Optional[str]:
+    """APPEND ``message_bytes`` (flagged \\Seen) to the server's Sent folder.
+
+    Returns the new UID when the server answers with APPENDUID (UIDPLUS),
+    else None. Raises on failure so callers can retry.
+    """
+    return _append_to_sent(connection, message_bytes, imap=imap)[0]
+
+
+def _append_to_sent(connection, message_bytes: bytes, imap=None) -> Tuple[Optional[str], str]:
+    """``append_to_sent_folder`` returning ``(uid, uidvalidity)`` from APPENDUID.
+
+    The target is the folder sync stores as "Sent" (``resolve_raw_folder``),
+    created when the server has none, so the APPENDed copy is the one sync
+    sees and the uid is recorded against the right folder.
+    """
+    from . import email_mailbox
+    own_imap = imap is None
+    if own_imap:
+        imap = _connect_imap(connection)
+    try:
+        target = email_mailbox.resolve_raw_folder(imap, email_mailbox.CANONICAL_FOLDERS['sent'], create=True)
+        if not target:
+            target = 'Sent'
+
+        typ, data = imap.append(
+            _quote_mailbox(target), '(\\Seen)',
+            imaplib.Time2Internaldate(time.time()), message_bytes,
+        )
+        if typ != 'OK':
+            raise imaplib.IMAP4.error(f"APPEND to {target!r} failed: {data!r}")
+
+        for item in data or []:
+            if isinstance(item, str):
+                item = item.encode('utf-8', errors='replace')
+            if isinstance(item, bytes):
+                match = _APPENDUID_RE.search(item)
+                if match:
+                    return match.group(2).decode(), match.group(1).decode()
+        return None, ''
+    finally:
+        if own_imap:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+
+
+def imap_add_flag(imap, message, flag: str) -> bool:
+    """Best-effort ``UID STORE +FLAGS (flag)`` on ``message`` in its folder.
+
+    ``imap`` must be a session of ``message``'s own connection. The stored
+    uid is only used once its Message-ID / UIDVALIDITY check out
+    (``resolve_item_uids``); otherwise the uid is searched by Message-ID.
+    """
+    from . import email_mailbox
+    raw_folder = email_mailbox.resolve_raw_folder(imap, message.folder)
+    if not raw_folder:
+        return False
+    ok, uidvalidity, _ = email_mailbox.select_folder(imap, raw_folder, readonly=False)
+    if not ok:
+        return False
+    resolved = email_mailbox.resolve_item_uids(imap, [email_mailbox.message_item(message)], uidvalidity)
+    if not resolved:
+        return False
+    typ, _ = imap.uid('STORE', resolved[0][1], '+FLAGS', f'({flag})')
+    return typ == 'OK'
+
+
+def perform_post_send_imap(connection, message_bytes: Optional[bytes], sent_message_id=None,
+                           flag_targets=None) -> Optional[str]:
+    """Server-side bookkeeping after a send, in one IMAP session.
+
+    Flags the originals (best-effort, never raises), then APPENDs the sent
+    copy when ``message_bytes`` is given (raises on failure so the Celery task
+    retries) and stores the APPENDUID on the sent row.
+    """
+    from .models import EmailMessage
+
+    imap = _connect_imap(connection)
+    try:
+        for message_pk, flag in flag_targets or []:
+            try:
+                # Only this connection's messages: a uid of another mailbox
+                # would flag an unrelated message here.
+                message = EmailMessage.objects.filter(pk=message_pk, connection=connection).first()
+                if message is not None:
+                    imap_add_flag(imap, message, flag)
+            except Exception as e:
+                logger.warning(f"Failed to set {flag} on message {message_pk}: {e}")
+
+        uid = None
+        if message_bytes is not None:
+            uid, uidvalidity = _append_to_sent(connection, message_bytes, imap=imap)
+            if uid and sent_message_id:
+                EmailMessage.objects.filter(pk=sent_message_id).update(uid=uid, uid_validity=uidvalidity or '')
+        return uid
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+def schedule_post_send_imap(connection, message_bytes: Optional[bytes], sent_message_id=None,
+                            flag_targets=None) -> None:
+    """Queue perform_post_send_imap in Celery once the DB transaction commits.
+
+    Falls back to running it inline when the broker is unavailable. Never
+    raises: the mail has already been delivered.
+    """
+    if message_bytes is None and not flag_targets:
+        return
+    from django.db import connection as db_connection, transaction
+
+    schema_name = getattr(db_connection, 'schema_name', None)
+    eml_b64 = base64.b64encode(message_bytes).decode('ascii') if message_bytes is not None else None
+    targets = [list(t) for t in (flag_targets or [])]
+
+    def _dispatch():
+        try:
+            from .tasks import email_post_send_task
+            email_post_send_task.delay(schema_name, connection.pk, sent_message_id, eml_b64, targets)
+            return
+        except Exception as e:
+            logger.warning(f"Could not queue post-send IMAP task, running inline: {e}")
+        try:
+            perform_post_send_imap(connection, message_bytes, sent_message_id, targets)
+        except Exception as e:
+            logger.error(f"Post-send IMAP (Sent APPEND) failed for {connection.email_address}: {e}")
+
+    try:
+        transaction.on_commit(_dispatch)
+    except Exception as e:
+        logger.error(f"Failed to schedule post-send IMAP work: {e}")
+
+
+SYNC_HEADER_BATCH = 200
+SYNC_BODY_BATCH = 25
+
+
+def _sync_window_start(connection):
+    """Oldest timestamp inside the synced date window (None = all history)."""
+    if connection.sync_days_back and connection.sync_days_back > 0:
+        return timezone.now() - timedelta(days=connection.sync_days_back)
+    return None
+
+
+def _flag_changes(row: Dict[str, Any], flags: set, held: bool = False) -> Dict[str, Any]:
+    """DB field updates that bring an existing row in line with server FLAGS.
+
+    ``held``: the row's read/star state was just changed in EchoDesk and the
+    server STORE is still queued, so only \\Answered is taken from the server.
+    """
+    changes = {}
+    if held:
+        if '\\answered' in flags and not row['is_answered']:
+            changes['is_answered'] = True
+        return changes
+    seen = '\\seen' in flags
+    if row['is_read'] != seen:
+        changes['is_read'] = seen
+        changes['is_read_by_staff'] = seen
+        changes['read_by_staff_at'] = timezone.now() if seen else None
+    elif seen and not row['is_read_by_staff']:
+        # Read in Outlook/webmail: the unified unread badge should agree.
+        changes['is_read_by_staff'] = True
+        changes['read_by_staff_at'] = timezone.now()
+    starred = '\\flagged' in flags
+    if row['is_starred'] != starred:
+        changes['is_starred'] = starred
+    # \\Answered is only ever added: EchoDesk sets is_answered on send before
+    # the server STORE runs (or when the original's uid can't be found), and
+    # a later sync must not quietly undo that.
+    if '\\answered' in flags and not row['is_answered']:
+        changes['is_answered'] = True
+    return changes
+
+
+def _build_synced_message(connection, raw_email: bytes, message_id: str, db_folder_name: str,
+                          uid: str, uidvalidity: str, flags: set):
+    """EmailMessage (unsaved) for one RFC822 message fetched by sync."""
+    from .models import EmailMessage
+    from .email_mailbox import normalize_message_id
+
+    email_message = email.message_from_bytes(raw_email)
+
+    from_name, from_email_addr = parseaddr(email_message.get('From', ''))
+    from_name = decode_mime_header(from_name)
+
+    to_emails = parse_address_list(email_message.get('To', ''))
+    cc_emails = parse_address_list(email_message.get('Cc', ''))
+    reply_to = parseaddr(email_message.get('Reply-To', '') or '')[1]
+    if reply_to and ('@' not in reply_to or len(reply_to) > 254):
+        reply_to = ''
+
+    try:
+        timestamp = parsedate_to_datetime(email_message.get('Date'))
+        if timestamp.tzinfo is None:
+            timestamp = timezone.make_aware(timestamp)
+    except Exception:
+        timestamp = timezone.now()
+
+    body_text, body_html = extract_body(email_message)
+    message_attachments = extract_attachments(email_message, connection)
+
+    references = ' '.join((email_message.get('References', '') or '').split())
+    in_reply_to = normalize_message_id(email_message.get('In-Reply-To', ''))
+    thread_id = compute_thread_id(message_id, in_reply_to, references)
+
+    is_read = '\\seen' in flags
+    return EmailMessage(
+        connection=connection,
+        message_id=message_id,
+        thread_id=thread_id,
+        in_reply_to=in_reply_to[:500],
+        references=references,
+        from_email=from_email_addr,
+        from_name=from_name[:200],
+        to_emails=to_emails,
+        cc_emails=cc_emails,
+        reply_to=reply_to if reply_to.lower() != (from_email_addr or '').lower() else '',
+        subject=decode_mime_header(email_message.get('Subject', ''))[:1000],
+        body_text=body_text,
+        body_html=body_html,
+        attachments=message_attachments,
+        timestamp=timestamp,
+        folder=db_folder_name,
+        uid=uid,
+        uid_validity=uidvalidity,
+        is_from_business=(from_email_addr or '').lower() == connection.email_address.lower(),
+        is_read=is_read,
+        is_read_by_staff=is_read,
+        is_starred='\\flagged' in flags,
+        is_answered='\\answered' in flags,
+    )
+
+
+def _sync_folder(imap, connection, imap_folder_name: str, db_folder_name: str, max_messages: int,
+                 state: Optional[Dict[str, Any]] = None) -> int:
     """
     Sync messages from a specific IMAP folder.
+
+    Cheap path first: UID SEARCH, then one UID FETCH (UID FLAGS Message-ID
+    header) for the synced window. Only messages not yet stored are
+    downloaded in full (BODY.PEEK[], so nothing is marked read). Existing
+    rows get their uid/UIDVALIDITY and \\Seen/\\Flagged/\\Answered refreshed.
+
+    ``state`` (optional) is filled for ``sync_imap_messages``' reconciliation:
+    ok, all_uids, uidvalidity, legacy_uids_consistent and move candidates
+    (rows stored under another folder that is synced in the same run).
 
     Args:
         imap: IMAP connection object
         connection: EmailConnection model instance
         imap_folder_name: Raw folder name for IMAP operations (may be UTF-7 encoded)
-        db_folder_name: Decoded folder name for storing in database
+        db_folder_name: Decoded/canonical folder name stored in the database
         max_messages: Maximum messages to sync per folder
 
     Returns:
         Number of new messages synced from this folder
     """
+    from django.db import IntegrityError, transaction
     from .models import EmailMessage
-    import re as re_module
+    from . import email_mailbox as mailbox
+
+    if state is None:
+        state = {}
+    run_folders = state.get('run_folders') or set()
+    state.update({
+        'ok': False, 'db_folder': db_folder_name, 'raw_folder': imap_folder_name,
+        'all_uids': set(), 'uidvalidity': '', 'exists': 0,
+        'legacy_uids_consistent': False, 'candidates': [],
+    })
 
     try:
-        # Quote folder name for IMAP (handles spaces and special chars)
-        quoted_folder = f'"{imap_folder_name}"'
-        result, data = imap.select(quoted_folder, readonly=True)
-        if result != 'OK':
-            logger.warning(f"[EMAIL_SYNC] Failed to select folder '{db_folder_name}': {result}")
+        ok, uidvalidity, exists = mailbox.select_folder(imap, imap_folder_name, readonly=True)
+        if not ok:
+            logger.warning(f"[EMAIL_SYNC] Failed to select folder '{db_folder_name}'")
             return 0
-
-        # Log folder selection and message count
-        msg_count = int(data[0]) if data and data[0] else 0
-        logger.info(f"[EMAIL_SYNC] Selected folder '{db_folder_name}' - {msg_count} total messages on server")
+        logger.info(f"[EMAIL_SYNC] Selected folder '{db_folder_name}' - {exists} total messages on server")
+    except (imaplib.IMAP4.abort, OSError):
+        raise
     except Exception as e:
         logger.warning(f"[EMAIL_SYNC] Error selecting folder '{db_folder_name}': {e}")
         return 0
 
-    # Search for messages - use date filter only if sync_days_back > 0
-    if connection.sync_days_back > 0:
-        since_date = (timezone.now() - timedelta(days=connection.sync_days_back)).strftime('%d-%b-%Y')
-        logger.info(f"[EMAIL_SYNC] Searching '{db_folder_name}' for messages since {since_date} ({connection.sync_days_back} days)")
-        result, data = imap.search(None, f'(SINCE {since_date})')
-    else:
-        # sync_days_back = 0 means sync ALL history
-        logger.info(f"[EMAIL_SYNC] Searching '{db_folder_name}' for ALL messages (sync_days_back=0)")
-        result, data = imap.search(None, 'ALL')
-
+    result, data = imap.uid('SEARCH', None, 'ALL')
     if result != 'OK':
-        logger.warning(f"[EMAIL_SYNC] Failed to search emails in '{db_folder_name}': {result}")
+        logger.warning(f"[EMAIL_SYNC] UID SEARCH ALL failed in '{db_folder_name}': {result}")
         return 0
+    all_uids = sorted({int(u) for u in (data[0].split() if data and data[0] else []) if u.isdigit()})
 
-    message_nums = data[0].split()
-    total_found = len(message_nums)
-    logger.info(f"[EMAIL_SYNC] Found {total_found} messages in '{db_folder_name}' matching search criteria")
+    window_start = _sync_window_start(connection)
+    if window_start is not None:
+        since_date = window_start.strftime('%d-%b-%Y')
+        result, data = imap.uid('SEARCH', None, f'(SINCE {since_date})')
+        if result != 'OK':
+            logger.warning(f"[EMAIL_SYNC] UID SEARCH SINCE failed in '{db_folder_name}': {result}")
+            return 0
+        window = sorted({int(u) for u in (data[0].split() if data and data[0] else []) if u.isdigit()})
+    else:
+        window = list(all_uids)
+    logger.info(f"[EMAIL_SYNC] Found {len(window)} messages in '{db_folder_name}' matching search criteria")
+    if len(window) > max_messages:
+        window = window[-max_messages:]
 
-    # Limit to most recent messages
-    if len(message_nums) > max_messages:
-        message_nums = message_nums[-max_messages:]
-        logger.info(f"[EMAIL_SYNC] Limited to {len(message_nums)} most recent messages (max_messages={max_messages})")
+    # Phase 1: UID + FLAGS + Message-ID for the window (no bodies).
+    headers = {}
+    for chunk in mailbox._chunks(window, SYNC_HEADER_BATCH):
+        result, data = imap.uid(
+            'FETCH', ','.join(str(u) for u in chunk),
+            f'(UID FLAGS BODY.PEEK[HEADER.FIELDS ({mailbox.SYNC_HEADER_FIELDS})])',
+        )
+        if result != 'OK':
+            logger.warning(f"[EMAIL_SYNC] Header FETCH failed in '{db_folder_name}': {result}")
+            return 0
+        for entry in mailbox.parse_fetch_response(data):
+            raw_message_id = mailbox._raw_header_message_id(entry['body'])
+            message_id = mailbox.normalize_message_id(raw_message_id)
+            if not message_id:
+                raw_message_id = ''
+                message_id = mailbox.synthetic_message_id(
+                    connection.pk, imap_folder_name, uidvalidity, entry['uid'], entry['body'],
+                )
+            headers[entry['uid']] = {
+                'message_id': message_id[:500],
+                # Rows stored by the pre-UID sync kept the raw header value
+                # (folding whitespace included); look those up too.
+                'raw_message_id': raw_message_id[:500] if raw_message_id[:500] != message_id[:500] else '',
+                'flags': entry['flags'],
+            }
 
-    if not message_nums:
-        return 0
+    # Phase 2: existing rows of THIS mailbox (dedupe is per connection).
+    existing = {}
+    message_ids = [h['message_id'] for h in headers.values()]
+    message_ids += [h['raw_message_id'] for h in headers.values() if h['raw_message_id']]
+    for chunk in mailbox._chunks(message_ids, 500):
+        for row in EmailMessage.objects.filter(connection=connection, message_id__in=chunk).values(
+            'id', 'message_id', 'folder', 'uid', 'uid_validity',
+            'is_read', 'is_starred', 'is_answered', 'is_read_by_staff', 'is_deleted',
+        ):
+            existing[row['message_id']] = row
+    # Flags changed in EchoDesk whose server STORE hasn't run yet: the
+    # server's (older) flags must not overwrite them.
+    held = mailbox.held_flag_ids(row['id'] for row in existing.values())
 
-    # Phase 1: Fetch all messages and extract their data
-    fetched_messages = []
-    message_id_headers = []
-
-    for msg_num in message_nums:
-        try:
-            result, msg_data = imap.fetch(msg_num, '(RFC822 FLAGS UID)')
-            if result != 'OK':
-                continue
-
-            raw_email = msg_data[0][1]
-            email_message = email.message_from_bytes(raw_email)
-
-            # Parse Message-ID
-            message_id_header = email_message.get('Message-ID', '')
-            if not message_id_header:
-                message_id_header = make_msgid()
-
-            message_id_headers.append(message_id_header)
-            fetched_messages.append({
-                'msg_num': msg_num,
-                'msg_data': msg_data,
-                'email_message': email_message,
-                'message_id_header': message_id_header,
-            })
-        except Exception as e:
-            logger.warning(f"[EMAIL_SYNC] Failed to fetch email {msg_num} in folder '{db_folder_name}': {e}")
+    new_uids = []
+    updates = []
+    candidates = []
+    legacy_checked = 0
+    legacy_mismatch = False
+    seen_new_ids = set()
+    for uid, header in headers.items():
+        row = existing.get(header['message_id'])
+        renamed = {}
+        if row is None and header['raw_message_id']:
+            row = existing.get(header['raw_message_id'])
+            if row is not None:
+                # Legacy row keyed by the un-normalised header: adopt it
+                # (and normalise its id) instead of inserting a duplicate.
+                renamed = {'message_id': header['message_id']}
+        if row is None:
+            if header['message_id'] not in seen_new_ids:
+                seen_new_ids.add(header['message_id'])
+                new_uids.append(uid)
             continue
+        if row['is_deleted']:
+            if renamed:
+                updates.append((row['id'], renamed))
+            continue
+        if row['folder'] == db_folder_name:
+            if row['uid'] and not row['uid_validity']:
+                legacy_checked += 1
+                if row['uid'] != uid:
+                    legacy_mismatch = True
+            changes = _flag_changes(row, header['flags'], held=row['id'] in held)
+            changes.update(renamed)
+            if row['uid'] != uid or row['uid_validity'] != uidvalidity:
+                changes['uid'] = uid
+                changes['uid_validity'] = uidvalidity
+            if changes:
+                updates.append((row['id'], changes))
+        elif row['folder'] not in run_folders:
+            # Stored under a folder this run doesn't sync (renamed, or an old
+            # non-canonical name): it lives here now.
+            changes = _flag_changes(row, header['flags'], held=row['id'] in held)
+            changes.update(renamed)
+            changes.update(folder=db_folder_name, uid=uid, uid_validity=uidvalidity)
+            updates.append((row['id'], changes))
+        else:
+            # Same Message-ID in two synced folders: only re-folder if the
+            # old folder no longer has it (decided after every folder ran).
+            if renamed:
+                updates.append((row['id'], renamed))
+            changes = _flag_changes(row, header['flags'], held=row['id'] in held)
+            changes.update(folder=db_folder_name, uid=uid, uid_validity=uidvalidity)
+            candidates.append({'id': row['id'], 'old_folder': row['folder'], 'changes': changes})
 
-    if not fetched_messages:
-        return 0
-
-    # Phase 2: Batch query for existing messages (single query instead of N queries)
-    existing_messages = EmailMessage.objects.filter(
-        message_id__in=message_id_headers
-    ).values('message_id', 'folder', 'id')
-
-    # Create lookup dict for O(1) access
-    existing_lookup = {msg['message_id']: msg for msg in existing_messages}
-
-    # Track messages that need folder updates (batch update later)
-    messages_to_update_folder = []
-
-    # Phase 3: Process messages and create new ones
-    new_count = 0
-    messages_to_create = []
-
-    for msg_info in fetched_messages:
-        try:
-            message_id_header = msg_info['message_id_header']
-            email_message = msg_info['email_message']
-            msg_data = msg_info['msg_data']
-
-            # Check if already exists using lookup dict (O(1) instead of DB query)
-            existing = existing_lookup.get(message_id_header)
-            if existing:
-                # Update folder if it changed (email was moved on server)
-                if existing['folder'] != db_folder_name:
-                    logger.info(f"[EMAIL_SYNC] Updating folder '{existing['folder']}' -> '{db_folder_name}' for message_id={message_id_header[:50]}")
-                    messages_to_update_folder.append(existing['id'])
-                else:
-                    logger.debug(f"[EMAIL_SYNC] Message already synced in correct folder: {message_id_header[:50]}")
-                continue
-
-            # Parse sender
-            from_header = email_message.get('From', '')
-            from_name, from_email_addr = parseaddr(from_header)
-            from_name = decode_mime_header(from_name)  # Decode MIME-encoded sender names
-
-            # Parse recipients
-            to_emails = parse_address_list(email_message.get('To', ''))
-            cc_emails = parse_address_list(email_message.get('Cc', ''))
-
-            # Parse date
-            date_str = email_message.get('Date')
+    for pk, changes in updates:
+        if 'message_id' in changes:
             try:
-                timestamp = parsedate_to_datetime(date_str)
-                if timestamp.tzinfo is None:
-                    timestamp = timezone.make_aware(timestamp)
-            except Exception:
-                timestamp = timezone.now()
+                with transaction.atomic():
+                    EmailMessage.objects.filter(pk=pk).update(**changes)
+                continue
+            except IntegrityError:
+                # Normalised id already taken by another row: keep the old one.
+                changes = {k: v for k, v in changes.items() if k != 'message_id'}
+                if not changes:
+                    continue
+        EmailMessage.objects.filter(pk=pk).update(**changes)
+    if updates:
+        logger.info(f"[EMAIL_SYNC] Refreshed {len(updates)} existing messages in '{db_folder_name}'")
 
-            # Get body
-            body_text, body_html = extract_body(email_message)
-
-            # Get attachments
-            message_attachments = extract_attachments(email_message, connection)
-
-            # Thread ID
-            references = email_message.get('References', '')
-            in_reply_to = email_message.get('In-Reply-To', '')
-            thread_id = compute_thread_id(message_id_header, in_reply_to, references)
-
-            # Determine if from business
-            is_from_business = from_email_addr.lower() == connection.email_address.lower()
-
-            # Parse IMAP flags
-            flags_data = msg_data[0][0] if len(msg_data[0]) > 0 else b''
-            flags = imaplib.ParseFlags(flags_data) if flags_data else ()
-
-            # Get UID
-            uid = ''
-            uid_match = msg_data[0][0].decode() if isinstance(msg_data[0][0], bytes) else str(msg_data[0][0])
-            if 'UID' in uid_match:
-                uid_search = re_module.search(r'UID (\d+)', uid_match)
-                if uid_search:
-                    uid = uid_search.group(1)
-
-            # Create message object (will be bulk created)
-            messages_to_create.append(EmailMessage(
-                connection=connection,
-                message_id=message_id_header,
-                thread_id=thread_id,
-                in_reply_to=in_reply_to,
-                references=references,
-                from_email=from_email_addr,
-                from_name=from_name,
-                to_emails=to_emails,
-                cc_emails=cc_emails,
-                subject=decode_mime_header(email_message.get('Subject', '')),
-                body_text=body_text,
-                body_html=body_html,
-                attachments=message_attachments,
-                timestamp=timestamp,
-                folder=db_folder_name,
-                uid=uid,
-                is_from_business=is_from_business,
-                is_read=b'\\Seen' in flags,
-                is_starred=b'\\Flagged' in flags,
-                is_answered=b'\\Answered' in flags,
-            ))
-            new_count += 1
-            logger.info(f"[EMAIL_SYNC] Prepared new message in folder '{db_folder_name}': {email_message.get('Subject', '')[:50]}")
-
+    # Phase 3: download only the new messages.
+    messages_to_create = []
+    for chunk in mailbox._chunks(new_uids, SYNC_BODY_BATCH):
+        try:
+            result, data = imap.uid('FETCH', ','.join(chunk), '(UID FLAGS BODY.PEEK[])')
+        except (imaplib.IMAP4.abort, OSError):
+            raise
         except Exception as e:
-            logger.warning(f"[EMAIL_SYNC] Failed to process email {msg_info['msg_num']} in folder '{db_folder_name}': {e}")
+            logger.warning(f"[EMAIL_SYNC] Body FETCH failed in '{db_folder_name}': {e}")
             continue
+        if result != 'OK':
+            continue
+        for entry in mailbox.parse_fetch_response(data):
+            header = headers.get(entry['uid'])
+            if header is None or not entry['body']:
+                continue
+            try:
+                messages_to_create.append(_build_synced_message(
+                    connection, entry['body'], header['message_id'], db_folder_name,
+                    entry['uid'], uidvalidity, entry['flags'] or header['flags'],
+                ))
+            except Exception as e:
+                logger.warning(f"[EMAIL_SYNC] Failed to process UID {entry['uid']} in '{db_folder_name}': {e}")
 
-    # Batch create new messages (single INSERT instead of N INSERTs)
     if messages_to_create:
         EmailMessage.objects.bulk_create(messages_to_create, ignore_conflicts=True)
         logger.info(f"[EMAIL_SYNC] Bulk created {len(messages_to_create)} messages")
 
-    # Batch update folder for moved messages (single UPDATE instead of N UPDATEs)
-    if messages_to_update_folder:
-        EmailMessage.objects.filter(id__in=messages_to_update_folder).update(folder=db_folder_name)
-        logger.info(f"[EMAIL_SYNC] Batch updated folder for {len(messages_to_update_folder)} messages")
+    state.update({
+        'ok': True,
+        'all_uids': set(all_uids),
+        'uidvalidity': uidvalidity,
+        'exists': exists,
+        'legacy_uids_consistent': legacy_checked > 0 and not legacy_mismatch,
+        'candidates': candidates,
+    })
+    logger.info(f"[EMAIL_SYNC] Folder '{db_folder_name}' sync complete: {len(messages_to_create)} new messages created")
+    return len(messages_to_create)
 
-    logger.info(f"[EMAIL_SYNC] Folder '{db_folder_name}' sync complete: {new_count} new messages created")
-    return new_count
+
+def _reconcile_synced_folders(connection, states: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Apply server-side deletions/moves inside the synced window.
+
+    For each folder that synced cleanly, stored rows whose uid (recorded under
+    the folder's current UIDVALIDITY) is no longer on the server are either
+    re-foldered (the same Message-ID was seen in another synced folder) or
+    marked is_deleted. Skipped when UIDVALIDITY is unknown/changed for a row,
+    or when the server's UID list disagrees with its EXISTS count.
+    """
+    from django.db.models import Q
+    from .models import EmailMessage
+
+    candidates = {}
+    for state in states:
+        for candidate in state.get('candidates') or []:
+            candidates.setdefault(candidate['id'], candidate)
+
+    window_start = _sync_window_start(connection)
+    stats = {'deleted': 0, 'moved': 0}
+    now = timezone.now()
+    for state in states:
+        if not state.get('ok'):
+            continue
+        if len(state['all_uids']) != state.get('exists', len(state['all_uids'])):
+            logger.warning(
+                f"[EMAIL_SYNC] '{state['db_folder']}': UID list ({len(state['all_uids'])}) != EXISTS "
+                f"({state.get('exists')}); skipping deletion reconciliation"
+            )
+            continue
+        trusted = Q(pk__in=[])
+        if state['uidvalidity']:
+            trusted |= Q(uid_validity=state['uidvalidity'])
+        if state['legacy_uids_consistent']:
+            trusted |= Q(uid_validity='')
+        rows = EmailMessage.objects.filter(
+            connection=connection, folder=state['db_folder'], is_deleted=False,
+        ).exclude(uid='').filter(trusted)
+        if window_start is not None:
+            rows = rows.filter(timestamp__gte=window_start)
+
+        gone_ids = []
+        for row in rows.values('id', 'uid'):
+            try:
+                uid = int(row['uid'])
+            except (TypeError, ValueError):
+                continue
+            if uid in state['all_uids']:
+                continue
+            candidate = candidates.pop(row['id'], None)
+            if candidate is not None:
+                EmailMessage.objects.filter(pk=row['id']).update(**candidate['changes'])
+                stats['moved'] += 1
+            else:
+                gone_ids.append(row['id'])
+        if gone_ids:
+            stats['deleted'] += EmailMessage.objects.filter(pk__in=gone_ids).update(
+                is_deleted=True, deleted_at=now,
+            )
+    if stats['deleted'] or stats['moved']:
+        logger.info(
+            f"[EMAIL_SYNC] Reconciled {connection.email_address}: {stats['moved']} moved, "
+            f"{stats['deleted']} removed on the server"
+        )
+    return stats
 
 
 def _connect_imap(connection):
@@ -1153,14 +1681,89 @@ def _auto_disable_email_connection(connection, error_message: str) -> None:
         )
 
 
+SYNC_LOCK_TIMEOUT = 30 * 60
+
+_AUTH_ERROR_MARKERS = (
+    'authenticationfailed', 'authentication failed', 'invalid credentials',
+    'login failed', 'logon failure', 'incorrect password', 'invalid password',
+    'authenticate failed', 'auth failed', '[auth]', 'login incorrect',
+    'username or password',
+)
+
+
+def _is_imap_auth_error(error: Exception) -> bool:
+    """True only for credential problems (the user must fix the password)."""
+    if not isinstance(error, imaplib.IMAP4.error) or isinstance(error, imaplib.IMAP4.abort):
+        return False
+    text = str(error).lower()
+    return any(marker in text for marker in _AUTH_ERROR_MARKERS)
+
+
+def _sync_lock_key(connection) -> str:
+    from django.db import connection as db_connection
+    schema = getattr(db_connection, 'schema_name', '') or 'public'
+    return f'email-sync-lock:{schema}:{connection.pk}'
+
+
+def _acquire_sync_lock(key: str) -> bool:
+    """cache.add-based lock. A cache outage never blocks syncing."""
+    from django.core.cache import cache
+    try:
+        acquired = cache.add(key, timezone.now().isoformat(), SYNC_LOCK_TIMEOUT)
+    except Exception as e:
+        logger.warning(f"[EMAIL_SYNC] Sync lock unavailable ({e}); syncing without it")
+        return True
+    # django-redis with IGNORE_EXCEPTIONS returns None on a Redis error.
+    return acquired is not False
+
+
+def _release_sync_lock(key: str) -> None:
+    from django.core.cache import cache
+    try:
+        cache.delete(key)
+    except Exception:
+        pass
+
+
+def _record_sync_failure(connection, error: Exception) -> None:
+    """Count a failed run; auto-disable past SYNC_FAILURE_THRESHOLD."""
+    connection.sync_failure_count = (connection.sync_failure_count or 0) + 1
+    failure_count = connection.sync_failure_count
+
+    if failure_count >= SYNC_FAILURE_THRESHOLD:
+        logger.warning(
+            f"[EMAIL_SYNC] {connection.email_address} hit "
+            f"{failure_count} consecutive errors; auto-disabling. "
+            f"Last error: {error}"
+        )
+        _auto_disable_email_connection(
+            connection,
+            f"Disabled after {failure_count} consecutive failures. Last error: {error}",
+        )
+    else:
+        logger.warning(
+            f"Email sync error for {connection.email_address} "
+            f"({failure_count}/{SYNC_FAILURE_THRESHOLD}): {error}"
+        )
+        connection.last_sync_error = str(error)
+        connection.save(update_fields=['last_sync_error', 'sync_failure_count'])
+
+
 def sync_imap_messages(connection, max_messages: int = 500) -> int:
     """
     Sync messages from IMAP server for a given connection.
-    Syncs both the configured folder (usually INBOX) and the Sent folder.
 
-    If the IMAP connection drops mid-sync (e.g. "connection already closed"),
-    the function will automatically reconnect and retry the failed folder
-    (up to 2 retries per folder).
+    Syncs every selectable folder except Drafts and Gmail's All Mail. Special
+    folders are stored under canonical names (C4): \\Sent -> "Sent",
+    \\Trash -> "Trash", \\Junk -> "Junk", \\Archive -> "Archive"; custom
+    folders keep their decoded name. After all folders ran, server-side
+    deletions/moves inside the synced window are reconciled.
+
+    A per-connection cache lock keeps overlapping runs (beat + manual sync)
+    from racing. If the IMAP connection drops mid-sync it reconnects and
+    retries the folder (up to 2 retries). Only authentication failures
+    disable the connection at once; other errors count toward
+    SYNC_FAILURE_THRESHOLD.
 
     Args:
         connection: EmailConnection model instance
@@ -1169,71 +1772,63 @@ def sync_imap_messages(connection, max_messages: int = 500) -> int:
     Returns:
         Number of new messages synced
     """
+    lock_key = _sync_lock_key(connection)
+    if not _acquire_sync_lock(lock_key):
+        logger.info(f"[EMAIL_SYNC] Sync already running for {connection.email_address}; skipping")
+        return 0
+    try:
+        return _sync_imap_messages_locked(connection, max_messages)
+    finally:
+        _release_sync_lock(lock_key)
+
+
+def _sync_imap_messages_locked(connection, max_messages: int) -> int:
+    from . import email_mailbox as mailbox
+
     try:
         # Connect to IMAP
         imap = _connect_imap(connection)
 
         total_new_count = 0
 
-        # Get all available folders
-        result, folders_data = imap.list()
-        if result == 'OK':
-            all_folders = []
+        mailboxes = mailbox.list_mailboxes(imap)
+        if mailboxes is not None:
             folders_to_sync = []
             skipped_folders = []
-
-            # RFC 6154 special-use flags identify these folders even when the
-            # server localises their names.
-            skip_flags = {'\\drafts', '\\trash', '\\junk', '\\all'}
-            for folder_data in folders_data:
-                raw_folder_name = parse_imap_list_entry(folder_data)  # Keep raw for IMAP operations
-                if not raw_folder_name:
-                    continue
-                flags = imap_list_flags(folder_data)
-                if '\\noselect' in flags or '\\nonexistent' in flags:
-                    continue
-                display_folder_name = decode_imap_utf7(raw_folder_name) or raw_folder_name  # Decode for display/DB
-                all_folders.append(display_folder_name)
-                # Skip Drafts, All Mail, Trash, and Spam. Sent IS synced
-                # (normalized to the 'Sent' DB folder) so replies the
-                # business sends from an external email client are
-                # detectable — EchoDesk-sent mail auto-saved to the
-                # server's Sent folder dedupes on the unique
-                # message_id, since send_email_smtp stores the real
-                # Message-ID header.
-                skip_folders = ['Drafts', '[Gmail]/Drafts', '[Gmail]/All Mail', 'Trash', '[Gmail]/Trash', 'Deleted', 'Deleted Items', 'Deleted Messages', 'Spam', '[Gmail]/Spam', 'Junk', 'Junk E-mail']
-                sent_folders = ['Sent', '[Gmail]/Sent Mail', 'Sent Items', 'Sent Messages']
-                if flags & skip_flags or any(skip.lower() == display_folder_name.lower() for skip in skip_folders):
-                    skipped_folders.append(display_folder_name)
-                elif '\\sent' in flags or any(sent.lower() == display_folder_name.lower() for sent in sent_folders):
-                    # Normalize provider-specific sent folder names so
-                    # all business-sent mail lives in folder='Sent'.
-                    folders_to_sync.append((raw_folder_name, 'Sent'))
+            for entry in mailboxes:
+                if entry['flags'] & mailbox.SYNC_SKIP_FLAGS or entry['name'].lower() in mailbox.SYNC_SKIP_NAMES \
+                        or entry['role'] == 'drafts':
+                    skipped_folders.append(entry['name'])
                 else:
-                    # Store tuple of (raw_name, display_name)
-                    folders_to_sync.append((raw_folder_name, display_folder_name))
+                    folders_to_sync.append((entry['raw_name'], entry['db_name']))
 
             # Log folder discovery details
             logger.info(f"[EMAIL_SYNC] ===== FOLDER DISCOVERY for {connection.email_address} =====")
-            logger.info(f"[EMAIL_SYNC] All folders on server ({len(all_folders)}): {all_folders}")
+            logger.info(f"[EMAIL_SYNC] All folders on server ({len(mailboxes)}): {[e['name'] for e in mailboxes]}")
             logger.info(f"[EMAIL_SYNC] Folders to sync ({len(folders_to_sync)}): {[f[1] for f in folders_to_sync]}")
             logger.info(f"[EMAIL_SYNC] Skipped folders ({len(skipped_folders)}): {skipped_folders}")
             logger.info(f"[EMAIL_SYNC] sync_days_back setting: {connection.sync_days_back} (0=all history)")
-            logger.info(f"[EMAIL_SYNC] ================================================")
+
+            run_folders = {db_name for _, db_name in folders_to_sync}
+            states = []
 
             # Sync each folder with automatic reconnection on connection drop
             for raw_folder_name, display_folder_name in folders_to_sync:
                 max_retries = 2
                 for attempt in range(max_retries + 1):
+                    state = {'run_folders': run_folders}
                     try:
-                        folder_count = _sync_folder(imap, connection, raw_folder_name, display_folder_name, max_messages)
+                        folder_count = _sync_folder(
+                            imap, connection, raw_folder_name, display_folder_name, max_messages, state,
+                        )
+                        states.append(state)
                         total_new_count += folder_count
                         if folder_count > 0:
                             logger.info(f"Synced {folder_count} emails from {display_folder_name}")
                         break  # Success, move to next folder
                     except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError, ConnectionError, BrokenPipeError) as e:
                         error_msg = str(e).lower()
-                        is_connection_error = any(keyword in error_msg for keyword in [
+                        is_connection_error = isinstance(e, imaplib.IMAP4.abort) or any(keyword in error_msg for keyword in [
                             'connection already closed', 'socket error', 'broken pipe',
                             'connection reset', 'eof', 'timed out', 'bad file descriptor',
                         ])
@@ -1255,6 +1850,11 @@ def sync_imap_messages(connection, max_messages: int = 500) -> int:
                         logger.warning(f"Failed to sync folder {display_folder_name}: {e}")
                         break  # Unknown error, skip folder
 
+            try:
+                _reconcile_synced_folders(connection, states)
+            except Exception as e:
+                logger.error(f"[EMAIL_SYNC] Reconciliation failed for {connection.email_address}: {e}")
+
         try:
             imap.logout()
         except Exception:
@@ -1269,172 +1869,117 @@ def sync_imap_messages(connection, max_messages: int = 500) -> int:
         logger.info(f"Synced {total_new_count} total new emails for {connection.email_address}")
         return total_new_count
 
-    except (ssl.SSLError, socket.error, OSError, imaplib.IMAP4.abort) as e:
-        # Transient SSL/socket errors (e.g. BAD_LENGTH, EOF violations, "connection
-        # reset by peer"). Normally we retry next cycle — but if the same class of
-        # error keeps happening, the server is effectively refusing us and retrying
-        # forever won't help. Track consecutive failures and auto-disable past the
-        # threshold so the user sees the outage.
-        connection.sync_failure_count = (connection.sync_failure_count or 0) + 1
-        failure_count = connection.sync_failure_count
-
-        if failure_count >= SYNC_FAILURE_THRESHOLD:
-            logger.warning(
-                f"[EMAIL_SYNC] {connection.email_address} hit "
-                f"{failure_count} consecutive transient errors; auto-disabling. "
-                f"Last error: {e}"
-            )
-            _auto_disable_email_connection(
-                connection,
-                f"Disabled after {failure_count} consecutive failures. Last error: {e}",
-            )
-        else:
-            logger.warning(
-                f"Transient email sync error for {connection.email_address} "
-                f"({failure_count}/{SYNC_FAILURE_THRESHOLD}): {e}"
-            )
-            connection.last_sync_error = str(e)
-            connection.save(update_fields=['last_sync_error', 'sync_failure_count'])
-        return 0
     except Exception as e:
-        # Non-transient (auth failure, host resolution, permission, etc.) —
-        # disable immediately. The user must fix credentials and click
-        # Reactivate in the UI to resume sync.
-        logger.error(f"Email sync error for {connection.email_address}: {e}")
-        _auto_disable_email_connection(connection, str(e))
+        if _is_imap_auth_error(e):
+            # Wrong credentials: disable immediately. The user must fix the
+            # password and click Reactivate in the UI to resume sync.
+            logger.error(f"Email sync authentication failed for {connection.email_address}: {e}")
+            _auto_disable_email_connection(connection, str(e))
+        else:
+            # Transient SSL/socket errors, server BAD/NO replies, timeouts,
+            # host resolution, code bugs: retry next cycle, disable only after
+            # SYNC_FAILURE_THRESHOLD consecutive failures.
+            _record_sync_failure(connection, e)
         return 0
 
 
 def delete_emails_from_imap(connection, message_ids: List[str]) -> int:
     """
-    Delete emails from IMAP server by moving them to Trash.
+    Move emails to the server's Trash folder (kept for back-compat).
+
+    Uses the UID-only mailbox helpers: never a bare EXPUNGE, and it works in
+    whichever folder each message is stored in, not just INBOX.
 
     Args:
         connection: EmailConnection model instance
         message_ids: List of Message-ID headers to delete
 
     Returns:
-        Number of emails deleted
+        Number of emails moved to Trash
     """
+    from .models import EmailMessage
+    from . import email_mailbox as mailbox
+
     if not message_ids:
         return 0
-
-    try:
-        # Connect to IMAP
-        if connection.imap_use_ssl:
-            imap = imaplib.IMAP4_SSL(connection.imap_server, connection.imap_port, timeout=30)
-        else:
-            imap = imaplib.IMAP4(connection.imap_server, connection.imap_port)
-            imap.starttls()
-
-        _imap_authenticate(imap, connection.username, connection.get_password())
-
-        # Select folder (not readonly - we need to modify)
-        result, data = imap.select(connection.sync_folder, readonly=False)
-        if result != 'OK':
-            raise Exception(f"Failed to select folder {connection.sync_folder}")
-
-        deleted_count = 0
-
-        for message_id in message_ids:
-            try:
-                # Search for message by Message-ID header
-                # Note: Message-ID includes angle brackets, search needs them
-                search_id = message_id if message_id.startswith('<') else f'<{message_id}>'
-                result, data = imap.search(None, f'HEADER Message-ID "{search_id}"')
-
-                if result != 'OK' or not data[0]:
-                    # Try without angle brackets
-                    clean_id = message_id.strip('<>')
-                    result, data = imap.search(None, f'HEADER Message-ID "{clean_id}"')
-
-                if result == 'OK' and data[0]:
-                    msg_nums = data[0].split()
-                    for msg_num in msg_nums:
-                        # Mark as deleted
-                        imap.store(msg_num, '+FLAGS', '\\Deleted')
-                        deleted_count += 1
-
-            except Exception as e:
-                logger.warning(f"Failed to delete email {message_id}: {e}")
-                continue
-
-        # Expunge to permanently remove deleted messages
-        imap.expunge()
-
-        imap.close()
-        imap.logout()
-
-        logger.info(f"Deleted {deleted_count} emails from IMAP for {connection.email_address}")
-        return deleted_count
-
-    except Exception as e:
-        logger.error(f"IMAP delete error for {connection.email_address}: {e}")
-        raise
+    rows = EmailMessage.objects.filter(connection=connection, message_id__in=message_ids).exclude(folder='Trash')
+    items = [mailbox.message_item(row) for row in rows]
+    summary = mailbox.perform_mailbox_operation(connection, 'move', items, target_folder='Trash')
+    logger.info(f"Moved {summary['done']} emails to Trash for {connection.email_address}")
+    return summary['done']
 
 
-def move_email_to_folder(connection, message_id: str, source_folder: str, target_folder: str) -> bool:
+def move_email_to_folder(connection, message_id: str, source_folder: str, target_folder: str,
+                         result: Optional[Dict[str, Any]] = None) -> bool:
     """
     Move an email from one IMAP folder to another.
+
+    Folder names may be DB/canonical names ("Sent", "Trash") or decoded IMAP
+    names, including non-ASCII and space-containing ones: they are resolved
+    to the raw modified-UTF-7 name and quoted. Uses UID MOVE when the server
+    supports it, else UID COPY + UID STORE \\Deleted + UID EXPUNGE <uid>
+    (never a bare EXPUNGE). The new UID (COPYUID) is stored on the row.
 
     Args:
         connection: EmailConnection model instance
         message_id: Message-ID header of the email to move
         source_folder: Current folder of the email
         target_folder: Destination folder
+        result: Optional dict; on success ``result['db_folder']`` is the DB
+            folder name of the folder the server moved it to (as sync stores it)
 
     Returns:
         True if successful, False otherwise
     """
+    from .models import EmailMessage
+    from . import email_mailbox as mailbox
+
+    imap = None
     try:
-        # Connect to IMAP
-        if connection.imap_use_ssl:
-            imap = imaplib.IMAP4_SSL(connection.imap_server, connection.imap_port, timeout=30)
-        else:
-            imap = imaplib.IMAP4(connection.imap_server, connection.imap_port)
-            imap.starttls()
+        row = EmailMessage.objects.filter(connection=connection, message_id=message_id).first()
+        item = mailbox.message_item(row) if row is not None else {
+            'id': None, 'uid': '', 'uid_validity': '', 'message_id': message_id,
+        }
+        if row is not None and row.folder != source_folder:
+            # The client's idea of the folder wins; the stored uid belongs
+            # to another folder.
+            item.update(uid='', uid_validity='')
+        item['folder'] = source_folder
 
-        _imap_authenticate(imap, connection.username, connection.get_password())
+        imap = _connect_imap(connection)
+        mailboxes = mailbox.list_mailboxes(imap) or []
+        source_raw = mailbox.resolve_raw_folder(imap, source_folder, mailboxes)
+        target_raw = mailbox.resolve_raw_folder(
+            imap, target_folder, mailboxes,
+            create=mailbox.role_for_db_folder(target_folder) in ('trash', 'archive', 'junk'),
+        )
+        if not source_raw or not target_raw:
+            logger.warning(f"Move: folder not found (source={source_folder!r}, target={target_folder!r})")
+            return False
 
-        # Select source folder
-        result, data = imap.select(source_folder, readonly=False)
-        if result != 'OK':
+        ok, uidvalidity, _ = mailbox.select_folder(imap, source_raw, readonly=False)
+        if not ok:
             raise Exception(f"Failed to select source folder {source_folder}")
 
-        # Search for message by Message-ID
-        search_id = message_id if message_id.startswith('<') else f'<{message_id}>'
-        result, data = imap.search(None, f'HEADER Message-ID "{search_id}"')
-
-        if result != 'OK' or not data[0]:
-            # Try without angle brackets
-            clean_id = message_id.strip('<>')
-            result, data = imap.search(None, f'HEADER Message-ID "{clean_id}"')
-
-        if result != 'OK' or not data[0]:
+        resolved = mailbox.resolve_item_uids(imap, [item], uidvalidity)
+        if not resolved:
             logger.warning(f"Message {message_id} not found in {source_folder}")
-            imap.logout()
             return False
+        uid = resolved[0][1]
 
-        msg_nums = data[0].split()
-        if not msg_nums:
-            imap.logout()
-            return False
+        ok, target_validity, mapping = mailbox.uid_move(imap, [uid], target_raw)
+        if not ok:
+            raise Exception(f"Failed to move message to {target_folder}")
 
-        msg_num = msg_nums[0]
-
-        # Copy to target folder
-        result, data = imap.copy(msg_num, target_folder)
-        if result != 'OK':
-            raise Exception(f"Failed to copy message to {target_folder}")
-
-        # Mark original as deleted
-        imap.store(msg_num, '+FLAGS', '\\Deleted')
-
-        # Expunge to remove the original
-        imap.expunge()
-
-        imap.close()
-        imap.logout()
+        if row is not None:
+            new_uid = mapping.get(uid, '')
+            EmailMessage.objects.filter(pk=row.pk).update(
+                uid=new_uid, uid_validity=target_validity if new_uid else '',
+            )
+        if result is not None:
+            entry = next((m for m in mailboxes if m['raw_name'] == target_raw), None)
+            # Not listed = just CREATEd for its role (Trash/Junk/Archive).
+            result['db_folder'] = entry['db_name'] if entry else mailbox.canonical_db_folder(target_folder)
 
         logger.info(f"Moved email {message_id} from {source_folder} to {target_folder}")
         return True
@@ -1442,43 +1987,45 @@ def move_email_to_folder(connection, message_id: str, source_folder: str, target
     except Exception as e:
         logger.error(f"IMAP move error: {e}")
         return False
+    finally:
+        if imap is not None:
+            try:
+                imap.logout()
+            except Exception:
+                pass
 
 
 def get_available_folders(connection) -> List[Dict[str, Any]]:
     """
     Get list of available IMAP folders for a connection.
 
+    Returns every selectable folder (Sent/Trash/Junk/Drafts included) with
+    its role and the DB folder name messages are stored under.
+
     Returns:
-        List of folder info dicts with name and flags
+        List of folder info dicts: name, display_name, db_name, raw_name, role
     """
+    from . import email_mailbox as mailbox
+
     try:
-        if connection.imap_use_ssl:
-            imap = imaplib.IMAP4_SSL(connection.imap_server, connection.imap_port, timeout=30)
-        else:
-            imap = imaplib.IMAP4(connection.imap_server, connection.imap_port)
-            imap.starttls()
-
-        _imap_authenticate(imap, connection.username, connection.get_password())
-
-        result, folders_data = imap.list()
-        folders = []
-
-        if result == 'OK':
-            for folder_data in folders_data:
-                raw_name = parse_imap_list_entry(folder_data)
-                folder_name = decode_imap_utf7(raw_name) if raw_name else None
-                if not folder_name:
-                    continue
-                # Skip Drafts, All Mail, Trash, Sent, and Spam
-                skip_folders = ['Drafts', '[Gmail]/Drafts', '[Gmail]/All Mail', 'Trash', '[Gmail]/Trash', 'Deleted', 'Deleted Items', 'Deleted Messages', 'Sent', '[Gmail]/Sent Mail', 'Sent Items', 'Sent Messages', 'Spam', '[Gmail]/Spam', 'Junk', 'Junk E-mail']
-                if not any(skip.lower() == folder_name.lower() for skip in skip_folders):
-                    folders.append({
-                        'name': folder_name,
-                        'display_name': folder_name.replace('[Gmail]/', '').replace('INBOX/', '')
-                    })
-
-        imap.logout()
-        return folders
+        imap = _connect_imap(connection)
+        try:
+            entries = mailbox.list_mailboxes(imap) or []
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+        return [
+            {
+                'name': entry['name'],
+                'display_name': entry['name'].replace('[Gmail]/', '').replace('INBOX/', ''),
+                'db_name': entry['db_name'],
+                'raw_name': entry['raw_name'],
+                'role': entry['role'],
+            }
+            for entry in entries
+        ]
 
     except Exception as e:
         logger.error(f"Error getting folders: {e}")

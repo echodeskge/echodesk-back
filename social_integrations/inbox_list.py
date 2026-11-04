@@ -203,11 +203,18 @@ def _whatsapp_heads(ctx):
     return _take(_apply_visibility(qs, 'whatsapp', ctx), ctx)
 
 
+EMAIL_EXCLUDED_FROM_ALL = ('Trash', 'Junk')
+
+
 def _email_heads(ctx, connection_ids, folder):
     base = EmailMessage.objects.filter(connection_id__in=connection_ids)
     all_folders = folder.lower() in ('all', 'all folders') if folder else True
     if folder and not all_folders:
         base = base.filter(folder=folder)
+    elif all_folders:
+        # Trash / Junk are synced now; deleted and spam threads stay out of
+        # the "all folders" inbox (Outlook's conversation list does the same).
+        base = base.exclude(folder__in=EMAIL_EXCLUDED_FROM_ALL)
     heads = (
         base.order_by('connection_id', 'thread_id', '-timestamp', '-id')
         .distinct('connection_id', 'thread_id')
@@ -457,6 +464,8 @@ def _build_email(rows, folder):
     base = EmailMessage.objects.filter(connection_id__in=conn_ids, thread_id__in=thread_ids)
     if folder and folder.lower() not in ('all', 'all folders'):
         base = base.filter(folder=folder)
+    else:
+        base = base.exclude(folder__in=EMAIL_EXCLUDED_FROM_ALL)
     unread = {
         (r['connection_id'], r['thread_id']): r['n']
         for r in base.filter(is_from_business=False, is_read=False)
