@@ -110,6 +110,9 @@ class UserManager(BaseUserManager):
         return self.create_user(email, password, **extra_fields)
 
 
+# Statuses that take a user's access away (``is_active`` stays true).
+BLOCKED_STATUSES = ('inactive', 'suspended')
+
 class User(AbstractBaseUser):
     ROLE_CHOICES = [
         ('admin', 'Administrator'),
@@ -312,6 +315,12 @@ class User(AbstractBaseUser):
         if 'tenant_groups' in getattr(self, '_prefetched_objects_cache', {}):
             return [group for group in self.tenant_groups.all() if group.is_active]
         return list(self.tenant_groups.filter(is_active=True))
+
+    @property
+    def can_sign_in(self):
+        """Disabled accounts and the inactive / suspended statuses (which keep
+        ``is_active`` true so they can be restored as-is) must not sign in."""
+        return self.is_active and self.status not in BLOCKED_STATUSES
 
     def revoke_auth_tokens(self, keep=None):
         """

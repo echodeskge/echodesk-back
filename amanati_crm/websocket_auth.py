@@ -21,8 +21,8 @@ except ImportError:
 
 
 def _can_sign_in(user):
-    """Disabled and suspended accounts (suspension keeps is_active) are refused."""
-    return user.is_active and getattr(user, 'status', None) != 'suspended'
+    """Disabled, inactive and suspended accounts are refused."""
+    return user.can_sign_in
 
 
 def _user_for_token(token_string, tenant_schema=None):

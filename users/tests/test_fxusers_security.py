@@ -573,9 +573,34 @@ class TestWebSocketRefusesSuspended(GuardTestCase):
         from amanati_crm.websocket_auth import _user_for_token
         schema = self.tenant.schema_name
         self.assertEqual(_user_for_token(Token.objects.create(user=self.agent).key, schema), self.agent)
-        for i, kwargs in enumerate(({'status': 'suspended'}, {'is_active': False})):
+        for i, kwargs in enumerate(({'status': 'suspended'}, {'status': 'inactive'}, {'is_active': False})):
             user = self.create_user(email=f'fx-ws-{i}@test.com', **kwargs)
             web = Token.objects.create(user=user)
             device = AuthDeviceToken.issue(user, 'ios', device_id=f'ws-{user.pk}')
             for key in (web.key, device.key):
                 self.assertFalse(_user_for_token(key, schema).is_authenticated, (kwargs, key))
+
+
+class TestInactiveStatusCannotSignIn(GuardTestCase):
+    """status='inactive' keeps is_active true; it used to sign out once and
+    then let the user straight back in."""
+
+    def test_existing_tokens_are_refused(self):
+        from users.authentication import MultiTokenAuthentication
+        from rest_framework.exceptions import AuthenticationFailed
+        user = self.create_user(email='fx-inactive@test.com', status='inactive')
+        for key in (Token.objects.create(user=user).key,
+                    AuthDeviceToken.issue(user, 'ios', device_id='inactive-1').key):
+            with self.assertRaises(AuthenticationFailed):
+                MultiTokenAuthentication().authenticate_credentials(key)
+
+    @patch('tenants.views.SecurityService')
+    def test_login_is_refused(self, mock_security):
+        mock_security.get_client_ip.return_value = '127.0.0.1'
+        mock_security.is_ip_whitelisted.return_value = True
+        user = self.create_user(email='fx-inactive-login@test.com', status='inactive')
+        user.set_password('Correct-pass-123')
+        user.save()
+        resp = self.api_post('/api/auth/login/', {'email': user.email, 'password': 'Correct-pass-123'})
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST, resp.data)
+        self.assertFalse(Token.objects.filter(user=user).exists())

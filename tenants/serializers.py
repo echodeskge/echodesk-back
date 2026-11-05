@@ -217,9 +217,7 @@ class TenantLoginSerializer(serializers.Serializer):
             if not user:
                 raise serializers.ValidationError('Invalid email or password')
             
-            # A suspended account keeps is_active=true (so it can be restored
-            # as-is) but must not sign in.
-            if not user.is_active or getattr(user, 'status', None) == 'suspended':
+            if not user.can_sign_in:
                 raise serializers.ValidationError('User account is disabled')
             
             attrs['user'] = user

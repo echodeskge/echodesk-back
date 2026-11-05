@@ -35,7 +35,7 @@ class MultiTokenAuthentication(TokenAuthentication):
         except exceptions.AuthenticationFailed:
             pass
         else:
-            self._check_not_suspended(user)
+            self._check_can_sign_in(user)
             return (user, token)
 
         try:
@@ -45,7 +45,7 @@ class MultiTokenAuthentication(TokenAuthentication):
 
         if not token.user.is_active:
             raise exceptions.AuthenticationFailed(_('User inactive or deleted.'))
-        self._check_not_suspended(token.user)
+        self._check_can_sign_in(token.user)
 
         if token.is_expired:
             raise exceptions.AuthenticationFailed(_('Token has expired.'))
@@ -54,13 +54,13 @@ class MultiTokenAuthentication(TokenAuthentication):
         return (token.user, token)
 
     @staticmethod
-    def _check_not_suspended(user):
+    def _check_can_sign_in(user):
         """
-        Suspension keeps ``is_active`` true, so a token minted before it (or
-        one that survived it) must still be refused.
+        The inactive and suspended statuses keep ``is_active`` true, so a token
+        minted before them (or one that survived them) must still be refused.
         """
-        if getattr(user, 'status', None) == 'suspended':
-            raise exceptions.AuthenticationFailed(_('User account is suspended.'))
+        if not user.can_sign_in:
+            raise exceptions.AuthenticationFailed(_('User account is disabled.'))
 
     @staticmethod
     def _touch(token):

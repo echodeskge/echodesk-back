@@ -19,7 +19,7 @@ import string
 import logging
 from rest_framework.authtoken.models import Token
 from .tasks import send_user_invitation_email_task, send_new_password_email_task
-from .models import AuthDeviceToken, Department, TenantGroup, Notification, NotificationPreference, UserOnlineStatus, TeamChatConversation, TeamChatMessage, HiddenTeamChatConversation
+from .models import BLOCKED_STATUSES, AuthDeviceToken, Department, TenantGroup, Notification, NotificationPreference, UserOnlineStatus, TeamChatConversation, TeamChatMessage, HiddenTeamChatConversation
 from .serializers import (
     UserSerializer, UserCreateSerializer, UserUpdateSerializer, UserDirectorySerializer,
     GroupSerializer, GroupCreateSerializer, PermissionSerializer,
@@ -76,7 +76,7 @@ def _can_manage_users(user):
 
 # Statuses that take a user's access away; moving a user into one signs them
 # out everywhere.
-REVOKING_STATUSES = ('inactive', 'suspended')
+REVOKING_STATUSES = BLOCKED_STATUSES
 
 
 def _guard_target(actor, target):
