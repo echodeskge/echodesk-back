@@ -255,3 +255,44 @@ class TestSendPushNotification(EchoDeskTenantTestCase):
         self.assertEqual(log.title, 'Log Data')
         self.assertEqual(log.body, 'Check log')
         self.assertEqual(log.data.get('ticket_id'), 42)
+
+
+class TestTransientNetworkErrors(EchoDeskTenantTestCase):
+    """A sub-second network blip used to drop the browser notification."""
+
+    def setUp(self):
+        super().setUp()
+        self.user = self.create_user(email='push-blip@test.com')
+        self.sub = PushSubscription.objects.create(
+            user=self.user,
+            endpoint='https://push.example.com/blip',
+            p256dh='test-p256dh',
+            auth='test-auth',
+            is_active=True,
+        )
+
+    @patch('notifications.utils.time.sleep')
+    @patch('notifications.utils.get_vapid_keys', return_value=MOCK_VAPID)
+    @patch('notifications.utils.webpush')
+    def test_connection_error_is_retried(self, mock_wp, mock_keys, mock_sleep):
+        import requests
+        mock_wp.side_effect = [requests.ConnectionError('Network is unreachable'), MagicMock(status_code=201)]
+
+        self.assertTrue(send_push_notification(subscription=self.sub, title='Hi', body='There'))
+        self.assertEqual(mock_wp.call_count, 2)
+        log = NotificationLog.objects.filter(subscription=self.sub).latest('created_at')
+        self.assertEqual(log.status, 'sent')
+
+    @patch('notifications.utils.time.sleep')
+    @patch('notifications.utils.get_vapid_keys', return_value=MOCK_VAPID)
+    @patch('notifications.utils.webpush')
+    def test_persistent_connection_error_fails_and_keeps_subscription(self, mock_wp, mock_keys, mock_sleep):
+        import requests
+        mock_wp.side_effect = requests.ConnectionError('Network is unreachable')
+
+        self.assertFalse(send_push_notification(subscription=self.sub, title='Hi', body='There'))
+        self.assertEqual(mock_wp.call_count, 3)
+        self.sub.refresh_from_db()
+        self.assertTrue(self.sub.is_active)
+        log = NotificationLog.objects.filter(subscription=self.sub).latest('created_at')
+        self.assertEqual(log.status, 'failed')

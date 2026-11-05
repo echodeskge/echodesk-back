@@ -1,5 +1,8 @@
 import json
 import logging
+import time
+
+import requests
 from typing import Dict, List, Optional
 from pywebpush import webpush, WebPushException
 from django.conf import settings
@@ -33,6 +36,10 @@ def get_vapid_keys():
         'public_key': public_key,
         'admin_email': getattr(settings, 'VAPID_ADMIN_EMAIL', 'mailto:admin@echodesk.ge')
     }
+
+
+# Seconds to wait before each retry of a push that failed to connect.
+TRANSIENT_RETRY_DELAYS = (1, 3)
 
 
 def send_push_notification(
@@ -101,15 +108,26 @@ def send_push_notification(
     )
 
     try:
-        # Send push notification
-        response = webpush(
-            subscription_info=subscription_info,
-            data=json.dumps(notification_data),
-            vapid_private_key=vapid_keys['private_key'],
-            vapid_claims={
-                "sub": vapid_keys['admin_email']
-            }
-        )
+        # A network blip (e.g. "Network is unreachable" for a fraction of a
+        # second) used to drop the notification for good; retry it briefly.
+        for attempt in range(len(TRANSIENT_RETRY_DELAYS) + 1):
+            try:
+                webpush(
+                    subscription_info=subscription_info,
+                    data=json.dumps(notification_data),
+                    vapid_private_key=vapid_keys['private_key'],
+                    vapid_claims={
+                        "sub": vapid_keys['admin_email']
+                    }
+                )
+                break
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt == len(TRANSIENT_RETRY_DELAYS):
+                    raise
+                logger.warning(
+                    f"WebPush network error for subscription {subscription.id}, retrying: {e}"
+                )
+                time.sleep(TRANSIENT_RETRY_DELAYS[attempt])
 
         # Update log
         log.status = 'sent'
