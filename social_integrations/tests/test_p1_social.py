@@ -140,6 +140,52 @@ class AssignmentNormalisationTests(WidgetFixtureMixin, SocialIntegrationTestCase
         self.assertEqual(resp.status_code, 200, resp.data)
         self.assertEqual(ChatAssignment.objects.get(platform='widget').conversation_id, 'visitor-a')
 
+    @patch('social_integrations.views._broadcast_assignment_change')
+    def test_staff_can_take_over_a_chat_held_by_another_agent(self, _b):
+        self.create_chat_assignment(user=self.agent, platform='facebook', conversation_id='psid',
+                                    account_id='pg', status='in_session')
+        body = {'platform': 'facebook', 'conversation_id': 'psid', 'account_id': 'pg',
+                'target_user_id': self.staff.id}
+        resp = self.api_post('/api/social/assignments/transfer/', body, user=self.staff)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(ChatAssignment.objects.get(platform='facebook').assigned_user, self.staff)
+        # Taking over a chat that is already yours stays a 400.
+        resp = self.api_post('/api/social/assignments/transfer/', body, user=self.staff)
+        self.assertEqual(resp.status_code, 400)
+
+    @patch('social_integrations.views._broadcast_assignment_change')
+    def test_non_staff_cannot_take_over(self, _b):
+        self.create_chat_assignment(user=self.agent, platform='facebook', conversation_id='psid',
+                                    account_id='pg', status='in_session')
+        body = {'platform': 'facebook', 'conversation_id': 'psid', 'account_id': 'pg',
+                'target_user_id': self.other.id}
+        resp = self.api_post('/api/social/assignments/transfer/', body, user=self.other)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(ChatAssignment.objects.get(platform='facebook').assigned_user, self.agent)
+
+    @patch('social_integrations.views._broadcast_archive_change')
+    @patch('social_integrations.views._broadcast_assignment_change')
+    def test_archiving_releases_the_assignment(self, broadcast_assignment, _a):
+        self.create_chat_assignment(user=self.agent, platform='facebook', conversation_id='psid',
+                                    account_id='pg', status='in_session')
+        resp = self.api_post('/api/social/conversations/archive/', {'conversations': [
+            {'platform': 'facebook', 'conversation_id': 'psid', 'account_id': 'pg'}]}, user=self.staff)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        assignment = ChatAssignment.objects.get(platform='facebook')
+        self.assertEqual(assignment.status, 'completed')
+        self.assertIsNone(assignment.assigned_user)
+        broadcast_assignment.assert_called_once()
+
+    @patch('social_integrations.views._broadcast_archive_change')
+    @patch('social_integrations.views._broadcast_assignment_change')
+    def test_archiving_widget_chat_releases_visitor_assignment(self, _b, _a):
+        self.create_chat_assignment(user=self.agent, platform='widget', conversation_id='visitor-a',
+                                    account_id='7', status='in_session')
+        resp = self.api_post('/api/social/conversations/archive/', {'conversations': [
+            {'platform': 'widget', 'conversation_id': 'sess-a', 'account_id': '7'}]}, user=self.agent)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertIsNone(ChatAssignment.objects.get(platform='widget').assigned_user)
+
     def test_ai_state_widget_visitor_id_reads_session_state(self):
         AIConversationState.objects.create(platform='widget', conversation_id='sess-a', account_id='7',
                                            mode='needs_human', reason='asked for human')

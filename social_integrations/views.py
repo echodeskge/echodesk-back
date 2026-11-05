@@ -4841,12 +4841,22 @@ def transfer_chat(request):
     except User.DoesNotExist:
         return Response({'error': 'Target user not found or inactive'}, status=status.HTTP_404_NOT_FOUND)
 
-    # Cannot transfer to yourself
-    if target_user == request.user:
-        return Response({'error': 'Cannot transfer chat to yourself'}, status=status.HTTP_400_BAD_REQUEST)
-
     is_privileged = request.user.is_staff or request.user.is_superuser
     assignment = _find_assignment(platform, conversation_id, account_id)
+
+    # Transferring to yourself is only meaningful for staff taking over a
+    # chat another agent holds (the header's "take over" button).
+    if target_user == request.user:
+        taking_over = (
+            is_privileged
+            and assignment is not None
+            and assignment.status in ('active', 'in_session')
+            and assignment.assigned_user_id is not None
+            and assignment.assigned_user_id != request.user.id
+        )
+        if not taking_over:
+            return Response({'error': 'Cannot transfer chat to yourself'}, status=status.HTTP_400_BAD_REQUEST)
+
     if assignment is None:
         # If no assignment exists, create one for the target user
         assignment = ChatAssignment.objects.create(
@@ -12922,6 +12932,7 @@ def archive_conversation(request):
                 })
                 continue
 
+            raw_conversation_id = conversation_id
             if platform == 'widget':
                 # Archive rows must use the session id the list checks against
                 session_ids = widget_session_ids(conversation_id)
@@ -13027,6 +13038,19 @@ def archive_conversation(request):
                 archive.archived_by = request.user
                 archive.save()
                 logger.info(f"Updated archive timestamp: {platform}/{account_id}/{conversation_id}")
+
+            # A chat in History belongs to nobody: release its assignment
+            # (no rating request — that is what End session is for).
+            open_assignment = _find_assignment(
+                platform, raw_conversation_id, account_id,
+                status__in=('active', 'in_session'),
+            )
+            if open_assignment is not None:
+                open_assignment.status = 'completed'
+                open_assignment.session_ended_at = timezone.now()
+                open_assignment.assigned_user = None
+                open_assignment.save()
+                _broadcast_assignment_change(request, open_assignment)
 
             # Cross-user reactivity: beta clients move the row from active
             # inbox into the Archive tab on this frame, no list refetch.
