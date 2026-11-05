@@ -174,14 +174,14 @@ class TestCreateMessage(TeamChatConsumerTestBase):
     def test_empty_text_rejected(self):
         consumer = _build_consumer(self.sender)
         result = self._create(consumer, recipient_id=self.recipient.pk, text='   ')
-        self.assertIsNone(result)
+        self.assertEqual(result, {'error': 'EMPTY_TEXT'})
         self.assertEqual(TeamChatMessage.objects.filter(sender=self.sender).count(), 0)
         self.mock_push.assert_not_called()
 
     def test_message_to_self_rejected(self):
         consumer = _build_consumer(self.sender)
         result = self._create(consumer, recipient_id=self.sender.pk, text='me')
-        self.assertIsNone(result)
+        self.assertEqual(result, {'error': 'SELF_MESSAGE'})
         self.assertEqual(TeamChatMessage.objects.filter(sender=self.sender).count(), 0)
 
     def test_foreign_conversation_rejected(self):
@@ -189,7 +189,7 @@ class TestCreateMessage(TeamChatConsumerTestBase):
         conv = self._make_conversation(self.recipient, stranger)
         consumer = _build_consumer(self.sender)
         result = self._create(consumer, conversation_id=conv.pk, text='intrude')
-        self.assertIsNone(result)
+        self.assertEqual(result, {'error': 'NOT_FOUND'})
         self.assertEqual(conv.messages.count(), 0)
 
     def test_preference_in_app_disabled_skips_notification(self):
@@ -234,8 +234,8 @@ class TestHandleSendMessage(TeamChatConsumerTestBase):
                 'type': 'message', 'conversation_id': conv.pk, 'text': 'wire',
             }))
 
-        # recipient group event
-        self.assertEqual(len(consumer.channel_layer.sent), 1)
+        # recipient group event + the same event to the sender's other sockets
+        self.assertEqual(len(consumer.channel_layer.sent), 2)
         group, event = consumer.channel_layer.sent[0]
         self.assertEqual(group, f'team_chat_test_{self.recipient.pk}')
         self.assertEqual(event['type'], 'chat_message')
@@ -262,7 +262,7 @@ class TestHandleSendMessage(TeamChatConsumerTestBase):
 
     def test_failed_create_sends_error(self):
         consumer = _build_consumer(self.sender)
-        with patch.object(consumer, 'create_message', new=AsyncMock(return_value=None)):
+        with patch.object(consumer, 'create_message', new=AsyncMock(return_value={'error': 'EMPTY_TEXT'})):
             async_to_sync(consumer.receive)(text_data=json.dumps({
                 'type': 'message', 'recipient_id': self.recipient.pk, 'text': '',
             }))
@@ -336,3 +336,278 @@ class TestChatMessageHandler(TeamChatConsumerTestBase):
         frame = json.loads(consumer.send.call_args.kwargs['text_data'])
         self.assertEqual(frame['conversation_id'], 9)
         self.assertEqual(frame['conversation'], 9)
+
+
+# ---------------------------------------------------------------------------
+# Reliability fixes (BE-1 .. BE-7)
+# ---------------------------------------------------------------------------
+from users.models import HiddenTeamChatConversation  # noqa: E402
+from users.team_chat import get_or_create_pair_conversation  # noqa: E402
+
+
+class TestMessageRouting(TeamChatConsumerTestBase):
+    """BE-1 / BE-3: frames name both participants; the sender's other sockets get the message."""
+
+    def _send(self, consumer, created, payload):
+        with patch.object(consumer, 'create_message', new=AsyncMock(return_value=created)):
+            async_to_sync(consumer.receive)(text_data=json.dumps(payload))
+
+    def test_ack_and_events_carry_routing_keys_and_client_id(self):
+        consumer = _build_consumer(self.sender)
+        created = self._create(consumer, recipient_id=self.recipient.pk, text='route me')
+        self._send(consumer, created, {
+            'type': 'message', 'recipient_id': self.recipient.pk, 'text': 'route me', 'client_id': 'tmp-1',
+        })
+
+        groups = [g for g, _ in consumer.channel_layer.sent]
+        self.assertEqual(groups, [f'team_chat_test_{self.recipient.pk}', f'team_chat_test_{self.sender.pk}'])
+        for _, event in consumer.channel_layer.sent:
+            self.assertEqual(event['sender_id'], self.sender.pk)
+            self.assertEqual(event['recipient_id'], self.recipient.pk)
+            self.assertEqual(event['participant_ids'], [self.sender.pk, self.recipient.pk])
+            self.assertEqual(event['origin_channel'], consumer.channel_name)
+
+        ack = json.loads(consumer.send.call_args.kwargs['text_data'])
+        self.assertEqual(ack['type'], 'message_sent')
+        self.assertEqual(ack['client_id'], 'tmp-1')
+        self.assertEqual(ack['sender_id'], self.sender.pk)
+        self.assertEqual(ack['recipient_id'], self.recipient.pk)
+        self.assertEqual(ack['other_user_id'], self.recipient.pk)
+
+    def test_recipient_socket_gets_sender_as_other_user(self):
+        sender_consumer = _build_consumer(self.sender)
+        created = self._create(sender_consumer, recipient_id=self.recipient.pk, text='hey')
+        self._send(sender_consumer, created, {'type': 'message', 'recipient_id': self.recipient.pk, 'text': 'hey'})
+        _, event = sender_consumer.channel_layer.sent[0]
+
+        recipient_consumer = _build_consumer(self.recipient)
+        recipient_consumer.channel_name = 'recipient-socket'
+        async_to_sync(recipient_consumer.chat_message)(event)
+        frame = json.loads(recipient_consumer.send.call_args.kwargs['text_data'])
+        self.assertEqual(frame['type'], 'new_message')
+        self.assertEqual(frame['other_user_id'], self.sender.pk)
+        self.assertEqual(frame['recipient_id'], self.recipient.pk)
+        self.assertEqual(frame['conversation_id'], created['conversation_id'])
+
+    def test_senders_other_tab_gets_message_with_recipient_as_other_user(self):
+        sender_consumer = _build_consumer(self.sender)
+        created = self._create(sender_consumer, recipient_id=self.recipient.pk, text='tabs')
+        self._send(sender_consumer, created, {'type': 'message', 'recipient_id': self.recipient.pk, 'text': 'tabs'})
+        _, own_group_event = sender_consumer.channel_layer.sent[1]
+
+        other_tab = _build_consumer(self.sender)
+        other_tab.channel_name = 'second-tab'
+        async_to_sync(other_tab.chat_message)(own_group_event)
+        frame = json.loads(other_tab.send.call_args.kwargs['text_data'])
+        self.assertEqual(frame['type'], 'new_message')
+        self.assertEqual(frame['other_user_id'], self.recipient.pk)
+
+    def test_originating_socket_skips_its_own_fanout_copy(self):
+        consumer = _build_consumer(self.sender)
+        async_to_sync(consumer.chat_message)({
+            'type': 'chat_message', 'message': {'id': 1}, 'conversation_id': 3,
+            'sender_id': self.sender.pk, 'recipient_id': self.recipient.pk,
+            'origin_channel': consumer.channel_name,
+        })
+        consumer.send.assert_not_called()
+
+
+class TestSendErrors(TeamChatConsumerTestBase):
+    """BE-4: failures carry a code and the client's correlation id."""
+
+    def _error_frame(self, consumer, payload, created):
+        with patch.object(consumer, 'create_message', new=AsyncMock(return_value=created)):
+            async_to_sync(consumer.receive)(text_data=json.dumps(payload))
+        return json.loads(consumer.send.call_args.kwargs['text_data'])
+
+    def test_error_frame_has_code_and_client_id(self):
+        consumer = _build_consumer(self.sender)
+        frame = self._error_frame(consumer, {
+            'type': 'message', 'recipient_id': self.recipient.pk, 'text': ' ', 'client_id': 'c-9',
+        }, {'error': 'EMPTY_TEXT'})
+        self.assertEqual(frame['type'], 'error')
+        self.assertEqual(frame['code'], 'EMPTY_TEXT')
+        self.assertEqual(frame['client_id'], 'c-9')
+
+    def test_missing_target_error_has_code(self):
+        consumer = _build_consumer(self.sender)
+        async_to_sync(consumer.receive)(text_data=json.dumps({'type': 'message', 'text': 'x', 'client_id': 'c-1'}))
+        frame = json.loads(consumer.send.call_args.kwargs['text_data'])
+        self.assertEqual(frame['code'], 'MISSING_TARGET')
+        self.assertEqual(frame['client_id'], 'c-1')
+
+    def test_unexpected_failure_maps_to_server_error(self):
+        consumer = _build_consumer(self.sender)
+        with patch('users.consumers.TeamChatMessage.objects.create', side_effect=RuntimeError('db down')):
+            result = self._create(consumer, recipient_id=self.recipient.pk, text='boom')
+        self.assertEqual(result, {'error': 'SERVER_ERROR'})
+
+    def test_unknown_recipient_is_not_found(self):
+        consumer = _build_consumer(self.sender)
+        self.assertEqual(self._create(consumer, recipient_id=999999, text='x'), {'error': 'NOT_FOUND'})
+        self.assertEqual(self._create(consumer, recipient_id='abc', text='x'), {'error': 'NOT_FOUND'})
+
+
+class TestPairConversation(TeamChatConsumerTestBase):
+    """BE-2: one conversation per pair; the window's conversation id is honoured."""
+
+    def test_get_or_create_is_idempotent_and_symmetric(self):
+        conv, created = get_or_create_pair_conversation(self.sender, self.recipient)
+        self.assertTrue(created)
+        again, created_again = get_or_create_pair_conversation(self.recipient, self.sender)
+        self.assertFalse(created_again)
+        self.assertEqual(again.pk, conv.pk)
+
+    def test_lookup_picks_oldest_duplicate(self):
+        old = self._make_conversation(self.sender, self.recipient)
+        newer = self._make_conversation(self.sender, self.recipient)
+        newer.save()  # newest updated_at; the old `.first()` would have picked it
+        conv, created = get_or_create_pair_conversation(self.sender, self.recipient)
+        self.assertFalse(created)
+        self.assertEqual(conv.pk, old.pk)
+
+    def test_ws_send_by_recipient_reuses_existing_conversation(self):
+        conv = self._make_conversation(self.sender, self.recipient)
+        consumer = _build_consumer(self.sender)
+        result = self._create(consumer, recipient_id=self.recipient.pk, text='same thread')
+        self.assertEqual(result['conversation_id'], conv.pk)
+        self.assertEqual(
+            TeamChatConversation.objects.filter(participants=self.sender).filter(participants=self.recipient).count(),
+            1,
+        )
+
+    def test_explicit_conversation_id_wins_over_pair_lookup(self):
+        self._make_conversation(self.sender, self.recipient)
+        window_conv = self._make_conversation(self.sender, self.recipient)
+        consumer = _build_consumer(self.sender)
+        result = self._create(
+            consumer, recipient_id=self.recipient.pk, conversation_id=window_conv.pk, text='here',
+        )
+        self.assertEqual(result['conversation_id'], window_conv.pk)
+
+    def test_conversation_id_of_other_pair_falls_back_to_recipient(self):
+        stranger = self.create_user(email='ws-stranger2@test.com')
+        other = self._make_conversation(self.sender, stranger)
+        consumer = _build_consumer(self.sender)
+        result = self._create(consumer, recipient_id=self.recipient.pk, conversation_id=other.pk, text='fix')
+        self.assertEqual(result['recipient_id'], self.recipient.pk)
+        self.assertNotEqual(result['conversation_id'], other.pk)
+
+
+class TestUnhideOnNewMessage(TeamChatConsumerTestBase):
+    """BE-7: a new message brings a hidden thread back."""
+
+    def test_ws_message_unhides_for_recipient(self):
+        conv = self._make_conversation(self.sender, self.recipient)
+        HiddenTeamChatConversation.objects.create(user=self.recipient, conversation=conv)
+        consumer = _build_consumer(self.sender)
+        self._create(consumer, recipient_id=self.recipient.pk, text='back again')
+        self.assertFalse(HiddenTeamChatConversation.objects.filter(conversation=conv).exists())
+
+
+class TestReadReceipts(TeamChatConsumerTestBase):
+    """BE-6: receipts are routed by the messages, not by the client's conversation id."""
+
+    def test_receipt_without_conversation_id_reaches_sender(self):
+        conv = self._make_conversation(self.sender, self.recipient)
+        msg = TeamChatMessage.objects.create(conversation=conv, sender=self.sender, text='read me')
+        consumer = _build_consumer(self.recipient)
+        receipts = TeamChatConsumer.__dict__['mark_messages_read'].func(consumer, [msg.pk])
+        self.assertEqual(receipts, {(conv.pk, self.sender.pk): [msg.pk]})
+        msg.refresh_from_db()
+        self.assertTrue(msg.is_read)
+
+        with patch.object(consumer, 'mark_messages_read', new=AsyncMock(return_value=receipts)):
+            async_to_sync(consumer.receive)(text_data=json.dumps({'type': 'read', 'message_ids': [msg.pk]}))
+        self.assertEqual(len(consumer.channel_layer.sent), 1)
+        group, event = consumer.channel_layer.sent[0]
+        self.assertEqual(group, f'team_chat_test_{self.sender.pk}')
+        self.assertEqual(event['type'], 'read_receipt')
+        self.assertEqual(event['conversation_id'], conv.pk)
+        self.assertEqual(event['message_ids'], [msg.pk])
+        self.assertEqual(event['read_by'], self.recipient.pk)
+
+    def test_cannot_mark_foreign_or_own_messages(self):
+        stranger = self.create_user(email='ws-stranger3@test.com')
+        foreign = self._make_conversation(self.sender, stranger)
+        foreign_msg = TeamChatMessage.objects.create(conversation=foreign, sender=self.sender, text='x')
+        own_conv = self._make_conversation(self.sender, self.recipient)
+        own_msg = TeamChatMessage.objects.create(conversation=own_conv, sender=self.recipient, text='mine')
+        consumer = _build_consumer(self.recipient)
+        receipts = TeamChatConsumer.__dict__['mark_messages_read'].func(consumer, [foreign_msg.pk, own_msg.pk])
+        self.assertEqual(receipts, {})
+        foreign_msg.refresh_from_db()
+        self.assertFalse(foreign_msg.is_read)
+
+    def test_typing_only_to_conversation_peers(self):
+        stranger = self.create_user(email='ws-stranger4@test.com')
+        consumer = _build_consumer(self.sender)
+        with patch.object(consumer, '_shares_conversation', new=AsyncMock(side_effect=lambda uid: uid == self.recipient.pk)):
+            async_to_sync(consumer.receive)(text_data=json.dumps({'type': 'typing', 'recipient_id': stranger.pk, 'is_typing': True}))
+            self.assertEqual(consumer.channel_layer.sent, [])
+            async_to_sync(consumer.receive)(text_data=json.dumps({'type': 'typing', 'recipient_id': self.recipient.pk, 'is_typing': True}))
+        self.assertEqual(len(consumer.channel_layer.sent), 1)
+        self.assertEqual(consumer.channel_layer.sent[0][0], f'team_chat_test_{self.recipient.pk}')
+
+
+class TestMultiConnectionPresence(TeamChatConsumerTestBase):
+    """BE-5: closing one of several sockets keeps the user online."""
+
+    def _connected(self, user, channel):
+        consumer = _build_consumer(user)
+        consumer.channel_name = channel
+        consumer.personal_group_name = f'team_chat_test_{user.pk}'
+        consumer.tenant_group_name = 'team_chat_presence_test'
+        return consumer
+
+    def _presence_events(self, consumer):
+        return [e for _, e in consumer.channel_layer.sent if e['type'] == 'user_status_changed']
+
+    def test_disconnect_with_other_socket_open_stays_online(self):
+        UserOnlineStatus.objects.create(user=self.sender, is_online=True)
+        consumer = self._connected(self.sender, 'tab-1')
+        with patch.object(consumer, 'unregister_connection', new=AsyncMock(return_value=1)), \
+                patch.object(consumer, 'set_online_status', new=AsyncMock()) as set_status:
+            async_to_sync(consumer.disconnect)(1000)
+        set_status.assert_not_awaited()
+        self.assertEqual(self._presence_events(consumer), [])
+
+    def test_last_socket_disconnect_goes_offline(self):
+        consumer = self._connected(self.sender, 'tab-1')
+        with patch.object(consumer, 'unregister_connection', new=AsyncMock(return_value=0)), \
+                patch.object(consumer, 'set_online_status', new=AsyncMock()) as set_status:
+            async_to_sync(consumer.disconnect)(1000)
+        set_status.assert_awaited_once_with(False)
+        events = self._presence_events(consumer)
+        self.assertEqual(len(events), 1)
+        self.assertFalse(events[0]['is_online'])
+
+    def test_connection_counter_counts_sockets(self):
+        from django.core.cache.backends.locmem import LocMemCache
+        local = LocMemCache('team-chat-test', {})
+        with patch('django.core.cache.cache', local):
+            a = self._connected(self.sender, 'tab-1')
+            b = self._connected(self.sender, 'tab-2')
+            register = TeamChatConsumer.__dict__['register_connection'].func
+            unregister = TeamChatConsumer.__dict__['unregister_connection'].func
+            self.assertEqual(register(a), 1)
+            self.assertEqual(register(b), 2)
+            self.assertEqual(unregister(a), 1)
+            self.assertEqual(unregister(b), 0)
+            # missing counter → treated as last socket
+            self.assertEqual(unregister(a), 0)
+
+    def test_ping_heals_wrongly_offline_row_and_broadcasts(self):
+        UserOnlineStatus.objects.create(user=self.sender, is_online=False)
+        consumer = self._connected(self.sender, 'tab-2')
+        healed = TeamChatConsumer.__dict__['refresh_last_seen'].func(consumer)
+        self.assertTrue(healed)
+        self.assertTrue(UserOnlineStatus.objects.get(user=self.sender).is_online)
+        self.assertFalse(TeamChatConsumer.__dict__['refresh_last_seen'].func(consumer))
+
+        with patch.object(consumer, 'refresh_last_seen', new=AsyncMock(return_value=True)), \
+                patch.object(consumer, "touch_connection_counter", new=AsyncMock()):
+            async_to_sync(consumer.receive)(text_data=json.dumps({'type': 'ping'}))
+        events = self._presence_events(consumer)
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]['is_online'])

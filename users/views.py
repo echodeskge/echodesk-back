@@ -19,6 +19,13 @@ import string
 import logging
 from rest_framework.authtoken.models import Token
 from .tasks import send_user_invitation_email_task, send_new_password_email_task
+from .team_chat import (
+    broadcast_read_receipt as broadcast_team_chat_read_receipt,
+    get_or_create_pair_conversation,
+    message_event as team_chat_message_event,
+    personal_group as team_chat_personal_group,
+    unhide_conversation as unhide_team_chat_conversation,
+)
 from .models import BLOCKED_STATUSES, AuthDeviceToken, Department, TenantGroup, Notification, NotificationPreference, UserOnlineStatus, TeamChatConversation, TeamChatMessage, HiddenTeamChatConversation
 from .serializers import (
     UserSerializer, UserCreateSerializer, UserUpdateSerializer, UserDirectorySerializer,
@@ -1348,11 +1355,13 @@ TEAM_CHAT_LIST_SCOPES = ('today', 'all')
 
 def _team_chat_ws_notify(conversation, message, tenant_schema=None):
     """
-    Push a ``new_message`` frame to the recipient's team-chat websocket group.
+    Push a ``new_message`` frame to both participants' team-chat websocket
+    groups: the recipient, and the sender's own sockets (other tabs / mobile;
+    the originating client dedupes by message id).
 
     Shared by the REST create path; the consumer does its own group_send with
-    the same payload shape. Never raises — a dropped socket must not fail the
-    request that created the message.
+    the same payload shape (``users.team_chat.message_event``). Never raises —
+    a dropped socket must not fail the request that created the message.
     """
     try:
         from channels.layers import get_channel_layer
@@ -1370,21 +1379,19 @@ def _team_chat_ws_notify(conversation, message, tenant_schema=None):
             from django.db import connection
             tenant_schema = connection.schema_name
 
-        group_name = f"team_chat_{tenant_schema}_{recipient.id}"
         message_data = dict(TeamChatMessageSerializer(message).data)
         # Websocket payloads also carry `conversation_id` on the message (the
         # key the consumer-built payload used to have) next to `conversation`.
         message_data.setdefault('conversation_id', conversation.id)
 
-        async_to_sync(channel_layer.group_send)(
-            group_name,
-            {
-                'type': 'chat_message',
-                'message': message_data,
-                'conversation': conversation.id,
-                'conversation_id': conversation.id,
-            }
+        event = team_chat_message_event(
+            message_data, conversation.id,
+            sender_id=message.sender_id, recipient_id=recipient.id,
         )
+        for user_id in (recipient.id, message.sender_id):
+            async_to_sync(channel_layer.group_send)(
+                team_chat_personal_group(tenant_schema, user_id), event
+            )
     except (ConnectionError, OSError) as e:
         # Connection reset by peer (errno 104) and similar transient errors
         # are expected when clients disconnect before receiving the message
@@ -1564,25 +1571,16 @@ class TeamChatConversationViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Find existing conversation between these two users (atomic to prevent race condition)
-        with transaction.atomic():
-            conversation = TeamChatConversation.objects.filter(
-                participants=request.user
-            ).filter(
-                participants=other_user
-            ).select_for_update().first()
-
-            if not conversation:
-                # Create new conversation
-                conversation = TeamChatConversation.objects.create()
-                conversation.participants.add(request.user, other_user)
-            else:
-                # If conversation exists but was hidden by this user, unhide it
-                # since user is explicitly choosing to start a chat again
-                HiddenTeamChatConversation.objects.filter(
-                    user=request.user,
-                    conversation=conversation
-                ).delete()
+        # Find or create the pair's conversation (advisory-locked, so two
+        # first contacts at the same time can't create two conversations)
+        conversation, created = get_or_create_pair_conversation(request.user, other_user)
+        if not created:
+            # If conversation exists but was hidden by this user, unhide it
+            # since user is explicitly choosing to start a chat again
+            HiddenTeamChatConversation.objects.filter(
+                user=request.user,
+                conversation=conversation
+            ).delete()
 
         serializer = TeamChatConversationDetailSerializer(
             conversation,
@@ -1601,14 +1599,22 @@ class TeamChatConversationViewSet(viewsets.ModelViewSet):
         conversation = self.get_object()
 
         # Mark all unread messages from other participants as read
-        updated = conversation.messages.filter(
+        unread = conversation.messages.filter(
             is_read=False
         ).exclude(
             sender=request.user
-        ).update(
+        )
+        receipts = {}
+        for msg_id, sender_id in unread.values_list('id', 'sender_id'):
+            receipts.setdefault(sender_id, []).append(msg_id)
+        updated = unread.update(
             is_read=True,
             read_at=timezone.now()
         )
+
+        # Live "seen" ticks for the senders' open windows
+        for sender_id, message_ids in receipts.items():
+            broadcast_team_chat_read_receipt(conversation.id, request.user.id, [sender_id], message_ids)
 
         return Response({'marked_read': updated})
 
@@ -1790,15 +1796,7 @@ class TeamChatMessageViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_404_NOT_FOUND
                 )
 
-            conversation = TeamChatConversation.objects.filter(
-                participants=request.user
-            ).filter(
-                participants=recipient
-            ).first()
-
-            if not conversation:
-                conversation = TeamChatConversation.objects.create()
-                conversation.participants.add(request.user, recipient)
+            conversation, _ = get_or_create_pair_conversation(request.user, recipient)
 
         # Create message
         message_data = {
@@ -1825,6 +1823,9 @@ class TeamChatMessageViewSet(viewsets.ModelViewSet):
 
         # Update conversation timestamp
         conversation.save()  # This triggers auto_now on updated_at
+
+        # A new message brings a hidden ("deleted") thread back.
+        unhide_team_chat_conversation(conversation)
 
         # Return serialized message
         response_serializer = TeamChatMessageSerializer(
@@ -1860,8 +1861,11 @@ class TeamChatMessageViewSet(viewsets.ModelViewSet):
         message = self.get_object()
 
         # Only mark if user is not the sender
-        if message.sender != request.user:
+        if message.sender != request.user and not message.is_read:
             message.mark_as_read()
+            broadcast_team_chat_read_receipt(
+                message.conversation_id, request.user.id, [message.sender_id], [message.id]
+            )
 
         serializer = self.get_serializer(message)
         return Response(serializer.data)

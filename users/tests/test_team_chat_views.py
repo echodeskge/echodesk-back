@@ -1112,9 +1112,10 @@ class TestCreateMessageNotification(LocalMediaMixin, TeamChatTestMixin, EchoDesk
                 _ws_patch.start()
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
         chat_calls = [(g, e) for g, e in calls if e.get('type') == 'chat_message']
-        self.assertEqual(len(chat_calls), 1)
+        # recipient first, then the sender's own sockets (other tabs / devices)
+        self.assertEqual([g for g, _ in chat_calls],
+                         [f'team_chat_test_{self.user2.pk}', f'team_chat_test_{self.user1.pk}'])
         group, event = chat_calls[0]
-        self.assertEqual(group, f'team_chat_test_{self.user2.pk}')
         self.assertEqual(event['type'], 'chat_message')
         self.assertEqual(event['conversation'], self.conv.pk)
         self.assertEqual(event['conversation_id'], self.conv.pk)
@@ -1271,3 +1272,144 @@ class TestUploadValidator(TeamChatTestMixin, EchoDeskTenantTestCase):
             resp.data['file_mime_type'],
             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         )
+
+
+# ============================================================
+# Reliability fixes (BE-1, BE-2, BE-3, BE-6, BE-7)
+# ============================================================
+class _RecordingLayer:
+    def __init__(self):
+        self.sent = []
+
+    async def group_send(self, group, message):
+        self.sent.append((group, message))
+
+
+class TestTeamChatRealtimeFanout(TeamChatTestMixin, EchoDeskTenantTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.user1 = self.create_user(email='rt1@test.com')
+        self.user2 = self.create_user(email='rt2@test.com')
+        self.conv = self._make_conversation(self.user1, self.user2)
+        self.layer = _RecordingLayer()
+        self._layer_patch = patch('channels.layers.get_channel_layer', return_value=self.layer)
+        self._layer_patch.start()
+        self._push = _push_patch.start()
+
+    def tearDown(self):
+        _push_patch.stop()
+        self._layer_patch.stop()
+        super().tearDown()
+
+    def test_rest_message_reaches_both_participants_with_routing_keys(self):
+        resp = self._multipart_post(MESSAGES_URL, {
+            'conversation_id': self.conv.pk, 'text': 'via rest', 'message_type': 'text',
+        }, user=self.user1)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        chat_events = [(g, e) for g, e in self.layer.sent if e['type'] == 'chat_message']
+        groups = sorted(g for g, _ in chat_events)
+        schema = self.tenant.schema_name
+        self.assertEqual(groups, sorted([f'team_chat_{schema}_{self.user1.pk}', f'team_chat_{schema}_{self.user2.pk}']))
+        for _, event in chat_events:
+            self.assertEqual(event['sender_id'], self.user1.pk)
+            self.assertEqual(event['recipient_id'], self.user2.pk)
+            self.assertEqual(event['conversation_id'], self.conv.pk)
+            self.assertEqual(event['message']['id'], resp.data['id'])
+            self.assertNotIn('origin_channel', event)
+
+    def test_rest_message_unhides_conversation_for_recipient(self):
+        HiddenTeamChatConversation.objects.create(user=self.user2, conversation=self.conv)
+        resp = self._multipart_post(MESSAGES_URL, {
+            'recipient_id': self.user2.pk, 'text': 'are you there', 'message_type': 'text',
+        }, user=self.user1)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(HiddenTeamChatConversation.objects.filter(conversation=self.conv).exists())
+        list_resp = self.api_get(CONVERSATIONS_URL, user=self.user2)
+        results = list_resp.data.get('results', list_resp.data)
+        self.assertIn(self.conv.pk, [row['id'] for row in results])
+
+    def test_conversation_mark_read_broadcasts_receipt_to_sender(self):
+        m1 = self._make_message(self.conv, self.user2, 'one')
+        m2 = self._make_message(self.conv, self.user2, 'two')
+        resp = self.api_post(_conv_mark_read_url(self.conv.pk), user=self.user1)
+        self.assertEqual(resp.data['marked_read'], 2)
+        receipts = [(g, e) for g, e in self.layer.sent if e['type'] == 'read_receipt']
+        self.assertEqual(len(receipts), 1)
+        group, event = receipts[0]
+        self.assertEqual(group, f'team_chat_{self.tenant.schema_name}_{self.user2.pk}')
+        self.assertEqual(sorted(event['message_ids']), sorted([m1.pk, m2.pk]))
+        self.assertEqual(event['read_by'], self.user1.pk)
+        self.assertEqual(event['conversation_id'], self.conv.pk)
+
+    def test_conversation_mark_read_without_unread_sends_nothing(self):
+        self.api_post(_conv_mark_read_url(self.conv.pk), user=self.user1)
+        self.assertEqual([e for _, e in self.layer.sent if e['type'] == 'read_receipt'], [])
+
+    def test_single_message_mark_read_broadcasts_once(self):
+        msg = self._make_message(self.conv, self.user2, 'single')
+        self.api_post(_msg_mark_read_url(msg.pk), user=self.user1)
+        self.api_post(_msg_mark_read_url(msg.pk), user=self.user1)
+        receipts = [(g, e) for g, e in self.layer.sent if e['type'] == 'read_receipt']
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0][1]['message_ids'], [msg.pk])
+
+    def test_broadcast_failure_does_not_fail_mark_read(self):
+        self._make_message(self.conv, self.user2, 'x')
+        self.layer.group_send = None  # calling it raises TypeError
+        resp = self.api_post(_conv_mark_read_url(self.conv.pk), user=self.user1)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+
+class TestPairConversationDedup(TeamChatTestMixin, EchoDeskTenantTestCase):
+    """BE-2: every path resolves the same (oldest) conversation for a pair."""
+
+    def setUp(self):
+        super().setUp()
+        self.user1 = self.create_user(email='dup1@test.com')
+        self.user2 = self.create_user(email='dup2@test.com')
+
+    def test_with_user_returns_oldest_of_duplicates(self):
+        old = self._make_conversation(self.user1, self.user2)
+        newer = self._make_conversation(self.user1, self.user2)
+        newer.save()
+        resp = self.api_get(_conv_with_url(self.user2.pk), user=self.user1)
+        self.assertEqual(resp.data['id'], old.pk)
+
+    @patch('users.views.TeamChatMessageViewSet._notify_recipient')
+    def test_rest_send_and_with_user_agree(self, mock_notify):
+        resp = self._multipart_post(MESSAGES_URL, {
+            'recipient_id': self.user2.pk, 'text': 'first contact', 'message_type': 'text',
+        }, user=self.user1)
+        with_resp = self.api_get(_conv_with_url(self.user1.pk), user=self.user2)
+        self.assertEqual(with_resp.data['id'], resp.data['conversation'])
+        self.assertEqual(
+            TeamChatConversation.objects.filter(participants=self.user1).filter(participants=self.user2).count(), 1,
+        )
+
+
+class TestMergeDuplicateConversationsMigration(TeamChatTestMixin, EchoDeskTenantTestCase):
+
+    def test_merges_messages_onto_oldest_and_keeps_visibility(self):
+        import importlib
+        from django.apps import apps as global_apps
+        migration = importlib.import_module('users.migrations.0026_merge_duplicate_team_chat_conversations')
+
+        user1 = self.create_user(email='mig1@test.com')
+        user2 = self.create_user(email='mig2@test.com')
+        keep = self._make_conversation(user1, user2)
+        dup = self._make_conversation(user1, user2)
+        self._make_message(keep, user1, 'a')
+        self._make_message(dup, user2, 'b')
+        # user1 hid only the old one → merged thread must be visible to user1
+        HiddenTeamChatConversation.objects.create(user=user1, conversation=keep)
+        # user2 hid both → stays hidden for user2
+        HiddenTeamChatConversation.objects.create(user=user2, conversation=keep)
+        HiddenTeamChatConversation.objects.create(user=user2, conversation=dup)
+
+        migration.merge_duplicate_pairs(global_apps, None)
+
+        self.assertFalse(TeamChatConversation.objects.filter(pk=dup.pk).exists())
+        self.assertEqual(sorted(keep.messages.values_list('text', flat=True)), ['a', 'b'])
+        self.assertFalse(HiddenTeamChatConversation.objects.filter(user=user1, conversation=keep).exists())
+        self.assertTrue(HiddenTeamChatConversation.objects.filter(user=user2, conversation=keep).exists())

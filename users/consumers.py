@@ -5,12 +5,20 @@ Includes notification updates and ticket board collaboration.
 
 import json
 import asyncio
+import logging
 import time
 from channels.generic.websocket import AsyncWebsocketConsumer
+from asgiref.sync import sync_to_async
 from channels.db import database_sync_to_async
 from django.contrib.auth.models import AnonymousUser
 from tenant_schemas.utils import schema_context
 from .models import Notification, UserOnlineStatus, TeamChatConversation, TeamChatMessage
+from .team_chat import (
+    get_or_create_pair_conversation, message_event, personal_group,
+    read_receipt_event, unhide_conversation,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class NotificationConsumer(AsyncWebsocketConsumer):
@@ -820,25 +828,40 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
     WebSocket URL: /ws/team-chat/{tenant_schema}/?token={auth_token}
 
     Client -> Server messages:
-    - {"type": "message", "recipient_id": 123, "text": "Hello", "message_type": "text"}
+    - {"type": "message", "recipient_id": 123, "conversation_id": 45,
+       "text": "Hello", "client_id": "<temp uuid>"}
     - {"type": "typing", "recipient_id": 123, "is_typing": true}
     - {"type": "read", "message_ids": [1, 2, 3]}
 
     Server -> Client messages:
-    - {"type": "new_message", "message": {...}}
+    - {"type": "message_sent", "message": {...}, "conversation_id": 45,
+       "sender_id": 1, "recipient_id": 123, "other_user_id": 123, "client_id": ...}
+       (ack to the sending socket only)
+    - {"type": "new_message", "message": {...}, "conversation_id": 45,
+       "sender_id": 1, "recipient_id": 123, "other_user_id": ...}
+       (to the recipient's sockets AND the sender's other sockets/devices;
+       ``other_user_id`` is the chat partner from the receiving user's view)
+    - {"type": "error", "code": "EMPTY_TEXT|NOT_FOUND|SELF_MESSAGE|SERVER_ERROR|...",
+       "message": "...", "client_id": ...}
     - {"type": "typing_indicator", "user_id": 123, "is_typing": true}
-    - {"type": "read_receipt", "message_ids": [...], "read_by": 123}
+    - {"type": "read_receipt", "message_ids": [...], "read_by": 123, "conversation_id": 45}
     - {"type": "user_online", "user_id": 123, "is_online": true}
 
-    Presence: ``UserOnlineStatus.is_online`` is set on connect/disconnect and
+    Presence: ``UserOnlineStatus.is_online`` is set on connect and cleared on
+    disconnect of the user's LAST open socket (connections are counted per
+    user in the cache, so closing one of two tabs keeps the user online).
     ``last_seen`` is refreshed on the client's periodic ``ping`` (at most once
-    per ``PRESENCE_HEARTBEAT_SECONDS`` per connection). The notification layer
+    per ``PRESENCE_HEARTBEAT_SECONDS`` per connection), which also flips a
+    wrongly-offline row back online. The notification layer
     treats an online row older than ``TEAM_CHAT_PRESENCE_STALE_AFTER`` as
     stale, so a connection that died without its disconnect handler (server
     restart) stops suppressing chat notifications after that window.
     """
 
     PRESENCE_HEARTBEAT_SECONDS = 30
+    # Lifetime of the per-user open-connection counter; refreshed on ping so a
+    # counter left behind by a crashed server expires on its own.
+    CONNECTION_COUNTER_TTL = 120
 
     async def connect(self):
         self.tenant_schema = self.scope['url_route']['kwargs']['tenant_schema']
@@ -876,6 +899,8 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
             )
 
             await self.accept()
+
+            await self.register_connection()
 
             # Update online status (wrapped in try/catch to not fail connection)
             try:
@@ -925,11 +950,14 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
     async def disconnect(self, close_code):
         if hasattr(self, 'personal_group_name'):
             try:
-                # Update online status
-                await self.set_online_status(False)
+                # Only the user's last open socket (tab / device) takes them
+                # offline; closing one of several keeps them online.
+                remaining = await self.unregister_connection()
+                if remaining <= 0:
+                    await self.set_online_status(False)
 
                 # Notify other users that this user is offline
-                if hasattr(self, 'tenant_group_name'):
+                if remaining <= 0 and hasattr(self, 'tenant_group_name'):
                     await self.channel_layer.group_send(
                         self.tenant_group_name,
                         {
@@ -1002,18 +1030,37 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
                 'message': 'Internal server error'
             }))
 
+    # Error codes of a failed websocket send (``code`` of the error frame).
+    SEND_ERROR_MESSAGES = {
+        'MISSING_TARGET': 'recipient_id or conversation_id required',
+        'EMPTY_TEXT': 'Message text is empty',
+        'NOT_FOUND': 'Conversation or recipient not found',
+        'SELF_MESSAGE': 'You cannot send a message to yourself',
+        'SERVER_ERROR': 'Message could not be sent',
+    }
+
+    async def _send_error(self, code, client_id=None):
+        frame = {
+            'type': 'error',
+            'code': code,
+            'message': self.SEND_ERROR_MESSAGES.get(code, 'Message could not be sent'),
+        }
+        if client_id is not None:
+            frame['client_id'] = client_id
+        await self.send(text_data=json.dumps(frame))
+
     async def handle_send_message(self, data):
         """Handle sending a new message"""
         recipient_id = data.get('recipient_id')
         conversation_id = data.get('conversation_id')
         text = data.get('text', '')
         message_type = data.get('message_type', 'text')
+        # Client correlation id, echoed in the ack / error so the client can
+        # resolve its pending bubble (or fall back to REST).
+        client_id = data.get('client_id')
 
         if not recipient_id and not conversation_id:
-            await self.send(text_data=json.dumps({
-                'type': 'error',
-                'message': 'recipient_id or conversation_id required'
-            }))
+            await self._send_error('MISSING_TARGET', client_id)
             return
 
         # Create message in database
@@ -1024,40 +1071,48 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
             message_type=message_type
         )
 
-        if message_data:
-            # Send to recipient
-            recipient_group = f"team_chat_{self.tenant_schema}_{message_data['recipient_id']}"
+        if not message_data or message_data.get('error'):
+            code = (message_data or {}).get('error') or 'SERVER_ERROR'
+            await self._send_error(code, client_id)
+            return
 
-            await self.channel_layer.group_send(
-                recipient_group,
-                {
-                    'type': 'chat_message',
-                    'message': message_data['message'],
-                    'conversation': message_data['conversation_id'],
-                    'conversation_id': message_data['conversation_id']
-                }
-            )
+        recipient_id = message_data['recipient_id']
+        conversation_id = message_data['conversation_id']
+        event = message_event(
+            message_data['message'], conversation_id,
+            sender_id=self.user.id, recipient_id=recipient_id,
+            origin_channel=self.channel_name,
+        )
 
-            # Confirm to sender
-            await self.send(text_data=json.dumps({
-                'type': 'message_sent',
-                'message': message_data['message'],
-                'conversation': message_data['conversation_id'],
-                'conversation_id': message_data['conversation_id']
-            }))
-        else:
-            await self.send(text_data=json.dumps({
-                'type': 'error',
-                'message': 'Message could not be sent'
-            }))
+        # Send to the recipient, and to the sender's other sockets (other
+        # tabs / mobile) so their open window shows the message too. The
+        # originating socket skips that copy (see chat_message) and gets the
+        # ack below instead.
+        await self.channel_layer.group_send(personal_group(self.tenant_schema, recipient_id), event)
+        await self.channel_layer.group_send(personal_group(self.tenant_schema, self.user.id), event)
+
+        # Confirm to sender
+        ack = {
+            'type': 'message_sent',
+            'message': message_data['message'],
+            'conversation': conversation_id,
+            'conversation_id': conversation_id,
+            'sender_id': self.user.id,
+            'recipient_id': recipient_id,
+            'participant_ids': [self.user.id, recipient_id],
+            'other_user_id': recipient_id,
+        }
+        if client_id is not None:
+            ack['client_id'] = client_id
+        await self.send(text_data=json.dumps(ack))
 
     async def handle_typing(self, data):
-        """Handle typing indicator"""
+        """Handle typing indicator (only towards a user we share a conversation with)"""
         recipient_id = data.get('recipient_id')
         is_typing = data.get('is_typing', False)
 
-        if recipient_id:
-            recipient_group = f"team_chat_{self.tenant_schema}_{recipient_id}"
+        if recipient_id and await self.is_conversation_peer(recipient_id):
+            recipient_group = personal_group(self.tenant_schema, recipient_id)
 
             await self.channel_layer.group_send(
                 recipient_group,
@@ -1070,40 +1125,50 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
             )
 
     async def handle_read_receipt(self, data):
-        """Handle read receipt"""
-        message_ids = data.get('message_ids', [])
-        conversation_id = data.get('conversation_id')
+        """
+        Handle read receipt.
 
-        if message_ids:
-            # Mark messages as read in database
-            await self.mark_messages_read(message_ids)
+        The receipt is routed by the messages themselves (their conversation
+        and sender), so it works without — and cannot be misrouted by — the
+        client's ``conversation_id``.
+        """
+        message_ids = data.get('message_ids') or []
+        if not isinstance(message_ids, list) or not message_ids:
+            return
 
-            # Get the other participant to notify them
-            other_user_id = await self.get_conversation_other_participant(conversation_id)
+        # Mark messages as read; returns {(conversation_id, sender_id): [ids]}
+        receipts = await self.mark_messages_read(message_ids)
 
-            if other_user_id:
-                other_user_group = f"team_chat_{self.tenant_schema}_{other_user_id}"
-
-                await self.channel_layer.group_send(
-                    other_user_group,
-                    {
-                        'type': 'read_receipt',
-                        'message_ids': message_ids,
-                        'read_by': self.user.id,
-                        'conversation_id': conversation_id
-                    }
-                )
+        for (conversation_id, sender_id), ids in receipts.items():
+            await self.channel_layer.group_send(
+                personal_group(self.tenant_schema, sender_id),
+                read_receipt_event(conversation_id, self.user.id, ids),
+            )
 
     # Event handlers for messages from channel layer
     async def chat_message(self, event):
         """Send new message to WebSocket"""
+        # The socket that sent the message already got its `message_sent` ack.
+        origin = event.get('origin_channel')
+        if origin and origin == getattr(self, 'channel_name', None):
+            return
+
         conversation_id = event.get('conversation_id', event.get('conversation'))
-        await self.send(text_data=json.dumps({
+        frame = {
             'type': 'new_message',
             'message': event['message'],
             'conversation': conversation_id,
-            'conversation_id': conversation_id
-        }))
+            'conversation_id': conversation_id,
+        }
+        sender_id = event.get('sender_id')
+        recipient_id = event.get('recipient_id')
+        if sender_id is not None:
+            frame['sender_id'] = sender_id
+            frame['recipient_id'] = recipient_id
+            frame['participant_ids'] = event.get('participant_ids') or [sender_id, recipient_id]
+            # The chat partner from this socket's user's point of view.
+            frame['other_user_id'] = recipient_id if sender_id == self.user.id else sender_id
+        await self.send(text_data=json.dumps(frame))
 
     async def typing_indicator(self, event):
         """Send typing indicator to WebSocket"""
@@ -1151,17 +1216,98 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
             return
         self._presence_touched_at = now
         try:
-            await self.refresh_last_seen()
+            came_back_online = await self.refresh_last_seen()
         except Exception as e:
             print(f"[TeamChatWS] Error refreshing presence: {e}")
+            return
+        await self.touch_connection_counter()
+        if came_back_online and hasattr(self, 'tenant_group_name'):
+            # The row had been flipped offline (e.g. another tab of this user
+            # closed before connection counting, or the counter was lost) —
+            # tell everyone the user is online again.
+            try:
+                await self.channel_layer.group_send(
+                    self.tenant_group_name,
+                    {
+                        'type': 'user_status_changed',
+                        'user_id': self.user.id,
+                        'is_online': True,
+                        'user_name': self.user.get_full_name() or self.user.email,
+                        'exclude_channel': self.channel_name
+                    }
+                )
+            except Exception as e:
+                print(f"[TeamChatWS] Error broadcasting online status: {e}")
+
+    # Per-user open-connection counter (cache / Redis; no DB access, so plain
+    # sync_to_async rather than database_sync_to_async)
+    def _connection_counter_key(self):
+        return f'team_chat_conns:{self.tenant_schema}:{self.user.id}'
+
+    @sync_to_async
+    def register_connection(self):
+        """Count this socket in; returns the user's open-connection count (None on cache failure)."""
+        from django.core.cache import cache
+        key = self._connection_counter_key()
+        try:
+            cache.add(key, 0, self.CONNECTION_COUNTER_TTL)
+            count = cache.incr(key)
+            cache.touch(key, self.CONNECTION_COUNTER_TTL)
+            return count
+        except Exception as e:
+            print(f"[TeamChatWS] Error registering connection: {e}")
+            return None
+
+    @sync_to_async
+    def unregister_connection(self):
+        """
+        Count this socket out; returns how many sockets of the user remain.
+
+        A missing counter or a cache failure counts as "none left" — the
+        pre-counter behaviour; the ping self-heal in ``refresh_last_seen``
+        repairs a wrong offline mark within one heartbeat.
+        """
+        from django.core.cache import cache
+        key = self._connection_counter_key()
+        try:
+            remaining = cache.decr(key)
+        except Exception:
+            return 0
+        if remaining <= 0:
+            try:
+                cache.delete(key)
+            except Exception:
+                pass
+            return 0
+        return remaining
+
+    @sync_to_async
+    def touch_connection_counter(self):
+        """Keep the connection counter alive while this socket pings."""
+        from django.core.cache import cache
+        try:
+            cache.touch(self._connection_counter_key(), self.CONNECTION_COUNTER_TTL)
+        except Exception:
+            pass
 
     # Database operations
     @database_sync_to_async
     def refresh_last_seen(self):
-        """Bump ``last_seen`` on the user's presence row (keeps it non-stale)."""
+        """
+        Bump ``last_seen`` on the user's presence row (keeps it non-stale).
+
+        Also marks the row online again if it was flipped offline while this
+        socket is still open. Returns True when that happened.
+        """
         from django.utils import timezone
+        now = timezone.now()
         with schema_context(self.tenant_schema):
-            UserOnlineStatus.objects.filter(user=self.user).update(last_seen=timezone.now())
+            flipped = UserOnlineStatus.objects.filter(
+                user=self.user, is_online=False
+            ).update(is_online=True, last_seen=now)
+            if not flipped:
+                UserOnlineStatus.objects.filter(user=self.user).update(last_seen=now)
+            return bool(flipped)
 
     @database_sync_to_async
     def set_online_status(self, is_online):
@@ -1212,6 +1358,9 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
         ``TeamChatMessageSerializer`` — the same shape the REST API and the
         REST-triggered ``new_message`` frames use — and the recipient gets the
         same in-app/push notification as for a REST-created message.
+
+        Returns ``{'message', 'conversation_id', 'recipient_id'}`` on success,
+        ``{'error': <code>}`` otherwise (see ``SEND_ERROR_MESSAGES``).
         """
         try:
             with schema_context(self.tenant_schema):
@@ -1222,35 +1371,37 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
 
                 text = (text or '').strip()
                 if not text:
-                    print("[TeamChatWS] Rejecting empty websocket message")
-                    return None
+                    return {'error': 'EMPTY_TEXT'}
 
-                # Get or create conversation
+                conversation = None
+                recipient = None
+
+                # The window's conversation id wins, as long as it is the
+                # caller's conversation with the intended recipient.
                 if conversation_id:
-                    conversation = TeamChatConversation.objects.get(
+                    conversation = TeamChatConversation.objects.filter(
                         id=conversation_id,
                         participants=self.user
-                    )
-                    recipient = conversation.get_other_participant(self.user)
-                    if recipient is None:
-                        print(f"[TeamChatWS] Conversation {conversation_id} has no other participant")
-                        return None
-                else:
-                    recipient = User.objects.get(id=recipient_id)
-                    if recipient.id == self.user.id:
-                        print("[TeamChatWS] Rejecting message to self")
-                        return None
-
-                    # Find existing conversation
-                    conversation = TeamChatConversation.objects.filter(
-                        participants=self.user
-                    ).filter(
-                        participants=recipient
                     ).first()
+                    if conversation is not None:
+                        recipient = conversation.get_other_participant(self.user)
+                        if recipient is None:
+                            return {'error': 'NOT_FOUND'}
+                        if recipient_id and str(recipient.id) != str(recipient_id):
+                            # Stale/foreign id: fall back to the pair lookup.
+                            conversation = recipient = None
+                    elif not recipient_id:
+                        return {'error': 'NOT_FOUND'}
 
-                    if not conversation:
-                        conversation = TeamChatConversation.objects.create()
-                        conversation.participants.add(self.user, recipient)
+                if conversation is None:
+                    try:
+                        recipient = User.objects.get(id=int(recipient_id))
+                    except (User.DoesNotExist, TypeError, ValueError):
+                        return {'error': 'NOT_FOUND'}
+                    if recipient.id == self.user.id:
+                        return {'error': 'SELF_MESSAGE'}
+
+                    conversation, _ = get_or_create_pair_conversation(self.user, recipient)
 
                 # Create message (websocket messages are text-only)
                 message = TeamChatMessage.objects.create(
@@ -1263,6 +1414,9 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
                 # Update conversation timestamp
                 conversation.save()
 
+                # A new message brings a hidden ("deleted") thread back.
+                unhide_conversation(conversation)
+
                 # Serialize message with the REST serializer (one shape for all
                 # clients); keep `conversation_id` as an alias of `conversation`
                 # for clients written against the old websocket payload.
@@ -1272,8 +1426,8 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
                 # In-app notification + push for the recipient; never fail the send
                 try:
                     create_team_chat_message_notification(message, recipient=recipient)
-                except Exception as notify_err:
-                    print(f"[TeamChatWS] Error creating team chat notification: {notify_err}")
+                except Exception:
+                    logger.exception("[TeamChatWS] Error creating team chat notification")
 
                 return {
                     'message': message_data,
@@ -1281,45 +1435,69 @@ class TeamChatConsumer(AsyncWebsocketConsumer):
                     'recipient_id': recipient.id
                 }
 
-        except Exception as e:
-            print(f"[TeamChatWS] Error creating message: {e}")
-            return None
+        except Exception:
+            logger.exception("[TeamChatWS] Error creating message")
+            return {'error': 'SERVER_ERROR'}
 
     @database_sync_to_async
     def mark_messages_read(self, message_ids):
-        """Mark messages as read"""
+        """
+        Mark messages (sent to this user) as read.
+
+        Returns ``{(conversation_id, sender_id): [message ids]}`` for every
+        requested message of a conversation the user is in and sent by
+        someone else — the routing of the read receipts.
+        """
         try:
             with schema_context(self.tenant_schema):
                 from django.utils import timezone
-                TeamChatMessage.objects.filter(
+                messages = TeamChatMessage.objects.filter(
                     id__in=message_ids,
                     conversation__participants=self.user,
-                    is_read=False
                 ).exclude(
                     sender=self.user
-                ).update(
+                )
+                receipts = {}
+                for msg_id, conv_id, sender_id in messages.values_list(
+                    'id', 'conversation_id', 'sender_id'
+                ):
+                    receipts.setdefault((conv_id, sender_id), []).append(msg_id)
+                messages.filter(is_read=False).update(
                     is_read=True,
                     read_at=timezone.now()
                 )
-                return True
-        except Exception as e:
-            print(f"[TeamChatWS] Error marking messages read: {e}")
-            return False
+                return receipts
+        except Exception:
+            logger.exception("[TeamChatWS] Error marking messages read")
+            return {}
+
+    async def is_conversation_peer(self, user_id):
+        """True when the user shares a conversation with ``user_id`` (cached per socket)."""
+        peers = getattr(self, '_conversation_peers', None)
+        if peers is None:
+            peers = self._conversation_peers = set()
+        key = str(user_id)
+        if key in peers:
+            return True
+        if await self._shares_conversation(user_id):
+            peers.add(key)
+            return True
+        return False
 
     @database_sync_to_async
-    def get_conversation_other_participant(self, conversation_id):
-        """Get the other participant in a conversation"""
+    def _shares_conversation(self, user_id):
         try:
             with schema_context(self.tenant_schema):
-                conversation = TeamChatConversation.objects.get(
-                    id=conversation_id,
+                return TeamChatConversation.objects.filter(
                     participants=self.user
-                )
-                other = conversation.get_other_participant(self.user)
-                return other.id if other else None
-        except Exception as e:
-            print(f"[TeamChatWS] Error getting other participant: {e}")
-            return None
+                ).filter(
+                    participants__id=int(user_id)
+                ).exists()
+        except (TypeError, ValueError):
+            return False
+        except Exception:
+            logger.exception("[TeamChatWS] Error checking conversation peer")
+            return False
 
 
 # Utility function for sending team chat messages from REST views
@@ -1339,12 +1517,10 @@ async def send_team_chat_message(tenant_schema, recipient_id, message_data, conv
     if not channel_layer:
         return
 
-    await channel_layer.group_send(
-        f'team_chat_{tenant_schema}_{recipient_id}',
-        {
-            'type': 'chat_message',
-            'message': message_data,
-            'conversation': conversation_id,
-            'conversation_id': conversation_id
-        }
-    )
+    sender = (message_data or {}).get('sender')
+    sender_id = sender.get('id') if isinstance(sender, dict) else sender
+    event = message_event(message_data, conversation_id, sender_id=sender_id, recipient_id=recipient_id)
+    await channel_layer.group_send(personal_group(tenant_schema, recipient_id), event)
+    if sender_id is not None:
+        # The sender's own sockets (other tabs / devices) show it too.
+        await channel_layer.group_send(personal_group(tenant_schema, sender_id), event)
