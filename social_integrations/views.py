@@ -1,6 +1,7 @@
 import os
 import re
 import requests
+from social_integrations import http_retry
 import logging
 from datetime import datetime, timedelta
 from urllib.parse import urlencode, quote_plus
@@ -584,7 +585,7 @@ def send_facebook_auto_reply(recipient_id, message_text, page_connection):
             'message': {'text': message_text},
             'messaging_type': 'RESPONSE'
         }
-        response = requests.post(
+        response = http_retry.post(
             send_url,
             json=message_data,
             params={'access_token': page_connection.page_access_token},
@@ -642,7 +643,7 @@ def send_instagram_auto_reply(recipient_id, message_text, account_connection):
         # Use the Facebook Page's access token with platform=instagram
         access_token = account_connection.facebook_page.page_access_token
 
-        response = requests.post(
+        response = http_retry.post(
             send_url,
             json=message_data,
             params={
@@ -731,7 +732,7 @@ def send_whatsapp_auto_reply(recipient_number, message_text, account):
             'text': {'body': message_text}
         }
 
-        response = requests.post(
+        response = http_retry.post(
             send_url,
             json=message_data,
             headers={'Authorization': f'Bearer {account.access_token}'},
@@ -1251,7 +1252,7 @@ def facebook_oauth_callback(request):
                             'access_token': page_access_token
                         }
                         logger.info(f"📡 Subscribing page {page_name} ({page_id}) to webhooks...")
-                        subscribe_response = requests.post(subscribe_url, params=subscribe_params, timeout=30)
+                        subscribe_response = http_retry.post(subscribe_url, params=subscribe_params, timeout=30)
                         subscribe_data = subscribe_response.json()
 
                         if subscribe_response.status_code == 200 and subscribe_data.get('success'):
@@ -1849,7 +1850,7 @@ def facebook_send_message(request):
                 }
                 if reply_to_message_id:
                     text_payload['reply_to'] = {'mid': reply_to_message_id}
-                text_response = requests.post(
+                text_response = http_retry.post(
                     send_url,
                     json=text_payload,
                     headers={'Content-Type': 'application/json'},
@@ -1874,7 +1875,7 @@ def facebook_send_message(request):
                     )
 
             # Send media attachment using form data upload
-            response = requests.post(
+            response = http_retry.post(
                 send_url,
                 files={'filedata': (media_filename, media_file, media_mime_type)},
                 data={
@@ -1901,7 +1902,7 @@ def facebook_send_message(request):
                 message_data['reply_to'] = {'mid': reply_to_message_id}
                 logger.info(f"Replying to message: {reply_to_message_id}")
 
-            response = requests.post(
+            response = http_retry.post(
                 send_url,
                 json=message_data,
                 headers={'Content-Type': 'application/json'},
@@ -3599,7 +3600,7 @@ def instagram_send_message(request):
                 }
                 if reply_to_message_id:
                     text_payload['reply_to'] = {'mid': reply_to_message_id}
-                text_resp = requests.post(send_url, json=text_payload,
+                text_resp = http_retry.post(send_url, json=text_payload,
                               headers={'Content-Type': 'application/json'}, params=params, timeout=30)
                 # Don't silently drop the text half of a text+media reply.
                 if text_resp.status_code == 200:
@@ -3618,7 +3619,7 @@ def instagram_send_message(request):
                     )
 
             # Send media attachment using form data upload
-            response = requests.post(
+            response = http_retry.post(
                 send_url,
                 files={'filedata': (media_filename, media_file, media_mime_type)},
                 data={
@@ -3644,7 +3645,7 @@ def instagram_send_message(request):
             if reply_to_message_id:
                 message_data['reply_to'] = {'mid': reply_to_message_id}
 
-            response = requests.post(
+            response = http_retry.post(
                 send_url,
                 json=message_data,
                 headers={'Content-Type': 'application/json'},
@@ -5305,7 +5306,7 @@ def send_rating_request_facebook(conversation_id, page_id, message):
             "messaging_type": "RESPONSE",
         }
         headers = {"Authorization": f"Bearer {page.page_access_token}"}
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response = http_retry.post(url, json=payload, headers=headers, timeout=30)
         if response.ok:
             message_id = response.json().get('message_id')
             timestamp = datetime.now()
@@ -5379,7 +5380,7 @@ def send_rating_request_instagram(conversation_id, account_id, message):
             "access_token": account.facebook_page.page_access_token,
             "platform": "instagram"
         }
-        response = requests.post(url, json=payload, headers=headers, params=params, timeout=30)
+        response = http_retry.post(url, json=payload, headers=headers, params=params, timeout=30)
         if response.ok:
             message_id = response.json().get('message_id')
             timestamp = datetime.now()
@@ -5469,7 +5470,7 @@ def send_rating_request_whatsapp(conversation_id, waba_id, message):
             "Authorization": f"Bearer {account.access_token}",
             "Content-Type": "application/json"
         }
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response = http_retry.post(url, json=payload, headers=headers, timeout=30)
         if response.ok:
             data = response.json()
             message_id = data.get('messages', [{}])[0].get('id')
@@ -7297,7 +7298,7 @@ class WhatsAppBusinessAccountViewSet(viewsets.ModelViewSet):
 
             # Call Meta API to request contacts sync
             url = f"https://graph.facebook.com/v23.0/{account.phone_number_id}/smb_app_data"
-            response = requests.post(
+            response = http_retry.post(
                 url,
                 headers={
                     'Authorization': f'Bearer {account.access_token}',
@@ -7385,7 +7386,7 @@ class WhatsAppBusinessAccountViewSet(viewsets.ModelViewSet):
             elif phase == '90-180':
                 payload['history'] = {'start_days_ago': 90, 'end_days_ago': 180}
 
-            response = requests.post(
+            response = http_retry.post(
                 url,
                 headers={
                     'Authorization': f'Bearer {account.access_token}',
@@ -7950,7 +7951,7 @@ def whatsapp_embedded_signup_callback(request):
                             'Authorization': f'Bearer {access_token}',
                             'Content-Type': 'application/json'
                         }
-                        register_response = requests.post(register_url, headers=register_headers, json=register_data, timeout=30)
+                        register_response = http_retry.post(register_url, headers=register_headers, json=register_data, timeout=30)
                         if register_response.status_code == 200:
                             logger.info(f"✅ Registered phone number {phone_number_id}")
                         else:
@@ -7992,7 +7993,7 @@ def whatsapp_embedded_signup_callback(request):
                             'access_token': access_token,
                             'subscribed_fields': ','.join(webhook_fields)
                         }
-                        webhook_response = requests.post(webhook_url, params=webhook_params, timeout=30)
+                        webhook_response = http_retry.post(webhook_url, params=webhook_params, timeout=30)
                         if webhook_response.status_code == 200:
                             logger.info(f"✅ Subscribed WABA {waba_id} to webhooks with fields: {', '.join(webhook_fields)}")
                         else:
@@ -8312,7 +8313,7 @@ def whatsapp_send_message(request):
             media_filename = media_file.name or 'file'
 
             upload_url = f"https://graph.facebook.com/{fb_api_version}/{account.phone_number_id}/media"
-            upload_response = requests.post(
+            upload_response = http_retry.post(
                 upload_url,
                 headers=auth_headers,
                 files={'file': (media_filename, media_file, media_mime_type)},
@@ -8381,7 +8382,7 @@ def whatsapp_send_message(request):
         headers = {**auth_headers, 'Content-Type': 'application/json'}
 
         logger.info(f"Sending WhatsApp {message_type} message to {to_number} from {account.display_phone_number}")
-        response = requests.post(send_url, json=message_payload, headers=headers, timeout=30)
+        response = http_retry.post(send_url, json=message_payload, headers=headers, timeout=30)
         response_data = response.json()
 
         if response.status_code != 200 or 'error' in response_data:
@@ -9480,7 +9481,7 @@ def whatsapp_create_template(request):
                 'Content-Type': 'application/json'
             }
 
-            response = requests.post(create_url, json=payload, headers=headers, timeout=30)
+            response = http_retry.post(create_url, json=payload, headers=headers, timeout=30)
 
             if response.status_code not in [200, 201]:
                 return Response({
@@ -9703,7 +9704,7 @@ def whatsapp_send_template_message(request):
                 message_payload['template']['components'] = components
             headers = {'Authorization': f'Bearer {waba.access_token}', 'Content-Type': 'application/json'}
 
-            response = requests.post(send_url, json=message_payload, headers=headers, timeout=30)
+            response = http_retry.post(send_url, json=message_payload, headers=headers, timeout=30)
             try:
                 response_data = response.json()
             except ValueError:

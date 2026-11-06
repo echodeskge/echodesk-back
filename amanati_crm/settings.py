@@ -10,8 +10,23 @@ import sentry_sdk
 
 # Initialize Sentry for error tracking and performance monitoring
 SENTRY_DSN = config('SENTRY_DSN', default='')
+from amanati_crm import secret_scrub as _secret_scrub  # noqa: E402
+
+# Credentials (Graph access_token in request URLs etc.) never reach logs,
+# Sentry or API error bodies.
+_secret_scrub.install()
+
+# The app containers have no IPv6 route, so an outbound call that falls
+# back to an AAAA address fails with a misleading "Network is unreachable"
+# (ECHODESK-BACKEND-84). Resolve IPv4 only unless explicitly turned off.
+if config('FORCE_IPV4_OUTBOUND', default=True, cast=bool):
+    import urllib3.util.connection as _urllib3_connection
+    _urllib3_connection.HAS_IPV6 = False
+
 sentry_sdk.init(
     dsn=SENTRY_DSN,
+    before_send=_secret_scrub.sentry_before_send,
+    before_breadcrumb=_secret_scrub.sentry_before_breadcrumb,
     send_default_pii=False,  # Don't send PII to Sentry (GDPR)
     traces_sample_rate=0.2,  # Sample 20% of transactions (was 100%)
     profile_session_sample_rate=0.1,  # Sample 10% of profiles (was 100%)
@@ -138,6 +153,7 @@ if DEBUG:
 TENANT_MODEL = "tenants.Tenant"
 
 MIDDLEWARE = [
+    'amanati_crm.secret_scrub.ScrubErrorResponseMiddleware',  # Outermost: strip credentials from JSON error bodies
     'amanati_crm.middleware.BotBlockerMiddleware',  # Block bots/scanners early (before CommonMiddleware)
     'amanati_crm.middleware.WidgetPublicCorsMiddleware',  # Open CORS on /api/widget/public/* (arbitrary tenant origins)
     'amanati_crm.middleware.EcommerceClientCustomDomainCorsMiddleware',  # Open CORS on /api/ecommerce/* for verified TenantDomain custom domains
