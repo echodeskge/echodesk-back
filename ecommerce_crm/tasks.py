@@ -276,6 +276,52 @@ def check_low_stock_products(self):
         raise self.retry(exc=exc)
 
 
+def _confirm_quickshipper_order(order, client, error_cls):
+    """Send ``POST /v1/Order/confirm`` for an order booked by
+    ``book_quickshipper_courier`` and record the result in
+    ``payment_metadata['quickshipper']['confirmed']``. Idempotent: does
+    nothing once the order is marked confirmed. Raises ``error_cls`` on
+    failure so the task retries (the retry lands in the tracking-number
+    branch and only re-runs this confirm)."""
+    metadata = dict(order.payment_metadata or {})
+    qs_meta = dict(metadata.get('quickshipper') or {})
+    if qs_meta.get('confirmed'):
+        return
+    from django.utils import timezone
+
+    qs_order_id = qs_meta.get('order_id') or order.tracking_number
+    try:
+        qs_order_id = int(qs_order_id)
+    except (TypeError, ValueError):
+        logger.warning(
+            'book_quickshipper_courier: order %s has no numeric Quickshipper id to confirm',
+            order.id,
+        )
+        return
+    try:
+        resp = client.confirm_order(qs_order_id)
+    except error_cls as exc:
+        logger.warning(
+            'book_quickshipper_courier: confirm failed for order %s (qs %s): %s',
+            order.id, qs_order_id, exc,
+        )
+        raise
+    qs_meta['confirmed'] = True
+    qs_meta['confirmed_at'] = timezone.now().isoformat()
+    if isinstance(resp, dict):
+        if resp.get('trackingUrl') and not qs_meta.get('tracking_url'):
+            qs_meta['tracking_url'] = resp.get('trackingUrl')
+        if resp.get('providerName'):
+            qs_meta['provider_name'] = resp.get('providerName')
+    metadata['quickshipper'] = qs_meta
+    order.payment_metadata = metadata
+    order.save(update_fields=['payment_metadata', 'updated_at'])
+    logger.info(
+        'book_quickshipper_courier: order %s confirmed at Quickshipper (qs %s)',
+        order.id, qs_order_id,
+    )
+
+
 @shared_task(bind=True, max_retries=3, default_retry_delay=120)
 def book_quickshipper_courier(self, schema_name, order_id):
     """Create a Quickshipper shipment for a paid order, then store the
@@ -334,10 +380,16 @@ def book_quickshipper_courier(self, schema_name, order_id):
                 return
 
             if order.tracking_number:
-                logger.info(
-                    'book_quickshipper_courier: order %s already has tracking %s — skipping',
-                    order.id, order.tracking_number,
-                )
+                # Booked on an earlier run. If the confirm step didn't go
+                # through (network blip, retry), finish it now instead of
+                # leaving the order as a Draft at Quickshipper.
+                if order.courier_provider == 'quickshipper':
+                    _confirm_quickshipper_order(order, client, QuickshipperError)
+                else:
+                    logger.info(
+                        'book_quickshipper_courier: order %s already has tracking %s — skipping',
+                        order.id, order.tracking_number,
+                    )
                 return
 
             address = order.delivery_address
@@ -493,6 +545,10 @@ def book_quickshipper_courier(self, schema_name, order_id):
                 'book_quickshipper_courier: order %s booked, tracking=%s',
                 order.id, order.tracking_number,
             )
+            # A new Quickshipper order is a Draft until it is confirmed;
+            # confirming forwards it to the courier provider.
+            if qs_order_id is not None:
+                _confirm_quickshipper_order(order, client, QuickshipperError)
     except Exception as exc:
         logger.error('book_quickshipper_courier failed: %s', exc)
         raise self.retry(exc=exc)

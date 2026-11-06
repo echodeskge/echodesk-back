@@ -241,3 +241,81 @@ class TestGuestContactDetails(GuestCheckoutTestMixin, EchoDeskTenantTestCase):
         self.assertEqual(drop_off['phone'], '+995571575151')
         order.refresh_from_db()
         self.assertEqual(order.tracking_number, '555')
+
+    def _booked_order(self):
+        EcommerceSettings.objects.filter(tenant=self.tenant).update(quickshipper_enabled=True)
+        payload = self._payload(
+            email='shared@test.com', first_name='Nini', last_name='Second',
+            phone='+995571575151', payment_method='card',
+            **self._quickshipper_fields(),
+        )
+        with _mock_bog():
+            resp = self.api_post(GUEST_URL, payload)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        return Order.objects.get(order_number=resp.data['order_number'])
+
+    def test_courier_order_is_confirmed_after_booking(self):
+        """Quickshipper keeps a new order as Draft until /v1/Order/confirm
+        is called (ticket #242), so booking must send both requests."""
+        from ecommerce_crm.tasks import book_quickshipper_courier
+
+        order = self._booked_order()
+        courier = MagicMock()
+        courier.create_order.return_value = {'orderId': 555, 'providerName': 'Deliverers'}
+        courier.confirm_order.return_value = {'orderId': 555}
+        with patch('ecommerce_crm.services.quickshipper.client_from_settings', return_value=courier):
+            book_quickshipper_courier.run(self.tenant.schema_name, order.id)
+
+        courier.confirm_order.assert_called_once_with(555)
+        order.refresh_from_db()
+        self.assertTrue(order.payment_metadata['quickshipper']['confirmed'])
+
+        # Running again (e.g. a second paid webhook) neither re-books nor re-confirms.
+        with patch('ecommerce_crm.services.quickshipper.client_from_settings', return_value=courier):
+            book_quickshipper_courier.run(self.tenant.schema_name, order.id)
+        courier.create_order.assert_called_once()
+        courier.confirm_order.assert_called_once()
+
+    def test_failed_confirm_is_finished_on_retry_without_rebooking(self):
+        from ecommerce_crm.tasks import book_quickshipper_courier
+        from ecommerce_crm.services.quickshipper import QuickshipperError
+
+        order = self._booked_order()
+        courier = MagicMock()
+        courier.create_order.return_value = {'orderId': 777}
+        courier.confirm_order.side_effect = QuickshipperError('temporary')
+        with patch('ecommerce_crm.services.quickshipper.client_from_settings', return_value=courier), \
+                patch.object(book_quickshipper_courier, 'retry', side_effect=RuntimeError('retry')):
+            with self.assertRaises(RuntimeError):
+                book_quickshipper_courier.run(self.tenant.schema_name, order.id)
+        order.refresh_from_db()
+        self.assertEqual(order.tracking_number, '777')
+        self.assertFalse(order.payment_metadata['quickshipper'].get('confirmed'))
+
+        courier.confirm_order.side_effect = None
+        courier.confirm_order.return_value = {'orderId': 777}
+        with patch('ecommerce_crm.services.quickshipper.client_from_settings', return_value=courier):
+            book_quickshipper_courier.run(self.tenant.schema_name, order.id)
+        courier.create_order.assert_called_once()
+        self.assertEqual(courier.confirm_order.call_count, 2)
+        order.refresh_from_db()
+        self.assertTrue(order.payment_metadata['quickshipper']['confirmed'])
+
+
+class QuickshipperConfirmClientTest(EchoDeskTenantTestCase):
+    def test_confirm_posts_order_id(self):
+        from ecommerce_crm.services.quickshipper import QuickshipperClient
+
+        session = MagicMock()
+        token = MagicMock(status_code=200, content=b'x')
+        token.json.return_value = {'access_token': 'jwt', 'expires_in': 3600}
+        session.post.return_value = token
+        ok = MagicMock(status_code=200, content=b'x')
+        ok.json.return_value = {'success': True, 'orderId': 42}
+        session.request.return_value = ok
+
+        QuickshipperClient('key', session=session).confirm_order(42)
+        method, url = session.request.call_args[0]
+        self.assertEqual(method, 'POST')
+        self.assertTrue(url.endswith('/v1/Order/confirm'))
+        self.assertEqual(session.request.call_args[1]['json'], {'orderId': 42})

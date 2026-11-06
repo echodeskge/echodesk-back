@@ -108,6 +108,22 @@ def hide_assigned_applies(request):
     return bool(settings_obj and settings_obj.hide_assigned_chats)
 
 
+def _assigned_conversation_ids(platform, ctx):
+    """For the "Assigned to me" tab: the caller's active conversation ids on
+    ``platform``, so the DISTINCT ON head scan only reads those senders
+    instead of every message in the table (that full scan was a 1s+ query
+    on busy tenants). ``None`` when the tab isn't "assigned"."""
+    if not ctx.assigned_only:
+        return None
+    return list(
+        ChatAssignment.objects.filter(
+            platform=platform,
+            assigned_user=ctx.user,
+            status__in=ACTIVE_ASSIGNMENT_STATUSES,
+        ).values_list('conversation_id', flat=True).distinct()
+    )
+
+
 def _take(qs, ctx, order=('-timestamp', '-id')):
     return qs.count(), list(qs.order_by(*order)[:ctx.need])
 
@@ -115,8 +131,13 @@ def _take(qs, ctx, order=('-timestamp', '-id')):
 # ── Per-platform head queries ───────────────────────────────────────────────
 
 def _facebook_heads(ctx):
+    base = FacebookMessage.objects.filter(is_deleted=False)
+    assigned_ids = _assigned_conversation_ids('facebook', ctx)
+    if assigned_ids is not None:
+        # Narrowing only; _apply_visibility still checks the account match.
+        base = base.filter(sender_id__in=assigned_ids)
     heads = (
-        FacebookMessage.objects.filter(is_deleted=False)
+        base
         .order_by('page_connection_id', 'sender_id', '-timestamp', '-id')
         .distinct('page_connection_id', 'sender_id')
         .values('id')
@@ -134,8 +155,13 @@ def _facebook_heads(ctx):
 
 
 def _instagram_heads(ctx):
+    base = InstagramMessage.objects.filter(is_deleted=False)
+    assigned_ids = _assigned_conversation_ids('instagram', ctx)
+    if assigned_ids is not None:
+        # Narrowing only; _apply_visibility still checks the account match.
+        base = base.filter(sender_id__in=assigned_ids)
     heads = (
-        InstagramMessage.objects.filter(is_deleted=False)
+        base
         .order_by('account_connection_id', 'sender_id', '-timestamp', '-id')
         .distinct('account_connection_id', 'sender_id')
         .values('id')

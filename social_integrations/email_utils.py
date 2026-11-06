@@ -418,6 +418,23 @@ def extract_body(email_message) -> Tuple[str, str]:
     return body_text, body_html
 
 
+def _storage_safe_filename(filename: str) -> str:
+    """Object-storage key for an attachment. Keys built from raw mail
+    filenames (non-ASCII, "?", "=", "/", control chars) were rejected by
+    the S3 PutObject call with BadRequest, so the key gets an ASCII-only
+    name plus a short random prefix; the real filename is kept in the
+    attachment dict for display."""
+    import os
+    import unicodedata
+    base, ext = os.path.splitext(os.path.basename(filename.replace('\\', '/')))
+    def _ascii(value: str) -> str:
+        value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode('ascii')
+        return re.sub(r'[^A-Za-z0-9._-]+', '-', value).strip('.-_')
+    base = _ascii(base)[:80] or 'attachment'
+    ext = _ascii(ext)[:16]
+    return f"{uuid.uuid4().hex[:8]}-{base}{'.' + ext if ext else ''}"
+
+
 def extract_attachments(email_message, connection) -> List[Dict[str, Any]]:
     """
     Extract and save attachments from email message.
@@ -443,7 +460,9 @@ def extract_attachments(email_message, connection) -> List[Dict[str, Any]]:
         if part.get_content_maintype() == 'text' and 'attachment' not in content_disposition:
             continue
 
-        filename = part.get_filename()
+        # get_filename() leaves RFC 2047 words ("=?utf-8?B?...?=") encoded
+        # when the sender didn't use RFC 2231; decode them for display.
+        filename = decode_mime_header(part.get_filename() or '').strip()
         if not filename:
             # Generate filename for inline content
             ext = part.get_content_type().split('/')[-1]
@@ -455,7 +474,10 @@ def extract_attachments(email_message, connection) -> List[Dict[str, Any]]:
             payload = part.get_payload(decode=True)
             if payload:
                 # Save to storage
-                file_path = f'email_attachments/{connection.id}/{timezone.now().strftime("%Y/%m/%d")}/{filename}'
+                file_path = (
+                    f'email_attachments/{connection.id}/{timezone.now().strftime("%Y/%m/%d")}/'
+                    f'{_storage_safe_filename(filename)}'
+                )
                 saved_path = default_storage.save(file_path, ContentFile(payload))
                 url = default_storage.url(saved_path)
 

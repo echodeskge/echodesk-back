@@ -596,17 +596,21 @@ def send_facebook_auto_reply(recipient_id, message_text, page_connection):
             message_id = response_data.get('message_id', f"auto_{datetime.now().timestamp()}")
 
             # Save to database - use recipient_id for conversation grouping
-            FacebookMessage.objects.create(
-                page_connection=page_connection,
+            # update_or_create: the page's echo webhook can store the same
+            # message_id before this line runs (unique constraint).
+            FacebookMessage.objects.update_or_create(
                 message_id=message_id,
-                sender_id=recipient_id,  # Use recipient_id for conversation grouping
-                sender_name=page_connection.page_name,
-                message_text=message_text,
-                timestamp=timezone.now(),
-                is_from_page=True,
-                source='echodesk',
-                is_echo=False,
-                sent_by=None,  # Auto-reply, no user
+                defaults=dict(
+                    page_connection=page_connection,
+                    sender_id=recipient_id,  # Use recipient_id for conversation grouping
+                    sender_name=page_connection.page_name,
+                    message_text=message_text,
+                    timestamp=timezone.now(),
+                    is_from_page=True,
+                    source='echodesk',
+                    is_echo=False,
+                    sent_by=None,  # Auto-reply, no user
+                ),
             )
             logger.info(f"✅ Facebook auto-reply sent to {recipient_id}: {message_id}")
             return True
@@ -653,18 +657,22 @@ def send_instagram_auto_reply(recipient_id, message_text, account_connection):
             message_id = response_data.get('message_id', f"auto_{datetime.now().timestamp()}")
 
             # Save to database - use recipient_id for conversation grouping
-            InstagramMessage.objects.create(
-                account_connection=account_connection,
+            # update_or_create: Instagram's echo webhook often stores the
+            # same message_id before this line runs (unique constraint).
+            InstagramMessage.objects.update_or_create(
                 message_id=message_id,
-                sender_id=recipient_id,  # Use recipient_id for conversation grouping
-                sender_name=account_connection.username,
-                sender_username=account_connection.username,
-                message_text=message_text,
-                timestamp=timezone.now(),
-                is_from_business=True,
-                source='echodesk',
-                is_echo=False,
-                sent_by=None,  # Auto-reply, no user
+                defaults=dict(
+                    account_connection=account_connection,
+                    sender_id=recipient_id,  # Use recipient_id for conversation grouping
+                    sender_name=account_connection.username,
+                    sender_username=account_connection.username,
+                    message_text=message_text,
+                    timestamp=timezone.now(),
+                    is_from_business=True,
+                    source='echodesk',
+                    is_echo=False,
+                    sent_by=None,  # Auto-reply, no user
+                ),
             )
             logger.info(f"✅ Instagram auto-reply sent to {recipient_id}: {message_id}")
             return True

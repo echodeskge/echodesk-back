@@ -67,29 +67,67 @@ def send_auto_reply_task(self, schema_name, platform, recipient_id, message_text
         return sender(recipient_id, message_text, conn)
 
 
-@shared_task
+# One mailbox can take minutes (first sync of a big folder, slow attachment
+# uploads). The beat fires every 5 minutes, so without a lock the next run
+# synced the same mailbox in parallel and the hard limit killed the worker.
+EMAIL_SYNC_LOCK_SECONDS = 15 * 60
+
+
+def _sync_connection_locked(schema_name, connection):
+    """Sync one mailbox unless another worker is already on it. Returns the
+    number of new messages (0 when skipped)."""
+    from django.core.cache import cache
+    from social_integrations.email_utils import sync_imap_messages
+
+    lock_key = f'email-sync-lock:{schema_name}:{connection.id}'
+    try:
+        acquired = cache.add(lock_key, '1', EMAIL_SYNC_LOCK_SECONDS)
+    except Exception:  # cache down: sync anyway rather than never
+        acquired = True
+    if not acquired:
+        logger.info(f"Email sync {schema_name}/{connection.email_address}: already running, skipped")
+        return 0
+    try:
+        return sync_imap_messages(connection)
+    finally:
+        try:
+            cache.delete(lock_key)
+        except Exception:
+            pass
+
+
+@shared_task(soft_time_limit=540, time_limit=600)
 def sync_all_tenant_emails():
+    from celery.exceptions import SoftTimeLimitExceeded
     from tenant_schemas.utils import schema_context
     from tenants.models import Tenant
     from social_integrations.models import EmailConnection
-    from social_integrations.email_utils import sync_imap_messages
 
     tenants = Tenant.objects.exclude(schema_name='public')
     total_synced = 0
 
-    for tenant in tenants:
-        try:
-            with schema_context(tenant.schema_name):
-                connections = EmailConnection.objects.filter(is_active=True)
-                for connection in connections:
-                    try:
-                        count = sync_imap_messages(connection)
-                        total_synced += count
-                        logger.info(f"Email sync {tenant.schema_name}/{connection.email_address}: {count} new")
-                    except Exception as e:
-                        logger.error(f"Email sync failed {tenant.schema_name}/{connection.email_address}: {e}")
-        except Exception as e:
-            logger.error(f"Email sync failed for tenant {tenant.schema_name}: {e}")
+    try:
+        for tenant in tenants:
+            try:
+                with schema_context(tenant.schema_name):
+                    connections = EmailConnection.objects.filter(is_active=True)
+                    for connection in connections:
+                        try:
+                            count = _sync_connection_locked(tenant.schema_name, connection)
+                            total_synced += count
+                            logger.info(f"Email sync {tenant.schema_name}/{connection.email_address}: {count} new")
+                        except SoftTimeLimitExceeded:
+                            raise
+                        except Exception as e:
+                            logger.error(f"Email sync failed {tenant.schema_name}/{connection.email_address}: {e}")
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as e:
+                logger.error(f"Email sync failed for tenant {tenant.schema_name}: {e}")
+    except SoftTimeLimitExceeded:
+        # Stop cleanly; the next beat run (5 min) continues where IMAP
+        # left off because already-stored messages are skipped.
+        logger.warning(f'sync_all_tenant_emails hit its time limit after {total_synced} messages; continuing next run')
 
     logger.info(f'sync_all_tenant_emails completed: {total_synced} total messages')
     return total_synced
@@ -126,14 +164,13 @@ def generate_ai_post_for_tenant(schema_name):
 def sync_tenant_emails(schema_name):
     from tenant_schemas.utils import schema_context
     from social_integrations.models import EmailConnection
-    from social_integrations.email_utils import sync_imap_messages
 
     total = 0
     with schema_context(schema_name):
         connections = EmailConnection.objects.filter(is_active=True)
         for connection in connections:
             try:
-                count = sync_imap_messages(connection)
+                count = _sync_connection_locked(schema_name, connection)
                 total += count
                 logger.info(f"Email sync {schema_name}/{connection.email_address}: {count} new")
             except Exception as e:

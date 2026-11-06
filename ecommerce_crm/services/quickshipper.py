@@ -10,7 +10,9 @@ checkout + dashboard:
 
 - :py:meth:`get_quote` -> ``GET /v1/Order/fees`` (live shipping price at checkout)
 - :py:meth:`get_weights` -> ``GET /v1/Order/weights`` (parcel-dimension lookup)
-- :py:meth:`create_order` -> ``POST /v1/Order`` (book the courier)
+- :py:meth:`create_order` -> ``POST /v1/Order`` (book the courier; lands as Draft)
+- :py:meth:`confirm_order` -> ``POST /v1/Order/confirm`` (Draft -> ReadyForPickup,
+  i.e. actually hand the order to the courier provider)
 - :py:meth:`get_order` -> ``GET /v1/Order`` (poll status as a webhook fallback)
 - :py:meth:`change_status` -> ``POST /v1/Order/status`` (cancel / mark delivered)
 - :py:meth:`delete_order` -> ``DELETE /v1/Order``
@@ -322,6 +324,12 @@ class QuickshipperClient:
         - ``cartAmount`` for COD support
         """
         return self._request("POST", "/v1/Order", json=payload)
+
+    def confirm_order(self, order_id: int) -> dict[str, Any]:
+        """``POST /v1/Order/confirm`` — forward a Draft order to its courier
+        provider (status becomes ReadyForPickup). ``create_order`` alone
+        leaves the order as a Draft in the shop's Quickshipper dashboard."""
+        return self._request("POST", "/v1/Order/confirm", json={"orderId": int(order_id)})
 
     def get_order(self, order_id: int) -> dict[str, Any]:
         """``GET /v1/Order?OrderId=<id>`` — fallback when a webhook is missed."""
