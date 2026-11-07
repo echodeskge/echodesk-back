@@ -361,6 +361,15 @@ SPECTACULAR_SETTINGS = {
     # Keep these enum component names stable for the generated clients when
     # the same choice set appears in several components.
     'ENUM_NAME_OVERRIDES': {
+        'DirectionEnum': [('inbound', 'Inbound'), ('outbound', 'Outbound')],
+        'LeaveRequestStatusEnum': 'leave_management.models.LeaveRequest.STATUS_CHOICES',
+        'LeaveAuditEventKindEnum': 'leave_management.models.LeaveAuditEvent.KINDS',
+        'KindEnum': ['created', 'confirmed', 'rescheduled', 'cancelled', 'reminder'],
+        'KpiDirectionEnum': 'leave_management.models.KpiGoal.DIRECTIONS',
+        'KpiStatusEnum': 'leave_management.models.KpiGoal.STATUS_CHOICES',
+        'SubstituteConsentStatusEnum': 'leave_management.models.LeaveRequestSubstitute.STATUS_CHOICES',
+        'SubstitutionRateModeEnum': 'leave_management.models.SubstitutionRate.MODES',
+        'PayrollModeEnum': 'leave_management.models.LeaveSettings.PAYROLL_MODES',
         'UnifiedConversationPlatformEnum': ['facebook', 'instagram', 'whatsapp', 'email', 'widget', 'telegram'],
         'ModeEnum': ['ai', 'off'],
         'DeactivationReasonEnum': 'social_integrations.models.TelegramAccount.DEACTIVATION_REASONS',
@@ -690,6 +699,12 @@ CELERY_TASK_EAGER_PROPAGATES = config('CELERY_TASK_EAGER_PROPAGATES', default=Fa
 from celery.schedules import crontab
 
 CELERY_BEAT_SCHEDULE = {
+    # Georgian public holidays for tenants that switched auto mode on
+    # (1 Dec: next year, 1 Jan: current year; idempotent).
+    'leave-generate-georgian-holidays': {
+        'task': 'leave_management.tasks.generate_georgian_holidays',
+        'schedule': crontab(day_of_month=1, month_of_year='1,12', hour=4, minute=10),
+    },
     # Payment tasks — owned by Celery beat again since 2026-08-12. They were
     # previously removed in favor of DO Functions cron triggers (to prevent
     # double-charging while both existed); those Functions died with the

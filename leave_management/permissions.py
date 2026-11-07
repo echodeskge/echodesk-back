@@ -189,7 +189,7 @@ class CanCancelLeave(permissions.BasePermission):
             return True
 
         # Employees can cancel their own pending leaves
-        if obj.employee == request.user and obj.status in ['pending', 'manager_approved', 'hr_approved']:
+        if obj.employee == request.user and obj.status in ['awaiting_substitutes', 'pending', 'manager_approved', 'hr_approved']:
             return True
 
         # Managers can cancel their team's pending leaves
@@ -214,3 +214,37 @@ class IsLeaveOwnerOrManager(permissions.BasePermission):
 
         # Staff and the employee's manager have access
         return manages_employee(request.user, obj.employee)
+
+
+class LeaveFeatureDisabled(Exception):
+    pass
+
+
+def LeaveFeatureEnabled(*flags):
+    """
+    Permission class factory: 403 ``feature_disabled`` unless every
+    LeaveSettings boolean in ``flags`` is switched on for the tenant.
+    """
+    class _LeaveFeatureEnabled(permissions.BasePermission):
+        message = {'detail': 'This feature is turned off in leave settings.', 'code': 'feature_disabled'}
+
+        def has_permission(self, request, view):
+            from .utils import get_leave_settings
+            if getattr(view, 'swagger_fake_view', False):
+                return True
+            settings_obj = get_leave_settings(getattr(request, 'tenant', None))
+            return bool(settings_obj and all(getattr(settings_obj, f, False) for f in flags))
+
+    _LeaveFeatureEnabled.__name__ = 'LeaveFeatureEnabled_' + '_'.join(flags)
+    return _LeaveFeatureEnabled
+
+
+class IsPayrollManager(permissions.BasePermission):
+    """Staff/superusers and LeaveSettings.payroll_managers."""
+    message = "Only payroll managers can do this."
+
+    def has_permission(self, request, view):
+        from .utils import is_payroll_manager
+        if getattr(view, 'swagger_fake_view', False):
+            return True
+        return is_payroll_manager(request.user, getattr(request, 'tenant', None))

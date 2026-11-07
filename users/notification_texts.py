@@ -155,6 +155,51 @@ CATALOG = {
         'ka': '{employee} — შვებულების მოთხოვნა ({period}) გაუქმდა',
     },
 
+    'leave.substitute_requested.title': {
+        'en': 'Can you cover for a colleague?', 'ka': 'შეგიძლიათ კოლეგის ჩანაცვლება?',
+    },
+    'leave.substitute_requested.message': {
+        'en': '{employee} asks you to cover "{task}" during their leave ({period}). Please accept or decline.',
+        'ka': '{employee} გთხოვთ ჩაანაცვლოთ „{task}“ შვებულების პერიოდში ({period}). გთხოვთ დაეთანხმოთ ან უარი თქვათ.',
+    },
+    'leave.substitute_declined.message': {
+        'en': '{substitute} declined to cover your leave for {period}, so the request was rejected',
+        'ka': '{substitute} არ დაეთანხმა თქვენს ჩანაცვლებას ({period}), ამიტომ მოთხოვნა უარყოფილია',
+    },
+    'leave.substitutes_skipped.title': {
+        'en': 'Substitute consent skipped', 'ka': 'შემცვლელის თანხმობა გამოტოვებულია',
+    },
+    'leave.substitutes_skipped.message': {
+        'en': 'An administrator sent the leave request for {period} to approval without waiting for every substitute',
+        'ka': 'ადმინისტრატორმა შვებულების მოთხოვნა ({period}) დასამტკიცებლად გაგზავნა ყველა შემცვლელის თანხმობის გარეშე',
+    },
+    'leave.substitute_cancelled.message': {
+        'en': "{employee}'s leave for {period} was cancelled; you no longer need to cover it",
+        'ka': '{employee} — შვებულება ({period}) გაუქმდა; ჩანაცვლება აღარ არის საჭირო',
+    },
+
+    # --- KPI ---------------------------------------------------------------
+    'kpi.assigned.title': {'en': 'New KPI goal for {period}', 'ka': 'ახალი KPI მიზანი — {period}'},
+    'kpi.assigned.message': {
+        'en': '{title}: target {target} {unit}',
+        'ka': '{title}: მიზანი {target} {unit}',
+    },
+    'kpi.submitted.title': {'en': 'KPI result submitted', 'ka': 'KPI შედეგი გამოგზავნილია'},
+    'kpi.submitted.message': {
+        'en': '{employee} submitted "{title}" for {period}: {actual} {unit}',
+        'ka': '{employee} — „{title}“ ({period}): {actual} {unit}',
+    },
+    'kpi.approved.title': {'en': 'KPI result approved', 'ka': 'KPI შედეგი დამტკიცდა'},
+    'kpi.approved.message': {
+        'en': 'Your result for "{title}" ({period}) was approved',
+        'ka': 'თქვენი შედეგი „{title}“ ({period}) დამტკიცდა',
+    },
+    'kpi.returned.title': {'en': 'KPI result returned', 'ka': 'KPI შედეგი დაბრუნდა'},
+    'kpi.returned.message': {
+        'en': '"{title}" ({period}) was returned: {feedback}',
+        'ka': '„{title}“ ({period}) დაბრუნდა: {feedback}',
+    },
+
     # --- Calls -------------------------------------------------------------
     'call.missed.title': {'en': 'Missed call', 'ka': 'გამოტოვებული ზარი'},
     'call.missed.message': {

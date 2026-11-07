@@ -10,5 +10,4 @@ class LeaveManagementConfig(AppConfig):
         """
         Import signal handlers when app is ready
         """
-        # Import signals here if needed in future
-        pass
+        from . import signals  # noqa: F401

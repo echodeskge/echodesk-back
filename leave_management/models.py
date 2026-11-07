@@ -39,6 +39,58 @@ class LeaveSettings(models.Model):
         blank=True,
         help_text="Weekend days (0=Monday, 6=Sunday). Default: [5,6] for Sat/Sun"
     )
+
+    # ── Optional HR features (each switched on/off by the tenant admin) ──
+    substitutes_enabled = models.BooleanField(
+        default=False,
+        help_text="Employees keep a substitute list; leave types that require "
+                  "substitutes wait for every substitute's consent before approval"
+    )
+    substitution_pay_enabled = models.BooleanField(
+        default=False,
+        help_text="Track substitution rates and the days substitutes actually worked"
+    )
+    payroll_enabled = models.BooleanField(
+        default=False,
+        help_text="Salaries and the monthly payroll report"
+    )
+    payroll_self_view_enabled = models.BooleanField(
+        default=False,
+        help_text="Employees can see their own payroll row"
+    )
+    kpi_enabled = models.BooleanField(default=False, help_text="Monthly KPI goals")
+    attendance_grid_enabled = models.BooleanField(
+        default=False, help_text="Employees x days attendance grid for managers"
+    )
+    auto_georgian_holidays = models.BooleanField(
+        default=False,
+        help_text="Create Georgia's public holidays (incl. Orthodox Easter) every year"
+    )
+    block_deactivation_with_open_requests = models.BooleanField(
+        default=True,
+        help_text="Refuse to deactivate/delete users with open leave work or active reports"
+    )
+
+    PAYROLL_MODES = [('gross', 'Gross estimate'), ('net', 'Gross and net')]
+    payroll_mode = models.CharField(max_length=10, choices=PAYROLL_MODES, default='gross')
+    income_tax_rate = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal('20.00'),
+        validators=[MinValueValidator(Decimal('0')), MaxValueValidator(Decimal('100'))],
+        help_text="Income tax percent (net mode)"
+    )
+    pension_rate = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal('2.00'),
+        validators=[MinValueValidator(Decimal('0')), MaxValueValidator(Decimal('100'))],
+        help_text="Employee pension contribution percent (net mode)"
+    )
+    payroll_currency = models.CharField(max_length=3, default='GEL')
+    payroll_managers = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        blank=True,
+        related_name='payroll_managed_settings',
+        help_text="Besides staff, users who may see salaries and manage substitution pay"
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -130,6 +182,20 @@ class LeaveType(models.Model):
     sort_order = models.IntegerField(
         default=0,
         help_text="Display order"
+    )
+    requires_substitutes = models.BooleanField(
+        default=False,
+        help_text="Requests of this type wait for the substitutes' consent "
+                  "(only when substitutes are enabled in leave settings)"
+    )
+    max_requests_per_month = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text="At most this many requests of this type starting in one calendar month"
+    )
+    max_days_per_request = models.DecimalField(
+        max_digits=5, decimal_places=1, null=True, blank=True,
+        validators=[MinValueValidator(Decimal('0.5'))],
+        help_text="At most this many working days per request"
     )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -267,6 +333,7 @@ class LeaveRequest(models.Model):
     """Leave request submitted by employees"""
 
     STATUS_CHOICES = [
+        ('awaiting_substitutes', 'Awaiting Substitutes'),
         ('pending', 'Pending'),
         ('manager_approved', 'Manager Approved'),
         ('hr_approved', 'HR Approved'),
@@ -364,6 +431,17 @@ class LeaveRequest(models.Model):
     cancelled_at = models.DateTimeField(null=True, blank=True)
     cancellation_reason = models.TextField(blank=True)
 
+    # Admin override of pending substitute consents
+    substitutes_skipped_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='skipped_substitute_leaves'
+    )
+    substitutes_skipped_at = models.DateTimeField(null=True, blank=True)
+    substitutes_skip_reason = models.TextField(blank=True, default='')
+
     # Optional attachment
     attachment = models.URLField(
         max_length=2000,
@@ -403,7 +481,7 @@ class LeaveRequest(models.Model):
     @property
     def is_pending(self):
         """Check if request is in any pending state"""
-        return self.status in ['pending', 'manager_approved', 'hr_approved']
+        return self.status in ['awaiting_substitutes', 'pending', 'manager_approved', 'hr_approved']
 
     @property
     def is_approved(self):
@@ -580,3 +658,282 @@ class LeaveCarryForwardRun(models.Model):
 
     def __str__(self):
         return f"Carry forward {self.from_year} -> {self.to_year}"
+
+
+class LeaveAuditEvent(models.Model):
+    """
+    Append-only history of HR records: leave request status changes,
+    substitute answers, overrides, rates, salaries, worked days, payroll
+    runs and exports, KPI transitions.
+    """
+    KINDS = [
+        ('request', 'Leave request'),
+        ('substitute', 'Substitute'),
+        ('kpi', 'KPI'),
+        ('rate', 'Substitution rate'),
+        ('compensation', 'Compensation'),
+        ('payroll', 'Payroll'),
+        ('holiday', 'Holiday'),
+    ]
+
+    tenant = models.ForeignKey(
+        'tenants.Tenant', on_delete=models.CASCADE, related_name='leave_audit_events'
+    )
+    kind = models.CharField(max_length=20, choices=KINDS)
+    action = models.CharField(max_length=50)
+    leave_request = models.ForeignKey(
+        LeaveRequest, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='audit_events'
+    )
+    kpi = models.ForeignKey(
+        'leave_management.KpiGoal', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='audit_events'
+    )
+    subject_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='leave_audit_subject_events'
+    )
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='leave_audit_actor_events'
+    )
+    object_id = models.CharField(max_length=64, blank=True, default='')
+    from_status = models.CharField(max_length=30, blank=True, default='')
+    to_status = models.CharField(max_length=30, blank=True, default='')
+    data = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at', '-id']
+        indexes = [
+            models.Index(fields=['leave_request', '-created_at']),
+            models.Index(fields=['tenant', 'kind', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.kind}:{self.action} {self.from_status}->{self.to_status}"
+
+
+class SubstituteAssignment(models.Model):
+    """An employee's standing substitute for one of their tasks ("My substitutes")."""
+    MAX_PER_OWNER = 50
+
+    tenant = models.ForeignKey(
+        'tenants.Tenant', on_delete=models.CASCADE, related_name='substitute_assignments'
+    )
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='substitute_assignments'
+    )
+    substitute = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='substitute_for_assignments'
+    )
+    task = models.CharField(max_length=300)
+    sort_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['sort_order', 'id']
+        unique_together = [['owner', 'substitute']]
+
+    def __str__(self):
+        return f"{self.substitute} covers {self.task} for {self.owner}"
+
+
+class LeaveRequestSubstitute(models.Model):
+    """
+    A substitute's snapshot on one leave request: their task, consent and,
+    with substitution pay, the rate snapshot and the days they actually worked.
+    """
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('accepted', 'Accepted'),
+        ('rejected', 'Rejected'),
+        ('skipped', 'Skipped by admin'),
+    ]
+    RATE_MODES = [('day', 'Per day'), ('month', 'Per month')]
+
+    leave_request = models.ForeignKey(
+        LeaveRequest, on_delete=models.CASCADE, related_name='substitutes'
+    )
+    substitute = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='leave_substitutions'
+    )
+    task = models.CharField(max_length=300)
+    sort_order = models.PositiveIntegerField(default=0)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    responded_at = models.DateTimeField(null=True, blank=True)
+    comment = models.TextField(blank=True, default='')
+
+    # Substitution pay (snapshot at request creation, see SubstitutionRate)
+    rate_mode = models.CharField(max_length=10, choices=RATE_MODES, blank=True, default='')
+    rate_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    rate_currency = models.CharField(max_length=3, blank=True, default='')
+    worked_days = models.JSONField(default=list, blank=True)
+    totals_by_month = models.JSONField(default=dict, blank=True)
+    worked_confirmed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='confirmed_substitution_days'
+    )
+    worked_confirmed_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['sort_order', 'id']
+        unique_together = [['leave_request', 'substitute']]
+        indexes = [models.Index(fields=['substitute', 'status'])]
+
+    def __str__(self):
+        return f"{self.substitute} for request {self.leave_request_id} ({self.status})"
+
+
+class KpiGoal(models.Model):
+    """
+    A monthly KPI for one employee. The manager sets the target (draft), the
+    employee submits the result (pending), the manager approves it or
+    returns it with feedback.
+    """
+    STATUS_CHOICES = [
+        ('draft', 'Draft'),
+        ('pending', 'Pending review'),
+        ('approved', 'Approved'),
+        ('returned', 'Returned'),
+    ]
+    DIRECTIONS = [('higher', 'Higher is better'), ('lower', 'Lower is better')]
+
+    tenant = models.ForeignKey('tenants.Tenant', on_delete=models.CASCADE, related_name='kpi_goals')
+    employee = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='kpi_goals'
+    )
+    period = models.CharField(max_length=7, help_text='YYYY-MM')
+    title = models.CharField(max_length=200)
+    target = models.DecimalField(
+        max_digits=14, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))]
+    )
+    unit = models.CharField(max_length=50)
+    direction = models.CharField(max_length=10, choices=DIRECTIONS, default='higher')
+    actual = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True,
+        validators=[MinValueValidator(Decimal('0'))]
+    )
+    employee_note = models.TextField(blank=True, default='')
+    manager_feedback = models.TextField(blank=True, default='')
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='draft')
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='reviewed_kpi_goals'
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='created_kpi_goals'
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='updated_kpi_goals'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-period', 'employee_id', 'id']
+        indexes = [models.Index(fields=['employee', 'period']), models.Index(fields=['tenant', 'period'])]
+
+    def __str__(self):
+        return f"{self.employee} {self.period}: {self.title}"
+
+    @property
+    def percent(self):
+        """Achievement percent (None until a result exists, or for lower-is-better with 0)."""
+        if self.actual is None:
+            return None
+        if self.direction == 'higher':
+            return (self.actual / self.target * 100).quantize(Decimal('0.1'))
+        if self.actual == 0:
+            return None
+        return (self.target / self.actual * 100).quantize(Decimal('0.1'))
+
+
+class SubstitutionRate(models.Model):
+    """Pay for one substitute task (owner, substitute, task), per day or per month."""
+    MODES = [('day', 'Per day'), ('month', 'Per month')]
+
+    assignment = models.OneToOneField(
+        SubstituteAssignment, on_delete=models.CASCADE, related_name='rate'
+    )
+    mode = models.CharField(max_length=10, choices=MODES, default='day')
+    amount = models.DecimalField(
+        max_digits=12, decimal_places=2,
+        validators=[MinValueValidator(Decimal('0.01')), MaxValueValidator(Decimal('1000000'))]
+    )
+    currency = models.CharField(max_length=3, default='GEL')
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='updated_substitution_rates'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.amount} {self.currency}/{self.mode} for {self.assignment}"
+
+
+class EmployeeCompensation(models.Model):
+    """Salary history: the monthly salary that applies from ``effective_from``."""
+    tenant = models.ForeignKey(
+        'tenants.Tenant', on_delete=models.CASCADE, related_name='employee_compensations'
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='compensations'
+    )
+    monthly_salary = models.DecimalField(
+        max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal('0'))]
+    )
+    currency = models.CharField(max_length=3, default='GEL')
+    effective_from = models.DateField()
+    note = models.CharField(max_length=255, blank=True, default='')
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='created_compensations'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['user_id', '-effective_from', '-id']
+        unique_together = [['user', 'effective_from']]
+
+    def __str__(self):
+        return f"{self.user} {self.monthly_salary} {self.currency} from {self.effective_from}"
+
+
+class PayrollRun(models.Model):
+    """A locked payroll month: the report is frozen as ``snapshot``."""
+    tenant = models.ForeignKey('tenants.Tenant', on_delete=models.CASCADE, related_name='payroll_runs')
+    period = models.CharField(max_length=7, help_text='YYYY-MM')
+    mode = models.CharField(max_length=10, default='gross')
+    snapshot = models.JSONField(default=dict)
+    is_locked = models.BooleanField(default=True)
+    locked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='locked_payroll_runs'
+    )
+    locked_at = models.DateTimeField(null=True, blank=True)
+    unlocked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='unlocked_payroll_runs'
+    )
+    unlocked_at = models.DateTimeField(null=True, blank=True)
+    unlock_reason = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-period']
+        unique_together = [['tenant', 'period']]
+
+    def __str__(self):
+        return f"Payroll {self.period} ({'locked' if self.is_locked else 'open'})"

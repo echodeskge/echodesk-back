@@ -131,57 +131,73 @@ try:
             return LazyText(lambda language: render(name, language) or str(instance.leave_type))
         return str(instance.leave_type)
 
+    def _notify_leave_submitted(instance):
+        """Tell whoever acts on the first approval step about a new request."""
+        from users.notification_utils import create_notification
+        T, _, _ = _texts()
+
+        from leave_management.utils import get_next_approver_role
+
+        # Notify whoever acts on the FIRST chain step. When that is HR
+        # or admin (e.g. a chain stored hr@1, manager@2), the manager
+        # cannot approve yet, so tell the HR / admin proxies instead.
+        first_role = get_next_approver_role(instance)
+        if first_role in ('hr', 'admin'):
+            recipients = _leave_next_approvers(instance, first_role, None)
+        else:
+            # Notify the employee's direct manager when one is assigned
+            # and active; otherwise fall back to staff users as a proxy
+            # for HR.
+            manager = instance.employee.manager
+            if manager and manager.is_active and manager.id != instance.employee_id:
+                managers = [manager]
+            else:
+                managers = User.objects.filter(
+                    is_active=True, is_staff=True
+                ).exclude(id=instance.employee_id)[:10]
+            recipients = [
+                (m, f'/leave/team-requests?id={instance.id}') for m in managers
+            ]
+        employee_name = instance.employee.get_full_name() or instance.employee.email
+        for manager, link_url in recipients:
+            create_notification(
+                user=manager,
+                notification_type='leave_request_submitted',
+                title=T('leave.submitted.title'),
+                message=T(
+                    'leave.submitted.message',
+                    employee=employee_name, leave_type=_leave_type_text(instance),
+                ),
+                metadata={
+                    'leave_request_id': instance.id,
+                    'employee_name': employee_name,
+                    'leave_type': str(instance.leave_type),
+                    'start_date': str(instance.start_date),
+                    'end_date': str(instance.end_date),
+                },
+                link_url=link_url,
+            )
+
     @receiver(post_save, sender=LeaveRequest)
     def notify_leave_events(sender, instance, created, **kwargs):
         from users.notification_utils import create_notification
         T, _, _ = _texts()
 
         if created:
-            from leave_management.utils import get_next_approver_role
-
-            # Notify whoever acts on the FIRST chain step. When that is HR
-            # or admin (e.g. a chain stored hr@1, manager@2), the manager
-            # cannot approve yet, so tell the HR / admin proxies instead.
-            first_role = get_next_approver_role(instance)
-            if first_role in ('hr', 'admin'):
-                recipients = _leave_next_approvers(instance, first_role, None)
-            else:
-                # Notify the employee's direct manager when one is assigned
-                # and active; otherwise fall back to staff users as a proxy
-                # for HR.
-                manager = instance.employee.manager
-                if manager and manager.is_active and manager.id != instance.employee_id:
-                    managers = [manager]
-                else:
-                    managers = User.objects.filter(
-                        is_active=True, is_staff=True
-                    ).exclude(id=instance.employee_id)[:10]
-                recipients = [
-                    (m, f'/leave/team-requests?id={instance.id}') for m in managers
-                ]
-            employee_name = instance.employee.get_full_name() or instance.employee.email
-            for manager, link_url in recipients:
-                create_notification(
-                    user=manager,
-                    notification_type='leave_request_submitted',
-                    title=T('leave.submitted.title'),
-                    message=T(
-                        'leave.submitted.message',
-                        employee=employee_name, leave_type=_leave_type_text(instance),
-                    ),
-                    metadata={
-                        'leave_request_id': instance.id,
-                        'employee_name': employee_name,
-                        'leave_type': str(instance.leave_type),
-                        'start_date': str(instance.start_date),
-                        'end_date': str(instance.end_date),
-                    },
-                    link_url=link_url,
-                )
+            # Requests waiting for substitute consent notify the substitutes
+            # (leave_management.substitutes); approvers hear once they agree.
+            if instance.status != 'awaiting_substitutes':
+                _notify_leave_submitted(instance)
             return
 
         old_status = getattr(instance, '_old_status', None)
         if old_status == instance.status:
+            return
+
+        # Every substitute agreed (or an admin skipped them): the approval
+        # chain starts now, so tell the first approver.
+        if old_status == 'awaiting_substitutes' and instance.status == 'pending':
+            _notify_leave_submitted(instance)
             return
 
         # Set by the views on the request object before saving; used to keep
@@ -257,7 +273,12 @@ try:
                 user=instance.employee,
                 notification_type='leave_request_rejected',
                 title=T('leave.rejected.title'),
-                message=T('leave.rejected.message', period=period),
+                message=(
+                    T('leave.substitute_declined.message', period=period,
+                      substitute=(instance.rejected_by.get_full_name() or instance.rejected_by.email))
+                    if old_status == 'awaiting_substitutes' and instance.rejected_by
+                    else T('leave.rejected.message', period=period)
+                ),
                 metadata={
                     'leave_request_id': instance.id,
                     'rejection_reason': instance.rejection_reason or '',
@@ -286,7 +307,20 @@ try:
             for approver in (instance.manager_approver, instance.hr_approver, instance.final_approver):
                 if approver is not None:
                     recipients[approver.pk] = approver
-            if old_status == 'pending' and not recipients:
+            if old_status == 'awaiting_substitutes':
+                for row in instance.substitutes.exclude(status='rejected').select_related('substitute'):
+                    sub = row.substitute
+                    if sub.pk in (actor_id, instance.employee_id) or not sub.is_active:
+                        continue
+                    create_notification(
+                        user=sub,
+                        notification_type='leave_request_cancelled',
+                        title=T('leave.cancelled.title'),
+                        message=T('leave.substitute_cancelled.message', employee=employee_name, period=period),
+                        metadata={**metadata, 'employee_name': employee_name},
+                        link_url=f'/leave/covering?id={instance.id}',
+                    )
+            elif old_status == 'pending' and not recipients:
                 manager = instance.employee.manager
                 if manager is not None:
                     recipients[manager.pk] = manager

@@ -2,13 +2,15 @@ from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from decimal import Decimal
+from drf_spectacular.utils import extend_schema_field
 from .models import (
     LeaveSettings, LeaveType, LeaveBalance, LeaveRequest,
-    PublicHoliday, LeaveApprovalChain
+    PublicHoliday, LeaveApprovalChain, LeaveAuditEvent,
+    SubstituteAssignment, LeaveRequestSubstitute,
 )
 from .utils import (
     calculate_working_days, check_leave_balance,
-    check_overlapping_leaves, update_leave_balance
+    check_overlapping_leaves, update_leave_balance, validate_type_limits
 )
 
 User = get_user_model()
@@ -26,9 +28,22 @@ class LeaveSettingsSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'tenant', 'require_manager_approval', 'require_hr_approval',
             'allow_negative_balance', 'max_negative_days', 'working_days_per_week',
-            'weekend_days', 'created_at', 'updated_at'
+            'weekend_days',
+            'substitutes_enabled', 'substitution_pay_enabled', 'payroll_enabled',
+            'payroll_self_view_enabled', 'kpi_enabled', 'attendance_grid_enabled',
+            'auto_georgian_holidays', 'block_deactivation_with_open_requests',
+            'payroll_mode', 'income_tax_rate', 'pension_rate', 'payroll_currency',
+            'payroll_managers',
+            'created_at', 'updated_at'
         ]
         read_only_fields = ['tenant', 'created_at', 'updated_at']
+        extra_kwargs = {'payroll_managers': {'required': False}}
+
+    def validate_payroll_currency(self, value):
+        value = (value or '').upper()
+        if len(value) != 3 or not value.isalpha():
+            raise serializers.ValidationError('Use a 3-letter currency code, e.g. GEL')
+        return value
 
     def validate(self, attrs):
         # One settings row per tenant (OneToOne): a second POST used to
@@ -58,6 +73,7 @@ class LeaveTypeListSerializer(serializers.ModelSerializer):
             'requires_approval', 'color', 'is_active', 'sort_order',
             'calculation_method', 'default_days_per_year', 'accrual_rate_per_month',
             'max_carry_forward_days', 'carry_forward_expiry_months',
+            'requires_substitutes', 'max_requests_per_month', 'max_days_per_request',
         ]
 
     def get_name_display(self, obj):
@@ -79,7 +95,9 @@ class LeaveTypeDetailSerializer(serializers.ModelSerializer):
             'description_display', 'is_paid', 'requires_approval',
             'calculation_method', 'default_days_per_year', 'accrual_rate_per_month',
             'max_carry_forward_days', 'carry_forward_expiry_months', 'color',
-            'is_active', 'sort_order', 'created_by', 'created_by_name',
+            'is_active', 'sort_order',
+            'requires_substitutes', 'max_requests_per_month', 'max_days_per_request',
+            'created_by', 'created_by_name',
             'updated_by', 'updated_by_name', 'created_at', 'updated_at'
         ]
         read_only_fields = ['tenant', 'created_by', 'updated_by', 'created_at', 'updated_at']
@@ -112,7 +130,8 @@ class LeaveTypeCreateUpdateSerializer(serializers.ModelSerializer):
             'name', 'code', 'description', 'is_paid', 'requires_approval',
             'calculation_method', 'default_days_per_year', 'accrual_rate_per_month',
             'max_carry_forward_days', 'carry_forward_expiry_months', 'color',
-            'is_active', 'sort_order'
+            'is_active', 'sort_order',
+            'requires_substitutes', 'max_requests_per_month', 'max_days_per_request',
         ]
 
     def validate_code(self, value):
@@ -251,6 +270,29 @@ class LeaveRequestListSerializer(serializers.ModelSerializer):
         return obj.leave_type.get_name(language)
 
 
+class LeaveRequestSubstituteSerializer(serializers.ModelSerializer):
+    """A substitute's consent on a request (pay fields are on the payroll API)."""
+    substitute_name = serializers.SerializerMethodField()
+    substitute_email = serializers.EmailField(source='substitute.email', read_only=True)
+
+    class Meta:
+        model = LeaveRequestSubstitute
+        fields = [
+            'id', 'substitute', 'substitute_name', 'substitute_email', 'task',
+            'status', 'responded_at', 'comment',
+        ]
+        read_only_fields = fields
+
+    @extend_schema_field(serializers.CharField())
+    def get_substitute_name(self, obj):
+        return obj.substitute.get_full_name() or obj.substitute.email
+
+
+class SubstituteInputSerializer(serializers.Serializer):
+    substitute = serializers.IntegerField()
+    task = serializers.CharField(max_length=300)
+
+
 class LeaveRequestDetailSerializer(serializers.ModelSerializer):
     """Detailed serializer for leave request with full approval history"""
     employee_name = serializers.SerializerMethodField()
@@ -263,6 +305,9 @@ class LeaveRequestDetailSerializer(serializers.ModelSerializer):
     hr_approver_name = serializers.SerializerMethodField()
     final_approver_name = serializers.SerializerMethodField()
     rejected_by_name = serializers.SerializerMethodField()
+    history = serializers.SerializerMethodField()
+    substitutes = LeaveRequestSubstituteSerializer(many=True, read_only=True)
+    substitutes_skipped_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = LeaveRequest
@@ -275,9 +320,22 @@ class LeaveRequestDetailSerializer(serializers.ModelSerializer):
             'hr_comments', 'final_approver', 'final_approver_name', 'final_approved_at',
             'final_comments',
             'rejected_by', 'rejected_by_name', 'rejected_at', 'rejection_reason',
-            'cancelled_at', 'cancellation_reason', 'attachment', 'created_at', 'updated_at'
+            'cancelled_at', 'cancellation_reason', 'attachment',
+            'substitutes', 'substitutes_skipped_by', 'substitutes_skipped_by_name',
+            'substitutes_skipped_at', 'substitutes_skip_reason',
+            'history', 'created_at', 'updated_at'
         ]
         read_only_fields = ['tenant', 'created_at', 'updated_at']
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_substitutes_skipped_by_name(self, obj):
+        u = obj.substitutes_skipped_by
+        return (u.get_full_name() or u.email) if u else None
+
+    @extend_schema_field(serializers.ListField(child=serializers.DictField()))
+    def get_history(self, obj):
+        from .audit import serialize_events
+        return serialize_events(obj.audit_events.order_by('created_at', 'id'))
 
     def get_employee_name(self, obj):
         return obj.employee.get_full_name() or obj.employee.email
@@ -305,11 +363,16 @@ class LeaveRequestDetailSerializer(serializers.ModelSerializer):
 
 class LeaveRequestCreateSerializer(serializers.ModelSerializer):
     """Serializer for creating leave requests"""
+    substitutes = SubstituteInputSerializer(
+        many=True, required=False, write_only=True,
+        help_text='Only for leave types that require substitutes, when your '
+                  '"My substitutes" list is empty: who covers which task.'
+    )
 
     class Meta:
         model = LeaveRequest
         fields = [
-            'leave_type', 'start_date', 'end_date', 'reason', 'attachment'
+            'leave_type', 'start_date', 'end_date', 'reason', 'attachment', 'substitutes'
         ]
 
     def validate(self, attrs):
@@ -329,6 +392,9 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
         tenant = request.tenant
         user = request.user
 
+        if not leave_type.is_active or leave_type.tenant_id != getattr(tenant, 'pk', leave_type.tenant_id):
+            raise serializers.ValidationError({'leave_type': 'This leave type is not available'})
+
         # Calculate working days
         total_days = calculate_working_days(start_date, end_date, tenant)
 
@@ -338,6 +404,10 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
             )
 
         attrs['total_days'] = total_days
+
+        limit_msg = validate_type_limits(user, leave_type, start_date, total_days, tenant)
+        if limit_msg:
+            raise serializers.ValidationError({'leave_type': limit_msg})
 
         # Check for overlapping leaves
         has_overlap, overlap_msg = check_overlapping_leaves(
@@ -356,20 +426,39 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
         if not has_balance:
             raise serializers.ValidationError({'leave_type': balance_msg})
 
+        # Substitutes (feature switch + leave type flag)
+        from .substitutes import resolve_for_request, check_availability
+        substitutes = resolve_for_request(user, leave_type, tenant, attrs.pop('substitutes', None))
+        check_availability(user, substitutes, start_date, end_date, tenant)
+        attrs['_substitutes'] = substitutes
+
         return attrs
 
     def create(self, validated_data):
         """Create leave request and update pending balance"""
+        from django.db import transaction
+        from .substitutes import snapshot
+
         request = self.context['request']
+        substitutes = validated_data.pop('_substitutes', [])
+        validated_data.pop('substitutes', None)
 
-        leave_request = LeaveRequest.objects.create(
-            tenant=request.tenant,
-            employee=request.user,
-            **validated_data
-        )
+        with transaction.atomic():
+            leave_request = LeaveRequest.objects.create(
+                tenant=request.tenant,
+                employee=request.user,
+                status='awaiting_substitutes' if substitutes else 'pending',
+                **validated_data
+            )
 
-        # Update pending balance
-        update_leave_balance(leave_request, action='pending')
+            # Update pending balance
+            update_leave_balance(leave_request, action='pending')
+
+            if substitutes:
+                snapshot(leave_request, substitutes, actor=request.user, notify=False)
+        if substitutes:
+            from .substitutes import notify_requested
+            notify_requested(leave_request, list(leave_request.substitutes.all()))
 
         return leave_request
 
@@ -414,7 +503,7 @@ class LeaveRequestUpdateSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         """Validate that only pending requests can be updated"""
-        if self.instance.status not in ['pending']:
+        if self.instance.status not in ['pending', 'awaiting_substitutes']:
             raise serializers.ValidationError(
                 'Only pending leave requests can be updated'
             )
@@ -445,12 +534,40 @@ class LeaveRequestUpdateSerializer(serializers.ModelSerializer):
             if has_overlap:
                 raise serializers.ValidationError({'start_date': overlap_msg})
 
+            if total_days == 0:
+                raise serializers.ValidationError(
+                    'The selected date range contains no working days'
+                )
+            limit_msg = validate_type_limits(
+                self.instance.employee, self.instance.leave_type, start_date,
+                total_days, tenant, exclude_request_id=self.instance.id
+            )
+            if limit_msg:
+                raise serializers.ValidationError({'leave_type': limit_msg})
+
+            # New dates need the substitutes' consent again.
+            rows = list(self.instance.substitutes.select_related('substitute'))
+            if rows:
+                from .substitutes import check_availability
+                subs = [(r.substitute, r.task) for r in rows]
+                check_availability(
+                    self.instance.employee, subs, start_date, end_date, tenant,
+                    exclude_request_id=self.instance.id,
+                )
+                attrs['_resnapshot'] = subs
+
         return attrs
 
     def update(self, instance, validated_data):
         """Update request and adjust pending balance if days or year changed"""
         from django.db import transaction
 
+        resnapshot = validated_data.pop('_resnapshot', None)
+        if resnapshot is not None and (
+            validated_data.get('start_date', instance.start_date) == instance.start_date
+            and validated_data.get('end_date', instance.end_date) == instance.end_date
+        ):
+            resnapshot = None
         old_days = instance.total_days
         old_year = instance.start_date.year
 
@@ -470,6 +587,16 @@ class LeaveRequestUpdateSerializer(serializers.ModelSerializer):
 
             if moves:
                 update_leave_balance(instance, action='pending')
+
+            if resnapshot:
+                from .substitutes import snapshot
+                instance.status = 'awaiting_substitutes'
+                instance._leave_actor = instance.employee
+                instance.save()
+                snapshot(instance, resnapshot, actor=instance.employee, notify=False)
+        if resnapshot:
+            from .substitutes import notify_requested
+            notify_requested(instance, list(instance.substitutes.all()))
 
         return instance
 
@@ -668,3 +795,124 @@ class LeaveApprovalChainSerializer(serializers.ModelSerializer):
             })
 
         return attrs
+
+
+class LeaveAuditEventSerializer(serializers.ModelSerializer):
+    actor_name = serializers.SerializerMethodField()
+    subject_user_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LeaveAuditEvent
+        fields = [
+            'id', 'kind', 'action', 'leave_request', 'subject_user', 'subject_user_name',
+            'actor', 'actor_name', 'object_id', 'from_status', 'to_status', 'data', 'created_at',
+        ]
+        read_only_fields = fields
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_actor_name(self, obj):
+        return (obj.actor.get_full_name() or obj.actor.email) if obj.actor else None
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_subject_user_name(self, obj):
+        u = obj.subject_user
+        return (u.get_full_name() or u.email) if u else None
+
+
+# ============================================================================
+# SUBSTITUTES
+# ============================================================================
+
+class SubstituteAssignmentSerializer(serializers.ModelSerializer):
+    """One row of "My substitutes"."""
+    substitute_name = serializers.SerializerMethodField()
+    substitute_email = serializers.EmailField(source='substitute.email', read_only=True)
+
+    class Meta:
+        model = SubstituteAssignment
+        fields = ['id', 'substitute', 'substitute_name', 'substitute_email', 'task', 'sort_order']
+        read_only_fields = ['id', 'substitute_name', 'substitute_email']
+
+    @extend_schema_field(serializers.CharField())
+    def get_substitute_name(self, obj):
+        return obj.substitute.get_full_name() or obj.substitute.email
+
+    def validate(self, attrs):
+        from .substitutes import clean_rows
+        owner = self.context['request'].user
+        sub = attrs.get('substitute', getattr(self.instance, 'substitute', None))
+        task = attrs.get('task', getattr(self.instance, 'task', ''))
+        (user, cleaned_task), = clean_rows(owner, [{'substitute': sub, 'task': task}])
+        others = SubstituteAssignment.objects.filter(owner=owner, substitute=user)
+        if self.instance is not None:
+            others = others.exclude(pk=self.instance.pk)
+        if others.exists():
+            raise serializers.ValidationError({'substitute': 'Already in your list.'})
+        if self.instance is None and SubstituteAssignment.objects.filter(owner=owner).count() >= SubstituteAssignment.MAX_PER_OWNER:
+            raise serializers.ValidationError(
+                {'substitute': f'At most {SubstituteAssignment.MAX_PER_OWNER} substitutes.'}
+            )
+        attrs['substitute'] = user
+        attrs['task'] = cleaned_task
+        return attrs
+
+
+class SubstituteReplaceSerializer(serializers.Serializer):
+    items = SubstituteInputSerializer(many=True)
+
+
+class CoveringRequestSerializer(serializers.ModelSerializer):
+    """A request the caller is a substitute on."""
+    employee_name = serializers.SerializerMethodField()
+    leave_type_name = serializers.SerializerMethodField()
+    leave_type_color = serializers.CharField(source='leave_type.color', read_only=True)
+    my_task = serializers.SerializerMethodField()
+    my_status = serializers.SerializerMethodField()
+    my_row_id = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LeaveRequest
+        fields = [
+            'id', 'employee', 'employee_name', 'leave_type', 'leave_type_name',
+            'leave_type_color', 'start_date', 'end_date', 'total_days', 'status',
+            'my_row_id', 'my_task', 'my_status', 'created_at',
+        ]
+
+    def _row(self, obj):
+        user = self.context['request'].user
+        for row in obj.substitutes.all():
+            if row.substitute_id == user.pk:
+                return row
+        return None
+
+    @extend_schema_field(serializers.CharField())
+    def get_employee_name(self, obj):
+        return obj.employee.get_full_name() or obj.employee.email
+
+    @extend_schema_field(serializers.CharField())
+    def get_leave_type_name(self, obj):
+        return obj.leave_type.get_name(self.context.get('language', 'en'))
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_my_task(self, obj):
+        row = self._row(obj)
+        return row.task if row else None
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_my_status(self, obj):
+        row = self._row(obj)
+        return row.status if row else None
+
+    @extend_schema_field(serializers.IntegerField(allow_null=True))
+    def get_my_row_id(self, obj):
+        row = self._row(obj)
+        return row.pk if row else None
+
+
+class SubstituteRespondSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(choices=['accept', 'reject'])
+    comment = serializers.CharField(required=False, allow_blank=True, default='')
+
+
+class SkipSubstitutesSerializer(serializers.Serializer):
+    reason = serializers.CharField()

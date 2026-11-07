@@ -310,6 +310,7 @@ class UserSerializer(serializers.ModelSerializer):
             'id', 'email', 'first_name', 'last_name', 'full_name',
             'role', 'status', 'phone_number', 'job_title', 'department', 'department_id',
             'manager', 'manager_name', 'preferred_language',
+            'employment_start_date', 'employment_end_date',
             'is_active', 'is_staff', 'is_booking_staff', 'date_joined', 'last_login',
             'permissions', 'group_permissions', 'all_permissions', 'feature_keys',
             'group_ids', 'tenant_groups', 'tenant_group_ids', 'user_permission_ids'
@@ -472,6 +473,7 @@ class UserCreateSerializer(ManagerIdMixin, EmailUniquenessMixin, serializers.Mod
         fields = [
             'email', 'first_name', 'last_name',
             'role', 'status', 'phone_number', 'job_title', 'department_id', 'manager_id',
+            'employment_start_date', 'employment_end_date',
             'group_ids', 'tenant_group_ids', 'user_permission_ids'
         ]
         extra_kwargs = {
@@ -535,7 +537,7 @@ class UserUpdateSerializer(ManagerIdMixin, EmailUniquenessMixin, serializers.Mod
         fields = [
             'email', 'first_name', 'last_name', 'role', 'status',
             'phone_number', 'job_title', 'is_active', 'department_id', 'manager_id',
-            'preferred_language',
+            'preferred_language', 'employment_start_date', 'employment_end_date',
             'group_ids', 'tenant_group_ids', 'user_permission_ids'
         ]
         extra_kwargs = {
@@ -616,6 +618,11 @@ class BulkUserActionResponseSerializer(serializers.Serializer):
     skipped_user_ids = serializers.ListField(
         child=serializers.IntegerField(),
         help_text='Requested users left untouched (yourself, or superusers when you are not one).',
+    )
+    blocked = serializers.DictField(
+        child=serializers.ListField(child=serializers.CharField()),
+        required=False,
+        help_text='user id -> reasons, for users skipped because of open leave work or leave history.',
     )
 
 

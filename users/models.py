@@ -144,6 +144,14 @@ class User(AbstractBaseUser):
         related_name='managed_employees',
         help_text='Direct manager of this user (approves their leave requests)'
     )
+    employment_start_date = models.DateField(
+        null=True, blank=True,
+        help_text='First working day (payroll and attendance; defaults to date_joined)'
+    )
+    employment_end_date = models.DateField(
+        null=True, blank=True,
+        help_text='Last day of employment; set when the user is deactivated'
+    )
 
     # Permission flags
     is_active = models.BooleanField(default=True)
@@ -575,6 +583,13 @@ class Notification(models.Model):
         ('leave_request_progress', 'Leave Request Partially Approved'),
         ('leave_request_awaiting_approval', 'Leave Request Awaiting Your Approval'),
         ('leave_request_cancelled', 'Leave Request Cancelled'),
+        ('leave_substitute_requested', 'Substitute Consent Requested'),
+        ('leave_substitutes_skipped', 'Substitute Consents Skipped'),
+        # KPI goals
+        ('kpi_assigned', 'KPI Goal Assigned'),
+        ('kpi_submitted', 'KPI Result Submitted'),
+        ('kpi_approved', 'KPI Result Approved'),
+        ('kpi_returned', 'KPI Result Returned'),
         # Bookings
         ('booking_confirmed', 'Booking Confirmed'),
         ('booking_cancelled', 'Booking Cancelled'),

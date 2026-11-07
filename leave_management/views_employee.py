@@ -25,7 +25,7 @@ from .permissions import (
 from .utils import (
     update_leave_balance, filter_by_status_in,
     calculate_working_days, check_overlapping_leaves, check_leave_balance,
-    initialize_leave_balances_for_user
+    initialize_leave_balances_for_user, validate_type_limits
 )
 from .views import lock_leave_request
 
@@ -100,7 +100,7 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
         # (the serializer saves every field of its instance).
         with transaction.atomic():
             locked = lock_leave_request(serializer.instance)
-            if locked.status != 'pending':
+            if locked.status not in ('pending', 'awaiting_substitutes'):
                 raise ValidationError('Only pending leave requests can be updated')
             serializer.instance = locked
             serializer.save()
@@ -112,7 +112,7 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
         # cannot leave used days counted for a deleted request.
         with transaction.atomic():
             instance = lock_leave_request(instance)
-            if instance.status != 'pending':
+            if instance.status not in ('pending', 'awaiting_substitutes'):
                 raise ValidationError('Only pending leave requests can be deleted')
 
             # Remove from pending balance
@@ -127,7 +127,7 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
                 {'error': 'Leave request is already cancelled'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        if leave_request.status not in ['pending', 'manager_approved', 'hr_approved', 'approved']:
+        if leave_request.status not in ['awaiting_substitutes', 'pending', 'manager_approved', 'hr_approved', 'approved']:
             return Response(
                 {'error': 'Cannot cancel a rejected leave request'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -234,6 +234,10 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
                 total_days, False, 'The selected date range contains no working days'
             )
 
+        limit_msg = validate_type_limits(user, leave_type, start_date, total_days, tenant)
+        if limit_msg:
+            return respond(total_days, False, limit_msg)
+
         has_overlap, overlap_msg = check_overlapping_leaves(
             user, start_date, end_date, tenant
         )
@@ -256,7 +260,7 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
     def pending(self, request):
         """Get all pending leave requests"""
         queryset = self.get_queryset().filter(
-            status__in=['pending', 'manager_approved', 'hr_approved']
+            status__in=['awaiting_substitutes', 'pending', 'manager_approved', 'hr_approved']
         )
         page = self.paginate_queryset(queryset)
 

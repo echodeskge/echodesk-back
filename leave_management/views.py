@@ -13,7 +13,7 @@ from drf_spectacular.utils import (
 
 from .models import (
     LeaveSettings, LeaveType, LeaveBalance, LeaveRequest,
-    PublicHoliday, LeaveApprovalChain, LeaveCarryForwardRun
+    PublicHoliday, LeaveApprovalChain, LeaveCarryForwardRun, LeaveAuditEvent
 )
 from .serializers import (
     LeaveActionResponseSerializer, LeaveErrorResponseSerializer,
@@ -26,7 +26,7 @@ from .serializers import (
     LeaveRequestCreateSerializer, LeaveRequestUpdateSerializer,
     LeaveApprovalSerializer, LeaveCancellationSerializer,
     PublicHolidayListSerializer, PublicHolidayDetailSerializer, PublicHolidayCreateUpdateSerializer,
-    LeaveApprovalChainSerializer
+    LeaveApprovalChainSerializer, LeaveAuditEventSerializer
 )
 from .permissions import (
     HasLeaveManagementFeature, CanManageLeaveSettings, CanManageLeaveTypes,
@@ -36,7 +36,7 @@ from .permissions import (
 from .utils import (
     update_leave_balance, carry_forward_balances, initialize_leave_balances_for_user,
     CarryForwardAlreadyRun, apply_approval_step, filter_by_status_in,
-    OPEN_APPROVAL_STATUSES,
+    OPEN_APPROVAL_STATUSES, OPEN_REQUEST_STATUSES,
 )
 
 
@@ -102,7 +102,27 @@ class LeaveSettingsViewSet(viewsets.ModelViewSet):
         return LeaveSettings.objects.filter(tenant=self.request.tenant)
 
     def perform_create(self, serializer):
-        serializer.save(tenant=self.request.tenant)
+        instance = serializer.save(tenant=self.request.tenant)
+        self._after_save(instance, was_auto=False)
+
+    def perform_update(self, serializer):
+        was_auto = serializer.instance.auto_georgian_holidays
+        instance = serializer.save()
+        self._after_save(instance, was_auto=was_auto)
+
+    def _after_save(self, instance, was_auto):
+        # Switching Georgian auto-holidays on fills this year and next.
+        if instance.auto_georgian_holidays and not was_auto:
+            from .holidays_ge import load_georgian_holidays
+            from .audit import log_event
+            year = timezone.localdate().year
+            for y in (year, year + 1):
+                created, _ = load_georgian_holidays(instance.tenant, y, self.request.user)
+                if created:
+                    log_event(
+                        instance.tenant, 'holiday', 'georgian_loaded', actor=self.request.user,
+                        object_id=y, data={'year': y, 'created': [str(d) for d in created]},
+                    )
 
     @extend_schema(tags=['Leave Management - Admin'], summary='Get leave settings')
     def list(self, request, *args, **kwargs):
@@ -679,6 +699,25 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
             'status': leave_request.status,
         })
 
+    @extend_schema(
+        tags=['Leave Management - Admin'],
+        summary='Skip pending substitute consents',
+        description='Staff override: substitutes who have not answered are marked skipped and '
+                    'the request goes to its approvers. A reason is required and is audit-logged.',
+        request=inline_serializer('SkipSubstitutesRequest', {'reason': serializers.CharField()}),
+        responses={200: LeaveRequestDetailSerializer, 400: ERROR_RESPONSE},
+    )
+    @action(detail=True, methods=['post'], url_path='skip-substitutes',
+            permission_classes=[IsAuthenticated, HasLeaveManagementFeature, CanManageLeaveSettings])
+    def skip_substitutes(self, request, pk=None):
+        from .substitutes import skip_pending, SubstituteResponseError
+        leave_request = self.get_object()
+        try:
+            updated = skip_pending(leave_request, request.user, request.data.get('reason', ''))
+        except SubstituteResponseError as exc:
+            return Response({'error': exc.message}, status=exc.status_code)
+        return Response(LeaveRequestDetailSerializer(updated, context=self.get_serializer_context()).data)
+
     @extend_schema(tags=['Leave Management - Admin'], summary='Delete leave request')
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -692,7 +731,7 @@ class AdminLeaveRequestViewSet(viewsets.ModelViewSet):
             instance = lock_leave_request(instance)
             if instance.status == 'approved':
                 update_leave_balance(instance, action='cancel_approved')
-            elif instance.status in OPEN_APPROVAL_STATUSES:
+            elif instance.status in OPEN_REQUEST_STATUSES:
                 update_leave_balance(instance, action='cancel')
             self.perform_destroy(instance)
 
@@ -756,6 +795,38 @@ class PublicHolidayViewSet(viewsets.ModelViewSet):
     )
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
+
+    @extend_schema(
+        tags=['Leave Management - Admin'],
+        summary="Load Georgia's public holidays for a year",
+        description='Creates the Labour Code holidays (fixed dates, 17 May from 2025 and '
+                    'Orthodox Easter Friday-Monday) for `year`. Dates that already have a '
+                    'holiday are skipped, so the call is safe to repeat.',
+        request=inline_serializer('LoadGeorgianHolidaysRequest', {
+            'year': serializers.IntegerField(min_value=2000, max_value=2100),
+        }),
+        responses={200: inline_serializer('LoadGeorgianHolidaysResponse', {
+            'year': serializers.IntegerField(),
+            'created': serializers.ListField(child=serializers.DateField()),
+            'skipped': serializers.ListField(child=serializers.DateField()),
+        })},
+    )
+    @action(detail=False, methods=['post'], url_path='load-georgian')
+    def load_georgian(self, request):
+        from .holidays_ge import load_georgian_holidays
+        from .audit import log_event
+        try:
+            year = int(request.data.get('year') or timezone.localdate().year)
+        except (TypeError, ValueError):
+            return Response({'year': ['A valid year is required.']}, status=status.HTTP_400_BAD_REQUEST)
+        if not 2000 <= year <= 2100:
+            return Response({'year': ['Year must be between 2000 and 2100.']}, status=status.HTTP_400_BAD_REQUEST)
+        created, skipped = load_georgian_holidays(request.tenant, year, request.user)
+        log_event(
+            request.tenant, 'holiday', 'georgian_loaded', actor=request.user, object_id=year,
+            data={'year': year, 'created': [str(d) for d in created]},
+        )
+        return Response({'year': year, 'created': created, 'skipped': skipped})
 
     @extend_schema(tags=['Leave Management - Admin'], summary='Get holiday details', parameters=[LANG_PARAM])
     def retrieve(self, request, *args, **kwargs):
@@ -825,3 +896,41 @@ class LeaveApprovalChainViewSet(viewsets.ModelViewSet):
     @extend_schema(tags=['Leave Management - Admin'], summary='Delete approval chain')
     def destroy(self, request, *args, **kwargs):
         return super().destroy(request, *args, **kwargs)
+
+
+@extend_schema_view(
+    list=extend_schema(
+        tags=['Leave Management - Admin'], summary='HR audit log',
+        parameters=[
+            OpenApiParameter('leave_request', int, OpenApiParameter.QUERY),
+            OpenApiParameter('kpi', int, OpenApiParameter.QUERY),
+            OpenApiParameter('user', int, OpenApiParameter.QUERY, description='Subject user'),
+            OpenApiParameter('kind', str, OpenApiParameter.QUERY),
+        ],
+    ),
+    retrieve=extend_schema(tags=['Leave Management - Admin'], summary='Audit event'),
+)
+class LeaveAuditEventViewSet(viewsets.ReadOnlyModelViewSet):
+    """Staff-only, read-only view of the HR audit trail."""
+    serializer_class = LeaveAuditEventSerializer
+    permission_classes = [IsAuthenticated, HasLeaveManagementFeature, CanManageLeaveSettings]
+    schema_path_param_types = STR_ID
+
+    def get_queryset(self):
+        if _is_schema_view(self):
+            return LeaveAuditEvent.objects.none()
+        qs = LeaveAuditEvent.objects.filter(tenant=self.request.tenant).select_related(
+            'actor', 'subject_user'
+        )
+        params = self.request.query_params
+        for param, field in (('leave_request', 'leave_request_id'), ('kpi', 'kpi_id'),
+                             ('user', 'subject_user_id')):
+            value = params.get(param)
+            if value:
+                try:
+                    qs = qs.filter(**{field: int(value)})
+                except (TypeError, ValueError):
+                    raise serializers.ValidationError({param: 'Must be an integer id'})
+        if params.get('kind'):
+            qs = qs.filter(kind=params['kind'])
+        return qs

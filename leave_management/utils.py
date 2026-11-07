@@ -88,56 +88,131 @@ def filter_by_status_in(queryset, raw):
     return queryset.filter(status__in=statuses)
 
 
+def get_leave_settings(tenant):
+    """The tenant's LeaveSettings row, or None when it was never created."""
+    from .models import LeaveSettings
+    if tenant is None:
+        return None
+    return LeaveSettings.objects.filter(tenant=tenant).first()
+
+
+def feature_on(tenant, flag):
+    """Is the optional HR feature ``flag`` (a LeaveSettings boolean) switched on?"""
+    settings_obj = get_leave_settings(tenant)
+    return bool(settings_obj and getattr(settings_obj, flag, False))
+
+
+def is_payroll_manager(user, tenant=None, settings_obj=None):
+    """Staff/superusers and the users listed in LeaveSettings.payroll_managers."""
+    if not user or not user.is_authenticated:
+        return False
+    if _is_elevated(user):
+        return True
+    if settings_obj is None:
+        settings_obj = get_leave_settings(tenant)
+    if settings_obj is None:
+        return False
+    return settings_obj.payroll_managers.filter(pk=user.pk).exists()
+
+
+def employment_start(user):
+    """First day the user counts as employed."""
+    if getattr(user, 'employment_start_date', None):
+        return user.employment_start_date
+    joined = getattr(user, 'date_joined', None)
+    if joined is None:
+        return None
+    return timezone.localdate(joined) if timezone.is_aware(joined) else joined.date()
+
+
+def employment_end(user):
+    """Last employed day, or None while employed."""
+    return getattr(user, 'employment_end_date', None)
+
+
+def _weekend_days(tenant):
+    settings_obj = get_leave_settings(tenant)
+    if settings_obj and settings_obj.weekend_days:
+        return list(settings_obj.weekend_days)
+    return [5, 6]
+
+
+def holiday_dates(start_date, end_date, tenant):
+    """
+    Holiday dates in [start_date, end_date]. Recurring holidays repeat on
+    their month/day in every year (they used to count only in the year they
+    were stored for).
+    """
+    from .models import PublicHoliday
+
+    days = set(
+        PublicHoliday.objects.filter(
+            tenant=tenant, date__gte=start_date, date__lte=end_date
+        ).values_list('date', flat=True)
+    )
+    recurring = PublicHoliday.objects.filter(tenant=tenant, is_recurring=True).values_list('date', flat=True)
+    for stored in recurring:
+        for year in range(start_date.year, end_date.year + 1):
+            try:
+                candidate = stored.replace(year=year)
+            except ValueError:  # 29 Feb in a non-leap year
+                continue
+            if start_date <= candidate <= end_date:
+                days.add(candidate)
+    return days
+
+
+def working_dates(start_date, end_date, tenant, exclude_public_holidays=True):
+    """Sorted list of the working dates in [start_date, end_date]."""
+    if start_date > end_date:
+        return []
+    weekend = _weekend_days(tenant)
+    holidays = holiday_dates(start_date, end_date, tenant) if exclude_public_holidays else set()
+    result = []
+    current = start_date
+    while current <= end_date:
+        if current.weekday() not in weekend and current not in holidays:
+            result.append(current)
+        current += timedelta(days=1)
+    return result
+
+
 def calculate_working_days(start_date, end_date, tenant, exclude_public_holidays=True):
     """
-    Calculate working days between start_date and end_date (inclusive)
-    excluding weekends and optionally public holidays.
-
-    Args:
-        start_date: Start date
-        end_date: End date (inclusive)
-        tenant: Tenant object
-        exclude_public_holidays: Whether to exclude public holidays
-
-    Returns:
-        Decimal: Number of working days
+    Working days between start_date and end_date (inclusive), excluding the
+    tenant's weekend days and (optionally) public holidays. Returns Decimal.
     """
-    if start_date > end_date:
-        return Decimal('0')
+    return Decimal(len(working_dates(start_date, end_date, tenant, exclude_public_holidays)))
 
-    # Get weekend days from settings (default: Saturday=5, Sunday=6)
-    try:
-        from .models import LeaveSettings
-        leave_settings = LeaveSettings.objects.get(tenant=tenant)
-        weekend_days = leave_settings.weekend_days if leave_settings.weekend_days else [5, 6]
-    except Exception as e:
-        logger.debug(f"No leave settings for tenant, using default weekends: {e}")
-        weekend_days = [5, 6]  # Default to Sat/Sun
 
-    # Get public holidays in date range
-    public_holidays = set()
-    if exclude_public_holidays:
-        from .models import PublicHoliday
-        holidays = PublicHoliday.objects.filter(
-            tenant=tenant,
-            date__gte=start_date,
-            date__lte=end_date
-        ).values_list('date', flat=True)
-        public_holidays = set(holidays)
+CLOSED_STATUSES = ('rejected', 'cancelled')
 
-    # Count working days
-    working_days = 0
-    current_date = start_date
 
-    while current_date <= end_date:
-        # Check if it's a weekend day
-        if current_date.weekday() not in weekend_days:
-            # Check if it's a public holiday
-            if current_date not in public_holidays:
-                working_days += 1
-        current_date += timedelta(days=1)
+def validate_type_limits(employee, leave_type, start_date, total_days, tenant, exclude_request_id=None):
+    """
+    Per-type limits (max working days per request, max requests starting in
+    one calendar month). Returns '' when allowed, else the reason.
+    """
+    from .models import LeaveRequest
 
-    return Decimal(str(working_days))
+    if leave_type.max_days_per_request is not None and total_days > leave_type.max_days_per_request:
+        return (
+            f"This leave type allows at most {leave_type.max_days_per_request} "
+            f"working day(s) per request"
+        )
+    if leave_type.max_requests_per_month:
+        qs = LeaveRequest.objects.filter(
+            tenant=tenant, employee=employee, leave_type=leave_type,
+            start_date__year=start_date.year, start_date__month=start_date.month,
+        ).exclude(status__in=CLOSED_STATUSES)
+        if exclude_request_id:
+            qs = qs.exclude(pk=exclude_request_id)
+        if qs.count() >= leave_type.max_requests_per_month:
+            return (
+                f"This leave type can be requested at most "
+                f"{leave_type.max_requests_per_month} time(s) per month"
+            )
+    return ''
 
 
 def check_leave_balance(user, leave_type, days, year, tenant):
@@ -260,7 +335,7 @@ def check_overlapping_leaves(employee, start_date, end_date, tenant, exclude_req
 
     # Build query for overlapping dates
     query = Q(employee=employee, tenant=tenant)
-    query &= Q(status__in=['pending', 'manager_approved', 'hr_approved', 'approved'])
+    query &= Q(status__in=['awaiting_substitutes', 'pending', 'manager_approved', 'hr_approved', 'approved'])
     query &= (
         Q(start_date__lte=end_date, end_date__gte=start_date) |
         Q(start_date__range=[start_date, end_date]) |
@@ -541,6 +616,8 @@ ROLE_APPROVED_STATUS = {
     'admin': 'approved',
 }
 OPEN_APPROVAL_STATUSES = tuple(APPROVAL_STATUS_RANK)
+# Every status that still holds pending days (substitute consent included).
+OPEN_REQUEST_STATUSES = ('awaiting_substitutes',) + OPEN_APPROVAL_STATUSES
 
 
 def _step_signed(leave_request, role):
@@ -758,3 +835,37 @@ def initialize_leave_balances_for_user(user, tenant, year=None):
                 created_count += 1
 
     return created_count
+
+
+def leave_features_for(user, tenant):
+    """Feature switches + the user's HR capabilities, for the profile endpoint."""
+    settings_obj = get_leave_settings(tenant)
+    flags = {
+        'substitutes': False, 'substitution_pay': False, 'payroll': False,
+        'payroll_self_view': False, 'kpi': False, 'attendance': False,
+        'can_manage_payroll': False, 'pending_substitute_count': 0,
+    }
+    if settings_obj is None:
+        return flags
+    flags.update({
+        'substitutes': settings_obj.substitutes_enabled,
+        'substitution_pay': settings_obj.substitutes_enabled and settings_obj.substitution_pay_enabled,
+        'payroll': settings_obj.payroll_enabled,
+        'payroll_self_view': settings_obj.payroll_enabled and settings_obj.payroll_self_view_enabled,
+        'kpi': settings_obj.kpi_enabled,
+        'attendance': settings_obj.attendance_grid_enabled,
+    })
+    flags['can_manage_payroll'] = bool(
+        (flags['payroll'] or flags['substitution_pay'])
+        and is_payroll_manager(user, settings_obj=settings_obj)
+    )
+    if flags['substitutes']:
+        try:
+            from .models import LeaveRequestSubstitute
+            flags['pending_substitute_count'] = LeaveRequestSubstitute.objects.filter(
+                substitute=user, status='pending',
+                leave_request__status='awaiting_substitutes',
+            ).count()
+        except ImportError:  # pragma: no cover
+            pass
+    return flags

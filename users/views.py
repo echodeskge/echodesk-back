@@ -164,6 +164,26 @@ def _guard_disable(actor, target, verb='deactivate, suspend or delete'):
         )
 
 
+class LeaveRemovalBlocked(APIException):
+    """400 when open leave work / leave history blocks a deactivation or delete."""
+    status_code = status.HTTP_400_BAD_REQUEST
+    default_code = 'leave_removal_blocked'
+
+    def __init__(self, reasons):
+        message = 'This user cannot be removed yet: ' + '; '.join(reasons) + '.'
+        super().__init__({
+            'detail': message, 'error': message,
+            'code': 'leave_removal_blocked', 'reasons': reasons,
+        })
+
+
+def _guard_leave_removal(target, delete=False):
+    from leave_management.guards import check_removal
+    reasons = check_removal(target, delete=delete)
+    if reasons:
+        raise LeaveRemovalBlocked(reasons)
+
+
 def _can_manage_groups(user):
     return user.is_superuser or user.is_staff or user.has_permission('manage_groups')
 
@@ -581,6 +601,7 @@ class UserViewSet(viewsets.ModelViewSet):
                 raise SelfLockoutError('You cannot deactivate or suspend your own account.')
             if disabling:
                 _guard_disable(actor, user_being_updated)
+                _guard_leave_removal(user_being_updated)
             # Reactivating undoes someone's decision to disable the account:
             # same rule as disabling it.
             enabling = (
@@ -614,6 +635,10 @@ class UserViewSet(viewsets.ModelViewSet):
         )
         if email_changed or lost_access:
             user.revoke_auth_tokens()
+        if lost_access and not user.employment_end_date:
+            from django.utils import timezone as _tz
+            user.employment_end_date = _tz.localdate()
+            user.save(update_fields=['employment_end_date'])
     
     def perform_destroy(self, instance):
         # Check if user has permission to manage users
@@ -625,6 +650,7 @@ class UserViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("You cannot delete your own account")
         _guard_target(self.request.user, instance)
         _guard_disable(self.request.user, instance)
+        _guard_leave_removal(instance, delete=True)
 
         instance.delete()
     
@@ -679,6 +705,7 @@ class UserViewSet(viewsets.ModelViewSet):
 
         users = User.objects.filter(id__in=user_ids)
         skipped = set()
+        blocked = {}
         if not actor.is_superuser:
             skipped.update(users.filter(is_superuser=True).values_list('id', flat=True))
         if action_type == 'change_role':
@@ -701,6 +728,15 @@ class UserViewSet(viewsets.ModelViewSet):
         if action_type in ('deactivate', 'delete'):
             # Same rule as a single deactivate / delete.
             skipped.update(u.id for u in users if u.id != actor.id and not _may_disable(actor, u))
+            # Open leave work / leave history (LeaveSettings guard).
+            from leave_management.guards import check_removal
+            for u in users:
+                if u.id in skipped:
+                    continue
+                reasons = check_removal(u, delete=action_type == 'delete')
+                if reasons:
+                    skipped.add(u.id)
+                    blocked[u.id] = reasons
         if action_type in ('add_to_group', 'remove_from_group'):
             # Groups grant feature keys: same permission as the group's own
             # add_users / remove_users.
@@ -718,6 +754,10 @@ class UserViewSet(viewsets.ModelViewSet):
             message = f'Activated {count} users'
 
         elif action_type == 'deactivate':
+            from django.utils import timezone as _tz
+            User.objects.filter(id__in=target_ids, employment_end_date__isnull=True).update(
+                employment_end_date=_tz.localdate()
+            )
             User.objects.filter(id__in=target_ids).update(is_active=False, status='inactive')
             _revoke_tokens_for(target_ids)
             from tenants.user_count import sync_current_schema_user_count
@@ -753,6 +793,7 @@ class UserViewSet(viewsets.ModelViewSet):
             'message': message,
             'affected': count,
             'skipped_user_ids': sorted(i for i in skipped if i in set(user_ids)),
+            'blocked': {str(k): v for k, v in blocked.items()},
         })
 
     @extend_schema(

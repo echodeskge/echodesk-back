@@ -278,6 +278,20 @@ def tenant_dashboard(request):
                         'type': 'boolean',
                         'description': 'True when the user can open the leave management manager views (staff, manager role, or has direct reports)'
                     },
+                    'leave_features': {
+                        'type': 'object', 'nullable': True,
+                        'description': 'Optional HR features switched on in leave settings, and what this user may do with them',
+                        'properties': {
+                            'substitutes': {'type': 'boolean'},
+                            'substitution_pay': {'type': 'boolean'},
+                            'payroll': {'type': 'boolean'},
+                            'payroll_self_view': {'type': 'boolean'},
+                            'kpi': {'type': 'boolean'},
+                            'attendance': {'type': 'boolean'},
+                            'can_manage_payroll': {'type': 'boolean'},
+                            'pending_substitute_count': {'type': 'integer'},
+                        },
+                    },
                     'preferred_language': {
                         'type': 'string', 'enum': ['en', 'ka'], 'nullable': True,
                         'description': (
@@ -418,7 +432,11 @@ def tenant_profile(request):
         pass
 
     # Whether to show the leave "team" views (mobile reads this on login)
-    from leave_management.utils import is_leave_manager
+    from leave_management.utils import is_leave_manager, leave_features_for
+    try:
+        leave_features = leave_features_for(user, getattr(request, 'tenant', None))
+    except Exception:
+        leave_features = None
 
     return Response({
         'id': user.id,
@@ -428,6 +446,7 @@ def tenant_profile(request):
         'is_staff': user.is_staff,
         'is_superuser': user.is_superuser,
         'is_leave_manager': is_leave_manager(user),
+        'leave_features': leave_features,
         'preferred_language': user.preferred_language,
         'date_joined': user.date_joined,
         'last_login': user.last_login,
