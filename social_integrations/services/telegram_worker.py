@@ -451,8 +451,17 @@ class ManagedClient:
                     return
                 self.account_key = str(account.telegram_user_id)
 
+                try:
+                    session = StringSession(account.session_string)
+                except ValueError as e:
+                    # Corrupt / undecryptable session string: retrying can never succeed.
+                    await db(self.schema, _disable_account, self.account_id,
+                             'session_revoked', f'invalid session string: {e}')
+                    self.app.registry.pop(self.key, None)
+                    return
+
                 client = TelegramClient(
-                    StringSession(account.session_string),
+                    session,
                     self.app.api_id, self.app.api_hash,
                     catch_up=True, flood_sleep_threshold=60,
                 )

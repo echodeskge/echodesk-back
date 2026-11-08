@@ -170,3 +170,17 @@ class TestRecountCommand(_Base):
     def test_sync_returns_none_without_subscription(self):
         self.sub.delete()
         self.assertIsNone(sync_subscription_user_count(self.tenant))
+
+
+class TestSignalInsideSchemaContext(_Base):
+    """Seeds / commands / tasks save users inside schema_context(), where
+    connection.tenant is a pk-less FakeTenant; the signal must still recount."""
+
+    def test_user_created_inside_schema_context_updates_count(self):
+        from tenant_schemas.utils import schema_context
+
+        before = self.stored()
+        with schema_context(self.tenant.schema_name):
+            User.objects.create_user(email='ctx-user@test.com', password='x-unused-123', is_active=True)
+        self.assertEqual(self.stored(), before + 1)
+        self.assertEqual(self.stored(), self.active())

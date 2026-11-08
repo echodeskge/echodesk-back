@@ -968,7 +968,8 @@ class DemoSeeder:
         tg = TelegramAccount.objects.create(
             telegram_user_id=900000000000 + zlib.crc32(self.schema.encode()) % 99999, phone_number='+995599000999',
             first_name='Demo', last_name='Shop', username='echodesk_demo_shop', session_string=fake,
-            connected_by=self.admin, last_seen_at=self.now)
+            # Inactive: the always-on Telegram worker would otherwise retry the fake session forever.
+            connected_by=self.admin, last_seen_at=self.now, is_active=False)
         from widget_registry.models import WidgetConnection
         with schema_context(get_public_schema_name()):
             widget, _ = WidgetConnection.objects.get_or_create(

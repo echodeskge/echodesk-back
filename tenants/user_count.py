@@ -65,7 +65,8 @@ def sync_current_schema_user_count():
     if not schema or schema == get_public_schema_name():
         return None
     tenant = getattr(connection, 'tenant', None)
-    if tenant is None or getattr(tenant, 'schema_name', None) != schema:
+    # Inside schema_context() connection.tenant is a pk-less FakeTenant: load the real row.
+    if not isinstance(tenant, Tenant) or getattr(tenant, 'schema_name', None) != schema:
         tenant = Tenant.objects.filter(schema_name=schema).first()
         if tenant is None:
             return None
