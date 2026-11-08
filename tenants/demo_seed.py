@@ -320,11 +320,17 @@ class DemoSeeder:
             TicketColumn, TicketComment, TicketHistory, TicketPayment, TicketTimeLog,
         )
 
+        from tickets.dates import tickets_today
+
         rng = self.rng
+        # Task due dates are computed in the tickets' local zone (Asia/Tbilisi),
+        # the same "today" the API uses for is_overdue_task and the due filters.
+        local_today = tickets_today()
         support = Board(name='Customer Support', description='Customer issues and requests', is_default=True,
-                        created_by=self.admin)
+                        color='#3b82f6', position=0, created_by=self.admin)
         _clean_save(support)
-        sales = Board(name='Sales Pipeline', description='Leads and deals', created_by=self.manager)
+        sales = Board(name='Sales Pipeline', description='Leads and deals', color='#22c55e', position=1,
+                      created_by=self.manager)
         _clean_save(sales)
         for board in (support, sales):
             board.board_groups.add(self.groups['everyone'])
@@ -385,6 +391,11 @@ class DemoSeeder:
         assignees = [self.agent, self.manager, self.users['staff1'], self.users['staff2'],
                      self.users['staff3'], self.admin]
         priorities = ['low', 'medium', 'medium', 'high', 'critical']
+        # Task due dates on 2 of every 5 tickets (~40 %), several in the past so
+        # the overdue chip shows. Deterministic offsets (no rng draw), so the
+        # random stream every later module uses stays exactly as before.
+        due_offsets = [-6, 0, -2, 3, 1, 7, -1, 14, 2, 5, -4, 21]
+        due_index = 0
 
         specs = [(support, sup_cols, t) for t in support_titles] + [(sales, sales_cols, t) for t in sales_titles]
         for i, (board, cols, title) in enumerate(specs):
@@ -401,6 +412,9 @@ class DemoSeeder:
                 assigned_to=assignee,
                 assigned_department=assignee.department,
             )
+            if i % 5 in (1, 3):
+                ticket.due_date = local_today + timedelta(days=due_offsets[due_index % len(due_offsets)])
+                due_index += 1
             if board is sales:
                 price = Decimal(rng.choice([450, 900, 1500, 2400, 3600]))
                 ticket.is_order = True
@@ -431,12 +445,17 @@ class DemoSeeder:
                 author = [self.agent, self.manager, self.admin, self.users['staff1']][(i + c) % 4]
                 text = comment_texts[(i + c) % len(comment_texts)].format(
                     agent=self.agent.email, manager=self.manager.email)
-                comment = TicketComment.objects.create(ticket=ticket, user=author, comment=text)
+                # Mixed internal / not-internal comments (internal is the default).
+                comment = TicketComment.objects.create(ticket=ticket, user=author, comment=text,
+                                                       is_internal=(i + c) % 3 != 1)
                 _backdate(comment, created_at=created_at + timedelta(hours=c + 1))
 
             for p in range(i % 5 if board is support else 0):
-                ChecklistItem.objects.create(ticket=ticket, text=checklist_texts[p], is_checked=p < 2,
-                                             position=p, created_by=creator)
+                checked = p < 2
+                ChecklistItem.objects.create(ticket=ticket, text=checklist_texts[p], is_checked=checked,
+                                             position=p, created_by=creator,
+                                             checked_by=assignee if checked else None,
+                                             checked_at=created_at + timedelta(hours=p + 1) if checked else None)
 
             if i % 6 == 0:
                 fname = ['photo-damage.jpg', 'invoice.pdf', 'screenshot.png'][i % 3]
@@ -1041,11 +1060,13 @@ class DemoSeeder:
                     is_read_by_staff=out or c > 0, sent_by=self.agent if out else None)
             ci += 1
         # Instagram
+        ig_clients = []
         for c, script in enumerate(scripts[:3]):
             igsid = self._ext(f'ig-user-{c + 1}')
             first, last = CUSTOMER_NAMES[ci % len(CUSTOMER_NAMES)]
             handle = f'{first.lower()}_{last.lower()}'
-            social_client(ci, 'instagram', igsid, ig.instagram_account_id, f'{first} {last}', handle)
+            ig_clients.append(social_client(ci, 'instagram', igsid, ig.instagram_account_id, f'{first} {last}',
+                                            handle))
             for m, (direction, text) in enumerate(script):
                 out = direction == 'out'
                 InstagramMessage.objects.create(
@@ -1128,6 +1149,14 @@ class DemoSeeder:
         ]):
             QuickReply.objects.create(title=title, message=msg, platforms=platforms, shortcut=shortcut,
                                       category=cat, position=pos, created_by=self.admin, use_count=pos * 3)
+
+        # One support ticket linked to its customer (Ticket.customer): the
+        # Instagram customer asking where their order is. A queryset update, so
+        # no ticket signal (history, broadcast) fires while seeding. No-op when
+        # the tickets module didn't seed this ticket.
+        from tickets.models import Ticket
+        Ticket.objects.filter(title='Instagram order follow-up', customer__isnull=True).update(
+            customer=ig_clients[1])
 
     # ------------------------------------------------------------------ calls
     def seed_calls(self):
