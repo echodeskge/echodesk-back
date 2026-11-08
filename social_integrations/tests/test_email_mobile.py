@@ -734,7 +734,7 @@ class TestEmailOpenApiSchema(SocialIntegrationTestCase):
     def test_threads_is_bare_array(self):
         schema = self._schema()
         op = schema['paths']['/api/social/email-messages/threads/']['get']
-        self.assertEqual({p['name'] for p in op['parameters']}, {'folder', 'connection_id', 'lite'})
+        self.assertEqual({p['name'] for p in op['parameters']}, {'folder', 'connection_id', 'lite', 'view', 'unread'})
         body = op['responses']['200']['content']['application/json']['schema']
         self.assertEqual(body['type'], 'array')
         self.assertEqual(body['items']['$ref'], '#/components/schemas/EmailThread')

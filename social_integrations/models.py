@@ -1441,6 +1441,31 @@ class EmailDraft(models.Model):
         return f"Draft: {self.subject[:50] or 'No subject'}"
 
 
+class EmailThreadTicket(models.Model):
+    """Ticket created from an email conversation (one per mailbox thread)."""
+
+    connection = models.ForeignKey(
+        EmailConnection, on_delete=models.CASCADE, related_name='thread_tickets',
+    )
+    thread_id = models.CharField(max_length=500, db_index=True)
+    ticket = models.ForeignKey(
+        'tickets.Ticket', on_delete=models.CASCADE, related_name='email_threads',
+    )
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['connection', 'thread_id'], name='uniq_email_thread_ticket'),
+        ]
+        verbose_name = "Email Thread Ticket"
+
+    def __str__(self):
+        return f"{self.connection_id}/{self.thread_id} -> ticket {self.ticket_id}"
+
+
 class TikTokShopAccount(models.Model):
     """Stores TikTok Shop seller account connection details for a tenant"""
 

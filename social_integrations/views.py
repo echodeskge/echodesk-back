@@ -9787,6 +9787,17 @@ def whatsapp_send_template_message(request):
 # Email Integration Views
 # =============================================================================
 
+def _apply_email_view_filters(queryset, request):
+    """``view=assigned_to_me|unassigned|ticketed`` and ``unread=1`` (email lists)."""
+    from .email_threads import apply_thread_view
+    view = request.query_params.get('view')
+    if view:
+        queryset = apply_thread_view(queryset, view, request.user)
+    if _truthy_param(request.query_params.get('unread')):
+        queryset = queryset.filter(is_read=False)
+    return queryset
+
+
 EMAIL_ACCESS_RULES_DOC = (
     "Mailbox visibility (EmailConnectionUserAssignment) is decided per "
     "connection, with the same rule as /email/status/, /unread-count/ and the "
@@ -10898,6 +10909,14 @@ def email_update_sync_days(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+_EMAIL_THREAD_VIEW_PARAMS = (
+    OpenApiParameter('view', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+                     enum=['assigned_to_me', 'unassigned', 'ticketed'],
+                     description="Inbox view by conversation: assigned to me / nobody assigned / linked to a ticket"),
+    OpenApiParameter('unread', OpenApiTypes.BOOL, OpenApiParameter.QUERY, required=False,
+                     description="`1`/`true` → only unread messages (same as is_read=false)"),
+)
+
 _EMAIL_LITE_PARAM = OpenApiParameter(
     'lite', OpenApiTypes.BOOL, OpenApiParameter.QUERY, required=False,
     description=(
@@ -10937,6 +10956,7 @@ def _truthy_param(value) -> bool:
                              description="Only this email account (pk)"),
             OpenApiParameter('search', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
                              description="icontains on subject, from_email, from_name, body_text"),
+            *_EMAIL_THREAD_VIEW_PARAMS,
             _EMAIL_LITE_PARAM,
         ],
         responses={200: EmailMessageSerializer(many=True)},
@@ -10966,6 +10986,20 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
             return EmailMessageListSerializer
         return EmailMessageSerializer
 
+    def get_serializer(self, *args, **kwargs):
+        """Resolve assignee / ticket for every row being serialized at once."""
+        instance = args[0] if args else kwargs.get('instance')
+        if instance is not None and 'context' not in kwargs:
+            rows = [instance] if isinstance(instance, EmailMessage) else list(instance)
+            from .email_threads import thread_meta as email_thread_meta
+            kwargs['context'] = {
+                **self.get_serializer_context(),
+                'email_thread_meta': email_thread_meta(
+                    (m.connection_id, m.thread_id) for m in rows if isinstance(m, EmailMessage)
+                ),
+            }
+        return super().get_serializer(*args, **kwargs)
+
     @extend_schema(
         summary="List email messages (lite rows)",
         description=(
@@ -10983,6 +11017,7 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
             OpenApiParameter('thread_id', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False),
             OpenApiParameter('connection_id', OpenApiTypes.INT, OpenApiParameter.QUERY, required=False),
             OpenApiParameter('search', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False),
+            *_EMAIL_THREAD_VIEW_PARAMS,
         ],
         responses={200: EmailMessageListSerializer(many=True)},
     )
@@ -11063,6 +11098,8 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
         if label:
             queryset = queryset.filter(labels__contains=[label])
 
+        queryset = _apply_email_view_filters(queryset, self.request)
+
         # Search in subject, from_email, body_text
         search = self.request.query_params.get('search')
         if search:
@@ -11088,6 +11125,7 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
             OpenApiParameter('folder', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
                              description="IMAP folder; omit or 'All' for every folder"),
             OpenApiParameter('connection_id', OpenApiTypes.INT, OpenApiParameter.QUERY, required=False),
+            *_EMAIL_THREAD_VIEW_PARAMS,
             _EMAIL_LITE_PARAM,
         ],
         responses={200: EmailThreadSerializer(many=True)},
@@ -11124,6 +11162,8 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
             base_queryset = base_queryset.filter(folder=folder)
         else:
             base_queryset = base_queryset.exclude(folder__in=EMAIL_EXCLUDED_FROM_ALL)
+
+        base_queryset = _apply_email_view_filters(base_queryset, request)
 
         if assignment_enabled:
             # Get active assignments (not 'completed' - those return to everyone)
@@ -11214,6 +11254,15 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
                 if msg.thread_id not in business_by_thread:
                     business_by_thread[msg.thread_id] = msg
 
+        # Assignee / ticket of every thread on the page in two queries.
+        from .email_threads import thread_meta as email_thread_meta
+        row_context = {
+            **self.get_serializer_context(),
+            'email_thread_meta': email_thread_meta(
+                (m.connection_id, m.thread_id) for m in latest_by_thread.values()
+            ),
+        }
+
         # Build result using the pre-fetched data
         result = []
         for thread_id in thread_ids:
@@ -11222,7 +11271,7 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
                 continue
 
             meta = thread_meta[thread_id]
-            msg_data = row_serializer(latest_msg).data
+            msg_data = row_serializer(latest_msg, context=row_context).data
             msg_data['message_count'] = meta['message_count']
             msg_data['unread_count'] = meta['unread_count']
 

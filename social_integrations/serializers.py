@@ -656,6 +656,18 @@ class EmailConnectionCreateSerializer(serializers.Serializer):
         return data
 
 
+class EmailThreadAssigneeSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    initials = serializers.CharField()
+    email = serializers.EmailField()
+
+
+class EmailThreadTicketBriefSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    title = serializers.CharField()
+
+
 class EmailMessageSerializer(serializers.ModelSerializer):
     """Serializer for email messages"""
     connection_id = serializers.IntegerField(source='connection.id', read_only=True)
@@ -668,6 +680,31 @@ class EmailMessageSerializer(serializers.ModelSerializer):
     def get_has_business_reply(self, obj) -> bool:
         return bool(getattr(obj, 'has_business_reply', False))
 
+    # Per-thread work state (social_integrations.email_threads). The viewset
+    # resolves it for a whole page at once and passes it in the context
+    # (``email_thread_meta``); a lone instance is looked up on demand.
+    assignee = serializers.SerializerMethodField()
+    ticket = serializers.SerializerMethodField()
+
+    def _thread_meta(self, obj):
+        key = (obj.connection_id, obj.thread_id)
+        meta = self.context.get('email_thread_meta')
+        if meta is None or key not in meta:
+            from .email_threads import thread_meta
+            found = thread_meta([key]).get(key)
+            if meta is not None and found is not None:
+                meta[key] = found
+            return found or {}
+        return meta[key]
+
+    @extend_schema_field(EmailThreadAssigneeSerializer(allow_null=True))
+    def get_assignee(self, obj):
+        return self._thread_meta(obj).get('assignee')
+
+    @extend_schema_field(EmailThreadTicketBriefSerializer(allow_null=True))
+    def get_ticket(self, obj):
+        return self._thread_meta(obj).get('ticket')
+
     class Meta:
         model = EmailMessage
         fields = [
@@ -676,7 +713,7 @@ class EmailMessageSerializer(serializers.ModelSerializer):
             'subject', 'body_text', 'body_html', 'attachments',
             'timestamp', 'folder', 'previous_folder', 'uid',
             'is_from_business', 'is_read', 'is_starred', 'is_answered', 'is_draft', 'labels',
-            'has_business_reply',
+            'has_business_reply', 'assignee', 'ticket',
             'is_read_by_staff', 'read_by_staff_at',
             'is_deleted', 'deleted_at',
             'connection_id', 'connection_email', 'connection_display_name',
@@ -726,7 +763,7 @@ class EmailMessageListSerializer(EmailMessageSerializer):
             'subject', 'snippet', 'attachments_count',
             'timestamp', 'folder', 'previous_folder', 'uid',
             'is_from_business', 'is_read', 'is_starred', 'is_answered', 'is_draft', 'labels',
-            'has_business_reply',
+            'has_business_reply', 'assignee', 'ticket',
             'is_read_by_staff', 'read_by_staff_at',
             'is_deleted', 'deleted_at',
             'connection_id', 'connection_email', 'connection_display_name',
@@ -1969,3 +2006,24 @@ class TelegramSendMessageResponseSerializer(serializers.Serializer):
     success = serializers.BooleanField()
     message = TelegramMessageSerializer(allow_null=True, required=False)
     error = serializers.CharField(required=False)
+
+
+class EmailThreadAssignSerializer(serializers.Serializer):
+    connection_id = serializers.IntegerField()
+    thread_id = serializers.CharField(max_length=500)
+    user_id = serializers.IntegerField(allow_null=True, required=False)
+
+
+class EmailThreadAssignResponseSerializer(serializers.Serializer):
+    assignee = EmailThreadAssigneeSerializer(allow_null=True)
+
+
+class EmailThreadCreateTicketSerializer(serializers.Serializer):
+    connection_id = serializers.IntegerField()
+    thread_id = serializers.CharField(max_length=500)
+    column_id = serializers.IntegerField(required=False, allow_null=True)
+
+
+class EmailThreadCreateTicketResponseSerializer(serializers.Serializer):
+    ticket = EmailThreadTicketBriefSerializer()
+    created = serializers.BooleanField()

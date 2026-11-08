@@ -178,6 +178,13 @@ CATALOG = {
         'ka': '{employee} — შვებულება ({period}) გაუქმდა; ჩანაცვლება აღარ არის საჭირო',
     },
 
+    # --- Email -------------------------------------------------------------
+    'email.assigned.title': {'en': 'Email conversation assigned to you', 'ka': 'მეილის მიმოწერა დაგენიშნათ'},
+    'email.assigned.message': {
+        'en': '{actor} assigned you "{subject}"',
+        'ka': '{actor} — დაგნიშნათ „{subject}“',
+    },
+
     # --- KPI ---------------------------------------------------------------
     'kpi.assigned.title': {'en': 'New KPI goal for {period}', 'ka': 'ახალი KPI მიზანი — {period}'},
     'kpi.assigned.message': {
