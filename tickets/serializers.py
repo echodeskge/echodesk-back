@@ -32,7 +32,7 @@ def user_display_name(user):
     """Full name, falling back to the e-mail address."""
     if user is None:
         return ''
-    full = (user.get_full_name() or '').strip()
+    full = f"{user.first_name or ''} {user.last_name or ''}".strip()
     return full or (user.email or '')
 
 
@@ -54,7 +54,8 @@ def initials_for(name, email=''):
 def user_initials(user):
     if user is None:
         return ''
-    return initials_for((user.get_full_name() or '').strip(), user.email or '')
+    full = f"{user.first_name or ''} {user.last_name or ''}".strip()
+    return initials_for(full, user.email or '')
 
 
 class UserRefSerializer(serializers.Serializer):
