@@ -10124,7 +10124,8 @@ def email_update_connection(request):
         if 'signature_enabled' in request.data:
             connection.signature_enabled = request.data['signature_enabled']
         if 'signature_html' in request.data:
-            connection.signature_html = request.data['signature_html']
+            from .email_utils import externalize_data_images
+            connection.signature_html = externalize_data_images(request.data['signature_html'] or '')
         if 'signature_text' in request.data:
             connection.signature_text = request.data['signature_text']
 
@@ -10995,7 +10996,8 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
             kwargs['context'] = {
                 **self.get_serializer_context(),
                 'email_thread_meta': email_thread_meta(
-                    (m.connection_id, m.thread_id) for m in rows if isinstance(m, EmailMessage)
+                    ((m.connection_id, m.thread_id) for m in rows if isinstance(m, EmailMessage)),
+                    self.request.user,
                 ),
             }
         return super().get_serializer(*args, **kwargs)
@@ -11259,7 +11261,8 @@ class EmailMessageViewSet(viewsets.ReadOnlyModelViewSet):
         row_context = {
             **self.get_serializer_context(),
             'email_thread_meta': email_thread_meta(
-                (m.connection_id, m.thread_id) for m in latest_by_thread.values()
+                ((m.connection_id, m.thread_id) for m in latest_by_thread.values()),
+                request.user,
             ),
         }
 

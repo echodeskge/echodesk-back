@@ -494,6 +494,106 @@ def extract_attachments(email_message, connection) -> List[Dict[str, Any]]:
     return attachments
 
 
+# <img src="data:image/...;base64,..."> — Gmail and Outlook strip data: URIs
+# from received mail, so a signature logo pasted as base64 arrives as a blank
+# box. Before sending they are moved into multipart/related parts and the img
+# points at them with cid: (which every client renders inline).
+_DATA_IMG_RE = re.compile(
+    r"""(<img\b[^>]*?\bsrc\s*=\s*)(["'])data:(image/(?:png|jpe?g|gif|webp|bmp));base64,([A-Za-z0-9+/=\s]+)\2""",
+    re.IGNORECASE,
+)
+MAX_INLINE_IMAGES = 20
+MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
+
+
+def inline_data_images(html: str, domain: Optional[str] = None):
+    """Replace base64 ``data:`` images in ``html`` with ``cid:`` references.
+
+    Returns ``(html, parts)`` where ``parts`` are ``MIMEImage``-style parts
+    (Content-ID + inline disposition) to attach next to the HTML inside a
+    ``multipart/related``. Identical images share one part; undecodable or
+    oversized ones, and anything past ``MAX_INLINE_IMAGES``, are left as is.
+    """
+    from email.mime.image import MIMEImage
+
+    if not html or 'data:' not in html:
+        return html, []
+    parts = []
+    by_digest = {}
+
+    def replace(match):
+        mime, payload = match.group(3).lower(), re.sub(r'\s+', '', match.group(4))
+        try:
+            data = base64.b64decode(payload, validate=True)
+        except (ValueError, base64.binascii.Error):
+            return match.group(0)
+        if not data or len(data) > MAX_INLINE_IMAGE_BYTES:
+            return match.group(0)
+        digest = hashlib.sha256(data).hexdigest()
+        cid = by_digest.get(digest)
+        if cid is None:
+            if len(parts) >= MAX_INLINE_IMAGES:
+                return match.group(0)
+            cid = make_msgid(idstring=f'img{len(parts) + 1}', domain=domain or 'echodesk.ge')[1:-1]
+            subtype = mime.split('/', 1)[1].replace('jpg', 'jpeg')
+            part = MIMEImage(data, _subtype=subtype)
+            part.add_header('Content-ID', f'<{cid}>')
+            part.add_header('Content-Disposition', 'inline', filename=f'image{len(parts) + 1}.{subtype}')
+            parts.append(part)
+            by_digest[digest] = cid
+        return f'{match.group(1)}{match.group(2)}cid:{cid}{match.group(2)}'
+
+    return _DATA_IMG_RE.sub(replace, html), parts
+
+
+def externalize_data_images(html: str, folder: str = 'email_signatures') -> str:
+    """Upload base64 ``data:`` images in a saved signature to public storage
+    and point the ``<img>`` at the public URL.
+
+    Signatures pasted from another mail client often carry the logo inline as
+    base64; stored as a URL they stay small, show in previews and in EchoDesk's
+    reader, and (should one slip through) ``inline_data_images`` still covers
+    sending. Undecodable or oversized images are left untouched; a storage
+    failure keeps the original HTML.
+    """
+    if not html or 'data:' not in html:
+        return html
+
+    def replace(match):
+        mime, payload = match.group(3).lower(), re.sub(r'\s+', '', match.group(4))
+        try:
+            data = base64.b64decode(payload, validate=True)
+        except (ValueError, base64.binascii.Error):
+            return match.group(0)
+        if not data or len(data) > MAX_INLINE_IMAGE_BYTES:
+            return match.group(0)
+        ext = mime.split('/', 1)[1].replace('jpeg', 'jpg')
+        digest = hashlib.sha256(data).hexdigest()[:16]
+        try:
+            path = default_storage.save(f'{folder}/{digest}.{ext}', ContentFile(data))
+            url = default_storage.url(path)
+        except Exception as exc:  # pragma: no cover - storage outage
+            logger.warning('Could not store signature image: %s', exc)
+            return match.group(0)
+        return f'{match.group(1)}{match.group(2)}{url}{match.group(2)}'
+
+    return _DATA_IMG_RE.sub(replace, html)
+
+
+def html_mime_part(html: str, domain: Optional[str] = None):
+    """The text/html part, wrapped in multipart/related with its inline images
+    when the HTML carries base64 ``data:`` images (see ``inline_data_images``)."""
+    html, images = inline_data_images(html, domain)
+    html_part = MIMEText(html, 'html', 'utf-8')
+    if not images:
+        return html_part
+    related = MIMEMultipart('related')
+    related.attach(html_part)
+    for image in images:
+        related.attach(image)
+    return related
+
+
 def wrap_html_email(body_html: str, signature_html: str = None) -> str:
     """
     Wrap HTML content in a proper email template with inline styles.
@@ -883,13 +983,14 @@ def send_email_smtp(connection, to_emails: List[str], cc_emails: List[str] = Non
     if body_html:
         final_body_html = wrap_html_email(body_html, signature_html_content)
 
-    # Create message body
+    # Create message body (base64 images -> inline cid parts, html_mime_part)
+    inline_domain = connection.email_address.rpartition('@')[2] or None
     if final_body_html and final_body_text:
         body_part = MIMEMultipart('alternative')
         body_part.attach(MIMEText(final_body_text, 'plain', 'utf-8'))
-        body_part.attach(MIMEText(final_body_html, 'html', 'utf-8'))
+        body_part.attach(html_mime_part(final_body_html, inline_domain))
     elif final_body_html:
-        body_part = MIMEText(final_body_html, 'html', 'utf-8')
+        body_part = html_mime_part(final_body_html, inline_domain)
     else:
         body_part = MIMEText(final_body_text or '', 'plain', 'utf-8')
 

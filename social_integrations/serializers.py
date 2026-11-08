@@ -665,7 +665,8 @@ class EmailThreadAssigneeSerializer(serializers.Serializer):
 
 class EmailThreadTicketBriefSerializer(serializers.Serializer):
     id = serializers.IntegerField()
-    title = serializers.CharField()
+    # null when the viewer cannot see the ticket's board (show the number only)
+    title = serializers.CharField(allow_null=True)
 
 
 class EmailMessageSerializer(serializers.ModelSerializer):
@@ -691,7 +692,8 @@ class EmailMessageSerializer(serializers.ModelSerializer):
         meta = self.context.get('email_thread_meta')
         if meta is None or key not in meta:
             from .email_threads import thread_meta
-            found = thread_meta([key]).get(key)
+            request = self.context.get('request')
+            found = thread_meta([key], getattr(request, 'user', None)).get(key)
             if meta is not None and found is not None:
                 meta[key] = found
             return found or {}
@@ -1382,6 +1384,11 @@ class EmailSignatureSerializer(serializers.ModelSerializer):
         if obj.created_by:
             return obj.created_by.get_full_name() or obj.created_by.email
         return None
+
+    def validate_signature_html(self, value):
+        # Base64 logos are uploaded and replaced by their public URL.
+        from .email_utils import externalize_data_images
+        return externalize_data_images(value or '')
 
 
 # =============================================================================

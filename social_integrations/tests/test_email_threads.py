@@ -205,3 +205,94 @@ class TestListAnnotationsAndViews(EmailThreadBase):
             EmailThreadTicket.objects.create(connection=self.conn, thread_id=m.thread_id,
                                              ticket=Ticket.objects.create(title=f'x{i}', created_by=self.admin))
         self.assertEqual(count(), baseline)
+
+
+class TestAssignHardening(EmailThreadBase):
+    """Review follow-ups: session kept, eligibility, bulk users, races."""
+
+    def test_reassign_keeps_running_session(self):
+        from django.utils import timezone
+        started = timezone.now()
+        ChatAssignment.objects.create(
+            platform='email', conversation_id='t-1', account_id=str(self.conn.id),
+            assigned_user=self.agent, status='in_session', session_started_at=started,
+        )
+        self.assertEqual(self.assign(self.admin, self.other.id).status_code, status.HTTP_200_OK)
+        row = ChatAssignment.objects.get(platform='email', conversation_id='t-1')
+        self.assertEqual(row.assigned_user, self.other)
+        self.assertEqual(row.status, 'in_session')
+        self.assertEqual(row.session_started_at, started)
+
+    def test_users_without_inbox_feature_not_assignable(self):
+        from users.models import User
+        self._feature_patcher.stop()  # swap the blanket "True" for a per-user rule
+
+        def has_feature(user, *args, **kwargs):
+            return user.email != 'thr-other@test.com'
+        try:
+            with patch.object(User, 'has_feature', autospec=True, side_effect=has_feature):
+                ids = {u['id'] for u in self.api_get(f'{USERS_URL}?connection_id={self.conn.id}',
+                                                     user=self.admin).json()}
+                self.assertIn(self.agent.id, ids)
+                self.assertNotIn(self.other.id, ids)
+                self.assertEqual(self.assign(self.admin, self.other.id).status_code, status.HTTP_400_BAD_REQUEST)
+        finally:
+            self._feature_patcher.start()
+
+    def test_assignable_users_query_count_is_flat(self):
+        def count():
+            with CaptureQueriesContext(connection) as ctx:
+                resp = self.api_get(f'{USERS_URL}?connection_id={self.conn.id}', user=self.admin)
+            self.assertEqual(resp.status_code, status.HTTP_200_OK)
+            return len(ctx.captured_queries)
+        baseline = count()
+        for i in range(10):
+            self.create_user(email=f'bulk-{i}@test.com')
+        self.assertEqual(count(), baseline)
+
+    def test_concurrent_insert_is_retried(self):
+        from django.db import IntegrityError
+        from social_integrations import views_email_threads as mod
+        real = mod._apply_assignment
+        calls = []
+
+        def flaky(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise IntegrityError('duplicate key')
+            return real(*args, **kwargs)
+
+        with patch.object(mod, '_apply_assignment', side_effect=flaky):
+            resp = self.assign(self.admin, self.agent.id)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(ChatAssignment.objects.get(platform='email', conversation_id='t-1').assigned_user, self.agent)
+
+
+class TestTicketVisibility(EmailThreadBase):
+    def setUp(self):
+        super().setUp()
+        from tickets.models import Board, TicketColumn
+        self.board = Board.objects.create(name='Private', created_by=self.admin)
+        self.board.board_users.add(self.admin)
+        self.column = TicketColumn.objects.create(board=self.board, name='Todo', position=0, created_by=self.admin)
+        self.ticket = Ticket.objects.create(title='Secret', column=self.column, created_by=self.admin)
+        EmailThreadTicket.objects.create(connection=self.conn, thread_id='t-1', ticket=self.ticket)
+
+    def chip(self, user):
+        rows = self.api_get(f'{LIST_URL}?lite=1&folder=INBOX', user=user).json()['results']
+        return next(r['ticket'] for r in rows if r['thread_id'] == 't-1')
+
+    def test_title_hidden_without_board_access(self):
+        self.assertEqual(self.chip(self.agent), {'id': self.ticket.id, 'title': None})
+        self.assertEqual(self.chip(self.admin), {'id': self.ticket.id, 'title': 'Secret'})
+
+    @patch(FEATURE, return_value=True)
+    def test_create_ticket_rejects_inaccessible_column(self, _feature):
+        self.create_email_message(connection=self.conn, thread_id='t-9', subject='Other')
+        resp = self.api_post(TICKET_URL, {'connection_id': self.conn.id, 'thread_id': 't-9',
+                                          'column_id': self.column.id}, user=self.agent)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        resp = self.api_post(TICKET_URL, {'connection_id': self.conn.id, 'thread_id': 't-9',
+                                          'column_id': self.column.id}, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)

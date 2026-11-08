@@ -16,8 +16,10 @@ from rest_framework.response import Response
 
 from tenants.permissions import has_subscription_feature
 
-from .email_threads import find_thread_assignment, ticket_brief, user_brief
-from .models import ChatAssignment, EmailConnection, EmailMessage, EmailThreadTicket
+from .email_threads import TicketVisibility, ticket_brief, user_brief
+from .models import (
+    ChatAssignment, EmailConnection, EmailConnectionUserAssignment, EmailMessage, EmailThreadTicket,
+)
 from .permissions import CanViewSocialMessages
 from .serializers import (
     EmailThreadAssigneeSerializer,
@@ -30,7 +32,6 @@ from .views import (
     EMAIL_ACCESS_RULES_DOC,
     _broadcast_assignment_change,
     _can_access_email_connection,
-    _email_connection_access,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,20 +58,51 @@ def _is_privileged(user):
     return bool(user.is_staff or user.is_superuser or getattr(user, 'role', None) == 'admin')
 
 
-def _can_use_mailbox(user, conn):
-    allowed = _email_connection_access(user)
-    return allowed is None or conn.id in allowed
+def _mailbox_assignee_ids(conn):
+    return set(
+        EmailConnectionUserAssignment.objects.filter(connection=conn).values_list('user_id', flat=True)
+    )
+
+
+def _can_be_assigned(user, subscription_keys, mailbox_assignee_ids):
+    """May ``user`` hold a thread of this mailbox?
+
+    They need the social_integrations feature (what ``CanViewSocialMessages``
+    checks, so they can open the inbox the notification links to) and access
+    to the mailbox (``EMAIL_ACCESS_RULES_DOC``: privileged users see every
+    mailbox; a mailbox with no user assignments is shared).
+    """
+    if not user.has_feature('social_integrations', subscription_keys):
+        return False
+    if (
+        user.is_superuser or user.is_staff or getattr(user, 'role', None) == 'admin'
+        or user.has_permission('manage_social_connections')
+    ):
+        return True
+    return not mailbox_assignee_ids or user.id in mailbox_assignee_ids
 
 
 def _assignable_users(conn):
-    from users.models import User
-    users = User.objects.filter(is_active=True).order_by('first_name', 'last_name', 'email')
-    return [u for u in users if _can_use_mailbox(u, conn)]
+    """Every eligible user in a fixed number of queries (no per-user lookups)."""
+    from users.models import User, current_subscription_feature_keys
+    subscription_keys = set(current_subscription_feature_keys())
+    assignee_ids = _mailbox_assignee_ids(conn)
+    users = (
+        User.objects.filter(is_active=True)
+        .prefetch_related('tenant_groups__features')
+        .order_by('first_name', 'last_name', 'email')
+    )
+    return [u for u in users if _can_be_assigned(u, subscription_keys, assignee_ids)]
+
+
+def _is_assignable(user, conn):
+    from users.models import current_subscription_feature_keys
+    return _can_be_assigned(user, set(current_subscription_feature_keys()), _mailbox_assignee_ids(conn))
 
 
 @extend_schema(
     summary='Users an email thread can be assigned to',
-    description='Active users who can open this mailbox. ' + EMAIL_ACCESS_RULES_DOC,
+    description='Active users who can open the inbox (social_integrations feature) and this mailbox. ' + EMAIL_ACCESS_RULES_DOC,
     parameters=[OpenApiParameter('connection_id', OpenApiTypes.INT, OpenApiParameter.QUERY, required=True)],
     responses={200: EmailThreadAssigneeSerializer(many=True)},
     tags=TAGS,
@@ -111,6 +143,60 @@ def _notify_assignee(assignee, actor, conn, thread_id):
         logger.exception('email thread assignment notification failed')
 
 
+def _apply_assignment(request, conn, thread_id, target):
+    """Write the assignment under a row lock.
+
+    Returns a Response on refusal, ``False`` when nothing changed and ``True``
+    otherwise. A thread already ``in_session`` (a running chat session from
+    the unified inbox) keeps its status and session timestamps when it is
+    handed to someone else; only a fresh row starts as ``active``.
+    """
+    with transaction.atomic():
+        current = (
+            ChatAssignment.objects.select_for_update()
+            .filter(platform='email', account_id=str(conn.id), conversation_id=thread_id)
+            .order_by('-updated_at').first()
+        )
+        holder_id = (
+            current.assigned_user_id
+            if current and current.status in ('active', 'in_session') else None
+        )
+        if holder_id and holder_id != request.user.id and not _is_privileged(request.user):
+            return _error('Only the assigned agent or an admin can reassign this conversation',
+                          status.HTTP_403_FORBIDDEN)
+
+        if target is None:
+            if current is not None:
+                snapshot = {
+                    'platform': 'email', 'conversation_id': current.conversation_id,
+                    'account_id': current.account_id, 'status': None,
+                    'session_started_at': None, 'session_ended_at': None,
+                }
+                ChatAssignment.objects.filter(
+                    platform='email', account_id=str(conn.id), conversation_id=thread_id,
+                ).delete()
+                transaction.on_commit(lambda: _broadcast_assignment_change(request, snapshot))
+            return True
+
+        if holder_id == target.id:
+            return False
+
+        if current is None:
+            current = ChatAssignment(
+                platform='email', conversation_id=thread_id, account_id=str(conn.id), status='active',
+            )
+        elif current.status != 'in_session':
+            current.status = 'active'
+            current.session_started_at = None
+            current.session_ended_at = None
+        current.assigned_user = target
+        with transaction.atomic():  # savepoint: a duplicate insert raises cleanly
+            current.save()
+        assignment = current
+        transaction.on_commit(lambda: _broadcast_assignment_change(request, assignment))
+    return True
+
+
 @extend_schema(
     summary='Assign an email thread',
     description=(
@@ -142,45 +228,20 @@ def email_thread_assign(request):
     if user_id is not None:
         from users.models import User
         target = User.objects.filter(id=user_id, is_active=True).first()
-        if target is None or not _can_use_mailbox(target, conn):
+        if target is None or not _is_assignable(target, conn):
             return _error('This user cannot be assigned to this mailbox')
 
-    with transaction.atomic():
-        current = find_thread_assignment(conn.id, thread_id)
-        holder_id = (
-            current.assigned_user_id
-            if current and current.status in ('active', 'in_session') else None
-        )
-        if holder_id and holder_id != request.user.id and not _is_privileged(request.user):
-            return _error('Only the assigned agent or an admin can reassign this conversation',
-                          status.HTTP_403_FORBIDDEN)
-        if target is not None and holder_id == target.id:
-            return Response({'assignee': user_brief(target)})
-
-        if target is None:
-            if current is not None:
-                snapshot = {
-                    'platform': 'email', 'conversation_id': current.conversation_id,
-                    'account_id': current.account_id, 'status': None,
-                    'session_started_at': None, 'session_ended_at': None,
-                }
-                ChatAssignment.objects.filter(
-                    platform='email', account_id=str(conn.id), conversation_id=thread_id,
-                ).delete()
-                transaction.on_commit(lambda: _broadcast_assignment_change(request, snapshot))
-            return Response({'assignee': None})
-
-        if current is None:
-            current = ChatAssignment(
-                platform='email', conversation_id=thread_id, account_id=str(conn.id),
-            )
-        current.assigned_user = target
-        current.status = 'active'
-        current.session_started_at = None
-        current.session_ended_at = None
-        current.save()
-        assignment = current
-        transaction.on_commit(lambda: _broadcast_assignment_change(request, assignment))
+    try:
+        result = _apply_assignment(request, conn, thread_id, target)
+    except IntegrityError:
+        # A parallel assign inserted the row first: retry against it.
+        result = _apply_assignment(request, conn, thread_id, target)
+    if isinstance(result, Response):
+        return result
+    if target is None:
+        return Response({'assignee': None})
+    if not result:  # already held by the target
+        return Response({'assignee': user_brief(target)})
 
     if target.id != request.user.id:
         _notify_assignee(target, request.user, conn, thread_id)
@@ -234,9 +295,9 @@ def email_thread_create_ticket(request):
         return _error('Mailbox not found', status.HTTP_404_NOT_FOUND)
     thread_id = data['thread_id']
 
-    existing = EmailThreadTicket.objects.filter(connection=conn, thread_id=thread_id).select_related('ticket').first()
+    existing = EmailThreadTicket.objects.filter(connection=conn, thread_id=thread_id).select_related('ticket', 'ticket__column').first()
     if existing:
-        return Response({'ticket': ticket_brief(existing.ticket), 'created': False})
+        return Response({'ticket': ticket_brief(existing.ticket, TicketVisibility(request.user)(existing.ticket)), 'created': False})
 
     messages = _thread_messages(conn, thread_id)
     source = (
@@ -249,7 +310,10 @@ def email_thread_create_ticket(request):
     column = None
     column_id = data.get('column_id')
     if column_id:
-        column = TicketColumn.objects.filter(id=column_id).first()
+        from tickets.views import accessible_boards
+        column = TicketColumn.objects.filter(
+            id=column_id, board__in=accessible_boards(request.user),
+        ).first()
         if column is None:
             return _error('Column not found')
 
@@ -272,9 +336,9 @@ def email_thread_create_ticket(request):
             )
     except IntegrityError:
         # Someone linked the thread in parallel: return theirs.
-        existing = EmailThreadTicket.objects.filter(connection=conn, thread_id=thread_id).select_related('ticket').first()
+        existing = EmailThreadTicket.objects.filter(connection=conn, thread_id=thread_id).select_related('ticket', 'ticket__column').first()
         if existing:
-            return Response({'ticket': ticket_brief(existing.ticket), 'created': False})
+            return Response({'ticket': ticket_brief(existing.ticket, TicketVisibility(request.user)(existing.ticket)), 'created': False})
         raise
     open_time_log(ticket, ticket.column, request.user)
     logger.info('Ticket %s created from email thread %s/%s at %s', ticket.id, conn.id, thread_id, timezone.now())

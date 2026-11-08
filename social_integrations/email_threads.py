@@ -23,14 +23,45 @@ def user_brief(user):
     return {'id': user.id, 'name': name, 'initials': initials, 'email': user.email}
 
 
-def ticket_brief(ticket):
+def ticket_brief(ticket, visible=True):
+    """``{id, title}``; the title is withheld (None) when the viewer cannot see
+    the ticket's board, so a restricted board's ticket only shows its number."""
     if ticket is None:
         return None
-    return {'id': ticket.id, 'title': ticket.title}
+    return {'id': ticket.id, 'title': ticket.title if visible else None}
 
 
-def thread_meta(pairs):
-    """``{(connection_id, thread_id): {'assignee': …, 'ticket': …}}`` in two queries."""
+class TicketVisibility:
+    """Per-request "may this user see the ticket's title?" check.
+
+    Staff and superusers see every ticket; others see tickets they created or
+    whose board is in ``tickets.views.accessible_boards`` (queried once,
+    lazily, only when a ticket is actually shown). ``user=None`` means no
+    viewer context (internal use): everything is visible.
+    """
+
+    def __init__(self, user):
+        self.user = user
+        self._board_ids = None
+
+    def __call__(self, ticket):
+        user = self.user
+        if user is None or user.is_staff or user.is_superuser:
+            return True
+        if ticket.created_by_id == user.id:
+            return True
+        column = ticket.column
+        if column is None:
+            return True
+        if self._board_ids is None:
+            from tickets.views import accessible_boards
+            self._board_ids = set(accessible_boards(user).values_list('id', flat=True))
+        return column.board_id in self._board_ids
+
+
+def thread_meta(pairs, user=None):
+    """``{(connection_id, thread_id): {'assignee': …, 'ticket': …}}`` in two queries
+    (plus one for the viewer's boards when a ticket title has to be checked)."""
     pairs = {(c, t) for c, t in pairs if c and t}
     if not pairs:
         return {}
@@ -52,11 +83,12 @@ def thread_meta(pairs):
 
     links = EmailThreadTicket.objects.filter(
         connection_id__in=conn_ids, thread_id__in=thread_ids,
-    ).select_related('ticket')
+    ).select_related('ticket', 'ticket__column')
+    visible = TicketVisibility(user)
     for link in links:
         key = (link.connection_id, link.thread_id)
         if key in out:
-            out[key]['ticket'] = ticket_brief(link.ticket)
+            out[key]['ticket'] = ticket_brief(link.ticket, visible(link.ticket))
     return out
 
 

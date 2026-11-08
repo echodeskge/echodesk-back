@@ -422,12 +422,14 @@ class User(AbstractBaseUser):
         """Alias for get_group_permissions for consistency"""
         return self.get_group_permissions()
 
-    def has_feature(self, feature_key):
+    def has_feature(self, feature_key, subscription_feature_keys=None):
         """
         Check if user has access to a specific feature
 
         Args:
             feature_key: The feature key string (e.g., 'ticket_management', 'whatsapp_integration')
+            subscription_feature_keys: optional precomputed tenant subscription
+                keys (see ``get_feature_keys``) when checking many users
 
         Returns:
             bool: True if user has access to the feature
@@ -437,7 +439,7 @@ class User(AbstractBaseUser):
             - All users in a tenant get the package features
             - Staff/superuser status does NOT bypass tenant subscription limits
         """
-        return feature_key in self.get_feature_keys()
+        return feature_key in self.get_feature_keys(subscription_feature_keys)
 
     def get_feature_keys(self, subscription_feature_keys=None):
         """
