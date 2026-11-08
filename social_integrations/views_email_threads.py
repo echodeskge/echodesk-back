@@ -264,11 +264,26 @@ def _ticket_description(message):
     return header + '<hr>' + body
 
 
+def _customer_id_for_sender(message):
+    """Id of the one ``Client`` whose email matches the customer message's
+    sender (case-insensitive), or None when none or several match. A thread
+    with only business messages has no customer sender."""
+    from .models import Client
+
+    email = (message.from_email or '').strip()
+    if message.is_from_business or not email:
+        return None
+    ids = list(Client.objects.filter(email__iexact=email).values_list('id', flat=True)[:2])
+    return ids[0] if len(ids) == 1 else None
+
+
 @extend_schema(
     summary='Create a ticket from an email thread',
     description=(
         'Creates a ticket from the conversation (title = subject, description = the '
-        'latest customer message and its sender) and links it to the thread. '
+        'latest customer message and its sender) and links it to the thread. The '
+        'ticket\'s customer is the client whose email matches that sender, when exactly '
+        'one does. '
         'Returns 200 with the existing ticket when the thread already has one. '
         'Needs the ticket_management feature and the create_tickets permission.'
     ),
@@ -328,6 +343,7 @@ def email_thread_create_ticket(request):
                 description_format='html',
                 column=column,
                 created_by=request.user,
+                customer_id=_customer_id_for_sender(source),
             )
             ticket._current_user = request.user
             ticket.save()
