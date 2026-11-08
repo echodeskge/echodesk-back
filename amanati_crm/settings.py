@@ -412,31 +412,30 @@ CORS_ALLOWED_ORIGIN_REGEXES = [
 
 # CORS configuration for multi-tenant setup
 CORS_ALLOW_CREDENTIALS = True
-CORS_ALLOW_ALL_HEADERS = True
-CORS_ALLOWED_HEADERS = [
-    'accept',
-    'accept-encoding',
-    'authorization',
-    'content-type',
-    'dnt',
-    'origin',
-    'user-agent',
-    'x-csrftoken',
-    'x-requested-with',
+
+# django-cors-headers reads CORS_ALLOW_HEADERS / CORS_ALLOW_METHODS. The old
+# CORS_ALLOW_ALL_HEADERS / CORS_ALLOWED_HEADERS / CORS_ALLOWED_METHODS names were
+# never read by the library, so only its defaults applied. These keep the
+# library defaults and add the custom headers the web app sends cross-origin.
+from corsheaders.defaults import default_headers  # noqa: E402
+
+CORS_ALLOW_HEADERS = (
+    *default_headers,
     'x-tenant-subdomain',
     'x-tenant-domain',
     'cache-control',
-]
+    'dnt',
+    'x-client-mutation',  # tickets realtime: echo suppression of own mutations
+)
 
-# Allow all HTTP methods
-CORS_ALLOWED_METHODS = [
+CORS_ALLOW_METHODS = (
     'DELETE',
     'GET',
     'OPTIONS',
     'PATCH',
     'POST',
     'PUT',
-]
+)
 
 # Preflight cache time
 CORS_PREFLIGHT_MAX_AGE = 86400
