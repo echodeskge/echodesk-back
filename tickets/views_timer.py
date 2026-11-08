@@ -22,7 +22,7 @@ from . import timer
 from .models import TicketTimeEntry
 from .serializers_timer import (
     CurrentTimerSerializer, TicketTimeEntrySerializer, TicketTimerStateSerializer,
-    TimerConflictSerializer, TimerStartRequestSerializer,
+    TimerConflictSerializer, TimerStartSerializer,
 )
 
 _ID_PARAM = OpenApiParameter('id', OpenApiTypes.STR, OpenApiParameter.PATH)
@@ -57,7 +57,7 @@ class TicketTimerViewSet(viewsets.ViewSet):
     @extend_schema(
         operation_id='tickets_timer_start',
         parameters=[_ID_PARAM],
-        request=TimerStartRequestSerializer,
+        request=TimerStartSerializer,
         responses={
             200: OpenApiResponse(TicketTimeEntrySerializer, description='Already running on this ticket'),
             201: TicketTimeEntrySerializer,
@@ -68,7 +68,7 @@ class TicketTimerViewSet(viewsets.ViewSet):
     @action(detail=True, methods=['post'])
     def start(self, request, id=None):
         ticket = self._ticket(request, id)
-        body = TimerStartRequestSerializer(data=request.data or {})
+        body = TimerStartSerializer(data=request.data or {})
         body.is_valid(raise_exception=True)
         try:
             entry, created = timer.start(request.user, ticket, switch=body.validated_data['switch'])

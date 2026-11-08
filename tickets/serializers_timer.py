@@ -33,7 +33,7 @@ class TicketTimeEntrySerializer(serializers.ModelSerializer):
         return user_brief(u.pk, u.first_name, u.last_name, u.email)
 
 
-class TimerStartRequestSerializer(serializers.Serializer):
+class TimerStartSerializer(serializers.Serializer):
     switch = serializers.BooleanField(
         required=False, default=False,
         help_text='Stop the timer running on another ticket and start this one.',
