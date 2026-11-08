@@ -238,6 +238,23 @@ class Ticket(models.Model):
         blank=True,
         help_text='Due date for payment'
     )
+    # Task due date (separate from payment_due_date, which keeps its payment
+    # meaning). "Overdue" is computed against tickets_today() (Asia/Tbilisi).
+    due_date = models.DateField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text='Task due date'
+    )
+    # Customer (social_integrations.Client) this ticket is about.
+    customer = models.ForeignKey(
+        'social_integrations.Client',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='tickets',
+        help_text='Customer (client) this ticket is about'
+    )
     metadata = models.JSONField(null=True, blank=True, help_text='Additional metadata')
 
     class Meta:
@@ -289,6 +306,17 @@ class Ticket(models.Model):
             return False
         from django.utils import timezone
         return timezone.now().date() > self.payment_due_date
+
+    @property
+    def is_overdue_task(self):
+        """True when the task due date has passed (Tbilisi calendar) and the
+        ticket is not in a closed-status column."""
+        if not self.due_date:
+            return False
+        if self.column_id and self.column.is_closed_status:
+            return False
+        from tickets.dates import tickets_today
+        return self.due_date < tickets_today()
 
     def add_payment(self, amount, user=None):
         """Add a payment to this ticket."""
@@ -374,6 +402,19 @@ class ChecklistItem(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE
     )
+    checked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='+',
+        help_text='User who last checked this item'
+    )
+    checked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text='When this item was last checked'
+    )
 
     class Meta:
         ordering = ['position', 'created_at']
@@ -397,6 +438,10 @@ class TicketComment(models.Model):
     ticket = models.ForeignKey(Ticket, related_name='comments', on_delete=models.CASCADE)
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     comment = models.TextField()
+    # Comments are internal notes for now (public replies come later). The DB
+    # column also carries a permanent DEFAULT true (migration 0041) so older
+    # code that doesn't know the column can still insert rows.
+    is_internal = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -566,6 +611,11 @@ class Board(models.Model):
     name = models.CharField(max_length=255)
     description = models.TextField(blank=True, null=True)
     is_default = models.BooleanField(default=False)
+    # Display colour and sidebar position. Both carry permanent DB defaults
+    # (migration 0041) so older code can insert boards without them. Ordering
+    # by (position, name) happens in querysets; Meta.ordering stays ['name'].
+    color = models.CharField(max_length=7, default='#3b82f6')
+    position = models.PositiveIntegerField(default=0)
 
     # Users who can create orders on this board
     order_users = models.ManyToManyField(
@@ -1134,3 +1184,61 @@ class BoardTelegramConnection(models.Model):
             return signer.unsign(self.bot_token)
         except BadSignature:
             return None
+
+
+class TicketTimeEntry(models.Model):
+    """A personal timer interval: one user working on one ticket.
+
+    At most one running entry (ended_at IS NULL) per user, enforced by a
+    partial unique constraint. ``user`` is SET_NULL so deleting a user keeps
+    their logged time.
+    """
+    ticket = models.ForeignKey(
+        Ticket,
+        on_delete=models.CASCADE,
+        related_name='time_entries'
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='ticket_time_entries'
+    )
+    started_at = models.DateTimeField(default=timezone.now)
+    ended_at = models.DateTimeField(null=True)
+    duration_seconds = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-started_at']
+        indexes = [
+            models.Index(fields=['ticket', '-started_at'], name='ticket_time_entry_tkt_idx'),
+            models.Index(fields=['user', 'ended_at'], name='ticket_time_entry_usr_idx'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user'],
+                condition=models.Q(ended_at__isnull=True),
+                name='tickets_one_running_timer_per_user',
+            ),
+        ]
+
+    def __str__(self):
+        state = 'running' if self.ended_at is None else f'{self.duration_seconds}s'
+        return f'Timer {self.user_id} on #{self.ticket_id} ({state})'
+
+    @property
+    def is_running(self):
+        return self.ended_at is None
+
+    def stop(self, now=None, save=True):
+        """Stop a running entry: set ended_at and duration_seconds
+        (whole seconds, floored, never negative). No-op if already stopped."""
+        if self.ended_at is not None:
+            return self
+        now = now or timezone.now()
+        self.ended_at = now
+        self.duration_seconds = max(0, int((now - self.started_at).total_seconds()))
+        if save:
+            self.save(update_fields=['ended_at', 'duration_seconds'])
+        return self

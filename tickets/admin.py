@@ -10,7 +10,8 @@ import csv
 from decimal import Decimal
 from .models import (
     Ticket, Tag, TicketComment, TicketColumn, ChecklistItem, Board, TicketTimeLog, TicketPayment,
-    ItemList, ListItem, TicketForm, TicketFormSubmission, TicketAttachment, TicketHistory
+    ItemList, ListItem, TicketForm, TicketFormSubmission, TicketAttachment, TicketHistory,
+    TicketTimeEntry,
 )
 
 
@@ -25,7 +26,7 @@ class BoardAdmin(admin.ModelAdmin):
 
     fieldsets = (
         ('Basic Information', {
-            'fields': ('name', 'description', 'is_default')
+            'fields': ('name', 'description', 'is_default', 'color', 'position')
         }),
         ('Payment Summary', {
             'fields': ('payment_summary_detailed',),
@@ -300,7 +301,7 @@ class TicketAdmin(admin.ModelAdmin):
         'assigned_to__email', 'assigned_to__first_name',
         'assigned_to__last_name'
     )
-    raw_id_fields = ('created_by', 'assigned_to')
+    raw_id_fields = ('created_by', 'assigned_to', 'customer')
     filter_horizontal = ('tags',)
     date_hierarchy = 'created_at'
     ordering = ('-created_at',)
@@ -309,14 +310,14 @@ class TicketAdmin(admin.ModelAdmin):
 
     fieldsets = (
         ('Basic Information', {
-            'fields': ('title', 'description', 'rich_description', 'description_format', 'column', 'priority', 'position_in_column', 'is_order')
+            'fields': ('title', 'description', 'rich_description', 'description_format', 'column', 'priority', 'position_in_column', 'is_order', 'due_date')
         }),
         ('Payment Information', {
             'fields': ('price', 'currency', 'is_paid', 'amount_paid', 'payment_due_date'),
             'classes': ('collapse',)
         }),
         ('Assignment', {
-            'fields': ('created_by', 'assigned_to', 'tags')
+            'fields': ('created_by', 'assigned_to', 'customer', 'tags')
         }),
         ('Timestamps', {
             'fields': ('created_at', 'updated_at'),
@@ -1091,4 +1092,21 @@ class TicketHistoryAdmin(admin.ModelAdmin):
 
     def has_change_permission(self, request, obj=None):
         """Don't allow editing history entries."""
+        return False
+
+
+@admin.register(TicketTimeEntry)
+class TicketTimeEntryAdmin(admin.ModelAdmin):
+    """Read-only admin for personal timer entries."""
+    list_display = ('ticket', 'user', 'started_at', 'ended_at', 'duration_seconds')
+    list_filter = ('started_at', 'ended_at')
+    search_fields = ('ticket__title', 'user__email')
+    raw_id_fields = ('ticket', 'user')
+    readonly_fields = ('ticket', 'user', 'started_at', 'ended_at', 'duration_seconds', 'created_at')
+    ordering = ('-started_at',)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
         return False
