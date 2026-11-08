@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from . import views, admin_views, ai_views, telegram_views, legal_views, views_email_threads
+from . import views, admin_views, ai_views, telegram_views, legal_views, views_email_threads, views_conversation_tickets
 
 # Create a router and register our viewsets with it
 router = DefaultRouter()
@@ -92,6 +92,9 @@ urlpatterns = [
     path('email/signature/', views.email_signature_view, name='email_signature'),
 
     # Email User Assignment endpoints
+    path('conversations/create-ticket/', views_conversation_tickets.conversation_create_ticket,
+         name='conversation_create_ticket'),
+    path('conversations/tickets/', views_conversation_tickets.conversation_tickets, name='conversation_tickets'),
     path('email/assignments/', views.email_assignments_list, name='email_assignments_list'),
     path('email/assignments/create/', views.email_assignment_create, name='email_assignment_create'),
     path('email/assignments/<int:assignment_id>/', views.email_assignment_delete, name='email_assignment_delete'),

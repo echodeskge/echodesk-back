@@ -1466,6 +1466,38 @@ class EmailThreadTicket(models.Model):
         return f"{self.connection_id}/{self.thread_id} -> ticket {self.ticket_id}"
 
 
+class ConversationTicket(models.Model):
+    """Ticket created from a chat conversation (one per conversation).
+
+    Addressed by the same (platform, conversation_id, account_id) triple as
+    ChatAssignment; ``conversation_id`` is stored in its assignment form
+    (``conversation_keys.assignment_conversation_id``). Email threads use
+    ``EmailThreadTicket`` instead.
+    """
+
+    platform = models.CharField(max_length=20)
+    conversation_id = models.CharField(max_length=255)
+    account_id = models.CharField(max_length=255)
+    ticket = models.ForeignKey(
+        'tickets.Ticket', on_delete=models.CASCADE, related_name='conversations',
+    )
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['platform', 'conversation_id', 'account_id'], name='uniq_conversation_ticket',
+            ),
+        ]
+        verbose_name = "Conversation Ticket"
+
+    def __str__(self):
+        return f"{self.platform}/{self.account_id}/{self.conversation_id} -> ticket {self.ticket_id}"
+
+
 class TikTokShopAccount(models.Model):
     """Stores TikTok Shop seller account connection details for a tenant"""
 
@@ -1839,6 +1871,7 @@ class Client(models.Model):
     email = models.EmailField(blank=True, null=True, help_text="Optional email address")
     phone = models.CharField(max_length=50, blank=True, help_text="Optional phone number")
     notes = models.TextField(blank=True, help_text="Internal notes about this client")
+    tags = models.JSONField(default=list, blank=True, help_text="Free-form labels shown on the client (list of strings)")
     profile_picture = models.URLField(
         max_length=500,
         blank=True,

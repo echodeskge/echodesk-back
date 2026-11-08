@@ -1500,6 +1500,10 @@ class SocialClientCustomFieldValueSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'field_name', 'field_label', 'field_type']
 
 
+CLIENT_TAGS_MAX = 30
+CLIENT_TAG_MAX_LENGTH = 40
+
+
 class SocialClientSerializer(serializers.ModelSerializer):
     """Serializer for clients with nested social accounts and custom fields"""
     social_accounts = SocialAccountSerializer(many=True, read_only=True)
@@ -1511,7 +1515,7 @@ class SocialClientSerializer(serializers.ModelSerializer):
     class Meta:
         model = SocialClient
         fields = [
-            'id', 'name', 'email', 'phone', 'notes', 'profile_picture',
+            'id', 'name', 'email', 'phone', 'notes', 'tags', 'profile_picture',
             'social_accounts', 'custom_fields',
             'created_by', 'created_by_name',
             'created_at', 'updated_at',
@@ -1635,7 +1639,7 @@ class SocialClientListSerializer(serializers.ModelSerializer):
     class Meta:
         model = SocialClient
         fields = [
-            'id', 'name', 'email', 'phone', 'profile_picture',
+            'id', 'name', 'email', 'phone', 'tags', 'profile_picture',
             'social_accounts_count', 'platforms', 'social_accounts',
             'created_at', 'updated_at',
             # Booking fields
@@ -1693,11 +1697,28 @@ class SocialClientCreateSerializer(serializers.ModelSerializer):
         model = SocialClient
         fields = [
             'id',
-            'name', 'email', 'phone', 'notes', 'profile_picture', 'custom_fields',
+            'name', 'email', 'phone', 'notes', 'tags', 'profile_picture', 'custom_fields',
             # Booking fields
             'first_name', 'last_name', 'is_booking_enabled', 'password'
         ]
         read_only_fields = ['id']
+
+    tags = serializers.ListField(
+        child=serializers.CharField(max_length=CLIENT_TAG_MAX_LENGTH, allow_blank=True),
+        required=False,
+        max_length=CLIENT_TAGS_MAX,
+        help_text=f"Labels for the client (at most {CLIENT_TAGS_MAX}, each up to {CLIENT_TAG_MAX_LENGTH} characters)",
+    )
+
+    def validate_tags(self, value):
+        # Trim, drop blanks and case-insensitive duplicates, keep the order.
+        seen, out = set(), []
+        for tag in value:
+            tag = ' '.join(str(tag).split())
+            if tag and tag.lower() not in seen:
+                seen.add(tag.lower())
+                out.append(tag)
+        return out
 
     def validate(self, attrs):
         # If enabling booking, require email and password
@@ -2034,3 +2055,40 @@ class EmailThreadCreateTicketSerializer(serializers.Serializer):
 class EmailThreadCreateTicketResponseSerializer(serializers.Serializer):
     ticket = EmailThreadTicketBriefSerializer()
     created = serializers.BooleanField()
+
+
+# =============================================================================
+# Tickets from chat conversations
+# =============================================================================
+
+CONVERSATION_TICKET_PLATFORMS = ('facebook', 'instagram', 'whatsapp', 'telegram', 'widget')
+
+
+class ConversationCreateTicketSerializer(serializers.Serializer):
+    # Plain string (validated below) so the schema doesn't grow another
+    # colliding "platform" enum.
+    platform = serializers.CharField(
+        max_length=20, help_text='facebook, instagram, whatsapp, telegram or widget (email threads use their own endpoint)',
+    )
+    conversation_id = serializers.CharField(max_length=255)
+    account_id = serializers.CharField(max_length=255)
+    column_id = serializers.IntegerField(required=False, allow_null=True)
+
+    def validate_platform(self, value):
+        if value not in CONVERSATION_TICKET_PLATFORMS:
+            raise serializers.ValidationError('Unsupported platform')
+        return value
+
+
+class ConversationCreateTicketResponseSerializer(serializers.Serializer):
+    ticket = EmailThreadTicketBriefSerializer()
+    created = serializers.BooleanField()
+
+
+class LinkedTicketSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    # title / column are null when the viewer cannot see the ticket's board
+    title = serializers.CharField(allow_null=True)
+    column = serializers.CharField(allow_null=True)
+    platform = serializers.CharField()
+    created_at = serializers.DateTimeField()
