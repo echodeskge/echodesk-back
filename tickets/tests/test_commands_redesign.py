@@ -327,6 +327,13 @@ class TestDemoSeedRedesignData(TicketTestCase):
 
         self.assertTrue(TicketComment.objects.filter(is_internal=True).exists())
         self.assertTrue(TicketComment.objects.filter(is_internal=False).exists())
+        # Backdated comments must not read as "edited" in the activity feed
+        # (edited = updated_at - created_at > 2s).
+        from django.db.models import F
+        self.assertFalse(
+            TicketComment.objects.exclude(updated_at=F('created_at')).exists(),
+            'seeded comments keep updated_at == created_at',
+        )
 
         linked = tickets.filter(customer__isnull=False)
         self.assertEqual(linked.count(), 1)

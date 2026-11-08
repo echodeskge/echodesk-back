@@ -448,7 +448,10 @@ class DemoSeeder:
                 # Mixed internal / not-internal comments (internal is the default).
                 comment = TicketComment.objects.create(ticket=ticket, user=author, comment=text,
                                                        is_internal=(i + c) % 3 != 1)
-                _backdate(comment, created_at=created_at + timedelta(hours=c + 1))
+                # updated_at too: the activity feed marks a comment "edited" when
+                # updated_at - created_at > 2s.
+                commented_at = created_at + timedelta(hours=c + 1)
+                _backdate(comment, created_at=commented_at, updated_at=commented_at)
 
             for p in range(i % 5 if board is support else 0):
                 checked = p < 2
