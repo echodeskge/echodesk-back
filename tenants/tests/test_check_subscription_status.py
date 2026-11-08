@@ -3,7 +3,7 @@ Tests for the check_subscription_status management command (run nightly by
 Celery beat). It used to crash with a FieldError on select_related('package')
 after subscriptions moved from packages to feature sets.
 """
-from datetime import timedelta
+from datetime import datetime, time, timedelta
 from io import StringIO
 from unittest import mock
 
@@ -36,7 +36,11 @@ class TestCheckSubscriptionStatus(EchoDeskTenantTestCase):
         return out.getvalue()
 
     def test_runs_without_error_and_sends_reminder(self):
-        self._subscription(expires_in_days=7, expires_at=timezone.now() + timedelta(days=7, hours=1))
+        # Noon, 7 days ahead: "now + 7 days + 1 hour" rolled into the next day
+        # when the suite ran after 23:00 UTC, and the reminder didn't match.
+        target = timezone.localdate() + timedelta(days=7)
+        expires_at = timezone.make_aware(datetime.combine(target, time(12, 0)))
+        self._subscription(expires_in_days=7, expires_at=expires_at)
         output = self._run()
         self.assertIn('Subscription Status Check Complete', output)
         self.assertEqual(len(mail.outbox), 1)
@@ -81,3 +85,4 @@ class TestCheckSubscriptionStatus(EchoDeskTenantTestCase):
     def test_groot_and_amanati_are_exempt(self):
         self.assertIn('groot', Command.EXEMPT_TENANTS)
         self.assertIn('amanati', Command.EXEMPT_TENANTS)
+
