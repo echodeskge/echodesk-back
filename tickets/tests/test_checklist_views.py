@@ -171,3 +171,64 @@ class TestChecklistMultiAssigneeDistinct(TicketTestCase):
         stranger = self.create_user(email='chk-stranger@test.com')
         resp = self.api_get(f'/api/checklist-items/{item.id}/', user=stranger)
         self.assertEqual(resp.status_code, 404)
+
+
+class TestChecklistToggleAudit(TicketTestCase):
+    """BE-02 / A11: toggle_check records who checked an item and when."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='chk-audit-admin@test.com')
+        self.agent = self.create_user(email='chk-audit-agent@test.com', first_name='Nino', last_name='B')
+        _, col1, _, _ = self.setup_board_with_columns(admin=self.admin)
+        self.ticket = self.create_ticket(title='T', column=col1, created_by=self.agent)
+        self.item = self.create_checklist_item(self.ticket, 'Audit', created_by=self.agent)
+
+    def toggle(self, user):
+        return self.api_patch(f'/api/checklist-items/{self.item.id}/toggle_check/', user=user)
+
+    def test_check_sets_checked_by_and_at(self):
+        resp = self.toggle(self.agent)
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data['is_checked'])
+        self.assertEqual(resp.data['checked_by'], {'id': self.agent.id, 'name': 'Nino B'})
+        self.assertIsNotNone(resp.data['checked_at'])
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.checked_by_id, self.agent.id)
+        self.assertIsNotNone(self.item.checked_at)
+
+    def test_uncheck_clears_both(self):
+        self.toggle(self.agent)
+        resp = self.toggle(self.admin)
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.data['is_checked'])
+        self.assertIsNone(resp.data['checked_by'])
+        self.assertIsNone(resp.data['checked_at'])
+        self.item.refresh_from_db()
+        self.assertIsNone(self.item.checked_by_id)
+        self.assertIsNone(self.item.checked_at)
+
+    def test_recheck_by_other_user_records_them(self):
+        self.toggle(self.agent)
+        self.toggle(self.agent)
+        resp = self.toggle(self.admin)
+        self.assertEqual(resp.data['checked_by']['id'], self.admin.id)
+
+    def test_detail_and_list_expose_fields(self):
+        self.toggle(self.agent)
+        resp = self.api_get(f'/api/checklist-items/{self.item.id}/', user=self.agent)
+        self.assertEqual(resp.data['checked_by']['id'], self.agent.id)
+        self.assertIn('checked_at', resp.data)
+        rows = self.get_results(self.api_get(f'/api/checklist-items/?ticket={self.ticket.id}', user=self.agent))
+        self.assertEqual(rows[0]['checked_by']['id'], self.agent.id)
+        resp = self.api_get(f'/api/tickets/{self.ticket.id}/', user=self.agent)
+        self.assertEqual(resp.data['checklist_items'][0]['checked_by']['id'], self.agent.id)
+
+    def test_checked_by_fields_are_read_only(self):
+        resp = self.api_patch(f'/api/checklist-items/{self.item.id}/', {
+            'checked_by': self.admin.id, 'checked_at': '2020-01-01T00:00:00Z', 'text': 'renamed',
+        }, user=self.agent)
+        self.assertEqual(resp.status_code, 200)
+        self.item.refresh_from_db()
+        self.assertIsNone(self.item.checked_by_id)
+        self.assertIsNone(self.item.checked_at)
