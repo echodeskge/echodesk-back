@@ -8,6 +8,7 @@ from .views import (
     TicketAttachmentViewSet
 )
 from .support_views import report_bug
+from .views_timer import TicketTimerViewSet, TimeEntryViewSet
 
 # Create router and register viewsets
 router = DefaultRouter()
@@ -26,10 +27,15 @@ router.register(r'list-items', ListItemViewSet, basename='listitem')
 router.register(r'ticket-forms', TicketFormViewSet, basename='ticketform')
 router.register(r'form-submissions', TicketFormSubmissionViewSet, basename='formsubmission')
 router.register(r'attachments', TicketAttachmentViewSet, basename='ticketattachment')
+router.register(r'time-entries', TimeEntryViewSet, basename='tickettimeentry')
 
 app_name = 'tickets'
 
 urlpatterns = [
+    # Personal timer (manual nested routes, like assignments below)
+    path('api/tickets/<int:id>/timer/', TicketTimerViewSet.as_view({'get': 'retrieve'}), name='ticket-timer'),
+    path('api/tickets/<int:id>/timer/start/', TicketTimerViewSet.as_view({'post': 'start'}), name='ticket-timer-start'),
+    path('api/tickets/<int:id>/timer/stop/', TicketTimerViewSet.as_view({'post': 'stop'}), name='ticket-timer-stop'),
     path('api/', include(router.urls)),
     # Manual nested URLs for assignments
     path('api/tickets/<int:ticket_pk>/assignments/', TicketAssignmentViewSet.as_view({'get': 'list', 'post': 'create'}), name='ticket-assignments-list'),

@@ -539,6 +539,20 @@ class TicketBoardConsumer(AsyncWebsocketConsumer):
             'user_name': event.get('user_name')
         }))
 
+    async def ticket_activity(self, event):
+        """Something changed inside a ticket (comment, attachment, checklist,
+        history, timer, form): clients refetch that ticket's detail parts."""
+        if event.get('exclude_channel') == self.channel_name:
+            return
+
+        await self.send(text_data=json.dumps({
+            'type': 'ticket_activity',
+            'ticket_id': event.get('ticket_id'),
+            'kind': event.get('kind'),
+            'actor_id': event.get('actor_id'),
+            'client_mutation_id': event.get('client_mutation_id'),
+        }))
+
     async def ticket_being_moved(self, event):
         """Notify users that someone is dragging a ticket"""
         if event.get('exclude_channel') == self.channel_name:
@@ -810,6 +824,35 @@ async def broadcast_ticket_commented(tenant_schema, board_id, ticket_id, comment
             'comments_count': comments_count,
             'user_id': user.id if user else None,
             'user_name': user.get_full_name() or user.email if user else 'System',
+            'exclude_channel': exclude_channel
+        }
+    )
+
+
+async def broadcast_ticket_activity(tenant_schema, board_id, payload, exclude_channel=None):
+    """
+    Broadcast a ``ticket_activity`` frame to everyone viewing the board.
+
+    Args:
+        tenant_schema: The tenant schema name
+        board_id: The board ID
+        payload: dict with ``ticket_id``, ``kind`` (comment|comment_edited|
+            comment_deleted|attachment|checklist|history|timer|form),
+            ``actor_id`` and optional ``client_mutation_id``
+        exclude_channel: Optional channel name to exclude from broadcast
+    """
+    from channels.layers import get_channel_layer
+
+    channel_layer = get_channel_layer()
+
+    await channel_layer.group_send(
+        f'board_{tenant_schema}_{board_id}',
+        {
+            'type': 'ticket_activity',
+            'ticket_id': payload.get('ticket_id'),
+            'kind': payload.get('kind'),
+            'actor_id': payload.get('actor_id'),
+            'client_mutation_id': payload.get('client_mutation_id'),
             'exclude_channel': exclude_channel
         }
     )

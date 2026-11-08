@@ -9,3 +9,4 @@ class TicketsConfig(AppConfig):
     def ready(self):
         """Import signals when app is ready."""
         import tickets.signals  # noqa
+        import tickets.timer  # noqa
