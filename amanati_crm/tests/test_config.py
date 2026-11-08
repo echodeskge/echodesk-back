@@ -198,20 +198,22 @@ class TestCORSConfig(SimpleTestCase):
     def test_cors_allow_credentials(self):
         self.assertTrue(settings.CORS_ALLOW_CREDENTIALS)
 
+    # django-cors-headers reads CORS_ALLOW_METHODS / CORS_ALLOW_HEADERS (the
+    # old CORS_ALLOWED_* names were never read by the library).
     def test_cors_allowed_methods(self):
-        methods = settings.CORS_ALLOWED_METHODS
+        methods = settings.CORS_ALLOW_METHODS
         for method in ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']:
             self.assertIn(method, methods)
 
     def test_cors_allowed_headers_includes_authorization(self):
-        self.assertIn('authorization', settings.CORS_ALLOWED_HEADERS)
+        self.assertIn('authorization', settings.CORS_ALLOW_HEADERS)
 
     def test_cors_allowed_headers_includes_content_type(self):
-        self.assertIn('content-type', settings.CORS_ALLOWED_HEADERS)
+        self.assertIn('content-type', settings.CORS_ALLOW_HEADERS)
 
     def test_cors_allowed_headers_includes_tenant_headers(self):
-        self.assertIn('x-tenant-subdomain', settings.CORS_ALLOWED_HEADERS)
-        self.assertIn('x-tenant-domain', settings.CORS_ALLOWED_HEADERS)
+        self.assertIn('x-tenant-subdomain', settings.CORS_ALLOW_HEADERS)
+        self.assertIn('x-tenant-domain', settings.CORS_ALLOW_HEADERS)
 
     def test_cors_allowed_origin_regexes_exist(self):
         self.assertIsInstance(settings.CORS_ALLOWED_ORIGIN_REGEXES, list)
