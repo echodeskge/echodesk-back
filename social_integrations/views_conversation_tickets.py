@@ -64,6 +64,22 @@ def _find_link(platform, conversation_id, account_id):
     )
 
 
+def _customer_id(platform, conversation_id, account_id):
+    """Id of the ``Client`` linked to this conversation's ``SocialAccount``, or
+    None. Matches every key form the conversation may be stored under (the same
+    set the ``client_id`` listing uses); more than one distinct client is
+    ambiguous and also gives None."""
+    from .models import SocialAccount
+
+    client_ids = set(
+        SocialAccount.objects.filter(
+            platform=platform, account_connection_id=str(account_id),
+            platform_id__in=_lookup_ids(platform, conversation_id, account_id),
+        ).values_list('client_id', flat=True)
+    )
+    return client_ids.pop() if len(client_ids) == 1 else None
+
+
 def _ticket_content(platform, conversation_id, account_id):
     """(customer name, description html, transcript) from the conversation."""
     from .services.conversation_transcript import build_transcript, get_customer_display_name
@@ -96,7 +112,9 @@ def _ticket_content(platform, conversation_id, account_id):
     summary='Create a ticket from a chat conversation',
     description=(
         'Creates a ticket (title = "<customer> · <channel>", description = the latest '
-        'customer messages) and links it to the conversation. Returns 200 with the '
+        'customer messages) and links it to the conversation. The ticket\'s customer '
+        'is the client linked to the conversation\'s social account, when there is one. '
+        'Returns 200 with the '
         'existing ticket when the conversation already has one. Needs the '
         'ticket_management feature and the create_tickets permission; `column_id` '
         'must belong to a board the user can access.'
@@ -148,6 +166,7 @@ def conversation_create_ticket(request):
                 description_format='html',
                 column=column,
                 created_by=request.user,
+                customer_id=_customer_id(platform, raw_id, account_id),
             )
             ticket._current_user = request.user
             ticket.save()
