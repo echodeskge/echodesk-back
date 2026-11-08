@@ -8,8 +8,113 @@ from .models import (
     BoardTelegramConnection
 )
 from users.models import TenantGroup, Department
+from social_integrations.models import Client
 
 User = get_user_model()
+
+
+# ---------------------------------------------------------------------------
+# Display helpers shared by the redesign fields (reporter, activity, cards)
+# ---------------------------------------------------------------------------
+
+def _is_georgian(ch):
+    # Mkhedruli/Asomtavruli (U+10A0-10FF) and Mtavruli (U+1C90-1CBF): never
+    # upper-case these (str.upper() turns Mkhedruli into Mtavruli).
+    return '\u10a0' <= ch <= '\u10ff' or '\u1c90' <= ch <= '\u1cbf'
+
+
+def _initial(word):
+    ch = word[:1]
+    return ch if _is_georgian(ch) else ch.upper()
+
+
+def user_display_name(user):
+    """Full name, falling back to the e-mail address."""
+    if user is None:
+        return ''
+    full = (user.get_full_name() or '').strip()
+    return full or (user.email or '')
+
+
+def initials_for(name, email=''):
+    """Up to two initials from a display name (first and last word); a
+    one-word name gives one initial. An empty name falls back to the e-mail
+    local part (split on . _ -). Georgian letters are kept as they are."""
+    import re
+    words = (name or '').split()
+    if not words and email:
+        words = [w for w in re.split(r'[._\-+]+', email.split('@', 1)[0]) if w]
+    if not words:
+        return ''
+    if len(words) == 1:
+        return _initial(words[0])
+    return _initial(words[0]) + _initial(words[-1])
+
+
+def user_initials(user):
+    if user is None:
+        return ''
+    return initials_for((user.get_full_name() or '').strip(), user.email or '')
+
+
+class UserRefSerializer(serializers.Serializer):
+    """Schema-only: ``{id, name, initials, email}`` user reference."""
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    initials = serializers.CharField()
+    email = serializers.CharField()
+
+
+class UserNameRefSerializer(serializers.Serializer):
+    """Schema-only: ``{id, name}`` user reference."""
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+
+
+class TicketBoardRefSerializer(serializers.Serializer):
+    """Schema-only: the board a ticket belongs to."""
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    color = serializers.CharField()
+
+
+class TicketCustomerSerializer(serializers.Serializer):
+    """Schema-only: the ticket's customer (social_integrations.Client)."""
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    email = serializers.CharField(allow_null=True)
+    phone = serializers.CharField()
+
+
+def user_ref(user):
+    if user is None:
+        return None
+    return {
+        'id': user.id,
+        'name': user_display_name(user),
+        'initials': user_initials(user),
+        'email': user.email or '',
+    }
+
+
+def can_view_customer(request):
+    """Whether the requesting user may see/set ``Ticket.customer`` (the
+    ``social_integrations`` feature). Cached on the request."""
+    if request is None:
+        return False
+    cached = getattr(request, '_tickets_can_view_customer', None)
+    if cached is not None:
+        return cached
+    user = getattr(request, 'user', None)
+    allowed = bool(
+        user is not None and user.is_authenticated
+        and user.has_feature('social_integrations')
+    )
+    try:
+        request._tickets_can_view_customer = allowed
+    except AttributeError:
+        pass
+    return allowed
 
 
 class UserMinimalSerializer(serializers.ModelSerializer):
@@ -102,9 +207,13 @@ class BoardSerializer(serializers.ModelSerializer):
             'id', 'name', 'description', 'is_default',
             'created_at', 'updated_at', 'created_by', 'columns_count',
             'order_users', 'order_user_ids', 'board_groups', 'board_group_ids',
-            'board_users', 'board_user_ids', 'payment_summary'
+            'board_users', 'board_user_ids', 'payment_summary',
+            'color', 'position',
         ]
         read_only_fields = ['created_at', 'updated_at', 'created_by']
+
+    def validate_color(self, value):
+        return validate_hex_color(value)
     
     @extend_schema_field(BoardPaymentSummarySerializer(allow_null=True))
     def get_payment_summary(self, obj):
@@ -276,36 +385,70 @@ class TicketAssignmentSerializer(serializers.ModelSerializer):
 
 
 class TicketCommentSerializer(serializers.ModelSerializer):
-    """Serializer for TicketComment model."""
+    """Serializer for TicketComment model.
+
+    The author is always the requesting user. ``user_id`` stays in the request
+    schema for older clients but is accepted and ignored. ``is_internal``
+    defaults to true and is forced to true for non-staff users.
+    """
     user = UserMinimalSerializer(read_only=True)
-    user_id = serializers.IntegerField(write_only=True, required=False)
-    
+    user_id = serializers.IntegerField(
+        write_only=True, required=False,
+        help_text='Deprecated; ignored. The author is always the requesting user.',
+    )
+    is_internal = serializers.BooleanField(
+        required=False, default=True,
+        help_text='Internal note (not visible to customers). Always true for non-staff users.',
+    )
+
     class Meta:
         model = TicketComment
-        fields = ['id', 'ticket', 'user', 'user_id', 'comment', 'created_at', 'updated_at']
+        fields = ['id', 'ticket', 'user', 'user_id', 'comment', 'is_internal', 'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
 
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        attrs.pop('user_id', None)
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        is_staff = bool(user is not None and (user.is_staff or user.is_superuser))
+        if not is_staff and (self.instance is None or 'is_internal' in attrs):
+            attrs['is_internal'] = True
+        return attrs
+
     def create(self, validated_data):
-        # Set user from request context if not provided
-        if 'user_id' not in validated_data:
-            validated_data['user'] = self.context['request'].user
-        else:
-            user_id = validated_data.pop('user_id')
-            validated_data['user'] = User.objects.get(id=user_id)
+        validated_data.pop('user_id', None)
+        request = self.context.get('request')
+        if not validated_data.get('user') and request is not None:
+            validated_data['user'] = request.user
         return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data.pop('user_id', None)
+        validated_data.pop('user', None)
+        return super().update(instance, validated_data)
 
 
 class ChecklistItemSerializer(serializers.ModelSerializer):
     """Serializer for ChecklistItem model."""
     created_by = UserMinimalSerializer(read_only=True)
+    checked_by = serializers.SerializerMethodField()
 
     class Meta:
         model = ChecklistItem
         fields = [
             'id', 'ticket', 'text', 'is_checked', 'position',
-            'created_at', 'updated_at', 'created_by'
+            'created_at', 'updated_at', 'created_by',
+            'checked_by', 'checked_at',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at', 'created_by']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'created_by', 'checked_by', 'checked_at']
+
+    @extend_schema_field(UserNameRefSerializer(allow_null=True))
+    def get_checked_by(self, obj):
+        if not obj.checked_by_id:
+            return None
+        user = obj.checked_by
+        return {'id': user.id, 'name': user_display_name(user)}
 
     def create(self, validated_data):
         # Set created_by from request context
@@ -373,6 +516,20 @@ class TicketSerializer(serializers.ModelSerializer):
     # Attachments field - returns all attachments for this ticket
     attachments = serializers.SerializerMethodField(read_only=True)
 
+    # Redesign fields
+    is_overdue_task = serializers.BooleanField(
+        read_only=True,
+        help_text='due_date is before today (Asia/Tbilisi) and the column is not closed',
+    )
+    customer = serializers.SerializerMethodField()
+    customer_id = serializers.PrimaryKeyRelatedField(
+        queryset=Client.objects.all(), source='customer',
+        allow_null=True, required=False, write_only=True,
+        help_text='Customer (client) id; null clears it. Ignored without the social_integrations feature.',
+    )
+    board = serializers.SerializerMethodField()
+    reporter = serializers.SerializerMethodField()
+
     class Meta:
         model = Ticket
         fields = [
@@ -386,9 +543,37 @@ class TicketSerializer(serializers.ModelSerializer):
             'checklist_items', 'checklist_items_count', 'completed_checklist_items_count',
             'price', 'currency', 'is_paid', 'amount_paid', 'payment_due_date',
             'payments', 'remaining_balance', 'payment_status', 'is_overdue', 'form_submissions',
-            'attachments'
+            'attachments',
+            'due_date', 'is_overdue_task', 'customer', 'customer_id', 'board', 'reporter',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'created_by', 'status', 'is_closed']
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        # customer_id is silently ignored for users without the feature (E3)
+        if 'customer' in attrs and not can_view_customer(self.context.get('request')):
+            attrs.pop('customer')
+        return attrs
+
+    @extend_schema_field(TicketCustomerSerializer(allow_null=True))
+    def get_customer(self, obj):
+        if not obj.customer_id or not can_view_customer(self.context.get('request')):
+            return None
+        c = obj.customer
+        return {'id': c.id, 'name': c.name, 'email': c.email, 'phone': c.phone or ''}
+
+    @extend_schema_field(TicketBoardRefSerializer(allow_null=True))
+    def get_board(self, obj):
+        if not obj.column_id:
+            return None
+        board = obj.column.board
+        if board is None:
+            return None
+        return {'id': board.id, 'name': board.name, 'color': board.color}
+
+    @extend_schema_field(UserRefSerializer(allow_null=True))
+    def get_reporter(self, obj):
+        return user_ref(obj.created_by) if obj.created_by_id else None
 
     def get_form_submissions(self, obj):
         """Get all form submissions for this ticket (uses prefetched data)."""
@@ -536,20 +721,48 @@ class TicketSerializer(serializers.ModelSerializer):
                     'assigned_user_ids': f'Cannot reduce assigned users below {min_users_required}. Only superadmins can do this.'
                 })
 
-            # Clear existing assignments
-            TicketAssignment.objects.filter(ticket=ticket).delete()
-
-            # Add new assignments
-            for user_id in assigned_user_ids:
-                role = assignment_roles.get(str(user_id), 'collaborator')
-                TicketAssignment.objects.create(
-                    ticket=ticket,
-                    user_id=user_id,
-                    role=role,
-                    assigned_by=current_user
-                )
+            self._apply_assignment_diff(ticket, assigned_user_ids, assignment_roles, current_user)
 
         return ticket
+
+    @staticmethod
+    def _apply_assignment_diff(ticket, assigned_user_ids, assignment_roles, current_user):
+        """Diff the ticket's assignments against ``assigned_user_ids`` (E5).
+
+        Removed users lose their row; added users get one (role from
+        ``assignment_roles``, else ``primary`` for the ticket's ``assigned_to``,
+        else ``collaborator``); kept users keep their row, ``assigned_at`` and
+        role unless ``assignment_roles`` names them. Only added users get a
+        ``ticket_assigned`` notification (the post_save signal on create).
+        """
+        roles = {str(k): v for k, v in (assignment_roles or {}).items()}
+        desired = list(dict.fromkeys(int(uid) for uid in assigned_user_ids))
+        existing = {a.user_id: a for a in TicketAssignment.objects.filter(ticket=ticket)}
+
+        removed = [uid for uid in existing if uid not in desired]
+        if removed:
+            TicketAssignment.objects.filter(ticket=ticket, user_id__in=removed).delete()
+
+        for user_id in desired:
+            named_role = roles.get(str(user_id))
+            current = existing.get(user_id)
+            if current is not None:
+                if named_role and current.role != named_role:
+                    current.role = named_role
+                    current.save(update_fields=['role'])
+                continue
+            if named_role:
+                role = named_role
+            elif ticket.assigned_to_id == user_id:
+                role = 'primary'
+            else:
+                role = 'collaborator'
+            TicketAssignment.objects.create(
+                ticket=ticket,
+                user_id=user_id,
+                role=role,
+                assigned_by=current_user,
+            )
 
 
 class TicketListSerializer(serializers.ModelSerializer):
@@ -564,9 +777,30 @@ class TicketListSerializer(serializers.ModelSerializer):
     comments_count = serializers.IntegerField(read_only=True)  # From annotation
     status = serializers.ReadOnlyField()  # Dynamic status from column
     is_closed = serializers.ReadOnlyField()  # Dynamic closed status from column
+    # Redesign fields (subquery annotations; 0 on an unannotated instance)
+    attachments_count = serializers.IntegerField(read_only=True, default=0)
+    checklist_items_count = serializers.IntegerField(read_only=True, default=0)
+    completed_checklist_items_count = serializers.IntegerField(read_only=True, default=0)
+    is_overdue_task = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Ticket
+        fields = [
+            'id', 'title', 'description', 'description_format',
+            'status', 'priority', 'is_closed', 'column', 'position_in_column',
+            'created_at', 'updated_at', 'created_by', 'assigned_to', 'assigned_users',
+            'assigned_groups', 'assignments', 'tags', 'comments_count',
+            'attachments_count', 'checklist_items_count', 'completed_checklist_items_count',
+            'due_date', 'is_overdue_task',
+        ]
+        read_only_fields = fields
+
+
+class KanbanTicketListSerializer(TicketListSerializer):
+    """The full (non-lite) kanban ticket shape, frozen at its 0040 key set so
+    ``kanban_board`` without ``lite`` keeps its exact response (C1)."""
+
+    class Meta(TicketListSerializer.Meta):
         fields = [
             'id', 'title', 'description', 'description_format',
             'status', 'priority', 'is_closed', 'column', 'position_in_column',
@@ -611,6 +845,10 @@ class TicketCardSerializer(serializers.ModelSerializer):
     assignees = serializers.SerializerMethodField()
     comments_count = serializers.IntegerField(read_only=True, default=0)
     attachments_count = serializers.IntegerField(read_only=True, default=0)
+    checklist_items_count = serializers.IntegerField(read_only=True, default=0)
+    completed_checklist_items_count = serializers.IntegerField(read_only=True, default=0)
+    is_overdue_task = serializers.BooleanField(read_only=True)
+    description_preview = serializers.SerializerMethodField()
 
     class Meta:
         model = Ticket
@@ -620,8 +858,23 @@ class TicketCardSerializer(serializers.ModelSerializer):
             'comments_count', 'attachments_count',
             'price', 'currency', 'is_paid', 'payment_due_date',
             'created_at', 'updated_at',
+            'due_date', 'is_overdue_task',
+            'checklist_items_count', 'completed_checklist_items_count',
+            'description_preview',
         ]
         read_only_fields = fields
+
+    @extend_schema_field(serializers.CharField())
+    def get_description_preview(self, obj):
+        """First 200 characters of the plain-text description. Uses the
+        database-side head from ``lite_card_queryset`` when present; on a
+        bare instance it reads the loaded description, and never triggers a
+        load of a deferred one."""
+        from .querysets import make_description_preview
+        head = getattr(obj, '_description_head', None)
+        if head is None:
+            head = obj.__dict__.get('description') or ''
+        return make_description_preview(head)
 
     def get_assignees(self, obj):
         users = []
@@ -649,7 +902,7 @@ class KanbanBoardSerializer(serializers.Serializer):
         for column in columns:
             # Use prefetched tickets (set by Prefetch in the view) instead of a separate query per column
             tickets = column.tickets.all()
-            tickets_data[column.id] = TicketListSerializer(tickets, many=True, context=self.context).data
+            tickets_data[column.id] = KanbanTicketListSerializer(tickets, many=True, context=self.context).data
 
         return tickets_data
 

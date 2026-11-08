@@ -31,8 +31,9 @@ from .serializers import (
     TicketFormSerializer, TicketFormMinimalSerializer, TicketFormSubmissionSerializer,
     TicketAttachmentSerializer, TicketHistorySerializer,
     BoardTelegramConnectionSerializer, BoardTelegramConnectionCreateSerializer,
-    TicketCardSerializer
+    TicketCardSerializer, KanbanTicketListSerializer,
 )
+from .querysets import child_count_subquery, lite_card_queryset, ticket_count_annotations
 
 
 def get_current_tenant(request):
@@ -557,17 +558,12 @@ class TicketViewSet(viewsets.ModelViewSet):
             # so drf-spectacular can still introspect the filterset parameters
             return Ticket.objects.none()
 
+        # Counts are scalar subqueries (no join fan-out, no GROUP BY).
         queryset = Ticket.objects.annotate(
-            comments_count=Count('comments', distinct=True),
-            checklist_items_count=Count('checklist_items', distinct=True),
-            completed_checklist_items_count=Count(
-                'checklist_items',
-                filter=Q(checklist_items__is_checked=True),
-                distinct=True,
-            ),
+            **ticket_count_annotations(),
         ).select_related(
             'created_by', 'assigned_to', 'column', 'column__board',
-            'assigned_department',
+            'assigned_department', 'customer',
         ).prefetch_related(
             'tags',
             'assigned_groups',
@@ -582,7 +578,7 @@ class TicketViewSet(viewsets.ModelViewSet):
             ),
             Prefetch(
                 'checklist_items',
-                queryset=ChecklistItem.objects.select_related('created_by'),
+                queryset=ChecklistItem.objects.select_related('created_by', 'checked_by'),
             ),
             Prefetch(
                 'attachments',
@@ -943,7 +939,8 @@ class TicketViewSet(viewsets.ModelViewSet):
 
         # Fetch comments
         comments = list(ticket.comments.select_related('user').order_by('created_at').values(
-            'id', 'comment', 'created_at', 'user__id', 'user__first_name', 'user__last_name', 'user__email'
+            'id', 'comment', 'is_internal', 'created_at', 'updated_at',
+            'user__id', 'user__first_name', 'user__last_name', 'user__email'
         ))
 
         # Fetch history
@@ -955,35 +952,50 @@ class TicketViewSet(viewsets.ModelViewSet):
         # Build unified timeline
         timeline = []
 
+        from .serializers import initials_for
+
         for c in comments:
+            full_name = f"{c['user__first_name'] or ''} {c['user__last_name'] or ''}".strip()
+            edited = bool(
+                c['updated_at'] and c['created_at']
+                and (c['updated_at'] - c['created_at']).total_seconds() > 2
+            )
             timeline.append({
                 'type': 'comment',
+                'kind': 'comment',
                 'id': f'comment-{c["id"]}',
                 'comment_id': c['id'],
                 'text': c['comment'],
+                'is_internal': c['is_internal'],
+                'edited': edited,
                 'created_at': c['created_at'].isoformat(),
                 'user': {
                     'id': c['user__id'],
-                    'name': f"{c['user__first_name'] or ''} {c['user__last_name'] or ''}".strip() or c['user__email'],
+                    'name': full_name or c['user__email'],
                     'email': c['user__email'],
+                    'initials': initials_for(full_name, c['user__email'] or ''),
                 },
             })
 
         for h in history:
+            full_name = f"{h['user__first_name'] or ''} {h['user__last_name'] or ''}".strip()
             timeline.append({
                 'type': 'event',
+                'kind': 'history',
                 'id': f'event-{h["id"]}',
                 'action': h['action'],
                 'field_name': h['field_name'],
                 'old_value': h['old_value'],
                 'new_value': h['new_value'],
                 'description': h['description'],
+                'edited': False,
                 'created_at': h['created_at'].isoformat(),
                 'user': {
                     'id': h['user__id'],
-                    'name': f"{h['user__first_name'] or ''} {h['user__last_name'] or ''}".strip() or (h['user__email'] or 'System'),
+                    'name': full_name or (h['user__email'] or 'System'),
                     'email': h['user__email'],
-                } if h['user__id'] else {'id': None, 'name': 'System', 'email': ''},
+                    'initials': initials_for(full_name, h['user__email'] or ''),
+                } if h['user__id'] else {'id': None, 'name': 'System', 'email': '', 'initials': ''},
             })
 
         # Sort chronologically (oldest first for chat-style)
@@ -1031,7 +1043,8 @@ class TicketCommentViewSet(viewsets.ModelViewSet):
         ).select_related('user', 'ticket').distinct()
 
     def perform_create(self, serializer):
-        """Set the user when creating a comment."""
+        """The author is always the requesting user (a ``user_id`` in the body
+        is accepted and ignored by the serializer)."""
         serializer.save(user=self.request.user)
 
 
@@ -1050,7 +1063,7 @@ class ChecklistItemViewSet(viewsets.ModelViewSet):
         """Filter checklist items based on user permissions."""
         if self.request.user.is_staff:
             return ChecklistItem.objects.all().select_related(
-                'ticket', 'created_by'
+                'ticket', 'created_by', 'checked_by'
             )
 
         # Non-staff users can only see checklist items for tickets they have access to.
@@ -1062,13 +1075,20 @@ class ChecklistItemViewSet(viewsets.ModelViewSet):
             Q(ticket__assigned_to=self.request.user) |
             Q(ticket__assigned_users=self.request.user) |
             Q(created_by=self.request.user)
-        ).select_related('ticket', 'created_by').distinct()
+        ).select_related('ticket', 'created_by', 'checked_by').distinct()
 
     @action(detail=True, methods=['patch'])
     def toggle_check(self, request, pk=None):
-        """Toggle the checked status of a checklist item."""
+        """Toggle the checked status of a checklist item, recording who
+        checked it and when (cleared again on uncheck)."""
         item = self.get_object()
         item.is_checked = not item.is_checked
+        if item.is_checked:
+            item.checked_by = request.user
+            item.checked_at = timezone.now()
+        else:
+            item.checked_by = None
+            item.checked_at = None
         item.save()
         serializer = self.get_serializer(item)
         return Response(serializer.data)
@@ -1633,21 +1653,9 @@ class BoardViewSet(viewsets.ModelViewSet):
         user = self.request.user
 
         # Scalar subquery so columns_count doesn't fan out the main row set
-        from django.db.models.functions import Coalesce
-        columns_count_sq = (
-            TicketColumn.objects
-            .filter(board=OuterRef('pk'))
-            .order_by()
-            .values('board')
-            .annotate(c=Count('*'))
-            .values('c')
-        )
+        # (COUNT() without GROUP BY; an empty board counts 0)
         base_qs = Board.objects.annotate(
-            columns_count=Coalesce(
-                Subquery(columns_count_sq, output_field=IntegerField()),
-                0,
-                output_field=IntegerField(),
-            ),
+            columns_count=child_count_subquery(TicketColumn, fk='board'),
         )
 
         return accessible_boards(user, base_qs).select_related('created_by').prefetch_related(
@@ -1693,20 +1701,14 @@ class BoardViewSet(viewsets.ModelViewSet):
             'assigned_users', queryset=User.objects.only('id', 'first_name', 'last_name', 'email'),
         )
         if lite:
-            # Card payload only needs assignees, tags and two counts
+            # Card payload: assignees, tags, subquery counts and the
+            # description head; full descriptions stay deferred.
             ticket_serializer_class = TicketCardSerializer
-            ticket_qs = (
-                Ticket.objects
-                .order_by('position_in_column', '-created_at')
-                .select_related('assigned_to', 'column')
-                .prefetch_related(assignee_prefetch, 'tags')
-                .annotate(
-                    comments_count=Count('comments', distinct=True),
-                    attachments_count=Count('attachments', distinct=True),
-                )
+            ticket_qs = lite_card_queryset(
+                Ticket.objects.order_by('position_in_column', '-created_at', '-id')
             )
         else:
-            ticket_serializer_class = TicketListSerializer
+            ticket_serializer_class = KanbanTicketListSerializer
             ticket_qs = (
                 Ticket.objects
                 .order_by('position_in_column', '-created_at')
@@ -1733,7 +1735,7 @@ class BoardViewSet(viewsets.ModelViewSet):
             .filter(board=board)
             .order_by('position')
             .select_related('board', 'created_by')
-            .annotate(tickets_count=Count('tickets'))
+            .annotate(tickets_count=child_count_subquery(Ticket, fk='column'))
             .prefetch_related(Prefetch('tickets', queryset=ticket_qs))
         )
 
