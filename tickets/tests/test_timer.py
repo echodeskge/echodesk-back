@@ -522,3 +522,15 @@ class TestTimerSchema(TicketTestCase):
         list_params = [p['name'] for p in paths['/api/time-entries/']['get']['parameters']]
         for name in ('ticket', 'user', 'started_after', 'started_before', 'page', 'page_size'):
             self.assertIn(name, list_params)
+
+
+class TestUserBriefInitials(TicketTestCase):
+    """Timer user refs use the same initials rule as reporter/activity."""
+
+    def test_georgian_names_are_not_upper_cased_to_mtavruli(self):
+        brief = timer.user_brief(1, 'ნინო', 'ბერიძე', 'n@x.ge')
+        self.assertEqual(brief, {'id': 1, 'name': 'ნინო ბერიძე', 'initials': 'ნბ'})
+
+    def test_empty_name_falls_back_to_email_local_part(self):
+        self.assertEqual(timer.user_brief(2, '', '', 'nino.beridze@x.ge')['initials'], 'NB')
+        self.assertEqual(timer.user_brief(3, '', '', 'nino@x.ge')['initials'], 'N')

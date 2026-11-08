@@ -277,13 +277,13 @@ def totals(ticket, user):
 
 
 def user_brief(user_id, first_name, last_name, email):
-    name = f'{first_name or ""} {last_name or ""}'.strip() or (email or '')
-    parts = [p for p in name.replace('@', ' ').split() if p]
-    if len(parts) >= 2 and (first_name or last_name):
-        initials = (parts[0][0] + parts[1][0]).upper()
-    else:
-        initials = (parts[0][:2] if parts else '?').upper()
-    return {'id': user_id, 'name': name, 'initials': initials}
+    # Same initials rule as reporter/activity (serializers.initials_for):
+    # Georgian letters are never upper-cased into Mtavruli, and an empty name
+    # falls back to the e-mail local part.
+    from .serializers import initials_for  # lazy: serializers imports the app's models
+    full = f'{first_name or ""} {last_name or ""}'.strip()
+    name = full or (email or '')
+    return {'id': user_id, 'name': name, 'initials': initials_for(full, email or '')}
 
 
 # ── receivers ───────────────────────────────────────────────────────────────
