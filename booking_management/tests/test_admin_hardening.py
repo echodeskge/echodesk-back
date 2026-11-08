@@ -409,8 +409,12 @@ class TestBookingLists(HardeningBase):
         self.assertEqual(rows.data['results'][0]['service'], lite['service'])
 
     def test_schedule_and_dashboard_lite(self):
-        self.booking(date=date.today(), status='confirmed')
-        resp = self.api_get(f'{ADMIN_SCHEDULE_URL}?date={date.today().isoformat()}&lite=1', user=self.agent)
+        # The dashboard's "today" is the tenant's local date, which differs
+        # from the runner's date.today() around midnight Tbilisi time.
+        from booking_management.utils import get_booking_settings, tenant_now
+        today = tenant_now(get_booking_settings()).date()
+        self.booking(date=today, status='confirmed')
+        resp = self.api_get(f'{ADMIN_SCHEDULE_URL}?date={today.isoformat()}&lite=1', user=self.agent)
         self.assertEqual(resp.status_code, 200)
         entry = [e for e in resp.data['schedule'] if e['staff']['id'] == self.staff.id][0]
         self.assertEqual(entry['booking_count'], 1)
