@@ -170,11 +170,15 @@ class LeaveRemovalBlocked(APIException):
     default_code = 'leave_removal_blocked'
 
     def __init__(self, reasons):
+        from leave_management.guards import reason_codes
         message = 'This user cannot be removed yet: ' + '; '.join(reasons) + '.'
         super().__init__({
             'detail': message, 'error': message,
-            'code': 'leave_removal_blocked', 'reasons': reasons,
+            'code': 'leave_removal_blocked', 'reasons': [str(r) for r in reasons],
         })
+        # Machine-readable reasons ({code, count}) the clients translate; kept as plain
+        # values (APIException would turn every leaf, counts included, into strings).
+        self.detail['reason_codes'] = reason_codes(reasons)
 
 
 def _guard_leave_removal(target, delete=False):
@@ -729,7 +733,7 @@ class UserViewSet(viewsets.ModelViewSet):
             # Same rule as a single deactivate / delete.
             skipped.update(u.id for u in users if u.id != actor.id and not _may_disable(actor, u))
             # Open leave work / leave history (LeaveSettings guard).
-            from leave_management.guards import check_removal
+            from leave_management.guards import check_removal, reason_codes
             for u in users:
                 if u.id in skipped:
                     continue
@@ -793,7 +797,8 @@ class UserViewSet(viewsets.ModelViewSet):
             'message': message,
             'affected': count,
             'skipped_user_ids': sorted(i for i in skipped if i in set(user_ids)),
-            'blocked': {str(k): v for k, v in blocked.items()},
+            'blocked': {str(k): [str(r) for r in v] for k, v in blocked.items()},
+            'blocked_codes': {str(k): reason_codes(v) for k, v in blocked.items()},
         })
 
     @extend_schema(

@@ -407,7 +407,7 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
 
         limit_msg = validate_type_limits(user, leave_type, start_date, total_days, tenant)
         if limit_msg:
-            raise serializers.ValidationError({'leave_type': limit_msg})
+            raise serializers.ValidationError({'leave_type': str(limit_msg), **limit_msg.error_fields()})
 
         # Check for overlapping leaves
         has_overlap, overlap_msg = check_overlapping_leaves(
@@ -492,6 +492,12 @@ class LeaveRequestPreviewResponseSerializer(serializers.Serializer):
         allow_blank=True,
         help_text='Why the request would be refused; empty when allowed'
     )
+    code = serializers.CharField(
+        required=False,
+        help_text="'leave_type_limit' when a per-type limit refused it (then limit and max are set)"
+    )
+    limit = serializers.ChoiceField(choices=['per_request', 'per_month'], required=False)
+    max = serializers.CharField(required=False, help_text='The limit: days per request or requests per month')
 
 
 class LeaveRequestUpdateSerializer(serializers.ModelSerializer):
@@ -543,7 +549,7 @@ class LeaveRequestUpdateSerializer(serializers.ModelSerializer):
                 total_days, tenant, exclude_request_id=self.instance.id
             )
             if limit_msg:
-                raise serializers.ValidationError({'leave_type': limit_msg})
+                raise serializers.ValidationError({'leave_type': str(limit_msg), **limit_msg.error_fields()})
 
             # New dates need the substitutes' consent again.
             rows = list(self.instance.substitutes.select_related('substitute'))

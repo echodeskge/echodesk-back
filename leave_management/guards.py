@@ -7,6 +7,24 @@ from django.db import connection
 OPEN_REQUEST_STATUSES = ('awaiting_substitutes', 'pending', 'manager_approved', 'hr_approved')
 
 
+class Reason(str):
+    """An English reason that also carries a machine code (and a count) the clients translate."""
+
+    def __new__(cls, text, code, count=None):
+        obj = super().__new__(cls, text)
+        obj.code = code
+        obj.count = count
+        return obj
+
+    def as_code(self):
+        return {'code': self.code, 'count': self.count}
+
+
+def reason_codes(reasons):
+    """[{code, count}] for a list of reasons (plain strings get code 'other')."""
+    return [r.as_code() if isinstance(r, Reason) else {'code': 'other', 'count': None} for r in reasons]
+
+
 def _tenant():
     return getattr(connection, 'tenant', None)
 
@@ -27,7 +45,9 @@ def deactivation_blockers(user):
         employee=user, status__in=OPEN_REQUEST_STATUSES
     ).count()
     if open_requests:
-        reasons.append(f'{open_requests} open leave request(s) must be decided or cancelled first')
+        reasons.append(Reason(
+            f'{open_requests} open leave request(s) must be decided or cancelled first',
+            'open_requests', open_requests))
 
     try:
         from .models import LeaveRequestSubstitute
@@ -39,11 +59,11 @@ def deactivation_blockers(user):
             leave_request__status__in=OPEN_REQUEST_STATUSES,
         ).exclude(status__in=('rejected', 'skipped')).count()
         if covering:
-            reasons.append(f'substitute on {covering} open leave request(s)')
+            reasons.append(Reason(f'substitute on {covering} open leave request(s)', 'covering', covering))
 
     reports = user.managed_employees.filter(is_active=True).count()
     if reports:
-        reasons.append(f'manager of {reports} active employee(s); reassign them first')
+        reasons.append(Reason(f'manager of {reports} active employee(s); reassign them first', 'manager_of', reports))
     return reasons
 
 
@@ -64,7 +84,7 @@ def deletion_blockers(user):
     except ImportError:  # pragma: no cover
         pass
     if has_history:
-        reasons.append('has leave/KPI history; deactivate the user instead of deleting')
+        reasons.append(Reason('has leave/KPI history; deactivate the user instead of deleting', 'has_history'))
     return reasons
 
 

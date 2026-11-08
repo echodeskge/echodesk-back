@@ -611,6 +611,11 @@ class BulkUserActionSerializer(serializers.Serializer):
         return attrs
 
 
+class LeaveRemovalReasonSerializer(serializers.Serializer):
+    code = serializers.CharField()
+    count = serializers.IntegerField(allow_null=True)
+
+
 class BulkUserActionResponseSerializer(serializers.Serializer):
     """Result of ``POST /api/users/bulk_action/``."""
     message = serializers.CharField()
@@ -623,6 +628,12 @@ class BulkUserActionResponseSerializer(serializers.Serializer):
         child=serializers.ListField(child=serializers.CharField()),
         required=False,
         help_text='user id -> reasons, for users skipped because of open leave work or leave history.',
+    )
+    blocked_codes = serializers.DictField(
+        child=serializers.ListField(child=LeaveRemovalReasonSerializer()),
+        required=False,
+        help_text='user id -> [{code, count}]: the same reasons as machine codes '
+                  '(open_requests | covering | manager_of | has_history | other).',
     )
 
 

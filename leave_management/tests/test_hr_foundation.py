@@ -87,12 +87,20 @@ class TestTypeLimits(HrTestCase):
         }, user=self.employee)
 
     def test_once_per_month_and_one_day(self):
-        self.assertEqual(self.post('2027-11-04', '2027-11-05').status_code, 400)
+        too_long = self.post('2027-11-04', '2027-11-05')
+        self.assertEqual(too_long.status_code, 400)
+        self.assertEqual(too_long.data['code'], ['leave_type_limit'])
+        self.assertEqual(too_long.data['limit'], ['per_request'])
+        self.assertEqual(too_long.data['max'], ['1'])
         first = self.post('2027-11-04', '2027-11-04')
         self.assertEqual(first.status_code, 201, first.data)
         second = self.post('2027-11-08', '2027-11-08')
         self.assertEqual(second.status_code, 400)
         self.assertIn('per month', str(second.data))
+        # Machine-readable code + limit for the clients to translate.
+        self.assertEqual(second.data['code'], ['leave_type_limit'])
+        self.assertEqual(second.data['limit'], ['per_month'])
+        self.assertEqual(second.data['max'], ['1'])
         # A different month is fine
         self.assertEqual(self.post('2027-12-06', '2027-12-06').status_code, 201)
 
@@ -115,6 +123,9 @@ class TestTypeLimits(HrTestCase):
         }, user=self.employee)
         self.assertEqual(resp.status_code, 200)
         self.assertFalse(resp.data['allowed'])
+        self.assertEqual(resp.data['code'], 'leave_type_limit')
+        self.assertEqual(resp.data['limit'], 'per_month')
+        self.assertEqual(resp.data['max'], '1')
 
     def test_inactive_type_refused(self):
         self.dayoff.is_active = False

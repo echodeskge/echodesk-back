@@ -9,7 +9,7 @@ from datetime import date, timedelta
 
 FIXED_HOLIDAYS = [
     ((1, 1), {'en': "New Year's Day", 'ka': 'ახალი წელი'}),
-    ((1, 2), {'en': "New Year's Holiday", 'ka': 'ახალი წელი'}),
+    ((1, 2), {'en': "New Year's Holiday", 'ka': 'ბედობა'}),
     ((1, 7), {'en': 'Orthodox Christmas', 'ka': 'შობა'}),
     ((1, 19), {'en': 'Epiphany', 'ka': 'ნათლისღება'}),
     ((3, 3), {'en': "Mother's Day", 'ka': 'დედის დღე'}),

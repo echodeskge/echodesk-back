@@ -26,6 +26,7 @@ class TestDeactivationGuard(HrTestCase):
         resp = self.deactivate(self.emp)
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST, resp.data)
         self.assertEqual(resp.data['code'], 'leave_removal_blocked')
+        self.assertEqual(resp.data['reason_codes'], [{'code': 'open_requests', 'count': 1}])
         req.status = 'approved'
         req.save()
         resp = self.deactivate(self.emp)
@@ -38,11 +39,13 @@ class TestDeactivationGuard(HrTestCase):
         resp = self.deactivate(self.manager)
         self.assertEqual(resp.status_code, 400)
         self.assertIn('manager of 1', str(resp.data))
+        self.assertEqual(resp.data['reason_codes'], [{'code': 'manager_of', 'count': 1}])
 
     def test_delete_with_history_blocked_but_clean_user_deletable(self):
         self.create_leave_request(self.emp, self.lt, status='approved')
         resp = self.api_delete(f'{USERS}{self.emp.id}/', user=self.admin)
         self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data['reason_codes'], [{'code': 'has_history', 'count': None}])
         clean = self.create_user(email='guard-clean@test.com')
         resp = self.api_delete(f'{USERS}{clean.id}/', user=self.admin)
         self.assertEqual(resp.status_code, 204)
@@ -56,6 +59,7 @@ class TestDeactivationGuard(HrTestCase):
         self.assertEqual(resp.status_code, 200, resp.data)
         self.assertEqual(resp.data['affected'], 1)
         self.assertIn(str(self.emp.id), resp.data['blocked'])
+        self.assertEqual(resp.data['blocked_codes'][str(self.emp.id)], [{'code': 'open_requests', 'count': 1}])
         free.refresh_from_db()
         self.assertFalse(free.is_active)
 

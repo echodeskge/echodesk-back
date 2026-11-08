@@ -188,17 +188,33 @@ def calculate_working_days(start_date, end_date, tenant, exclude_public_holidays
 CLOSED_STATUSES = ('rejected', 'cancelled')
 
 
+class LimitViolation(str):
+    """The English reason plus a code ('per_request' | 'per_month') and the limit, for the clients to translate."""
+
+    def __new__(cls, text, limit, maximum):
+        obj = super().__new__(cls, text)
+        obj.limit = limit
+        obj.maximum = maximum
+        return obj
+
+    def error_fields(self):
+        """Extra keys sent next to the message: code, limit, max."""
+        return {'code': 'leave_type_limit', 'limit': self.limit, 'max': str(self.maximum)}
+
+
 def validate_type_limits(employee, leave_type, start_date, total_days, tenant, exclude_request_id=None):
     """
     Per-type limits (max working days per request, max requests starting in
-    one calendar month). Returns '' when allowed, else the reason.
+    one calendar month). Returns '' when allowed, else the reason (a
+    LimitViolation: also carries a code and the limit).
     """
     from .models import LeaveRequest
 
     if leave_type.max_days_per_request is not None and total_days > leave_type.max_days_per_request:
-        return (
+        return LimitViolation(
             f"This leave type allows at most {leave_type.max_days_per_request} "
-            f"working day(s) per request"
+            f"working day(s) per request",
+            'per_request', leave_type.max_days_per_request.normalize(),
         )
     if leave_type.max_requests_per_month:
         qs = LeaveRequest.objects.filter(
@@ -208,9 +224,10 @@ def validate_type_limits(employee, leave_type, start_date, total_days, tenant, e
         if exclude_request_id:
             qs = qs.exclude(pk=exclude_request_id)
         if qs.count() >= leave_type.max_requests_per_month:
-            return (
+            return LimitViolation(
                 f"This leave type can be requested at most "
-                f"{leave_type.max_requests_per_month} time(s) per month"
+                f"{leave_type.max_requests_per_month} time(s) per month",
+                'per_month', leave_type.max_requests_per_month,
             )
     return ''
 

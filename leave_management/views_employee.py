@@ -221,6 +221,7 @@ class EmployeeLeaveRequestViewSet(viewsets.ModelViewSet):
                 'available_days': balance.available_days if balance else None,
                 'allowed': allowed,
                 'message': message,
+                **(message.error_fields() if hasattr(message, 'error_fields') else {}),
             }
             return Response(LeaveRequestPreviewResponseSerializer(data).data)
 
