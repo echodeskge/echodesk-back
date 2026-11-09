@@ -65,12 +65,15 @@ class FakeStorage:
 
 class MediaMirrorTestCase(SocialIntegrationTestCase):
     def setUp(self):
-        super().setUp()
         # Enabled per test: the tenant base class's setUpClass doesn't run
-        # SimpleTestCase's class-level override_settings machinery.
+        # SimpleTestCase's class-level override_settings machinery. Enable it
+        # BEFORE super().setUp() so it's undone after the base class's
+        # middleware override (LIFO); the other order leaves TEST_MIDDLEWARE
+        # in settings for every later test.
         overrides = override_settings(MEDIA_URL=MEDIA, CACHES=LOCMEM_CACHE)
         overrides.enable()
         self.addCleanup(overrides.disable)
+        super().setUp()
         self.storage = FakeStorage()
         p = patch.object(media_mirror, 'default_storage', self.storage)
         p.start()
