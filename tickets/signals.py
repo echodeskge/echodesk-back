@@ -571,15 +571,16 @@ def capture_ticket_prev_state(sender, instance, **kwargs):
 
     current_user = actor_for(instance)
 
-    # --- Board transfer (E13) ---
-    old_board = old.column.board if old.column_id and old.column else None
-    new_column = instance.column if instance.column_id else None
-    new_board_id = new_column.board_id if new_column else None
-    old_board_id = old_board.id if old_board else None
-    if old.column_id != instance.column_id and old_board_id != new_board_id:
-        instance._board_transfer = (old_board_id, new_board_id)
-    else:
-        instance._board_transfer = None
+    # --- Board transfer (E13); only looked at when the column changes ---
+    instance._board_transfer = None
+    old_board = new_column = None
+    if old.column_id != instance.column_id:
+        old_board = old.column.board if old.column_id and old.column else None
+        new_column = instance.column if instance.column_id else None
+        old_board_id = old_board.id if old_board else None
+        new_board_id = new_column.board_id if new_column else None
+        if old_board_id != new_board_id:
+            instance._board_transfer = (old_board_id, new_board_id)
 
     # --- TicketHistory records ---
     tracked_fields = [
