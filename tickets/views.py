@@ -33,7 +33,17 @@ from .serializers import (
     BoardTelegramConnectionSerializer, BoardTelegramConnectionCreateSerializer,
     TicketCardSerializer, KanbanTicketListSerializer,
 )
+from .dates import tickets_today
 from .querysets import child_count_subquery, lite_card_queryset, ticket_count_annotations
+from .query_filters import (
+    MANUAL_ORDER, apply_ticket_filters, assignee_q, column_ticket_order, due_q,
+    has_ticket_filters, list_ticket_order, open_ticket_q, ticket_filter_q,
+    unassigned_q, urgent_q,
+)
+from .serializers_lite import (
+    BoardLiteSerializer, TicketColumnCountsSerializer, TicketNavigationSerializer,
+    TicketViewCountsSerializer,
+)
 # The visibility helpers live in tickets.visibility; they are re-exported here
 # because other modules (timer, social_integrations) import them from views.
 from .visibility import (  # noqa: F401
@@ -383,6 +393,79 @@ class TicketColumnViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
+def _parse_int_param(params, name):
+    """An optional integer query parameter; 400 when it is not a number."""
+    raw = params.get(name)
+    if raw is None or str(raw).strip() == '':
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise drf_serializers.ValidationError({name: ['Expected an integer.']})
+
+
+# Columns in board order; ``column_id`` breaks ties between equal positions.
+_BOARD_COLUMN_ORDER = [F('column__position').asc(nulls_last=True), F('column_id').asc(nulls_last=True)]
+
+
+def keyset_neighbors(qs, pk, order):
+    """Position of ``pk`` in ``qs`` sorted by ``order``, with its neighbours.
+
+    Returns ``{'index', 'total', 'prev_id', 'next_id'}`` (``index`` 1-based),
+    or ``None`` when ``pk`` is not in ``qs``. One query whatever the size of
+    ``qs``: ``ROW_NUMBER``/``LAG``/``LEAD``/``COUNT(*) OVER ()`` are computed
+    over the whole ordered set in a subquery, and only the row for ``pk`` is
+    read back. Window functions handle NULL sort keys the same way the
+    ``ORDER BY`` does, so the neighbours always match the screen's order."""
+    from django.db import connection
+    from django.db.models import Window
+    from django.db.models.functions import Lag, Lead, RowNumber
+
+    inner = qs.order_by().annotate(
+        _nav_index=Window(RowNumber(), order_by=order),
+        _nav_prev=Window(Lag('id'), order_by=order),
+        _nav_next=Window(Lead('id'), order_by=order),
+        _nav_total=Window(Count('id')),
+    ).values('id', '_nav_index', '_nav_prev', '_nav_next', '_nav_total')
+    sql, sql_params = inner.query.sql_with_params()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            'SELECT nav."_nav_index", nav."_nav_total", nav."_nav_prev", nav."_nav_next" '
+            f'FROM ({sql}) AS nav WHERE nav."id" = %s',
+            [*sql_params, pk],
+        )
+        row = cursor.fetchone()
+    if row is None:
+        return None
+    index, total, prev_id, next_id = row
+    return {'index': index, 'total': total, 'prev_id': prev_id, 'next_id': next_id}
+
+
+# The A4 filters as documented on the *new* operations (column_counts,
+# navigation). Existing operations keep their 0040 parameters (E10).
+TICKET_FILTER_PARAMETERS = [
+    OpenApiParameter('assignee', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+                     description="'me', a user id, or a comma-separated list of user ids."),
+    OpenApiParameter('unassigned', OpenApiTypes.BOOL, OpenApiParameter.QUERY, required=False,
+                     description='Only tickets with no assignee.'),
+    OpenApiParameter('priority__in', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+                     description='Comma-separated priorities: low, medium, high, critical.'),
+    OpenApiParameter('tags__in', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+                     description='Comma-separated tag ids (any of them).'),
+    OpenApiParameter('due', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+                     enum=['overdue', 'week', 'none'],
+                     description='overdue / due by the end of this week (open tickets) / no due date.'),
+    OpenApiParameter('due_before', OpenApiTypes.DATE, OpenApiParameter.QUERY, required=False,
+                     description='Due on or before this date.'),
+    OpenApiParameter('due_after', OpenApiTypes.DATE, OpenApiParameter.QUERY, required=False,
+                     description='Due on or after this date.'),
+    OpenApiParameter('is_closed', OpenApiTypes.BOOL, OpenApiParameter.QUERY, required=False,
+                     description='In a closed-status column (true) or not (false).'),
+    OpenApiParameter('q', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+                     description='Text search: title, description, tag name or #id. `search` is an alias.'),
+]
+
+
 class TicketPermission(permissions.BasePermission):
     """
     Object rules for tickets (plan E3). The object always comes from
@@ -440,13 +523,32 @@ class TicketFilter(django_filters.FilterSet):
         fields = ['priority', 'assigned_to', 'created_by', 'tags', 'column', 'assigned_groups']
 
 
+class TicketSearchFilter(filters.SearchFilter):
+    """Documents ``search`` on the ticket list exactly as before. The matching
+    itself (title, description, tag names and ``#id``) is done by
+    ``tickets.query_filters`` in ``TicketViewSet.get_queryset``."""
+
+    def filter_queryset(self, request, queryset, view):
+        return queryset
+
+
+class TicketOrderingFilter(filters.OrderingFilter):
+    """Documents ``ordering`` on the ticket list exactly as before. The ordering
+    (``priority_rank``, ``due_date`` nulls last, ``group=column``, the ``-id``
+    tie-break) is applied in ``TicketViewSet.get_queryset``; DRF's version
+    would replace it with ``-created_at`` for the values it does not know."""
+
+    def filter_queryset(self, request, queryset, view):
+        return queryset
+
+
 class TicketViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing tickets with filtering and permissions.
     """
     serializer_class = TicketSerializer
     permission_classes = [TicketPermission]
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filter_backends = [DjangoFilterBackend, TicketSearchFilter, TicketOrderingFilter]
     filterset_class = TicketFilter
     search_fields = ['title', 'description']
     ordering_fields = ['created_at', 'updated_at', 'priority']
@@ -461,6 +563,12 @@ class TicketViewSet(viewsets.ModelViewSet):
             return TicketListSerializer
         return TicketSerializer
 
+    # Actions that render TicketSerializer (comments, checklist, attachments,
+    # payments, form submissions inline) keep the heavy prefetches; the list
+    # actions render TicketListSerializer and the read helpers need none (A7).
+    LIST_ACTIONS = ('list', 'my_tickets', 'assigned_to_me')
+    BARE_ACTIONS = ('navigation', 'view_counts', 'column_counts')
+
     def get_queryset(self):
         """
         Filter queryset based on user permissions and query parameters.
@@ -471,8 +579,74 @@ class TicketViewSet(viewsets.ModelViewSet):
             # so drf-spectacular can still introspect the filterset parameters
             return Ticket.objects.none()
 
+        action = getattr(self, 'action', None)
+        if action in self.BARE_ACTIONS:
+            queryset = Ticket.objects.select_related('column')
+        elif action in self.LIST_ACTIONS:
+            queryset = self._list_queryset()
+        else:
+            queryset = self._detail_queryset()
+
+        # Non-staff users only see the tickets tickets.visibility allows
+        # (Exists subqueries: no join fan-out, so no .distinct()).
+        queryset = visible_tickets(self.request.user, queryset)
+
+        if action in self.BARE_ACTIONS:
+            return queryset
+
+        # Additional filtering by query parameters
+        priority_filter = self.request.query_params.get('priority')
+        if priority_filter:
+            queryset = queryset.filter(priority=priority_filter)
+
+        assigned_to_filter = self.request.query_params.get('assigned_to')
+        if assigned_to_filter:
+            queryset = queryset.filter(assigned_to_id=assigned_to_filter)
+
+        created_by_filter = self.request.query_params.get('created_by')
+        if created_by_filter:
+            queryset = queryset.filter(created_by_id=created_by_filter)
+
+        assigned_group_filter = self.request.query_params.get('assigned_group')
+        if assigned_group_filter:
+            queryset = queryset.filter(assigned_groups__id=assigned_group_filter)
+
+        if action == 'list':
+            # A4 filters (undocumented on purpose, E10), the search that also
+            # matches tag names and ids, and the extended ordering.
+            params = self.request.query_params
+            queryset = apply_ticket_filters(queryset, params, self.request.user)
+            group = str(params.get('group', '')).strip().lower() == 'column'
+            queryset = queryset.order_by(
+                *list_ticket_order(params.get('ordering'), group_by_column=group)
+            )
+
+        return queryset
+
+    @staticmethod
+    def _list_queryset():
+        """Light list queryset: the TicketListSerializer relations only."""
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        return Ticket.objects.annotate(
+            **ticket_count_annotations(),
+        ).select_related(
+            'created_by', 'assigned_to', 'column', 'column__created_by',
+        ).prefetch_related(
+            'tags',
+            Prefetch('assigned_users', queryset=User.objects.only('id', 'email', 'first_name', 'last_name')),
+            'assigned_groups',
+            Prefetch(
+                'ticketassignment_set',
+                queryset=TicketAssignment.objects.select_related('user', 'assigned_by'),
+            ),
+        )
+
+    @staticmethod
+    def _detail_queryset():
+        """Full TicketSerializer queryset (detail, writes and moves)."""
         # Counts are scalar subqueries (no join fan-out, no GROUP BY).
-        queryset = Ticket.objects.annotate(
+        return Ticket.objects.annotate(
             **ticket_count_annotations(),
         ).select_related(
             'created_by', 'assigned_to', 'column', 'column__board', 'column__created_by',
@@ -508,29 +682,6 @@ class TicketViewSet(viewsets.ModelViewSet):
                 ).prefetch_related('selected_items').order_by('submitted_at'),
             ),
         )
-
-        # Non-staff users only see the tickets tickets.visibility allows
-        # (Exists subqueries: no join fan-out, so no .distinct()).
-        queryset = visible_tickets(self.request.user, queryset)
-
-        # Additional filtering by query parameters
-        priority_filter = self.request.query_params.get('priority')
-        if priority_filter:
-            queryset = queryset.filter(priority=priority_filter)
-
-        assigned_to_filter = self.request.query_params.get('assigned_to')
-        if assigned_to_filter:
-            queryset = queryset.filter(assigned_to_id=assigned_to_filter)
-
-        created_by_filter = self.request.query_params.get('created_by')
-        if created_by_filter:
-            queryset = queryset.filter(created_by_id=created_by_filter)
-
-        assigned_group_filter = self.request.query_params.get('assigned_group')
-        if assigned_group_filter:
-            queryset = queryset.filter(assigned_groups__id=assigned_group_filter)
-
-        return queryset
 
     def perform_create(self, serializer):
         """Create a ticket and start time tracking if applicable."""
@@ -936,6 +1087,124 @@ class TicketViewSet(viewsets.ModelViewSet):
         timeline.sort(key=lambda x: x['created_at'])
 
         return Response(timeline)
+
+    # ── read helpers for the redesigned screens (A5, A5b, A6) ────────────────
+
+    @extend_schema(
+        summary='Saved-view counts',
+        description=(
+            'Open tickets the caller can see, counted for the sidebar saved views: '
+            'assigned to me, unassigned, urgent (critical or high) and due by the end of '
+            'this week (overdue included; dates are Asia/Tbilisi calendar dates). '
+            'Without `board`, every board the caller can access.'
+        ),
+        filters=False,
+        parameters=[
+            OpenApiParameter('board', OpenApiTypes.INT, OpenApiParameter.QUERY, required=False,
+                             description='Limit the counts to one board.'),
+        ],
+        responses={200: TicketViewCountsSerializer},
+    )
+    @action(detail=False, methods=['get'])
+    def view_counts(self, request):
+        user = request.user
+        qs = self.get_queryset().filter(open_ticket_q())
+        board_id = _parse_int_param(request.query_params, 'board')
+        if board_id is not None:
+            qs = qs.filter(column__board_id=board_id)
+        else:
+            qs = qs.filter(column__board_id__in=accessible_boards(user).values('pk'))
+        today = tickets_today()
+        data = qs.aggregate(
+            mine=Count('pk', filter=assignee_q([user.id])),
+            unassigned=Count('pk', filter=unassigned_q()),
+            urgent=Count('pk', filter=urgent_q()),
+            due_this_week=Count('pk', filter=due_q('week', today)),
+        )
+        return Response(data)
+
+    @extend_schema(
+        summary='Ticket counts per column',
+        description=(
+            'Number of tickets in every column of `board` (zeros included) after the '
+            'same filters the kanban accepts, within what the caller can see. '
+            'Keys are column ids.'
+        ),
+        filters=False,
+        parameters=[
+            OpenApiParameter('board', OpenApiTypes.INT, OpenApiParameter.QUERY, required=True,
+                             description='The board whose columns are counted.'),
+            *TICKET_FILTER_PARAMETERS,
+        ],
+        responses={200: TicketColumnCountsSerializer},
+    )
+    @action(detail=False, methods=['get'])
+    def column_counts(self, request):
+        params = request.query_params
+        board_id = _parse_int_param(params, 'board')
+        if board_id is None:
+            return Response({'board': ['This parameter is required.']}, status=status.HTTP_400_BAD_REQUEST)
+        if not can_access_board(request.user, board_id):
+            return Response({'error': 'Board not found'}, status=status.HTTP_404_NOT_FOUND)
+        column_ids = list(
+            TicketColumn.objects.filter(board_id=board_id).order_by('position', 'id').values_list('id', flat=True)
+        )
+        qs = apply_ticket_filters(
+            self.get_queryset().filter(column__board_id=board_id), params, request.user, include_board=False,
+        )
+        counts = {str(cid): 0 for cid in column_ids}
+        for row in qs.order_by().values('column_id').annotate(n=Count('pk')):
+            if row['column_id'] is not None:
+                counts[str(row['column_id'])] = row['n']
+        return Response({'counts': counts})
+
+    @extend_schema(
+        summary='Position of a ticket among its board neighbours',
+        description=(
+            'Where the ticket sits in its board under the given filters and order, for '
+            '"x of n" and J/K navigation. `view=board` follows the kanban order (column '
+            'position, then the column order: manual `position_in_column, -created_at, -id` '
+            'or `ordering`); `view=list` follows the list order (column position, then '
+            '`ordering`, default `-created_at`, then `-id`). When the ticket does not match '
+            'the filters, `index` is null and the neighbours come from the unfiltered board order.'
+        ),
+        filters=False,
+        parameters=[
+            OpenApiParameter('view', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+                             enum=['board', 'list'], description='Which order to follow (default board).'),
+            OpenApiParameter('ordering', OpenApiTypes.STR, OpenApiParameter.QUERY, required=False,
+                             description='The sort in use on the screen (same values as the ticket list).'),
+            *TICKET_FILTER_PARAMETERS,
+        ],
+        responses={200: TicketNavigationSerializer},
+    )
+    @action(detail=True, methods=['get'])
+    def navigation(self, request, pk=None):
+        ticket = self.get_object()
+        params = request.query_params
+        empty = {'index': None, 'total': 0, 'prev_id': None, 'next_id': None}
+        if ticket.column_id is None or ticket.column.board_id is None:
+            return Response(empty)
+
+        board_scope = self.get_queryset().filter(column__board_id=ticket.column.board_id)
+        board_order = _BOARD_COLUMN_ORDER + list(MANUAL_ORDER)
+        view = str(params.get('view') or 'board').strip().lower()
+        if view == 'list':
+            order = list_ticket_order(params.get('ordering'), group_by_column=True)
+        else:
+            order = _BOARD_COLUMN_ORDER + column_ticket_order(params.get('ordering'))
+
+        position = None
+        if has_ticket_filters(params, include_board=False) or order != board_order:
+            filtered = apply_ticket_filters(board_scope, params, request.user, include_board=False)
+            position = keyset_neighbors(filtered, ticket.pk, order)
+        else:
+            # No filters and the board order: one query answers both.
+            position = keyset_neighbors(board_scope, ticket.pk, board_order)
+        if position is None:
+            fallback = keyset_neighbors(board_scope, ticket.pk, board_order)
+            position = dict(fallback or empty, index=None)
+        return Response(position)
 
 
 def _keep_pre_be06_schema(view):
@@ -1621,9 +1890,35 @@ class BoardViewSet(viewsets.ModelViewSet):
             columns_count=child_count_subquery(TicketColumn, fk='board'),
         )
 
+        if self._is_lite_list():
+            # A1: compact rows, open_count as one more scalar subquery, no
+            # prefetches -- the query count does not depend on the number of
+            # boards. Every ticket on an accessible board is visible, so
+            # open_count needs no per-user filtering.
+            return accessible_boards(user, base_qs.annotate(
+                open_count=child_count_subquery(
+                    Ticket, fk='column__board', column__is_closed_status=False,
+                ),
+            )).order_by('position', 'name', 'id')
+
+        # Board order lives in the queryset (E28): Meta.ordering stays ['name'].
         return accessible_boards(user, base_qs).select_related('created_by').prefetch_related(
             'board_users', 'board_groups', 'order_users', 'columns'
+        ).order_by('position', 'name', 'id')
+
+    def _is_lite_list(self):
+        """``GET boards/?lite=1`` (opt-in, undocumented: E10)."""
+        request = getattr(self, 'request', None)
+        return (
+            getattr(self, 'action', None) == 'list'
+            and request is not None
+            and str(request.query_params.get('lite', '')).lower() in ('1', 'true', 'yes')
         )
+
+    def get_serializer_class(self):
+        if self._is_lite_list():
+            return BoardLiteSerializer
+        return super().get_serializer_class()
 
     def perform_create(self, serializer):
         """Set the created_by field when creating a board."""
@@ -1655,7 +1950,14 @@ class BoardViewSet(viewsets.ModelViewSet):
     def kanban_board(self, request, pk=None):
         """Get kanban board data for a specific board."""
         board = self.get_object()
-        lite = str(request.query_params.get('lite', '')).lower() in ('1', 'true', 'yes')
+        params = request.query_params
+        lite = str(params.get('lite', '')).lower() in ('1', 'true', 'yes')
+        # A4 filters and the within-column order (undocumented on this
+        # operation, E10). Every ticket on an accessible board is visible, so
+        # filters only ever narrow. Columns stay present even when empty, and
+        # columns[].tickets_count stays unfiltered (F20).
+        ticket_filter = ticket_filter_q(params, request.user, include_board=False)
+        ticket_order = column_ticket_order(params.get('ordering'))
 
         # Build optimized ticket queryset with all relations prefetched
         from django.contrib.auth import get_user_model
@@ -1667,14 +1969,13 @@ class BoardViewSet(viewsets.ModelViewSet):
             # Card payload: assignees, tags, subquery counts and the
             # description head; full descriptions stay deferred.
             ticket_serializer_class = TicketCardSerializer
-            ticket_qs = lite_card_queryset(
-                Ticket.objects.order_by('position_in_column', '-created_at', '-id')
-            )
+            ticket_qs = lite_card_queryset(Ticket.objects.filter(ticket_filter).order_by(*ticket_order))
         else:
             ticket_serializer_class = KanbanTicketListSerializer
             ticket_qs = (
                 Ticket.objects
-                .order_by('position_in_column', '-created_at')
+                .filter(ticket_filter)
+                .order_by(*ticket_order)
                 .select_related(
                     'created_by', 'assigned_to', 'assigned_department',
                     'column', 'column__board', 'column__created_by',
