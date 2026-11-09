@@ -372,3 +372,31 @@ def email_mailbox_operation_task(self, schema_name, connection_id, operation, it
         except Exception as exc:
             logger.error("Email %s for %s/%s failed: %s", operation, schema_name, connection.email_address, exc)
         return None
+
+
+@shared_task(bind=True, max_retries=3, soft_time_limit=240, time_limit=300)
+def mirror_social_attachments_task(self, schema_name, platform, message_pk):
+    """Copy a Facebook/Instagram message's Meta CDN attachments into our
+    storage and rewrite its URLs (queued by social_integrations.signals).
+
+    Transient failures (timeouts, Meta 5xx, storage blips) retry with
+    backoff; a link that is already expired falls back to asking the Graph
+    API for fresh URLs once. Idempotent — safe to run repeatedly.
+    """
+    from tenant_schemas.utils import schema_context
+
+    from social_integrations.services import media_mirror
+
+    if platform not in media_mirror.PLATFORMS:
+        return None
+    with schema_context(schema_name):
+        Model = media_mirror.model_for(platform)
+        msg = Model.objects.filter(pk=message_pk).first()
+        if msg is None or not media_mirror.needs_mirroring(msg):
+            return None
+        result = media_mirror.mirror_message(msg, platform)
+        if any(f['reason'] in ('expired', 'not_found') for f in result.failures):
+            result = media_mirror.refresh_message(msg, platform, initial=result)
+        if result.transient and self.request.retries < self.max_retries:
+            raise self.retry(countdown=60 * (2 ** self.request.retries))
+        return {'mirrored': result.mirrored, 'failures': result.failures}

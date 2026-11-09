@@ -573,6 +573,10 @@ TIKTOK_SHOP_APP_SECRET = config('TIKTOK_SHOP_APP_SECRET', default='')
 TIKTOK_SHOP_SERVICE_ID = config('TIKTOK_SHOP_SERVICE_ID', default='')
 TIKTOK_SHOP_REDIRECT_URI = config('TIKTOK_SHOP_REDIRECT_URI', default='https://api.echodesk.ge/api/social/tiktok/oauth/callback/')
 
+# Copy Facebook/Instagram attachments off Meta's expiring CDN into our
+# storage when a message is saved (social_integrations/services/media_mirror.py).
+SOCIAL_MEDIA_MIRROR_ENABLED = config('SOCIAL_MEDIA_MIRROR_ENABLED', default=True, cast=bool)
+
 # Social Integration Configuration
 SOCIAL_INTEGRATIONS = {
     'FACEBOOK_APP_ID': FACEBOOK_APP_ID,

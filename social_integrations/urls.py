@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from . import views, admin_views, ai_views, telegram_views, legal_views, views_email_threads, views_conversation_tickets
+from . import views, views_media, admin_views, ai_views, telegram_views, legal_views, views_email_threads, views_conversation_tickets
 
 # Create a router and register our viewsets with it
 router = DefaultRouter()
@@ -124,6 +124,9 @@ urlpatterns = [
     path('settings/', views.social_settings, name='social_settings'),
 
     # Chat Assignment endpoints
+    # Re-mirror expired Facebook/Instagram attachments (web onError fallback)
+    path('attachments/refresh/', views_media.refresh_social_attachments, name='refresh_social_attachments'),
+
     path('assignments/', views.my_assignments, name='my_assignments'),
     path('assignments/all/', views.all_assignments, name='all_assignments'),
     path('assignments/assign/', views.assign_chat, name='assign_chat'),
