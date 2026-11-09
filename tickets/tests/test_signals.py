@@ -13,9 +13,10 @@ from tickets.models import TicketHistory
 
 User = get_user_model()
 
-# Suppress WebSocket/push side effects from post_save signals.
-# async_to_sync is imported at module level in tickets/signals.py
-_ws_patch = patch('tickets.signals.async_to_sync', return_value=lambda **kw: None)
+# Suppress WebSocket/push side effects from post_save signals. Board
+# broadcasts are sent by tickets.realtime (after commit, BE-08), which imports
+# async_to_sync at module level.
+_ws_patch = patch('tickets.realtime.async_to_sync', return_value=lambda *a, **kw: None)
 # In notification_utils, async_to_sync is imported inside the function body,
 # so we patch it at the source module.
 _notif_patch = patch(

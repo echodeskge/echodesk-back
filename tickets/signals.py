@@ -12,7 +12,7 @@ Signals for ticket notifications, history and board broadcasts.
   history at all.
 """
 from django.db.models import Q
-from django.db.models.signals import post_save, post_delete, pre_save, m2m_changed
+from django.db.models.signals import post_save, post_delete, pre_save, pre_delete, m2m_changed
 from django.dispatch import receiver
 from django.contrib.auth import get_user_model
 from .models import (
@@ -383,7 +383,9 @@ def _on_assignment_change(instance, added):
     if added:
         old_ids = [uid for uid in current if uid != user.id]
     else:
-        old_ids = current + [user.id]
+        # A queryset delete removes every row before the first post_delete,
+        # so the "before" set comes from pre_delete (see capture_assignees_before_delete).
+        old_ids = getattr(instance, '_assignees_before_delete', None) or current + [user.id]
     assigned_to_id = row['assigned_to_id']
     _queue_ticket_updated(instance.ticket_id, {
         'assignees': {
@@ -424,6 +426,17 @@ def notify_on_ticket_assignment(sender, instance, created, raw=False, **kwargs):
         )
 
     _on_assignment_change(instance, added=True)
+
+
+@receiver(pre_delete, sender=TicketAssignment)
+def capture_assignees_before_delete(sender, instance, **kwargs):
+    """The ticket's assigned user ids before this delete (all pre_delete
+    signals of a queryset delete run before its SQL DELETE)."""
+    if _deleted_with_parent(kwargs, TicketAssignment):
+        return
+    instance._assignees_before_delete = list(
+        TicketAssignment.objects.filter(ticket_id=instance.ticket_id).values_list('user_id', flat=True)
+    )
 
 
 @receiver(post_delete, sender=TicketAssignment)
