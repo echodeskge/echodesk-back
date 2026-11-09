@@ -156,7 +156,16 @@ class BoardPermission(permissions.BasePermission):
             # whose only access is an open board no longer gets 403.
             if user.has_permission('view_boards') or user.has_permission('access_orders'):
                 return True
-            return accessible_boards(user).exists()
+            # has_object_permission calls back into has_permission; answer the
+            # "can see any board" question once per request.
+            cached = getattr(request, '_tickets_any_board_access', None)
+            if cached is None:
+                cached = accessible_boards(user).exists()
+                try:
+                    request._tickets_any_board_access = cached
+                except AttributeError:
+                    pass
+            return cached
 
         elif view.action == 'create':
             return request.user.has_permission('create_boards')
@@ -633,7 +642,7 @@ class TicketViewSet(viewsets.ModelViewSet):
         ).select_related(
             'created_by', 'assigned_to', 'column', 'column__created_by',
         ).prefetch_related(
-            'tags',
+            Prefetch('tags', queryset=Tag.objects.select_related('created_by')),
             Prefetch('assigned_users', queryset=User.objects.only('id', 'email', 'first_name', 'last_name')),
             'assigned_groups',
             Prefetch(
@@ -652,7 +661,7 @@ class TicketViewSet(viewsets.ModelViewSet):
             'created_by', 'assigned_to', 'column', 'column__board', 'column__created_by',
             'assigned_department', 'customer',
         ).prefetch_related(
-            'tags',
+            Prefetch('tags', queryset=Tag.objects.select_related('created_by')),
             'assigned_groups',
             'assigned_users',
             Prefetch(
@@ -708,6 +717,10 @@ class TicketViewSet(viewsets.ModelViewSet):
             if old_id != new_id:
                 close_active_time_log(ticket, old_column)
                 open_time_log(ticket, new_column, self.request.user)
+        # DRF drops the prefetch cache after an update, so the response would
+        # load each child's users one by one; re-read with the detail
+        # prefetches instead (constant query count, A7).
+        serializer.instance = self._detail_queryset().get(pk=ticket.pk)
 
     def _get_ticket_for_move(self):
         """Resolve the ticket for a move (E4): 404 when it does not exist,
@@ -930,6 +943,11 @@ class TicketViewSet(viewsets.ModelViewSet):
             # Handle time tracking for new column (if enabled)
             open_time_log(ticket, new_column, request.user)
 
+        # Re-read with the detail prefetches so the response does not load
+        # comments/checklist/attachments users one row at a time. Unscoped:
+        # the move was authorised, and a transfer may take the ticket off the
+        # mover's visible boards.
+        ticket = self._detail_queryset().get(pk=ticket.pk)
         serializer = self.get_serializer(ticket)
         return Response(serializer.data)
 
@@ -1901,9 +1919,14 @@ class BoardViewSet(viewsets.ModelViewSet):
                 ),
             )).order_by('position', 'name', 'id')
 
+        # The kanban loads its columns itself; the board's own prefetch of
+        # them would be a wasted query there.
+        prefetch = ['board_users', 'board_groups', 'order_users']
+        if getattr(self, 'action', None) != 'kanban_board':
+            prefetch.append('columns')
         # Board order lives in the queryset (E28): Meta.ordering stays ['name'].
         return accessible_boards(user, base_qs).select_related('created_by').prefetch_related(
-            'board_users', 'board_groups', 'order_users', 'columns'
+            *prefetch
         ).order_by('position', 'name', 'id')
 
     def _is_lite_list(self):
@@ -1983,7 +2006,7 @@ class BoardViewSet(viewsets.ModelViewSet):
                 .prefetch_related(
                     assignee_prefetch,
                     'assigned_groups',
-                    'tags',
+                    Prefetch('tags', queryset=Tag.objects.select_related('created_by')),
                     'attachments',
                     Prefetch(
                         'ticketassignment_set',

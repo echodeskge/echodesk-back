@@ -68,3 +68,72 @@ class TestTicketOpenApiContract(TicketTestCase):
         component = self.resolve(body['$ref'])
         self.assertEqual(component['properties']['position_in_column']['type'], 'integer')
         self.assertEqual(component['properties']['position_in_column']['minimum'], 0)
+
+
+# Parameter names, in order, of the operations whose generated-client
+# signatures are positional (E10). Taken from schema-tickets-base.yml (the
+# 0040-era schema). New filters on these operations must stay undocumented.
+PINNED_PARAMETERS = {
+    ('/api/tickets/', 'get'): [
+        'assigned_groups', 'assigned_to', 'board', 'column', 'created_by', 'ordering',
+        'page', 'page_size', 'priority', 'search', 'tags',
+    ],
+    ('/api/boards/', 'get'): ['ordering', 'page', 'page_size', 'search'],
+    ('/api/columns/', 'get'): ['board', 'ordering', 'page', 'page_size'],
+    ('/api/tags/', 'get'): ['ordering', 'page', 'page_size', 'search'],
+    ('/api/boards/{id}/kanban_board/', 'get'): ['id', 'lite'],
+}
+PINNED_OPERATION_IDS = {
+    ('/api/tickets/', 'get'): 'tickets_list',
+    ('/api/boards/', 'get'): 'boards_list',
+    ('/api/columns/', 'get'): 'columns_list',
+    ('/api/tags/', 'get'): 'tags_list',
+    ('/api/boards/{id}/kanban_board/', 'get'): 'boards_kanban_board_retrieve',
+}
+
+
+class TestPinnedListParameters(TicketTestCase):
+    """E10: the redesign's filters (assignee, unassigned, priority__in,
+    tags__in, due, due_before, due_after, is_closed, q, group, lite on boards)
+    are accepted but never documented on the existing operations."""
+    _schema = None
+    schema = TestTicketOpenApiContract.__dict__['schema']
+    resolve = TestTicketOpenApiContract.resolve
+
+    def test_pinned_operations_keep_their_parameters_in_order(self):
+        paths = self.schema()['paths']
+        for (path, method), expected in PINNED_PARAMETERS.items():
+            op = paths[path][method]
+            self.assertEqual(op['operationId'], PINNED_OPERATION_IDS[(path, method)])
+            self.assertEqual([p['name'] for p in op.get('parameters', [])], expected, path)
+
+    def test_new_operations_are_documented(self):
+        op_ids = {
+            op['operationId']
+            for ops in self.schema()['paths'].values()
+            for op in ops.values() if isinstance(op, dict) and 'operationId' in op
+        }
+        for op_id in (
+            'tickets_view_counts_retrieve', 'tickets_column_counts_retrieve', 'tickets_navigation_retrieve',
+            'tickets_timer_retrieve', 'tickets_timer_start', 'tickets_timer_stop',
+            'time_entries_current_retrieve', 'time_entries_current_stop',
+        ):
+            self.assertIn(op_id, op_ids)
+
+    def test_new_operation_shapes(self):
+        paths = self.schema()['paths']
+
+        def props(path):
+            ref = paths[path]['get']['responses']['200']['content']['application/json']['schema']['$ref']
+            return self.resolve(ref)['properties']
+
+        self.assertEqual(set(props('/api/tickets/view_counts/')), {'mine', 'unassigned', 'urgent', 'due_this_week'})
+        self.assertEqual(set(props('/api/tickets/column_counts/')), {'counts'})
+        self.assertEqual(set(props('/api/tickets/{id}/navigation/')), {'index', 'total', 'prev_id', 'next_id'})
+        nav_id = next(p for p in paths['/api/tickets/{id}/navigation/']['get']['parameters'] if p['name'] == 'id')
+        self.assertEqual(nav_id['schema']['type'], 'string')
+
+    def test_comment_request_schema_still_has_user_id(self):
+        body = self.schema()['paths']['/api/comments/']['post']['requestBody']
+        ref = body['content']['application/json']['schema']['$ref']
+        self.assertIn('user_id', self.resolve(ref)['properties'])
