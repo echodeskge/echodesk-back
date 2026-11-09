@@ -169,7 +169,12 @@ def conversation_create_ticket(request):
                 customer_id=_customer_id(platform, raw_id, account_id),
             )
             ticket._current_user = request.user
-            ticket.save()
+            # One ``created`` history row, nothing else (E15)
+            from tickets.realtime import history_muted
+            from tickets.signals import record_ticket_created
+            with history_muted():
+                ticket.save()
+            record_ticket_created(ticket, request.user)
             ConversationTicket.objects.create(
                 platform=platform,
                 conversation_id=assignment_conversation_id(platform, raw_id, account_id),

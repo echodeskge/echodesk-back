@@ -14,9 +14,8 @@ Rules (plan E32):
 Every change broadcasts ``ticket_activity {kind:'timer'}`` to the ticket's
 board after commit.
 """
-from asgiref.sync import async_to_sync
 from django.contrib.auth import get_user_model
-from django.db import DatabaseError, IntegrityError, connection, transaction
+from django.db import DatabaseError, IntegrityError, transaction
 from django.db.models import Min, Q, Sum
 from django.db.models.signals import post_save, pre_delete
 from django.dispatch import receiver
@@ -76,26 +75,15 @@ def _ticket_title_if_visible(user, ticket_id):
 # ── broadcasting ────────────────────────────────────────────────────────────
 
 def _queue_timer_broadcast(ticket_id, board_id, actor_id):
-    """Send ``ticket_activity {kind:'timer'}`` after the transaction commits
-    (immediately in autocommit). Never raises."""
-    if not board_id:
-        return
-    schema = getattr(connection, 'schema_name', 'public')
-    payload = {
-        'ticket_id': ticket_id,
-        'kind': 'timer',
-        'actor_id': actor_id,
-        'client_mutation_id': None,
-    }
-
-    def send():
-        try:
-            from users.consumers import broadcast_ticket_activity
-            async_to_sync(broadcast_ticket_activity)(schema, board_id, payload)
-        except Exception as e:  # broadcasting must never break the request
-            print(f"[Timer] Error broadcasting ticket_activity: {e}")
-
-    transaction.on_commit(send)
+    """Queue ``ticket_activity {kind:'timer'}``: sent after the transaction
+    commits (immediately in autocommit) and coalesced with the request's
+    other board events (``tickets.realtime.queue_event``). Never raises."""
+    try:
+        from .realtime import queue_event
+        queue_event('ticket_activity', board_id=board_id, ticket_id=ticket_id,
+                    kind='timer', actor_id=actor_id)
+    except Exception as e:  # broadcasting must never break the request
+        print(f"[Timer] Error broadcasting ticket_activity: {e}")
 
 
 def _board_id_of(ticket_id):

@@ -346,7 +346,12 @@ def email_thread_create_ticket(request):
                 customer_id=_customer_id_for_sender(source),
             )
             ticket._current_user = request.user
-            ticket.save()
+            # One ``created`` history row, nothing else (E15)
+            from tickets.realtime import history_muted
+            from tickets.signals import record_ticket_created
+            with history_muted():
+                ticket.save()
+            record_ticket_created(ticket, request.user)
             EmailThreadTicket.objects.create(
                 connection=conn, thread_id=thread_id, ticket=ticket, created_by=request.user,
             )

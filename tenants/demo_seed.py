@@ -321,6 +321,7 @@ class DemoSeeder:
         )
 
         from tickets.dates import tickets_today
+        from tickets.realtime import history_muted
 
         rng = self.rng
         # Task due dates are computed in the tickets' local zone (Asia/Tbilisi),
@@ -398,100 +399,103 @@ class DemoSeeder:
         due_index = 0
 
         specs = [(support, sup_cols, t) for t in support_titles] + [(sales, sales_cols, t) for t in sales_titles]
-        for i, (board, cols, title) in enumerate(specs):
-            col = cols[i % len(cols)]
-            creator = [self.admin, self.manager, self.agent][i % 3]
-            assignee = assignees[i % len(assignees)]
-            created_at = self.now - timedelta(days=rng.randint(1, 30), hours=rng.randint(0, 23))
-            ticket = Ticket(
-                title=title,
-                description=f'{title}. Reported via {["phone", "e-mail", "Facebook", "website chat"][i % 4]}.',
-                priority=priorities[i % len(priorities)],
-                column=col,
-                created_by=creator,
-                assigned_to=assignee,
-                assigned_department=assignee.department,
-            )
-            if i % 5 in (1, 3):
-                ticket.due_date = local_today + timedelta(days=due_offsets[due_index % len(due_offsets)])
-                due_index += 1
-            if board is sales:
-                price = Decimal(rng.choice([450, 900, 1500, 2400, 3600]))
-                ticket.is_order = True
-                ticket.price = price
-                ticket.currency = 'GEL'
-                ticket.payment_due_date = self.today + timedelta(days=rng.randint(-10, 30))
-                if col.name == 'Won':
-                    ticket.amount_paid = price
-                elif i % 3 == 0:
-                    ticket.amount_paid = (price / 2).quantize(Decimal('0.01'))
-            _clean_save(ticket, exclude=['rich_description', 'metadata'])
-            _backdate(ticket, created_at=created_at)
-
-            TicketAssignment.objects.create(ticket=ticket, user=assignee, role='primary', assigned_by=creator)
-            if i % 4 == 0:
-                helper = assignees[(i + 1) % len(assignees)]
-                if helper.id != assignee.id:
-                    TicketAssignment.objects.create(ticket=ticket, user=helper, role='collaborator',
-                                                    assigned_by=creator)
-            if i % 5 == 0:
-                ticket.assigned_groups.add(self.groups['support'])
-            tag_names = list(tags)
-            ticket.tags.add(tags[tag_names[i % len(tag_names)]])
-            if i % 3 == 0:
-                ticket.tags.add(tags[tag_names[(i + 2) % len(tag_names)]])
-
-            for c in range(i % 4):
-                author = [self.agent, self.manager, self.admin, self.users['staff1']][(i + c) % 4]
-                text = comment_texts[(i + c) % len(comment_texts)].format(
-                    agent=self.agent.email, manager=self.manager.email)
-                # Mixed internal / not-internal comments (internal is the default).
-                comment = TicketComment.objects.create(ticket=ticket, user=author, comment=text,
-                                                       is_internal=(i + c) % 3 != 1)
-                # updated_at too: the activity feed marks a comment "edited" when
-                # updated_at - created_at > 2s.
-                commented_at = created_at + timedelta(hours=c + 1)
-                _backdate(comment, created_at=commented_at, updated_at=commented_at)
-
-            for p in range(i % 5 if board is support else 0):
-                checked = p < 2
-                ChecklistItem.objects.create(ticket=ticket, text=checklist_texts[p], is_checked=checked,
-                                             position=p, created_by=creator,
-                                             checked_by=assignee if checked else None,
-                                             checked_at=created_at + timedelta(hours=p + 1) if checked else None)
-
-            if i % 6 == 0:
-                fname = ['photo-damage.jpg', 'invoice.pdf', 'screenshot.png'][i % 3]
-                TicketAttachment.objects.create(
-                    ticket=ticket, file=f'ticket_attachments/demo/{ticket.id}-{fname}', filename=fname,
-                    file_size=rng.randint(40_000, 900_000),
-                    content_type={'jpg': 'image/jpeg', 'pdf': 'application/pdf', 'png': 'image/png'}[fname[-3:]],
-                    uploaded_by=creator,
+        # The seed writes its own history rows; the automatic ones (tags,
+        # assignees, checklist, attachments) stay muted (E15, F11).
+        with history_muted():
+            for i, (board, cols, title) in enumerate(specs):
+                col = cols[i % len(cols)]
+                creator = [self.admin, self.manager, self.agent][i % 3]
+                assignee = assignees[i % len(assignees)]
+                created_at = self.now - timedelta(days=rng.randint(1, 30), hours=rng.randint(0, 23))
+                ticket = Ticket(
+                    title=title,
+                    description=f'{title}. Reported via {["phone", "e-mail", "Facebook", "website chat"][i % 4]}.',
+                    priority=priorities[i % len(priorities)],
+                    column=col,
+                    created_by=creator,
+                    assigned_to=assignee,
+                    assigned_department=assignee.department,
                 )
+                if i % 5 in (1, 3):
+                    ticket.due_date = local_today + timedelta(days=due_offsets[due_index % len(due_offsets)])
+                    due_index += 1
+                if board is sales:
+                    price = Decimal(rng.choice([450, 900, 1500, 2400, 3600]))
+                    ticket.is_order = True
+                    ticket.price = price
+                    ticket.currency = 'GEL'
+                    ticket.payment_due_date = self.today + timedelta(days=rng.randint(-10, 30))
+                    if col.name == 'Won':
+                        ticket.amount_paid = price
+                    elif i % 3 == 0:
+                        ticket.amount_paid = (price / 2).quantize(Decimal('0.01'))
+                _clean_save(ticket, exclude=['rich_description', 'metadata'])
+                _backdate(ticket, created_at=created_at)
 
-            # Time tracking: tickets that sit in, or already went through, the
-            # track_time column get time logs (closed segment + open segment).
-            tracked = next(c for c in cols if c.track_time)
-            if col.position >= tracked.position:
-                entered = created_at + timedelta(hours=2)
-                if col.id == tracked.id:
-                    log = TicketTimeLog.objects.create(ticket=ticket, column=tracked, user=assignee)
-                    _backdate(log, entered_at=entered)
-                else:
-                    exited = entered + timedelta(hours=rng.randint(1, 30), minutes=rng.randint(0, 59))
-                    log = TicketTimeLog.objects.create(
-                        ticket=ticket, column=tracked, user=assignee, exited_at=exited,
-                        duration_seconds=int((exited - entered).total_seconds()))
-                    _backdate(log, entered_at=entered)
-                    TicketHistory.objects.create(
-                        ticket=ticket, action='status_changed', field_name='column',
-                        old_value=tracked.name, new_value=col.name, user=assignee,
-                        description=f'Moved from {tracked.name} to {col.name}')
+                TicketAssignment.objects.create(ticket=ticket, user=assignee, role='primary', assigned_by=creator)
+                if i % 4 == 0:
+                    helper = assignees[(i + 1) % len(assignees)]
+                    if helper.id != assignee.id:
+                        TicketAssignment.objects.create(ticket=ticket, user=helper, role='collaborator',
+                                                        assigned_by=creator)
+                if i % 5 == 0:
+                    ticket.assigned_groups.add(self.groups['support'])
+                tag_names = list(tags)
+                ticket.tags.add(tags[tag_names[i % len(tag_names)]])
+                if i % 3 == 0:
+                    ticket.tags.add(tags[tag_names[(i + 2) % len(tag_names)]])
 
-            if ticket.amount_paid:
-                TicketPayment.objects.create(ticket=ticket, amount=ticket.amount_paid, currency='GEL',
-                                             payment_method='bank_transfer', processed_by=self.manager,
-                                             payment_reference=f'DEMO-PAY-{ticket.id}')
+                for c in range(i % 4):
+                    author = [self.agent, self.manager, self.admin, self.users['staff1']][(i + c) % 4]
+                    text = comment_texts[(i + c) % len(comment_texts)].format(
+                        agent=self.agent.email, manager=self.manager.email)
+                    # Mixed internal / not-internal comments (internal is the default).
+                    comment = TicketComment.objects.create(ticket=ticket, user=author, comment=text,
+                                                           is_internal=(i + c) % 3 != 1)
+                    # updated_at too: the activity feed marks a comment "edited" when
+                    # updated_at - created_at > 2s.
+                    commented_at = created_at + timedelta(hours=c + 1)
+                    _backdate(comment, created_at=commented_at, updated_at=commented_at)
+
+                for p in range(i % 5 if board is support else 0):
+                    checked = p < 2
+                    ChecklistItem.objects.create(ticket=ticket, text=checklist_texts[p], is_checked=checked,
+                                                 position=p, created_by=creator,
+                                                 checked_by=assignee if checked else None,
+                                                 checked_at=created_at + timedelta(hours=p + 1) if checked else None)
+
+                if i % 6 == 0:
+                    fname = ['photo-damage.jpg', 'invoice.pdf', 'screenshot.png'][i % 3]
+                    TicketAttachment.objects.create(
+                        ticket=ticket, file=f'ticket_attachments/demo/{ticket.id}-{fname}', filename=fname,
+                        file_size=rng.randint(40_000, 900_000),
+                        content_type={'jpg': 'image/jpeg', 'pdf': 'application/pdf', 'png': 'image/png'}[fname[-3:]],
+                        uploaded_by=creator,
+                    )
+
+                # Time tracking: tickets that sit in, or already went through, the
+                # track_time column get time logs (closed segment + open segment).
+                tracked = next(c for c in cols if c.track_time)
+                if col.position >= tracked.position:
+                    entered = created_at + timedelta(hours=2)
+                    if col.id == tracked.id:
+                        log = TicketTimeLog.objects.create(ticket=ticket, column=tracked, user=assignee)
+                        _backdate(log, entered_at=entered)
+                    else:
+                        exited = entered + timedelta(hours=rng.randint(1, 30), minutes=rng.randint(0, 59))
+                        log = TicketTimeLog.objects.create(
+                            ticket=ticket, column=tracked, user=assignee, exited_at=exited,
+                            duration_seconds=int((exited - entered).total_seconds()))
+                        _backdate(log, entered_at=entered)
+                        TicketHistory.objects.create(
+                            ticket=ticket, action='status_changed', field_name='column',
+                            old_value=tracked.name, new_value=col.name, user=assignee,
+                            description=f'Moved from {tracked.name} to {col.name}')
+
+                if ticket.amount_paid:
+                    TicketPayment.objects.create(ticket=ticket, amount=ticket.amount_paid, currency='GEL',
+                                                 payment_method='bank_transfer', processed_by=self.manager,
+                                                 payment_reference=f'DEMO-PAY-{ticket.id}')
 
     # ------------------------------------------------------------------ leave
     def seed_leave(self):

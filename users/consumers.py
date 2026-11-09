@@ -499,7 +499,10 @@ class TicketBoardConsumer(AsyncWebsocketConsumer):
             'to_column_id': event['to_column_id'],
             'position': event.get('position'),
             'updated_by_id': event.get('updated_by_id'),
-            'updated_by_name': event.get('updated_by_name')
+            'updated_by_name': event.get('updated_by_name'),
+            'card': event.get('card'),
+            'actor_id': event.get('actor_id'),
+            'client_mutation_id': event.get('client_mutation_id'),
         }))
 
     async def ticket_updated(self, event):
@@ -512,7 +515,10 @@ class TicketBoardConsumer(AsyncWebsocketConsumer):
             'ticket_id': event['ticket_id'],
             'changes': event.get('changes', {}),
             'updated_by_id': event.get('updated_by_id'),
-            'updated_by_name': event.get('updated_by_name')
+            'updated_by_name': event.get('updated_by_name'),
+            'card': event.get('card'),
+            'actor_id': event.get('actor_id'),
+            'client_mutation_id': event.get('client_mutation_id'),
         }))
 
     async def ticket_created(self, event):
@@ -524,7 +530,9 @@ class TicketBoardConsumer(AsyncWebsocketConsumer):
             'type': 'ticket_created',
             'ticket': event['ticket'],
             'created_by_id': event.get('created_by_id'),
-            'created_by_name': event.get('created_by_name')
+            'created_by_name': event.get('created_by_name'),
+            'actor_id': event.get('actor_id'),
+            'client_mutation_id': event.get('client_mutation_id'),
         }))
 
     async def ticket_deleted(self, event):
@@ -536,7 +544,10 @@ class TicketBoardConsumer(AsyncWebsocketConsumer):
             'type': 'ticket_deleted',
             'ticket_id': event['ticket_id'],
             'deleted_by_id': event.get('deleted_by_id'),
-            'deleted_by_name': event.get('deleted_by_name')
+            'deleted_by_name': event.get('deleted_by_name'),
+            'reason': event.get('reason') or 'deleted',
+            'to_board_id': event.get('to_board_id'),
+            'client_mutation_id': event.get('client_mutation_id'),
         }))
 
     async def ticket_commented(self, event):
@@ -707,7 +718,7 @@ class TicketBoardConsumer(AsyncWebsocketConsumer):
 
 
 # Utility functions for sending WebSocket messages from Django views/signals
-async def broadcast_ticket_moved(tenant_schema, board_id, ticket_id, from_column_id, to_column_id, position, updated_by, exclude_channel=None):
+async def broadcast_ticket_moved(tenant_schema, board_id, ticket_id, from_column_id, to_column_id, position, updated_by, exclude_channel=None, **extra):
     """
     Broadcast ticket movement to all users viewing the board.
 
@@ -720,6 +731,8 @@ async def broadcast_ticket_moved(tenant_schema, board_id, ticket_id, from_column
         position: New position in column
         updated_by: User who moved the ticket
         exclude_channel: Optional channel name to exclude from broadcast
+        **extra: further message keys (BE-08: ``card``, ``actor_id``,
+            ``client_mutation_id``; deletes also ``reason`` / ``to_board_id``)
     """
     from channels.layers import get_channel_layer
 
@@ -735,12 +748,13 @@ async def broadcast_ticket_moved(tenant_schema, board_id, ticket_id, from_column
             'position': position,
             'updated_by_id': updated_by.id if updated_by else None,
             'updated_by_name': updated_by.get_full_name() or updated_by.email if updated_by else 'System',
+            **extra,
             'exclude_channel': exclude_channel
         }
     )
 
 
-async def broadcast_ticket_updated(tenant_schema, board_id, ticket_id, changes, updated_by, exclude_channel=None):
+async def broadcast_ticket_updated(tenant_schema, board_id, ticket_id, changes, updated_by, exclude_channel=None, **extra):
     """
     Broadcast ticket field changes to all users viewing the board.
 
@@ -751,6 +765,8 @@ async def broadcast_ticket_updated(tenant_schema, board_id, ticket_id, changes, 
         changes: Dictionary of field changes
         updated_by: User who updated the ticket
         exclude_channel: Optional channel name to exclude from broadcast
+        **extra: further message keys (BE-08: ``card``, ``actor_id``,
+            ``client_mutation_id``; deletes also ``reason`` / ``to_board_id``)
     """
     from channels.layers import get_channel_layer
 
@@ -764,12 +780,13 @@ async def broadcast_ticket_updated(tenant_schema, board_id, ticket_id, changes, 
             'changes': changes,
             'updated_by_id': updated_by.id if updated_by else None,
             'updated_by_name': updated_by.get_full_name() or updated_by.email if updated_by else 'System',
+            **extra,
             'exclude_channel': exclude_channel
         }
     )
 
 
-async def broadcast_ticket_created(tenant_schema, board_id, ticket_data, created_by, exclude_channel=None):
+async def broadcast_ticket_created(tenant_schema, board_id, ticket_data, created_by, exclude_channel=None, **extra):
     """
     Broadcast new ticket creation to all users viewing the board.
 
@@ -779,6 +796,8 @@ async def broadcast_ticket_created(tenant_schema, board_id, ticket_data, created
         ticket_data: Dictionary containing ticket data
         created_by: User who created the ticket
         exclude_channel: Optional channel name to exclude from broadcast
+        **extra: further message keys (BE-08: ``card``, ``actor_id``,
+            ``client_mutation_id``; deletes also ``reason`` / ``to_board_id``)
     """
     from channels.layers import get_channel_layer
 
@@ -791,12 +810,13 @@ async def broadcast_ticket_created(tenant_schema, board_id, ticket_data, created
             'ticket': ticket_data,
             'created_by_id': created_by.id if created_by else None,
             'created_by_name': created_by.get_full_name() or created_by.email if created_by else 'System',
+            **extra,
             'exclude_channel': exclude_channel
         }
     )
 
 
-async def broadcast_ticket_deleted(tenant_schema, board_id, ticket_id, deleted_by, exclude_channel=None):
+async def broadcast_ticket_deleted(tenant_schema, board_id, ticket_id, deleted_by, exclude_channel=None, **extra):
     """
     Broadcast ticket deletion to all users viewing the board.
 
@@ -806,6 +826,8 @@ async def broadcast_ticket_deleted(tenant_schema, board_id, ticket_id, deleted_b
         ticket_id: The ticket that was deleted
         deleted_by: User who deleted the ticket
         exclude_channel: Optional channel name to exclude from broadcast
+        **extra: further message keys (BE-08: ``card``, ``actor_id``,
+            ``client_mutation_id``; deletes also ``reason`` / ``to_board_id``)
     """
     from channels.layers import get_channel_layer
 
@@ -818,6 +840,7 @@ async def broadcast_ticket_deleted(tenant_schema, board_id, ticket_id, deleted_b
             'ticket_id': ticket_id,
             'deleted_by_id': deleted_by.id if deleted_by else None,
             'deleted_by_name': deleted_by.get_full_name() or deleted_by.email if deleted_by else 'System',
+            **extra,
             'exclude_channel': exclude_channel
         }
     )

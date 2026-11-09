@@ -666,31 +666,37 @@ class TicketSerializer(serializers.ModelSerializer):
 
         # The post_save broadcast would fire before the tags / assignees below
         # are written, so defer it and send the complete card at the end.
+        # History is muted while the ticket is assembled: it gets exactly one
+        # ``created`` row instead of tag_added / assigned rows (E15).
+        from .realtime import history_muted
+        from .signals import broadcast_new_ticket_card, record_ticket_created
         ticket = Ticket(**validated_data)
         ticket._defer_created_broadcast = True
-        ticket.save()
+        with history_muted():
+            ticket.save()
 
-        # Set tags
-        if tag_ids:
-            ticket.tags.set(tag_ids)
+            # Set tags
+            if tag_ids:
+                ticket.tags.set(tag_ids)
 
-        # Set assigned groups
-        if assigned_group_ids:
-            ticket.assigned_groups.set(assigned_group_ids)
+            # Set assigned groups
+            if assigned_group_ids:
+                ticket.assigned_groups.set(assigned_group_ids)
 
-        # Handle multiple user assignments
-        if assigned_user_ids:
-            for user_id in assigned_user_ids:
-                role = assignment_roles.get(str(user_id), 'collaborator')
-                TicketAssignment.objects.create(
-                    ticket=ticket,
-                    user_id=user_id,
-                    role=role,
-                    assigned_by=current_user
-                )
+            # Handle multiple user assignments
+            if assigned_user_ids:
+                for user_id in assigned_user_ids:
+                    role = assignment_roles.get(str(user_id), 'collaborator')
+                    TicketAssignment.objects.create(
+                        ticket=ticket,
+                        user_id=user_id,
+                        role=role,
+                        assigned_by=current_user
+                    )
+        record_ticket_created(ticket, current_user)
 
         # Board broadcast with tags + assignees in place (see note above)
-        from .signals import broadcast_new_ticket_card
+        ticket._defer_created_broadcast = False
         broadcast_new_ticket_card(ticket)
 
         return ticket

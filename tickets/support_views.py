@@ -8,6 +8,8 @@ from rest_framework import status
 from tenant_schemas.utils import schema_context
 
 from .models import Board, TicketColumn, Ticket, TicketAttachment
+from .realtime import history_muted
+from .signals import record_ticket_created
 
 User = get_user_model()
 
@@ -67,34 +69,37 @@ def report_bug(request):
 
             system_user = User.objects.filter(is_superuser=True).first()
 
-            ticket = Ticket.objects.create(
-                title=f'[Bug] {title}',
-                description=html_description,
-                column=column,
-                priority=priority,
-                created_by=system_user,
-                metadata={
-                    'bug_report': True,
-                    'reporter_email': reporter_email,
-                    'reporter_name': reporter_name,
-                    'reporter_tenant': source_tenant,
-                    # Stash the raw user-written description (plain text) so the
-                    # Telegram new-ticket signal can include it without having
-                    # to parse the HTML wrapper above.
-                    'description': description,
-                    'page_url': page_url,
-                },
-            )
-
-            for f in files:
-                TicketAttachment.objects.create(
-                    ticket=ticket,
-                    file=f,
-                    filename=f.name,
-                    file_size=f.size,
-                    content_type=f.content_type or 'application/octet-stream',
-                    uploaded_by=system_user,
+            # One ``created`` history row; the attachments write none (E15)
+            with history_muted():
+                ticket = Ticket.objects.create(
+                    title=f'[Bug] {title}',
+                    description=html_description,
+                    column=column,
+                    priority=priority,
+                    created_by=system_user,
+                    metadata={
+                        'bug_report': True,
+                        'reporter_email': reporter_email,
+                        'reporter_name': reporter_name,
+                        'reporter_tenant': source_tenant,
+                        # Stash the raw user-written description (plain text) so the
+                        # Telegram new-ticket signal can include it without having
+                        # to parse the HTML wrapper above.
+                        'description': description,
+                        'page_url': page_url,
+                    },
                 )
+
+                for f in files:
+                    TicketAttachment.objects.create(
+                        ticket=ticket,
+                        file=f,
+                        filename=f.name,
+                        file_size=f.size,
+                        content_type=f.content_type or 'application/octet-stream',
+                        uploaded_by=system_user,
+                    )
+            record_ticket_created(ticket, system_user)
 
         return Response({'success': True, 'ticket_id': ticket.id}, status=status.HTTP_201_CREATED)
 
