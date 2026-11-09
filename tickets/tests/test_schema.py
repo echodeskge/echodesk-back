@@ -133,6 +133,25 @@ class TestPinnedListParameters(TicketTestCase):
         nav_id = next(p for p in paths['/api/tickets/{id}/navigation/']['get']['parameters'] if p['name'] == 'id')
         self.assertEqual(nav_id['schema']['type'], 'string')
 
+    def test_new_operations_have_no_required_query_param_after_an_optional_one(self):
+        """The generated TS clients (web and mobile, @gordela/api-generator)
+        take path params, then query params in alphabetical order, as
+        positional arguments. A required one after an optional one does not
+        compile (TS1016), so new operations must not document that."""
+        paths = self.schema()['paths']
+        for path in ('/api/tickets/view_counts/', '/api/tickets/column_counts/',
+                     '/api/tickets/{id}/navigation/'):
+            query = sorted(
+                (p for p in paths[path]['get'].get('parameters', []) if p['in'] == 'query'),
+                key=lambda p: p['name'],
+            )
+            seen_optional = False
+            for p in query:
+                if p.get('required'):
+                    self.assertFalse(seen_optional, f"{path}: required '{p['name']}' after an optional param")
+                else:
+                    seen_optional = True
+
     def test_comment_request_schema_still_has_user_id(self):
         body = self.schema()['paths']['/api/comments/']['post']['requestBody']
         ref = body['content']['application/json']['schema']['$ref']

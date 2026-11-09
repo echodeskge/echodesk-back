@@ -1150,8 +1150,11 @@ class TicketViewSet(viewsets.ModelViewSet):
         ),
         filters=False,
         parameters=[
-            OpenApiParameter('board', OpenApiTypes.INT, OpenApiParameter.QUERY, required=True,
-                             description='The board whose columns are counted.'),
+            # Required at runtime (400 without it), but documented as optional:
+            # the generated TS clients order query params alphabetically, and a
+            # required ``board`` after the optional ``assignee`` is TS1016.
+            OpenApiParameter('board', OpenApiTypes.INT, OpenApiParameter.QUERY, required=False,
+                             description='Required. The board whose columns are counted.'),
             *TICKET_FILTER_PARAMETERS,
         ],
         responses={200: TicketColumnCountsSerializer},
