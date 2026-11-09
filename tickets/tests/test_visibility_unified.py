@@ -12,10 +12,28 @@ from unittest import mock
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
+from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 
 from tickets.models import Ticket, TicketComment
 from tickets.tests.conftest import TicketTestCase
+
+# Attachments live on S3 in production; keep test uploads in memory.
+IN_MEMORY_STORAGES = {
+    'default': {'BACKEND': 'django.core.files.storage.InMemoryStorage'},
+    'staticfiles': {'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage'},
+}
+
+
+class InMemoryStorageMixin:
+    """Enable IN_MEMORY_STORAGES per test (EchoDeskTenantTestCase.setUpClass
+    does not call super(), so class-level override_settings never applies)."""
+
+    def setUp(self):
+        super().setUp()
+        override = override_settings(STORAGES=IN_MEMORY_STORAGES)
+        override.enable()
+        self.addCleanup(override.disable)
 from tickets.visibility import (
     accessible_boards, can_access_board, ticket_viewer_permissions,
     ticket_visibility_q, visible_tickets,
@@ -213,7 +231,7 @@ class TestDefaultBoard(VisibilityBase):
         self.assertEqual(resp.data['id'], self.restricted.id)
 
 
-class TestChildEndpoints(VisibilityBase):
+class TestChildEndpoints(InMemoryStorageMixin, VisibilityBase):
     """Every child endpoint follows ticket visibility: 200/201 on the open
     board, 404 (reads, writes on rows) or 403 (creates) on hidden tickets."""
 
@@ -232,10 +250,10 @@ class TestChildEndpoints(VisibilityBase):
 
     def test_add_comment_action_for_viewer(self):
         resp = self.api_post(f'/api/tickets/{self.open_ticket.id}/add_comment/',
-                             {'comment': 'via action'}, user=self.agent)
+                             {'ticket': self.open_ticket.id, 'comment': 'via action'}, user=self.agent)
         self.assertEqual(resp.status_code, 201, resp.data)
         resp = self.api_post(f'/api/tickets/{self.hidden.id}/add_comment/',
-                             {'comment': 'x'}, user=self.agent)
+                             {'ticket': self.hidden.id, 'comment': 'x'}, user=self.agent)
         self.assertEqual(resp.status_code, 404)
 
     def test_attachments(self):

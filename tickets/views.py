@@ -475,7 +475,7 @@ class TicketViewSet(viewsets.ModelViewSet):
         queryset = Ticket.objects.annotate(
             **ticket_count_annotations(),
         ).select_related(
-            'created_by', 'assigned_to', 'column', 'column__board',
+            'created_by', 'assigned_to', 'column', 'column__board', 'column__created_by',
             'assigned_department', 'customer',
         ).prefetch_related(
             'tags',

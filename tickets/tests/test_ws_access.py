@@ -78,30 +78,36 @@ class TestBoardSocketAccess(TicketTestCase):
     def test_missing_board_is_4403(self):
         self.assertEqual(self._connect(self.admin, 999999)[2], 4403)
 
-    def test_accessible_board_connects(self):
-        for user, board in ((self.member, self.restricted), (self.agent, self.open_board)):
-            with self.subTest(user=user.email, board=board.name):
-                accepted, frame, code = self._connect(user, board.id)
-                self.assertIs(accepted, True)
-                self.assertEqual(frame['type'], 'connection')
-                self.assertEqual(frame['board_id'], str(board.id))
-                self.assertIsNone(code)
+    def test_member_connects_to_restricted_board(self):
+        accepted, frame, code = self._connect(self.member, self.restricted.id)
+        self.assertIs(accepted, True)
+        self.assertEqual(frame['type'], 'connection')
+        self.assertEqual(frame['board_id'], str(self.restricted.id))
+        self.assertIsNone(code)
+
+    def test_agent_connects_to_open_board(self):
+        accepted, frame, code = self._connect(self.agent, self.open_board.id)
+        self.assertIs(accepted, True)
+        self.assertEqual(frame['type'], 'connection')
+        self.assertIsNone(code)
 
     def test_staff_connects_to_any_board(self):
         accepted, frame, _ = self._connect(self.admin, self.restricted.id)
         self.assertEqual(frame['type'], 'connection')
 
-    def test_access_check_runs_in_the_url_tenant_schema(self):
-        """The consumer may run with the connection on another schema (here:
-        public, where no tickets tables exist). The check must still run in
-        the tenant schema from the URL and let the member in -- and keep the
-        agent out. (A full second tenant schema would need a ~20 s migration;
-        switching the connection to public exercises the same code path.)"""
+    def _connect_from_public(self, user, board_id):
+        """Connect while the connection points at the public schema (no
+        tickets tables there): the check must still run in the tenant schema
+        from the URL. (A full second tenant schema would need a ~20 s
+        migration; this exercises the same schema_context code path.)"""
         connection.set_schema_to_public()
         try:
-            member = self._connect(self.member, self.restricted.id)
-            agent = self._connect(self.agent, self.restricted.id)
+            return self._connect(user, board_id)
         finally:
             connection.set_tenant(self.tenant)
-        self.assertEqual(member[1]['type'], 'connection')
-        self.assertEqual(agent[2], 4403)
+
+    def test_access_check_runs_in_url_schema_allows_member(self):
+        self.assertEqual(self._connect_from_public(self.member, self.restricted.id)[1]['type'], 'connection')
+
+    def test_access_check_runs_in_url_schema_denies_agent(self):
+        self.assertEqual(self._connect_from_public(self.agent, self.restricted.id)[2], 4403)

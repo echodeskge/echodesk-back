@@ -1,11 +1,29 @@
 """Tests for TicketAttachmentViewSet (BE-06 / A12, GAP j)."""
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 
 from tickets.models import TicketAttachment
 from tickets.tests.conftest import TicketTestCase
 
+# Attachments live on S3 in production; keep test uploads in memory.
+IN_MEMORY_STORAGES = {
+    'default': {'BACKEND': 'django.core.files.storage.InMemoryStorage'},
+    'staticfiles': {'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage'},
+}
 
-class AttachmentBase(TicketTestCase):
+
+class InMemoryStorageMixin:
+    """Enable IN_MEMORY_STORAGES per test (EchoDeskTenantTestCase.setUpClass
+    does not call super(), so class-level override_settings never applies)."""
+
+    def setUp(self):
+        super().setUp()
+        override = override_settings(STORAGES=IN_MEMORY_STORAGES)
+        override.enable()
+        self.addCleanup(override.disable)
+
+
+class AttachmentBase(InMemoryStorageMixin, TicketTestCase):
 
     def setUp(self):
         super().setUp()
