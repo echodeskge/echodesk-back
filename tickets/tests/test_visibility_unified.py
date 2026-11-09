@@ -30,10 +30,13 @@ class InMemoryStorageMixin:
     does not call super(), so class-level override_settings never applies)."""
 
     def setUp(self):
-        super().setUp()
+        # Enable before super().setUp() so the overrides nest correctly with
+        # the base class's middleware override (disabled in tearDown, before
+        # this cleanup runs); the other order leaks TEST_MIDDLEWARE.
         override = override_settings(STORAGES=IN_MEMORY_STORAGES)
         override.enable()
         self.addCleanup(override.disable)
+        super().setUp()
 from tickets.visibility import (
     accessible_boards, can_access_board, ticket_viewer_permissions,
     ticket_visibility_q, visible_tickets,

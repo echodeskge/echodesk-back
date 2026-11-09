@@ -26,10 +26,25 @@ def _application():
     ])
 
 
-@override_settings(CHANNEL_LAYERS=IN_MEMORY_LAYERS)
+def _reset_channel_layers():
+    from channels.layers import channel_layers
+    channel_layers.backends = {}
+
+
 class TestBoardSocketAccess(TicketTestCase):
 
     def setUp(self):
+        # Per test: EchoDeskTenantTestCase.setUpClass does not call super(),
+        # so a class-level override_settings would never apply. Enabled
+        # before super().setUp() so it nests correctly with the base class's
+        # middleware override. Layers are cached per process (and bound to
+        # an event loop), so drop them on both sides to keep other socket
+        # tests on a fresh layer.
+        override = override_settings(CHANNEL_LAYERS=IN_MEMORY_LAYERS)
+        override.enable()
+        _reset_channel_layers()
+        self.addCleanup(_reset_channel_layers)
+        self.addCleanup(override.disable)
         super().setUp()
         self.schema = connection.schema_name
         self.admin = self.create_admin(email='wsa-admin@test.com')
