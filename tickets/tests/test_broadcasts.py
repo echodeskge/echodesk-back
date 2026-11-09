@@ -416,6 +416,14 @@ class TestCoalescing(BroadcastTestCase):
         client = self.authenticated_client(self.admin)
         return client.delete(url, data, format='json', HTTP_HOST='tenant.test.com')
 
+    def test_request_without_board_events_registers_no_callback(self):
+        """Other apps' tests count on-commit callbacks: a request that queues
+        no board event must not add one (the batch flush)."""
+        with self.captureOnCommitCallbacks() as callbacks:
+            resp = self.api_get('/api/tickets/', user=self.admin)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(callbacks), 0)
+
     def test_rolled_back_transaction_sends_nothing(self):
         ticket = self.create_ticket(title='T', column=self.col1, created_by=self.admin)
         with self.broadcasts() as m:

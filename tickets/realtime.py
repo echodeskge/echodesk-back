@@ -97,7 +97,11 @@ def request_context(request, client_mutation_id=None):
         yield batch
     finally:
         try:
-            if connection.in_atomic_block:
+            if not batch.queued:
+                # Nothing was queued: no on-commit callback to register (an
+                # event queued later, outside the request, sends directly).
+                batch.flushed = True
+            elif connection.in_atomic_block:
                 transaction.on_commit(batch.flush)
             else:
                 batch.flush()
@@ -281,6 +285,7 @@ class BroadcastBatch:
     def __init__(self):
         self._events = {}  # key -> Event, insertion ordered
         self.flushed = False
+        self.queued = 0  # events queue_event routed to this batch
 
     def __len__(self):
         return len(self._events)
@@ -329,6 +334,7 @@ def queue_event(type, *, board_id, ticket_id, schema=None, **data):
     )
     batch = _batch_var.get()
     if batch is not None:
+        batch.queued += 1
         if connection.in_atomic_block:
             transaction.on_commit(lambda: batch.add(event))
         else:
