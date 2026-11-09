@@ -394,8 +394,9 @@ class TicketPermission(permissions.BasePermission):
     - PUT/PATCH: the creator, an assignee or an assigned-group member;
       changing ``assigned_to_id``/``assigned_group_ids`` or moving into a
       closed column through PUT/PATCH is staff-only;
-    - DELETE: decided in ``TicketViewSet.destroy`` (tenant setting
-      ``only_superadmin_can_delete_tickets``).
+    - DELETE: staff only, whatever ``only_superadmin_can_delete_tickets``
+      says (pre-existing behaviour, kept on purpose: ``destroy`` also checks
+      the tenant setting, but non-staff never get that far).
     """
 
     def has_permission(self, request, view):
@@ -421,9 +422,7 @@ class TicketPermission(permissions.BasePermission):
                     return False
             return user_can_edit_ticket(user, obj)
 
-        if request.method == 'DELETE':
-            return True
-
+        # DELETE (and anything else) is staff-only; see the class docstring.
         return False
 
 

@@ -287,6 +287,8 @@ class TestTicketSummary(TicketTestCase):
         self.assertEqual(resp.status_code, 404)
 
     def test_non_staff_sees_own_ticket_but_not_others(self):
+        # Restricted board: tickets on an open board are visible to everyone.
+        self.ticket.column.board.board_users.add(self.admin)
         user = self.create_user(email='ts-user@test.com')
         own = self.create_ticket(title='Mine', column=self.col2, created_by=user)
         self.create_time_log(own, self.col2, self.admin)

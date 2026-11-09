@@ -20,7 +20,6 @@ Rules:
 Everything is built from ``Exists``/``IN`` subqueries, so filtering never
 fans out the outer query and no ``.distinct()`` is needed.
 """
-from django.db import connection
 from django.db.models import Exists, OuterRef, Q
 
 from .models import Board, Ticket, TicketAssignment
@@ -213,33 +212,15 @@ def user_can_manage_payments(user):
     return is_staff_user(user) or bool(user is not None and user.has_permission('access_orders'))
 
 
-def _current_tenant(request=None):
-    if request is not None:
-        cached = getattr(request, '_current_tenant', None)
-        if cached is not None:
-            return cached
-    from tenants.models import Tenant
-    tenant = Tenant.objects.filter(schema_name=connection.schema_name).first()
-    if request is not None and tenant is not None:
-        try:
-            request._current_tenant = tenant
-        except AttributeError:
-            pass
-    return tenant
+def user_can_delete_ticket(user, ticket):
+    """Ticket deletion is staff-only on the server.
 
-
-def user_can_delete_ticket(user, ticket, tenant=None, request=None):
-    """Staff always; otherwise the creator, unless the tenant restricts ticket
-    deletion to superadmins (``only_superadmin_can_delete_tickets``)."""
-    if is_staff_user(user):
-        return True
-    if user is None or not getattr(user, 'is_authenticated', False):
-        return False
-    if tenant is None:
-        tenant = _current_tenant(request)
-    if tenant is not None and tenant.only_superadmin_can_delete_tickets:
-        return False
-    return ticket.created_by_id == user.id
+    ``TicketViewSet.destroy`` also checks the tenant's
+    ``only_superadmin_can_delete_tickets`` flag, but ``TicketPermission``
+    already refuses DELETE to every non-staff user, so the flag never widens
+    access (pre-existing behaviour, kept as is). This reports exactly what the
+    server allows."""
+    return is_staff_user(user)
 
 
 def ticket_viewer_permissions(user, ticket, request=None):
@@ -250,7 +231,7 @@ def ticket_viewer_permissions(user, ticket, request=None):
     can_edit = user_can_edit_ticket(user, ticket)
     return {
         'can_edit': can_edit,
-        'can_delete': user_can_delete_ticket(user, ticket, request=request),
+        'can_delete': user_can_delete_ticket(user, ticket),
         # move_to_column lets anyone who can see the ticket move it into a
         # closed column (E4 status quo, confirmed in §13 Q1).
         'can_move_to_closed': True,

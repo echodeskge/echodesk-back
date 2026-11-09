@@ -168,6 +168,8 @@ class TestChecklistMultiAssigneeDistinct(TicketTestCase):
 
     def test_unrelated_user_still_denied(self):
         manager, item = self._multi_assignee_item()
+        # Restricted board: tickets on an open board are visible to everyone.
+        item.ticket.column.board.board_users.add(manager)
         stranger = self.create_user(email='chk-stranger@test.com')
         resp = self.api_get(f'/api/checklist-items/{item.id}/', user=stranger)
         self.assertEqual(resp.status_code, 404)

@@ -152,3 +152,94 @@ class TestActivityKeys(CommentBase):
         # oldest first
         stamps = [i['created_at'] for i in resp.data]
         self.assertEqual(stamps, sorted(stamps))
+
+
+class TestCommentVisibilityAndAuthorship(CommentBase):
+    """BE-06 / E6: create needs a visible ticket; update/delete need the
+    author or staff."""
+
+    def setUp(self):
+        super().setUp()
+        # Restricted board: tickets on an open board are visible to everyone.
+        self.board.board_users.add(self.agent)
+        self.viewer = self.create_user(email='cs-viewer@test.com')
+        self.board.board_users.add(self.viewer)
+
+    def test_create_on_invisible_ticket_is_403(self):
+        resp = self.api_post('/api/comments/', {'ticket': self.ticket.id, 'comment': 'x'}, user=self.other)
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(TicketComment.objects.filter(ticket=self.ticket).exists())
+
+    def test_update_by_non_author_non_staff_is_403(self):
+        c = self.create_comment(self.ticket, self.agent, 'mine')
+        resp = self.api_patch(f'/api/comments/{c.id}/', {'comment': 'hijack'}, user=self.viewer)
+        self.assertEqual(resp.status_code, 403)
+        c.refresh_from_db()
+        self.assertEqual(c.comment, 'mine')
+
+    def test_delete_by_non_author_non_staff_is_403(self):
+        c = self.create_comment(self.ticket, self.agent, 'mine')
+        resp = self.api_delete(f'/api/comments/{c.id}/', user=self.viewer)
+        self.assertEqual(resp.status_code, 403)
+        self.assertTrue(TicketComment.objects.filter(id=c.id).exists())
+
+    def test_author_may_update_and_delete(self):
+        c = self.create_comment(self.ticket, self.agent, 'mine')
+        self.assertEqual(self.api_patch(f'/api/comments/{c.id}/', {'comment': 'edit'}, user=self.agent).status_code, 200)
+        self.assertEqual(self.api_delete(f'/api/comments/{c.id}/', user=self.agent).status_code, 204)
+
+    def test_staff_may_update_and_delete(self):
+        c = self.create_comment(self.ticket, self.agent, 'theirs')
+        self.assertEqual(self.api_patch(f'/api/comments/{c.id}/', {'comment': 'mod'}, user=self.admin).status_code, 200)
+        self.assertEqual(self.api_delete(f'/api/comments/{c.id}/', user=self.admin).status_code, 204)
+
+    def test_invisible_comment_is_404(self):
+        c = self.create_comment(self.ticket, self.agent, 'mine')
+        self.assertEqual(self.api_patch(f'/api/comments/{c.id}/', {'comment': 'x'}, user=self.other).status_code, 404)
+
+    def test_comment_cannot_move_to_another_ticket(self):
+        c = self.create_comment(self.ticket, self.agent, 'mine')
+        other_ticket = self.create_ticket(title='Other', column=self.col1, created_by=self.agent)
+        resp = self.api_patch(f'/api/comments/{c.id}/', {'ticket': other_ticket.id}, user=self.agent)
+        self.assertEqual(resp.status_code, 403)
+        c.refresh_from_db()
+        self.assertEqual(c.ticket_id, self.ticket.id)
+
+
+class TestIsInternalOnPut(CommentBase):
+    """B1 leftover (c): ``is_internal`` defaults to true on create only."""
+
+    def test_staff_put_without_flag_keeps_public_comment_public(self):
+        c = TicketComment.objects.create(ticket=self.ticket, user=self.admin, comment='x', is_internal=False)
+        resp = self.api_put(f'/api/comments/{c.id}/', {'ticket': self.ticket.id, 'comment': 'edited'}, user=self.admin)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertIs(resp.data['is_internal'], False)
+        c.refresh_from_db()
+        self.assertFalse(c.is_internal)
+        self.assertEqual(c.comment, 'edited')
+
+    def test_staff_put_without_flag_keeps_internal_comment_internal(self):
+        c = TicketComment.objects.create(ticket=self.ticket, user=self.admin, comment='x', is_internal=True)
+        resp = self.api_put(f'/api/comments/{c.id}/', {'ticket': self.ticket.id, 'comment': 'e'}, user=self.admin)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        c.refresh_from_db()
+        self.assertTrue(c.is_internal)
+
+    def test_staff_put_may_still_set_flag_explicitly(self):
+        c = TicketComment.objects.create(ticket=self.ticket, user=self.admin, comment='x', is_internal=True)
+        resp = self.api_put(f'/api/comments/{c.id}/', {
+            'ticket': self.ticket.id, 'comment': 'e', 'is_internal': False,
+        }, user=self.admin)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        c.refresh_from_db()
+        self.assertFalse(c.is_internal)
+
+    def test_create_still_defaults_to_internal(self):
+        resp = self.api_post('/api/comments/', {'ticket': self.ticket.id, 'comment': 'n'}, user=self.admin)
+        self.assertIs(resp.data['is_internal'], True)
+
+    def test_openapi_still_documents_default_true(self):
+        schema = TenantAwareSchemaGenerator().get_schema(request=None, public=True)
+        components = schema['components']['schemas']
+        request_component = components.get('TicketCommentRequest') or components['TicketComment']
+        self.assertIs(request_component['properties']['is_internal'].get('default'), True)

@@ -105,3 +105,37 @@ class TestFormSubmission(TicketTestCase):
             f'/api/form-submissions/by_ticket/?ticket_id={ticket.id}', user=admin
         )
         self.assertEqual(resp.status_code, 200)
+
+
+class TestFormSubmissionVisibility(TicketTestCase):
+    """BE-06 / F8: submissions follow ticket visibility."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='fs-admin@test.com')
+        self.member = self.create_user(email='fs-member@test.com')
+        self.stranger = self.create_user(email='fs-stranger@test.com')
+        self.board = self.create_board('Forms', created_by=self.admin, users=[self.member])
+        self.col = self.create_column(self.board, 'New', 0)
+        self.ticket = self.create_ticket('T', column=self.col, created_by=self.admin)
+        self.form = self.create_ticket_form(created_by=self.admin)
+
+    def test_board_member_sees_submissions_of_board_tickets(self):
+        from tickets.models import TicketFormSubmission
+        sub = TicketFormSubmission.objects.create(ticket=self.ticket, form=self.form, submitted_by=self.admin)
+        resp = self.api_get('/api/form-submissions/', user=self.member)
+        self.assertEqual([s['id'] for s in self.get_results(resp)], [sub.id])
+        resp = self.api_get('/api/form-submissions/', user=self.stranger)
+        self.assertEqual(self.get_results(resp), [])
+
+    def test_create_on_invisible_ticket_is_403(self):
+        resp = self.api_post('/api/form-submissions/', {
+            'ticket': self.ticket.id, 'form_id': self.form.id, 'form_data': {},
+        }, user=self.stranger)
+        self.assertEqual(resp.status_code, 403)
+
+    def test_create_on_visible_ticket_is_201(self):
+        resp = self.api_post('/api/form-submissions/', {
+            'ticket': self.ticket.id, 'form_id': self.form.id, 'form_data': {},
+        }, user=self.member)
+        self.assertEqual(resp.status_code, 201, resp.data)

@@ -71,6 +71,7 @@ class TestCommentPermissions(TicketTestCase):
         user1 = self.create_user(email='u1c@test.com')
         user2 = self.create_user(email='u2c@test.com')
         board, col1, _, _ = self.setup_board_with_columns(admin=admin)
+        board.board_users.add(admin)  # restricted: open-board tickets are visible to all
         ticket = self.create_ticket(title='Private', column=col1, created_by=user1)
         self.create_comment(ticket, user1, 'Secret')
         resp = self.api_get('/api/comments/', user=user2)

@@ -223,3 +223,20 @@ class TestTicketUpdateTimeLogs(TicketTestCase):
         log.refresh_from_db()
         self.assertIsNotNone(log.exited_at)
         self.assertIsNotNone(log.duration_seconds)
+
+
+class TestTimeLogVisibility(TicketTestCase):
+    """BE-06 / F9: time logs follow ticket visibility."""
+
+    def test_board_member_sees_logs_of_board_tickets(self):
+        admin = self.create_admin(email='tlv-admin@test.com')
+        member = self.create_user(email='tlv-member@test.com')
+        stranger = self.create_user(email='tlv-stranger@test.com')
+        board = self.create_board('Logs', created_by=admin, users=[member])
+        col = self.create_column(board, 'Doing', 0, track_time=True)
+        ticket = self.create_ticket('T', column=col, created_by=admin)
+        log = self.create_time_log(ticket, col, admin)
+        resp = self.api_get('/api/time-logs/', user=member)
+        self.assertEqual([r['id'] for r in self.get_results(resp)], [log.id])
+        resp = self.api_get('/api/time-logs/', user=stranger)
+        self.assertEqual(self.get_results(resp), [])
