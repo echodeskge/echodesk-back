@@ -938,6 +938,19 @@ class TicketViewSet(viewsets.ModelViewSet):
         return Response(timeline)
 
 
+def _keep_pre_be06_schema(view):
+    """Schema generation only (E10, generated-client positional trap).
+
+    Before BE-06 the comment and checklist querysets could not be built for
+    the anonymous schema user, so drf-spectacular documented these operations
+    without model introspection (string ``{id}``, no ``ticket``/``is_checked``
+    /``created_by`` filters). Building them now would add filter parameters
+    and retype ``{id}``, shifting the generated clients' positional
+    arguments. Refusing here keeps the documented operations unchanged."""
+    if getattr(view, 'swagger_fake_view', False):
+        raise NotImplementedError('queryset is not introspected for the schema')
+
+
 class TagViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing tags.
@@ -964,6 +977,7 @@ class TicketCommentViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Comments on the tickets the user may see (tickets.visibility)."""
+        _keep_pre_be06_schema(self)
         return scope_to_visible_tickets(
             self.request.user,
             TicketComment.objects.select_related('user', 'ticket'),
@@ -1008,6 +1022,7 @@ class ChecklistItemViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """Checklist items of the tickets the user may see (F7). Items of
         other tickets are 404 for every action, writes included."""
+        _keep_pre_be06_schema(self)
         return scope_to_visible_tickets(
             self.request.user,
             ChecklistItem.objects.select_related('ticket', 'created_by', 'checked_by'),
