@@ -79,6 +79,19 @@ class TicketBoardRefSerializer(serializers.Serializer):
     color = serializers.CharField()
 
 
+class TicketViewerPermissionsSerializer(serializers.Serializer):
+    """Schema-only: what the requesting user may do with the ticket
+    (``tickets.visibility.ticket_viewer_permissions``)."""
+    can_edit = serializers.BooleanField()
+    can_delete = serializers.BooleanField()
+    can_move_to_closed = serializers.BooleanField()
+    can_assign = serializers.BooleanField()
+    can_change_groups = serializers.BooleanField()
+    can_transfer = serializers.BooleanField()
+    can_manage_payments = serializers.BooleanField()
+    can_view_customer = serializers.BooleanField()
+
+
 class TicketCustomerSerializer(serializers.Serializer):
     """Schema-only: the ticket's customer (social_integrations.Client)."""
     id = serializers.IntegerField()
@@ -103,19 +116,8 @@ def can_view_customer(request):
     ``social_integrations`` feature). Cached on the request."""
     if request is None:
         return False
-    cached = getattr(request, '_tickets_can_view_customer', None)
-    if cached is not None:
-        return cached
-    user = getattr(request, 'user', None)
-    allowed = bool(
-        user is not None and user.is_authenticated
-        and user.has_feature('social_integrations')
-    )
-    try:
-        request._tickets_can_view_customer = allowed
-    except AttributeError:
-        pass
-    return allowed
+    from .visibility import user_can_view_customer
+    return user_can_view_customer(getattr(request, 'user', None), request)
 
 
 class UserMinimalSerializer(serializers.ModelSerializer):
@@ -407,6 +409,16 @@ class TicketCommentSerializer(serializers.ModelSerializer):
         fields = ['id', 'ticket', 'user', 'user_id', 'comment', 'is_internal', 'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
 
+    def get_fields(self):
+        fields = super().get_fields()
+        # ``default=True`` applies on create only. On update (PUT included) a
+        # missing ``is_internal`` keeps the stored value; otherwise a staff PUT
+        # that omits it would silently turn a public comment internal.
+        if self.instance is not None and 'is_internal' in fields:
+            from rest_framework.fields import empty
+            fields['is_internal'].default = empty
+        return fields
+
     def validate(self, attrs):
         attrs = super().validate(attrs)
         attrs.pop('user_id', None)
@@ -530,6 +542,7 @@ class TicketSerializer(serializers.ModelSerializer):
     )
     board = serializers.SerializerMethodField()
     reporter = serializers.SerializerMethodField()
+    viewer_permissions = serializers.SerializerMethodField()
 
     class Meta:
         model = Ticket
@@ -546,6 +559,7 @@ class TicketSerializer(serializers.ModelSerializer):
             'payments', 'remaining_balance', 'payment_status', 'is_overdue', 'form_submissions',
             'attachments',
             'due_date', 'is_overdue_task', 'customer', 'customer_id', 'board', 'reporter',
+            'viewer_permissions',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'created_by', 'status', 'is_closed']
 
@@ -575,6 +589,32 @@ class TicketSerializer(serializers.ModelSerializer):
     @extend_schema_field(UserRefSerializer(allow_null=True))
     def get_reporter(self, obj):
         return user_ref(obj.created_by) if obj.created_by_id else None
+
+    @extend_schema_field(TicketViewerPermissionsSerializer(allow_null=True))
+    def get_viewer_permissions(self, obj):
+        """Null when there is no authenticated requesting user (e.g. a
+        serializer built outside a request)."""
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is None or not user.is_authenticated or obj.pk is None:
+            return None
+        from .visibility import ticket_viewer_permissions
+        return ticket_viewer_permissions(user, obj, request)
+
+    def _resolve_column(self, column_id, ticket=None):
+        """Look up a ``column_id`` write and apply the move rule (E4): 400 for
+        an unknown column, 403 (PermissionDenied) when its board is not
+        accessible or the change crosses boards without edit rights."""
+        from .visibility import check_column_write
+        try:
+            column = TicketColumn.objects.select_related('board').get(id=column_id)
+        except (TicketColumn.DoesNotExist, TypeError, ValueError):
+            raise serializers.ValidationError({'column_id': 'Column not found.'})
+        if ticket is not None and ticket.column_id == column.id:
+            return column  # unchanged column: nothing to authorise
+        request = self.context.get('request')
+        check_column_write(getattr(request, 'user', None), column, ticket)
+        return column
 
     def get_form_submissions(self, obj):
         """Get all form submissions for this ticket (uses prefetched data)."""
@@ -613,7 +653,7 @@ class TicketSerializer(serializers.ModelSerializer):
         # Handle order-specific logic
         if is_order and column_id:
             # For orders, automatically assign to the first column of the board
-            column = TicketColumn.objects.get(id=column_id)
+            column = self._resolve_column(column_id)
             board = column.board
             first_column = board.columns.order_by('position').first()
             if first_column:
@@ -622,7 +662,7 @@ class TicketSerializer(serializers.ModelSerializer):
                 validated_data['column'] = column  # fallback to provided column
         elif column_id:
             # Set column if provided (regular tickets)
-            validated_data['column'] = TicketColumn.objects.get(id=column_id)
+            validated_data['column'] = self._resolve_column(column_id)
 
         # The post_save broadcast would fire before the tags / assignees below
         # are written, so defer it and send the complete card at the end.
@@ -683,7 +723,7 @@ class TicketSerializer(serializers.ModelSerializer):
         # Handle column field
         if column_id is not None:
             if column_id:
-                validated_data['column'] = TicketColumn.objects.get(id=column_id)
+                validated_data['column'] = self._resolve_column(column_id, instance)
             else:
                 validated_data['column'] = None
 
@@ -1389,7 +1429,12 @@ class TicketAttachmentSerializer(serializers.ModelSerializer):
         """Handle file upload and metadata extraction."""
         file = validated_data.get('file')
         if file:
-            validated_data['filename'] = file.name
+            import os
+            # Keep only the base name, without control characters, whatever
+            # path the client sent.
+            name = os.path.basename(str(file.name).replace('\\', '/'))
+            name = ''.join(ch for ch in name if ch.isprintable()).strip() or 'file'
+            validated_data['filename'] = name[:255]
             validated_data['file_size'] = file.size
             validated_data['content_type'] = file.content_type or ''
         validated_data['uploaded_by'] = self.context['request'].user

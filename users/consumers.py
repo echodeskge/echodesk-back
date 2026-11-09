@@ -320,6 +320,20 @@ class TicketBoardConsumer(AsyncWebsocketConsumer):
             await self.close(code=4001)
             return
 
+        # Board access (plan E7): a non-numeric board id or a board the user
+        # cannot access gets an error frame and close code 4403. Accept first
+        # so browsers see 4403 rather than 1006.
+        if not str(self.board_id).isdigit() or not await self._can_access_board():
+            print(f"[TicketBoardWS] Rejecting connection - no access to board {self.board_id}")
+            await self.accept()
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': 'You do not have access to this board',
+                'code': 'FORBIDDEN'
+            }))
+            await self.close(code=4403)
+            return
+
         # Join the board group for this specific board in this tenant
         self.board_group_name = f'board_{self.tenant_schema}_{self.board_id}'
 
@@ -610,6 +624,17 @@ class TicketBoardConsumer(AsyncWebsocketConsumer):
         }))
 
     # Database operations and presence tracking
+    @database_sync_to_async
+    def _can_access_board(self):
+        """``tickets.visibility.can_access_board`` inside the tenant schema."""
+        try:
+            with schema_context(self.tenant_schema):
+                from tickets.visibility import can_access_board
+                return can_access_board(self.user, int(self.board_id))
+        except Exception as e:
+            print(f"[TicketBoardWS] Board access check failed: {e}")
+            return False
+
     @database_sync_to_async
     def get_board_data(self):
         """Get basic board data"""

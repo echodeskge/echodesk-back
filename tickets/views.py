@@ -34,6 +34,14 @@ from .serializers import (
     TicketCardSerializer, KanbanTicketListSerializer,
 )
 from .querysets import child_count_subquery, lite_card_queryset, ticket_count_annotations
+# The visibility helpers live in tickets.visibility; they are re-exported here
+# because other modules (timer, social_integrations) import them from views.
+from .visibility import (  # noqa: F401
+    accessible_boards, can_access_board, can_view_ticket, check_column_write,
+    is_staff_user, scope_to_visible_tickets, ticket_visibility_q,
+    user_can_delete_ticket, user_can_edit_ticket, user_can_manage_payments,
+    visible_ticket_ids, visible_tickets,
+)
 
 
 def get_current_tenant(request):
@@ -94,21 +102,6 @@ def _parse_position(raw):
         return None, 'position_in_column must be a number'
 
 
-def ticket_visibility_q(user):
-    """Q limiting tickets to what a non-staff user may see (shared by every
-    endpoint that resolves a ticket on the user's behalf)."""
-    user_groups = user.tenant_groups.all()
-    return (
-        Q(created_by=user) |
-        Q(assigned_to=user) |
-        Q(assigned_users=user) |
-        Q(assigned_groups__in=user_groups) |
-        Q(column__board__order_users=user) |  # Board order users
-        Q(column__board__board_users=user) |  # Board users
-        Q(column__board__board_groups__in=user_groups)  # Board groups
-    )
-
-
 def close_active_time_log(ticket, column):
     """Close the open time log of ``ticket`` in ``column`` (no-op unless the
     column tracks time and an open log exists). Returns the closed log or None."""
@@ -147,25 +140,13 @@ class BoardPermission(permissions.BasePermission):
             return True
 
         # Check permissions based on action
-        if view.action == 'list' or view.action == 'retrieve' or view.action == 'kanban_board':
-            # Allow access if:
-            # 1. User has full board permissions OR order access permissions
-            # 2. User is assigned to at least one board (directly or via group)
-            has_permission = (user.has_permission('view_boards') or
-                            user.has_permission('access_orders'))
-
-            if has_permission:
+        if view.action in ('list', 'retrieve', 'kanban_board', 'default'):
+            # Allowed with the board/order permissions, or when the user can
+            # see at least one board -- an open board counts (R10), so a user
+            # whose only access is an open board no longer gets 403.
+            if user.has_permission('view_boards') or user.has_permission('access_orders'):
                 return True
-
-            # Single query: does this user have access to any board either
-            # directly (board_users) or through one of their active groups?
-            user_group_ids = list(
-                user.tenant_groups.filter(is_active=True).values_list('id', flat=True)
-            )
-            access_filter = Q(board_users=user)
-            if user_group_ids:
-                access_filter |= Q(board_groups__id__in=user_group_ids)
-            return Board.objects.filter(access_filter).exists()
+            return accessible_boards(user).exists()
 
         elif view.action == 'create':
             return request.user.has_permission('create_boards')
@@ -191,51 +172,6 @@ class BoardPermission(permissions.BasePermission):
         # For object-level permissions, we can add additional checks
         # For now, rely on the general permission check
         return self.has_permission(request, view)
-
-
-def accessible_boards(user, base_qs=None):
-    """
-    Boards ``user`` may see: all of them for staff/superusers; otherwise the
-    boards they are attached to directly (board_users / order_users), through
-    an active group (board_groups), or boards open to everyone (no users and
-    no groups attached). ``BoardViewSet`` and the column endpoints share this.
-    """
-    qs = Board.objects.all() if base_qs is None else base_qs
-    if not user or not user.is_authenticated:
-        return qs.none()
-    if user.is_superuser or user.is_staff:
-        return qs
-
-    # Access check via Exists subqueries — avoids Cartesian join across 3+ M2Ms
-    BoardUsers = Board.board_users.through
-    BoardGroups = Board.board_groups.through
-    OrderUsers = Board.order_users.through
-
-    user_group_ids = list(
-        user.tenant_groups.filter(is_active=True).values_list('id', flat=True)
-    )
-
-    has_users_sq = BoardUsers.objects.filter(board_id=OuterRef('pk'))
-    has_groups_sq = BoardGroups.objects.filter(board_id=OuterRef('pk'))
-    user_in_board_sq = BoardUsers.objects.filter(board_id=OuterRef('pk'), user_id=user.id)
-    user_in_orders_sq = OrderUsers.objects.filter(board_id=OuterRef('pk'), user_id=user.id)
-    group_in_board_sq = (
-        BoardGroups.objects.filter(board_id=OuterRef('pk'), tenantgroup_id__in=user_group_ids)
-        if user_group_ids else BoardGroups.objects.none()
-    )
-
-    return qs.annotate(
-        _has_users=Exists(has_users_sq),
-        _has_groups=Exists(has_groups_sq),
-        _user_in_board=Exists(user_in_board_sq),
-        _user_in_orders=Exists(user_in_orders_sq),
-        _group_in_board=Exists(group_in_board_sq),
-    ).filter(
-        Q(_user_in_board=True)
-        | Q(_user_in_orders=True)
-        | Q(_group_in_board=True)
-        | Q(_has_users=False, _has_groups=False)
-    )
 
 
 class TicketColumnViewSet(viewsets.ModelViewSet):
@@ -449,66 +385,44 @@ class TicketColumnViewSet(viewsets.ModelViewSet):
 
 class TicketPermission(permissions.BasePermission):
     """
-    Custom permission for tickets:
-    - Anyone authenticated can create tickets
-    - Only staff can assign tickets or close them
-    - Users can view their own tickets or tickets assigned to them
+    Object rules for tickets (plan E3). The object always comes from
+    ``TicketViewSet.get_queryset()``, which is already limited to the tickets
+    the user may see (``tickets.visibility``), so reads need no extra check.
+
+    - staff/superusers: everything;
+    - reads and detail POST actions (``add_comment``): anyone who sees it;
+    - PUT/PATCH: the creator, an assignee or an assigned-group member;
+      changing ``assigned_to_id``/``assigned_group_ids`` or moving into a
+      closed column through PUT/PATCH is staff-only;
+    - DELETE: decided in ``TicketViewSet.destroy`` (tenant setting
+      ``only_superadmin_can_delete_tickets``).
     """
-    
+
     def has_permission(self, request, view):
         return request.user and request.user.is_authenticated
-    
+
     def has_object_permission(self, request, view, obj):
-        # Staff users have full access
-        if request.user.is_staff:
+        user = request.user
+        if is_staff_user(user):
             return True
 
-        # Check if user belongs to any group assigned to the ticket
-        user_groups = request.user.tenant_groups.all()
-        is_in_assigned_group = obj.assigned_groups.filter(id__in=user_groups).exists()
+        if request.method in permissions.SAFE_METHODS or request.method == 'POST':
+            return True
 
-        # Board-level access — mirrors the TicketViewSet.get_queryset() rules
-        # so a user who sees a ticket in the list can also open its detail.
-        board = obj.column.board if obj.column_id else None
-        has_board_access = bool(
-            board and (
-                board.board_users.filter(id=request.user.id).exists() or
-                board.order_users.filter(id=request.user.id).exists() or
-                board.board_groups.filter(id__in=user_groups).exists()
-            )
-        )
-
-        # Users can view tickets they created, are assigned to, belong to an
-        # assigned group, OR have access to the board the ticket lives on.
-        if request.method in permissions.SAFE_METHODS:
-            return (obj.created_by == request.user or
-                   obj.assigned_to == request.user or
-                   obj.assigned_users.filter(id=request.user.id).exists() or
-                   is_in_assigned_group or
-                   has_board_access)
-
-        # Only staff can assign tickets or move to closed columns
         if request.method in ['PUT', 'PATCH']:
-            # Check if trying to assign ticket or move to closed column
             if 'assigned_to_id' in request.data or 'assigned_group_ids' in request.data:
-                return request.user.is_staff
-            # Check if trying to move to a closed status column
+                return False
             if 'column_id' in request.data:
                 try:
-                    column = TicketColumn.objects.get(id=request.data['column_id'])
-                    if column.is_closed_status:
-                        return request.user.is_staff
-                except TicketColumn.DoesNotExist:
-                    pass
-            # Users can edit tickets they created, are assigned to, or belong to an assigned group (but not assign or close)
-            return (obj.created_by == request.user or
-                   obj.assigned_to == request.user or
-                   obj.assigned_users.filter(id=request.user.id).exists() or
-                   is_in_assigned_group)
+                    column = TicketColumn.objects.filter(id=int(request.data['column_id'])).first()
+                except (TypeError, ValueError):
+                    column = None
+                if column is not None and column.is_closed_status:
+                    return False
+            return user_can_edit_ticket(user, obj)
 
-        # Only staff can delete tickets
         if request.method == 'DELETE':
-            return request.user.is_staff
+            return True
 
         return False
 
@@ -596,12 +510,9 @@ class TicketViewSet(viewsets.ModelViewSet):
             ),
         )
 
-        # Non-staff users can only see their tickets or tickets on boards they have access to
-        if not self.request.user.is_staff:
-            # Users can see tickets if:
-            # 1. They created it, are assigned to it, or in assigned groups
-            # 2. They have access to the board (via order_users, board_users, or board_groups)
-            queryset = queryset.filter(ticket_visibility_q(self.request.user)).distinct()
+        # Non-staff users only see the tickets tickets.visibility allows
+        # (Exists subqueries: no join fan-out, so no .distinct()).
+        queryset = visible_tickets(self.request.user, queryset)
 
         # Additional filtering by query parameters
         priority_filter = self.request.query_params.get('priority')
@@ -647,6 +558,23 @@ class TicketViewSet(viewsets.ModelViewSet):
             if old_id != new_id:
                 close_active_time_log(ticket, old_column)
                 open_time_log(ticket, new_column, self.request.user)
+
+    def _get_ticket_for_move(self):
+        """Resolve the ticket for a move (E4): 404 when it does not exist,
+        403 (not 404) when it exists but is not visible -- mobile relies on a
+        denied move being a 403 (C7)."""
+        from django.http import Http404
+        try:
+            return self.get_object()
+        except Http404:
+            lookup = self.kwargs.get(self.lookup_url_kwarg or self.lookup_field)
+            try:
+                exists = Ticket.objects.filter(pk=int(lookup)).exists()
+            except (TypeError, ValueError):
+                exists = False
+            if exists:
+                raise PermissionDenied('You do not have access to this ticket.')
+            raise
 
     def destroy(self, request, *args, **kwargs):
         """Delete a ticket with permission check based on tenant settings."""
@@ -713,7 +641,7 @@ class TicketViewSet(viewsets.ModelViewSet):
         """Get tickets assigned to the current user."""
         queryset = self.get_queryset().filter(
             Q(assigned_to=request.user) |
-            Q(assigned_users=request.user)
+            Exists(TicketAssignment.objects.filter(ticket_id=OuterRef('pk'), user_id=request.user.id))
         )
         page = self.paginate_queryset(queryset)
         if page is not None:
@@ -783,8 +711,12 @@ class TicketViewSet(viewsets.ModelViewSet):
     )
     @action(detail=True, methods=['patch'], permission_classes=[permissions.IsAuthenticated])
     def move_to_column(self, request, pk=None):
-        """Move a ticket to a different column, inserting at a 0-based index."""
-        ticket = self.get_object()
+        """Move a ticket to a different column, inserting at a 0-based index.
+
+        403 when the ticket is not visible, the target column's board is not
+        accessible, or the move crosses boards without edit rights (E4). Any
+        user who can see the ticket may move it into a closed column."""
+        ticket = self._get_ticket_for_move()
         column_id = request.data.get('column_id')
         new_position, position_error = _parse_position(request.data.get('position_in_column'))
 
@@ -798,11 +730,12 @@ class TicketViewSet(viewsets.ModelViewSet):
 
         try:
             new_column = TicketColumn.objects.get(id=column_id)
-        except TicketColumn.DoesNotExist:
+        except (TicketColumn.DoesNotExist, TypeError, ValueError):
             return Response(
                 {'error': 'Column not found'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        check_column_write(request.user, new_column, ticket)
 
         with transaction.atomic():
             # Lock both columns' tickets first (one query, deterministic order)
@@ -874,8 +807,9 @@ class TicketViewSet(viewsets.ModelViewSet):
     )
     @action(detail=True, methods=['patch'], permission_classes=[permissions.IsAuthenticated])
     def reorder_in_column(self, request, pk=None):
-        """Reorder a ticket within its current column (0-based index)."""
-        ticket = self.get_object()
+        """Reorder a ticket within its current column (0-based index); same
+        access rules as ``move_to_column``."""
+        ticket = self._get_ticket_for_move()
         new_position, position_error = _parse_position(request.data.get('position_in_column'))
 
         if position_error:
@@ -891,6 +825,7 @@ class TicketViewSet(viewsets.ModelViewSet):
                 {'error': 'Ticket is not assigned to any column'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        check_column_write(request.user, ticket.column, ticket)
 
         with transaction.atomic():
             # Lock the whole column first (see move_to_column), then re-fetch
@@ -1029,23 +964,35 @@ class TicketCommentViewSet(viewsets.ModelViewSet):
     ordering = ['created_at']
 
     def get_queryset(self):
-        """Get comments for tickets the user has access to."""
-        if self.request.user.is_staff:
-            return TicketComment.objects.all().select_related('user', 'ticket')
-
-        # Non-staff users can see comments on tickets they created, are assigned to, or whose group is assigned
-        user_groups = self.request.user.tenant_groups.filter(is_active=True)
-        return TicketComment.objects.filter(
-            Q(ticket__created_by=self.request.user) |
-            Q(ticket__assigned_to=self.request.user) |
-            Q(ticket__assigned_users=self.request.user) |
-            Q(ticket__assigned_groups__in=user_groups)
-        ).select_related('user', 'ticket').distinct()
+        """Comments on the tickets the user may see (tickets.visibility)."""
+        return scope_to_visible_tickets(
+            self.request.user,
+            TicketComment.objects.select_related('user', 'ticket'),
+        )
 
     def perform_create(self, serializer):
-        """The author is always the requesting user (a ``user_id`` in the body
-        is accepted and ignored by the serializer)."""
+        """403 unless the ticket is visible. The author is always the
+        requesting user (a ``user_id`` in the body is accepted and ignored by
+        the serializer)."""
+        ticket = serializer.validated_data.get('ticket')
+        if ticket is not None and not can_view_ticket(self.request.user, ticket):
+            raise PermissionDenied('You do not have access to this ticket.')
         serializer.save(user=self.request.user)
+
+    def check_object_permissions(self, request, obj):
+        """Update and delete: the author or staff only, otherwise 403 (E6)."""
+        super().check_object_permissions(request, obj)
+        if request.method not in permissions.SAFE_METHODS:
+            user = request.user
+            if not (is_staff_user(user) or obj.user_id == user.id):
+                raise PermissionDenied('Only the author or staff can change this comment.')
+
+    def perform_update(self, serializer):
+        """The ticket of a comment cannot be changed."""
+        ticket = serializer.validated_data.get('ticket')
+        if ticket is not None and ticket.pk != serializer.instance.ticket_id:
+            raise PermissionDenied('A comment cannot be moved to another ticket.')
+        serializer.save()
 
 
 class ChecklistItemViewSet(viewsets.ModelViewSet):
@@ -1060,22 +1007,29 @@ class ChecklistItemViewSet(viewsets.ModelViewSet):
     ordering = ['position', 'created_at']
 
     def get_queryset(self):
-        """Filter checklist items based on user permissions."""
-        if self.request.user.is_staff:
-            return ChecklistItem.objects.all().select_related(
-                'ticket', 'created_by', 'checked_by'
-            )
+        """Checklist items of the tickets the user may see (F7). Items of
+        other tickets are 404 for every action, writes included."""
+        return scope_to_visible_tickets(
+            self.request.user,
+            ChecklistItem.objects.select_related('ticket', 'created_by', 'checked_by'),
+        )
 
-        # Non-staff users can only see checklist items for tickets they have access to.
-        # The assigned_users join yields one row per assignment, so without
-        # distinct() an item on a multi-assignee ticket appears several times
-        # (duplicates in the list, MultipleObjectsReturned on the detail routes).
-        return ChecklistItem.objects.filter(
-            Q(ticket__created_by=self.request.user) |
-            Q(ticket__assigned_to=self.request.user) |
-            Q(ticket__assigned_users=self.request.user) |
-            Q(created_by=self.request.user)
-        ).select_related('ticket', 'created_by', 'checked_by').distinct()
+    def perform_create(self, serializer):
+        """403 unless the ticket is visible."""
+        ticket = serializer.validated_data.get('ticket')
+        if ticket is not None and not can_view_ticket(self.request.user, ticket):
+            raise PermissionDenied('You do not have access to this ticket.')
+        serializer.save()
+
+    def perform_update(self, serializer):
+        """An item may not be moved onto a ticket the user cannot see."""
+        ticket = serializer.validated_data.get('ticket')
+        if (
+            ticket is not None and ticket.pk != serializer.instance.ticket_id
+            and not can_view_ticket(self.request.user, ticket)
+        ):
+            raise PermissionDenied('You do not have access to this ticket.')
+        serializer.save()
 
     @action(detail=True, methods=['patch'])
     def toggle_check(self, request, pk=None):
@@ -1151,12 +1105,15 @@ class TicketAssignmentViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
     
     def get_queryset(self):
-        """Return assignments for a specific ticket."""
+        """Assignments of one ticket, when the user may see that ticket."""
         ticket_pk = self.kwargs.get('ticket_pk')
         if ticket_pk:
-            return TicketAssignment.objects.filter(ticket_id=ticket_pk).select_related('ticket', 'user', 'assigned_by')
+            return scope_to_visible_tickets(
+                self.request.user,
+                TicketAssignment.objects.filter(ticket_id=ticket_pk),
+            ).select_related('ticket', 'user', 'assigned_by')
         return TicketAssignment.objects.none()
-    
+
     def perform_create(self, serializer):
         """Create a new ticket assignment.
 
@@ -1168,6 +1125,8 @@ class TicketAssignmentViewSet(viewsets.ModelViewSet):
         ticket_pk = self.kwargs.get('ticket_pk')
         if not Ticket.objects.filter(pk=ticket_pk).only('id').exists():
             raise Http404('Ticket not found')
+        if not can_view_ticket(self.request.user, ticket_pk):
+            raise PermissionDenied('You do not have access to this ticket.')
         serializer.save(ticket_id=ticket_pk, assigned_by=self.request.user)
     
     @action(detail=False, methods=['post'])
@@ -1300,18 +1259,11 @@ class TicketTimeLogViewSet(viewsets.ReadOnlyModelViewSet):
     ordering = ['-entered_at']
 
     def get_queryset(self):
-        """Return time logs for tickets the user has access to."""
-        if self.request.user.is_staff:
-            return TicketTimeLog.objects.all().select_related(
-                'ticket', 'column', 'user'
-            )
-
-        # Non-staff users can only see time logs for tickets they have access to
-        return TicketTimeLog.objects.filter(
-            Q(ticket__created_by=self.request.user) |
-            Q(ticket__assigned_to=self.request.user) |
-            Q(ticket__assigned_users=self.request.user)
-        ).distinct().select_related('ticket', 'column', 'user')
+        """Time logs of the tickets the user may see (F9)."""
+        return scope_to_visible_tickets(
+            self.request.user,
+            TicketTimeLog.objects.select_related('ticket', 'column', 'user'),
+        )
 
     @extend_schema(
         parameters=[
@@ -1581,10 +1533,7 @@ class TicketTimeLogViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        tickets = Ticket.objects.all()
-        if not request.user.is_staff:
-            tickets = tickets.filter(ticket_visibility_q(request.user)).distinct()
-        if not tickets.filter(pk=ticket_id).exists():
+        if not visible_tickets(request.user).filter(pk=ticket_id).exists():
             return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         logs = TicketTimeLog.objects.filter(ticket_id=ticket_id)
@@ -1782,10 +1731,16 @@ class BoardViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['get'])
     def default(self, request):
-        """Get the default board."""
-        default_board = Board.objects.filter(is_default=True).first()
-        if default_board:
-            return Response(BoardSerializer(default_board, context={'request': request}).data)
+        """The tenant's default board when the user can access it, otherwise
+        the first accessible board (by position, name); 404 only when the user
+        can access no board at all."""
+        boards = self.get_queryset()
+        board = (
+            boards.filter(is_default=True).first()
+            or boards.order_by('position', 'name', 'id').first()
+        )
+        if board:
+            return Response(BoardSerializer(board, context={'request': request}).data)
         return Response({'error': 'No default board found'}, status=status.HTTP_404_NOT_FOUND)
 
     @extend_schema(
@@ -1939,61 +1894,71 @@ class TicketPaymentViewSet(viewsets.ModelViewSet):
     ordering = ['-processed_at']
 
     def get_queryset(self):
-        """Filter payments based on user permissions."""
-        queryset = super().get_queryset().select_related('processed_by')
+        """Payments of the tickets the user may see (staff: all)."""
+        return scope_to_visible_tickets(
+            self.request.user,
+            super().get_queryset().select_related('processed_by'),
+        )
 
-        # If user has ticket permissions or is superuser, return all
-        if (self.request.user.is_superuser or
-            self.request.user.has_permission('view_tickets')):
-            return queryset
+    def _require_payment_manager(self):
+        if not user_can_manage_payments(self.request.user):
+            raise PermissionDenied('Managing payments needs the access_orders permission.')
 
-        # Otherwise, scope directly via joins instead of a correlated
-        # subquery over Ticket — single query, uses existing indexes.
-        user = self.request.user
-        return queryset.filter(
-            Q(ticket__created_by=user) |
-            Q(ticket__assigned_to=user) |
-            Q(ticket__assigned_users=user)
-        ).distinct()
+    def perform_create(self, serializer):
+        """Staff or ``access_orders``, on a visible ticket (E8)."""
+        self._require_payment_manager()
+        ticket = serializer.validated_data.get('ticket')
+        if ticket is not None and not can_view_ticket(self.request.user, ticket):
+            raise PermissionDenied('You do not have access to this ticket.')
+        serializer.save()
+
+    def perform_update(self, serializer):
+        self._require_payment_manager()
+        ticket = serializer.validated_data.get('ticket')
+        if ticket is not None and not can_view_ticket(self.request.user, ticket):
+            raise PermissionDenied('You do not have access to this ticket.')
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._require_payment_manager()
+        instance.delete()
 
     @action(detail=False, methods=['post'])
     def process_payment(self, request):
-        """Process a payment for a ticket."""
+        """Process a payment for a ticket (staff or ``access_orders``, on a
+        ticket the user can see)."""
         ticket_id = request.data.get('ticket_id')
         amount = request.data.get('amount')
-        
+
         if not ticket_id or not amount:
             return Response(
-                {'error': 'ticket_id and amount are required'}, 
+                {'error': 'ticket_id and amount are required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        from decimal import Decimal, InvalidOperation
-        try:
-            ticket = Ticket.objects.get(id=ticket_id)
-            amount = Decimal(str(amount))
-        except (Ticket.DoesNotExist, ValueError, InvalidOperation):
+
+        if not user_can_manage_payments(request.user):
             return Response(
-                {'error': 'Invalid ticket or amount'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Check if user can modify this ticket
-        if not (request.user.is_superuser or 
-                request.user.has_permission('edit_tickets') or
-                ticket.created_by == request.user):
-            return Response(
-                {'error': 'Permission denied'}, 
+                {'error': 'Permission denied'},
                 status=status.HTTP_403_FORBIDDEN
             )
-        
+
+        from decimal import Decimal, InvalidOperation
+        try:
+            ticket = visible_tickets(request.user).get(id=ticket_id)
+            amount = Decimal(str(amount))
+        except (Ticket.DoesNotExist, ValueError, TypeError, InvalidOperation):
+            return Response(
+                {'error': 'Invalid ticket or amount'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         try:
             remaining_balance = ticket.add_payment(amount, request.user)
-            
+
             # Get updated ticket data
             ticket.refresh_from_db()
             ticket_serializer = TicketSerializer(ticket, context={'request': request})
-            
+
             return Response({
                 'message': 'Payment processed successfully',
                 'remaining_balance': remaining_balance,
@@ -2001,30 +1966,30 @@ class TicketPaymentViewSet(viewsets.ModelViewSet):
             })
         except ValueError as e:
             return Response(
-                {'error': str(e)}, 
+                {'error': str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
     @action(detail=False, methods=['get'])
     def payment_summary(self, request):
-        """Get payment summary across all accessible tickets."""
+        """Payment summary across the tickets the user may see.
+
+        With ``?board_id=`` the board must be accessible and the user needs
+        staff or ``access_orders`` (403 otherwise)."""
         from django.db.models import Sum, Count, Q
         from decimal import Decimal
-        
-        # Get accessible tickets
-        accessible_tickets = Ticket.objects.all()
-        if not (request.user.is_superuser or request.user.has_permission('view_tickets')):
-            accessible_tickets = accessible_tickets.filter(
-                Q(created_by=request.user) |
-                Q(assigned_to=request.user) |
-                Q(assigned_users=request.user)
-            ).distinct()
-        
-        # Filter by board if provided
+
+        accessible_tickets = visible_tickets(request.user)
+
         board_id = request.query_params.get('board_id')
         if board_id:
-            accessible_tickets = accessible_tickets.filter(column__board_id=board_id)
-        
+            if not (user_can_manage_payments(request.user) and can_access_board(request.user, board_id)):
+                return Response(
+                    {'error': 'Permission denied'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            accessible_tickets = accessible_tickets.filter(column__board_id=int(board_id))
+
         summary = accessible_tickets.aggregate(
             total_tickets=Count('id'),
             billable_tickets=Count('id', filter=Q(price__gt=0)),
@@ -2033,16 +1998,16 @@ class TicketPaymentViewSet(viewsets.ModelViewSet):
             paid_tickets=Count('id', filter=Q(is_paid=True)),
             unpaid_tickets=Count('id', filter=Q(is_paid=False, price__gt=0)),
             overdue_tickets=Count('id', filter=Q(
-                is_paid=False, 
+                is_paid=False,
                 payment_due_date__lt=timezone.now().date()
             ))
         )
-        
+
         # Calculate remaining balance
         total_value = summary['total_value'] or Decimal('0.00')
         total_paid = summary['total_paid'] or Decimal('0.00')
         summary['remaining_balance'] = total_value - total_paid
-        
+
         return Response(summary)
 
 
@@ -2433,19 +2398,24 @@ class TicketFormSubmissionViewSet(viewsets.ModelViewSet):
     ordering = ['-submitted_at']
 
     def get_queryset(self):
-        """Filter submissions based on user permissions."""
-        queryset = super().get_queryset()
-        
-        # Non-staff users can only see submissions for tickets they have access to
-        if not self.request.user.is_staff:
-            queryset = queryset.filter(
-                Q(ticket__created_by=self.request.user) | 
-                Q(ticket__assigned_to=self.request.user) |
-                Q(ticket__assigned_users=self.request.user) |
-                Q(submitted_by=self.request.user)
-            ).distinct()
-        
-        return queryset
+        """Submissions of the tickets the user may see (F8)."""
+        return scope_to_visible_tickets(self.request.user, super().get_queryset())
+
+    def perform_create(self, serializer):
+        """403 unless the ticket is visible."""
+        ticket = serializer.validated_data.get('ticket')
+        if ticket is not None and not can_view_ticket(self.request.user, ticket):
+            raise PermissionDenied('You do not have access to this ticket.')
+        serializer.save()
+
+    def perform_update(self, serializer):
+        ticket = serializer.validated_data.get('ticket')
+        if (
+            ticket is not None and ticket.pk != serializer.instance.ticket_id
+            and not can_view_ticket(self.request.user, ticket)
+        ):
+            raise PermissionDenied('You do not have access to this ticket.')
+        serializer.save()
 
     @extend_schema(
         summary='Submissions of one form',
@@ -2513,23 +2483,38 @@ class TicketAttachmentViewSet(viewsets.ModelViewSet):
     filterset_fields = ['ticket']
 
     def get_queryset(self):
-        """Filter attachments based on user permissions."""
-        user = self.request.user
-        if user.is_staff:
-            return TicketAttachment.objects.select_related('ticket', 'uploaded_by').all()
-
-        # Users can see attachments for tickets they have access to
-        user_groups = user.tenant_groups.all()
-        return TicketAttachment.objects.filter(
-            Q(ticket__created_by=user) |
-            Q(ticket__assigned_to=user) |
-            Q(ticket__assigned_users=user) |
-            Q(ticket__assigned_groups__in=user_groups) |
-            Q(ticket__column__board__order_users=user) |
-            Q(ticket__column__board__board_users=user) |
-            Q(ticket__column__board__board_groups__in=user_groups)
-        ).select_related('ticket', 'uploaded_by').distinct()
+        """Attachments of the tickets the user may see."""
+        return scope_to_visible_tickets(
+            self.request.user,
+            TicketAttachment.objects.select_related('ticket', 'uploaded_by'),
+        )
 
     def perform_create(self, serializer):
-        """Save attachment with uploaded_by set to current user."""
+        """403 unless the ticket is visible; ``uploaded_by`` is the caller."""
+        ticket = serializer.validated_data.get('ticket')
+        if ticket is not None and not can_view_ticket(self.request.user, ticket):
+            raise PermissionDenied('You do not have access to this ticket.')
         serializer.save(uploaded_by=self.request.user)
+
+    def _check_can_change(self, attachment):
+        """The uploader, staff, or someone who can edit the ticket (A12)."""
+        user = self.request.user
+        if is_staff_user(user) or attachment.uploaded_by_id == user.id:
+            return
+        if user_can_edit_ticket(user, attachment.ticket):
+            return
+        raise PermissionDenied('Only the uploader, staff or a ticket editor can change this attachment.')
+
+    def perform_update(self, serializer):
+        self._check_can_change(serializer.instance)
+        ticket = serializer.validated_data.get('ticket')
+        if (
+            ticket is not None and ticket.pk != serializer.instance.ticket_id
+            and not can_view_ticket(self.request.user, ticket)
+        ):
+            raise PermissionDenied('You do not have access to this ticket.')
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._check_can_change(instance)
+        instance.delete()
