@@ -583,14 +583,14 @@ class TicketViewSet(viewsets.ModelViewSet):
         # Check if only superadmin can delete tickets
         if tenant.only_superadmin_can_delete_tickets:
             # Only superadmin can delete
-            if not request.user.is_staff:
+            if not is_staff_user(request.user):
                 return Response(
                     {'error': 'Only superadmins can delete tickets based on tenant settings.'},
                     status=status.HTTP_403_FORBIDDEN
                 )
         else:
             # Both ticket owner and superadmin can delete
-            if not request.user.is_staff and ticket.created_by != request.user:
+            if not is_staff_user(request.user) and ticket.created_by != request.user:
                 return Response(
                     {'error': 'Only the ticket owner or superadmins can delete this ticket.'},
                     status=status.HTTP_403_FORBIDDEN
