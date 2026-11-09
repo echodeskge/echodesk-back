@@ -167,15 +167,15 @@ def check_column_write(user, column, ticket=None):
     """Raise ``PermissionDenied`` unless ``user`` may put ``ticket`` (``None``
     on create) into ``column`` (plan E4).
 
-    - the column's board must be accessible;
+    - a move within the ticket's current board is always allowed here (the
+      caller's right to see or edit the ticket is checked by the view);
+    - otherwise the column's board must be accessible;
     - moving to another board needs ``user_can_transfer``.
     """
     from rest_framework.exceptions import PermissionDenied
 
     if column is None or is_staff_user(user):
         return
-    if column.board_id is None or not can_access_board(user, column.board_id):
-        raise PermissionDenied('You do not have access to the board of this column.')
     if ticket is not None and ticket.pk is not None:
         old_board_id = None
         if ticket.column_id:
@@ -183,7 +183,17 @@ def check_column_write(user, column, ticket=None):
                 ticket.column.board_id if 'column' in ticket._state.fields_cache and ticket.column
                 else Ticket.objects.filter(pk=ticket.pk).values_list('column__board_id', flat=True).first()
             )
-        if old_board_id != column.board_id and not user_can_transfer(user, ticket):
+        if old_board_id is not None and old_board_id == column.board_id:
+            # A move within the ticket's own board exposes nothing new: the
+            # caller already sees (moves) or edits (PATCH) the ticket. Users
+            # who see a ticket only through an assignment, on a board they are
+            # not a member of, could always move it between that board's
+            # columns; E2's only intended narrowing is inactive groups.
+            return
+    if column.board_id is None or not can_access_board(user, column.board_id):
+        raise PermissionDenied('You do not have access to the board of this column.')
+    if ticket is not None and ticket.pk is not None:
+        if not user_can_transfer(user, ticket):
             raise PermissionDenied('You do not have permission to move this ticket to another board.')
 
 

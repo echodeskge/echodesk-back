@@ -102,12 +102,42 @@ class TestReorderInColumn(MoveBase):
     def test_invisible_ticket_is_403(self):
         self.assertEqual(self.reorder(self.invisible).status_code, 403)
 
-    def test_assigned_ticket_on_inaccessible_board_is_403(self):
-        """Visible through assignment, but its board is not accessible."""
+    def test_assigned_ticket_on_inaccessible_board_reorders(self):
+        """Visible through assignment on a board the user is not a member of:
+        moves within that board keep working (pre-B2 behaviour; E2's only
+        narrowing is inactive groups)."""
         self.create_assignment(self.invisible, self.agent)
         resp = self.api_get(f'/api/tickets/{self.invisible.id}/', user=self.agent)
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(self.reorder(self.invisible).status_code, 403)
+        self.assertEqual(self.reorder(self.invisible).status_code, 200)
+
+
+class TestAssigneeOutsideBoard(MoveBase):
+    """An assignee who is not a member of the ticket's (restricted) board."""
+
+    def setUp(self):
+        super().setUp()
+        self.x2 = self.create_column(self.board_x, 'Done', 1, is_closed_status=True)
+        self.x3 = self.create_column(self.board_x, 'Doing', 2)
+        self.create_assignment(self.invisible, self.agent)
+
+    def test_move_within_its_board_is_200(self):
+        for column in (self.x3, self.x2):
+            with self.subTest(column=column.name):
+                resp = self.move(self.invisible, column)
+                self.assertEqual(resp.status_code, 200, resp.data)
+                self.invisible.refresh_from_db()
+                self.assertEqual(self.invisible.column_id, column.id)
+
+    def test_patch_column_within_its_board_is_200(self):
+        resp = self.api_patch(f'/api/tickets/{self.invisible.id}/', {'column_id': self.x3.id}, user=self.agent)
+        self.assertEqual(resp.status_code, 200, resp.data)
+
+    def test_move_off_its_board_still_needs_target_access(self):
+        # Board A is accessible and the agent can edit (assignee): allowed
+        self.assertEqual(self.move(self.invisible, self.a1).status_code, 200)
+        # Back onto board X, which the agent cannot access: refused
+        self.assertEqual(self.move(self.invisible, self.x1).status_code, 403)
 
 
 class TestColumnIdWrites(MoveBase):
