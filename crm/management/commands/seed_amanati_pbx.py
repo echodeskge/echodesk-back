@@ -7,8 +7,15 @@ new PBX management UI shows what's really running on Asterisk today.
 Idempotent — safe to re-run. Matches by Trunk.name / Queue.slug / InboundRoute.did.
 
 Usage:
-    python manage.py seed_amanati_pbx [--dry-run] [--schema amanati]
+    AMANATI_TRUNK_PASSWORD=... python manage.py seed_amanati_pbx [--dry-run] [--schema amanati]
+
+The trunk's SIP password is never stored in this file: it comes from the
+``AMANATI_TRUNK_PASSWORD`` environment variable (the command refuses to
+run without it) and is only ever written to the encrypted Trunk.password
+column.
 """
+
+import os
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
@@ -28,7 +35,7 @@ GEO_PROVIDER_TRUNK = {
     "sip_server": "89.150.1.11",
     "sip_port": 5060,
     "username": "1048444e3",
-    "password": "7DKG29",
+    # "password" is injected from AMANATI_TRUNK_PASSWORD at run time.
     "realm": "",
     "proxy": "",
     "register": True,
@@ -83,6 +90,13 @@ class Command(BaseCommand):
     def handle(self, *args, **opts):
         schema = opts["schema"]
         dry = opts["dry_run"]
+        trunk_password = os.environ.get("AMANATI_TRUNK_PASSWORD", "")
+        if not trunk_password:
+            raise CommandError(
+                "AMANATI_TRUNK_PASSWORD is not set: export the Magti trunk's SIP "
+                "password in the environment (it is not kept in the source tree)."
+            )
+        trunk_defaults = {**GEO_PROVIDER_TRUNK, "password": trunk_password}
 
         with schema_context(schema):
             # Lazy import so the TenantGroup model is resolved in the right schema
@@ -94,7 +108,7 @@ class Command(BaseCommand):
                 # --- Trunk ---
                 trunk, created = Trunk.objects.get_or_create(
                     name=GEO_PROVIDER_TRUNK["name"],
-                    defaults=GEO_PROVIDER_TRUNK,
+                    defaults=trunk_defaults,
                 )
                 self._report("Trunk", trunk.name, created, dry)
                 if not created and not dry:
