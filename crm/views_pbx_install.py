@@ -8,11 +8,17 @@ Flow:
        curl -sSL https://api.echodesk.ge/api/pbx/install/<token>/ | sudo bash
 
 2. The script writes ``/etc/asterisk/res_pgsql.conf``, appends sorcery /
-   extconfig stanzas, installs the AGI script, restarts Asterisk.
+   extconfig stanzas, installs the AGI script, writes the EchoDesk dialplan
+   (``/etc/asterisk/extensions_echodesk.conf``, ``#include``d from
+   ``extensions.conf``), restarts Asterisk.
 
 3. On success it ``POST``s to ``/api/pbx/install/<token>/ping`` which
    flips the PbxServer status to ``active`` and records the Asterisk
    version.
+
+4. ``GET /api/pbx/install/<token>/dialplan/`` returns the dialplan alone,
+   so the admin can re-pull it after adding or renaming a trunk (the
+   outbound trunk's endpoint name is baked into ``[outbound]``).
 
 The token is a single bearer secret — do not log it. Token is rotated
 when the admin clicks "Regenerate token" in the UI.
@@ -59,7 +65,7 @@ def install_script(request, token: str):
         # Build script body with the server's creds baked in. Passwords
         # touch the wire here — that's unavoidable for an install script;
         # the user runs this exactly once and the network is HTTPS.
-        script = _render_script(pbx, request)
+        script = _render_script(pbx, request, schema, _active_trunk_endpoint(pbx, schema))
 
     return HttpResponse(script, content_type="text/x-shellscript; charset=utf-8")
 
@@ -151,15 +157,243 @@ def _agi_script_source() -> str:
     return source if source.endswith("\n") else source + "\n"
 
 
-def _render_script(pbx, request) -> str:
+DIALPLAN_PATH = "/etc/asterisk/extensions_echodesk.conf"
+DIALPLAN_INCLUDE = '#include "extensions_echodesk.conf"'
+
+
+def _active_trunk_endpoint(pbx, schema: str) -> str:
+    """PJSIP endpoint name of the trunk outbound calls leave through.
+
+    The tenant's active trunks ordered by id (the default trunk first when
+    one is flagged); the endpoint name is the one the sync layer wrote to
+    ``ps_endpoints`` (``trunk_<slug>``, tenant-prefixed on legacy servers).
+    Empty string when the tenant has no active trunk yet.
+    """
+    from crm.asterisk_sync import AsteriskStateSync, _slugify_trunk
+    from crm.models import Trunk
+
+    trunk = Trunk.objects.filter(is_active=True).order_by("-is_default", "id").first()
+    if trunk is None:
+        return ""
+    return AsteriskStateSync.prefix_with(
+        schema, f"trunk_{_slugify_trunk(trunk)}", bool(getattr(pbx, "use_tenant_prefix", False)),
+    )
+
+
+_DIALPLAN_TEMPLATE = r"""; Managed by EchoDesk — do not hand-edit; the installer rewrites this file
+; (the previous copy is kept as extensions_echodesk.conf.bak.<timestamp>).
+; Tenant: @@SCHEMA@@
+; PBX: @@PBX_NAME@@ (@@PBX_FQDN@@)
+; API: @@API_BASE@@
+; Outbound trunk: @@TRUNK_LABEL@@
+; Generated: @@GENERATED@@
+;
+; Re-pull after changing trunks in EchoDesk (the trunk name is baked in):
+;   curl -fsSL @@API_BASE@@/api/pbx/install/<install-token>/dialplan/ \
+;     > @@DIALPLAN_PATH@@ && asterisk -rx 'dialplan reload'
+;
+; ECHODESK_API_URL and ECHODESK_PBX_TOKEN come from the systemd drop-in
+; (/etc/systemd/system/asterisk.service.d/echodesk.conf) — the same values the
+; routing AGI uses. The token is never a dialplan variable: a [globals] entry
+; would be written to the log at every dialplan load ("Setting global variable
+; ... to '<token>'"), so the curl inside ${SHELL(...)} reads $ECHODESK_PBX_TOKEN
+; from the shell environment itself (Asterisk only expands ${...} / $[...]),
+; and only the HTTP status is logged. ENV() here needs func_env preloaded
+; (modules.conf: the installer adds "preload => func_env.so").
+
+[globals]
+ECHODESK_API=${ENV(ECHODESK_API_URL)}
+RECORDING_BASE=@@RECORDING_BASE@@
+MAX_WAIT=60
+
+; ---------------------------------------------------------------------------
+; Calls placed by staff (browser softphone). PJSIP endpoints of this tenant's
+; extensions have context=tenant_@@SCHEMA@@ (crm/asterisk_sync.py).
+; ---------------------------------------------------------------------------
+[tenant_@@SCHEMA@@]
+; extension to extension (EchoDesk extensions are 3-4 digits)
+exten => _[1-9]XX,1,Goto(internal,${EXTEN},1)
+exten => _[1-9]XXX,1,Goto(internal,${EXTEN},1)
+; longer numbers / +E.164 go out through the provider trunk
+exten => _XXXXX.,1,Goto(outbound,${EXTEN},1)
+exten => _+X.,1,Goto(outbound,${EXTEN},1)
+
+[internal]
+exten => _X.,1,Dial(PJSIP/@@EXT_PREFIX@@${EXTEN},30,b(echodesk-predial^s^1))
+ same => n,Hangup()
+
+; Pre-dial handler on every agent leg (Dial b() / Queue b()), run before the
+; INVITE goes out: the browser reads X-EchoDesk-Call and posts it as
+; pbx_call_id so sibling ringall legs are matched exactly.
+[echodesk-predial]
+exten => s,1,Set(PJSIP_HEADER(add,X-EchoDesk-Call)=${LINKEDID})
+ same => n,Return()
+
+@@OUTBOUND_BODY@@
+
+; ---------------------------------------------------------------------------
+; Calls from the provider: EchoDesk decides where they go. Trunk endpoints
+; have context=from-provider-@@SCHEMA@@ (crm/asterisk_sync.py).
+; ---------------------------------------------------------------------------
+[from-provider-@@SCHEMA@@]
+exten => _X.,1,Goto(echodesk-inbound,${EXTEN},1)
+exten => _+X.,1,Goto(echodesk-inbound,${EXTEN},1)
+exten => s,1,Goto(echodesk-inbound,s,1)
+
+; Channel variables set by AGI(echodesk-routing.py) — see pbx/echodesk-routing.py:
+;   IS_WORKING, ROUTE_ACTION (queue|extension|voicemail|ivr_custom|hangup),
+;   AFTER_HOURS_ACTION (announcement|voicemail|forward), FORWARD_NUMBER, VM_ENABLED,
+;   QUEUE_NAME, QUEUE_SLUG, DEST_EXTENSIONS (comma-joined), IVR_CONTEXT, TENANT_SCHEMA,
+;   SOUND_GREETING, SOUND_AFTER_HOURS, SOUND_QUEUE_HOLD, SOUND_VOICEMAIL_PROMPT,
+;   SOUND_THANK_YOU, SOUND_TRANSFER_HOLD (URLs played through res_http_media_cache).
+; SIPCALLID is read before the leg dials, on PJSIP channels only (Local channels
+; from `channel originate` have none), so the hangup handler never touches the
+; SIP session after it is gone.
+[echodesk-inbound]
+; _[+s0-9]! (not _X.) also matches the bare "s" the provider sends with no number
+exten => _[+s0-9]!,1,Answer()
+ same => n,Wait(0.5)
+ same => n,AGI(echodesk-routing.py)
+ same => n,Set(DIALED_NUMBER=${EXTEN})
+ same => n,Set(REC_FILE=${UNIQUEID}.wav)
+ same => n,Set(SIPCALLID=)
+ same => n,GotoIf($["${CHANNEL(channeltype)}" != "PJSIP"]?rec)
+ same => n,Set(SIPCALLID=${FILTER(a-zA-Z0-9@._-,${CHANNEL(pjsip,call-id)})})
+ same => n(rec),MixMonitor(/var/spool/asterisk/recording/${REC_FILE},b)
+ same => n,Set(CHANNEL(hangup_handler_push)=echodesk-recording,s,1)
+ same => n,GotoIf($["${IS_WORKING}" = "false"]?after_hours)
+ same => n,ExecIf($["${SOUND_GREETING}" != ""]?Playback(${SOUND_GREETING}))
+ same => n,GotoIf($["${ROUTE_ACTION}" = "extension"]?to_ext)
+ same => n,GotoIf($["${ROUTE_ACTION}" = "voicemail"]?vm)
+ same => n,GotoIf($["${ROUTE_ACTION}" = "hangup"]?bye)
+ same => n,GotoIf($["${ROUTE_ACTION}" = "ivr_custom" & "${IVR_CONTEXT}" != ""]?ivr)
+ ; default: queue (falls back to "support" when EchoDesk is unreachable)
+ same => n,Set(QUEUE_TO_DIAL=${IF($["${QUEUE_NAME}" != ""]?${QUEUE_NAME}:support)})
+ same => n,ExecIf($["${SOUND_QUEUE_HOLD}" != ""]?Set(CHANNEL(musicclass)=echodesk_custom))
+ ; b() runs echodesk-predial on each member leg before its INVITE goes out
+ same => n,Queue(${QUEUE_TO_DIAL},tTb(echodesk-predial^s^1),,,${MAX_WAIT})
+ same => n,ExecIf($["${SOUND_THANK_YOU}" != ""]?Playback(${SOUND_THANK_YOU}))
+ same => n,Hangup()
+ ; direct extension(s): EchoDesk's "100,101" becomes PJSIP/100&PJSIP/101 (STRREPLACE, not REPLACE)
+ same => n(to_ext),Dial(PJSIP/@@EXT_PREFIX@@${STRREPLACE(DEST_EXTENSIONS,\,,&PJSIP/@@EXT_PREFIX@@)},30,b(echodesk-predial^s^1))
+ same => n,Goto(vm)
+ same => n(ivr),Goto(${IVR_CONTEXT},s,1)
+ same => n(after_hours),ExecIf($["${SOUND_AFTER_HOURS}" != ""]?Playback(${SOUND_AFTER_HOURS}))
+ same => n,GotoIf($["${AFTER_HOURS_ACTION}" = "voicemail"]?vm)
+ same => n,GotoIf($["${AFTER_HOURS_ACTION}" = "forward" & "${FORWARD_NUMBER}" != ""]?fwd)
+ same => n(bye),Hangup()
+ ; mailbox = the DID, context "default" (voicemail.conf)
+ same => n(vm),ExecIf($["${SOUND_VOICEMAIL_PROMPT}" != ""]?Playback(${SOUND_VOICEMAIL_PROMPT}))
+ same => n,VoiceMail(${EXTEN}@default,su)
+ same => n,Hangup()
+@@FORWARD_BODY@@
+
+; ---------------------------------------------------------------------------
+; After every recorded call: tell EchoDesk where the recording is.
+; Runs as a hangup handler, so ${EXTEN} is "s": the dialed number was saved in
+; DIALED_NUMBER before the handler was pushed, SIPCALLID likewise (read here only
+; when the leg did not capture it). The numbers are digit-filtered and SIPCALLID
+; token-filtered: they end up on a shell command line.
+; ---------------------------------------------------------------------------
+[echodesk-recording]
+exten => s,1,NoOp(EchoDesk: recording ${REC_FILE} for linkedid ${LINKEDID})
+ same => n,GotoIf($["${SIPCALLID}" != "" | "${CHANNEL(channeltype)}" != "PJSIP"]?post)
+ same => n,Set(SIPCALLID=${FILTER(a-zA-Z0-9@._-,${CHANNEL(pjsip,call-id)})})
+ same => n(post),Set(WEBHOOK_HTTP=${SHELL(curl -s -o /dev/null -w '%{http_code}' -m 10 -X POST -H 'Content-Type: application/json' -H "X-PBX-Token: $ECHODESK_PBX_TOKEN" -d '{"caller_number":"${FILTER(+0-9,${CALLERID(num)})}","recipient_number":"${FILTER(+0-9,${DIALED_NUMBER})}","recording_url":"${RECORDING_BASE}${REC_FILE}","pbx_call_id":"${LINKEDID}","sip_call_id":"${SIPCALLID}"}' ${ECHODESK_API}/api/webhooks/call-recording-url/)})
+ same => n,NoOp(EchoDesk recording webhook -> HTTP ${WEBHOOK_HTTP} for ${RECORDING_BASE}${REC_FILE})
+ same => n,Return()
+
+; merge_conference redirects both legs here (AMI Redirect, exten conf_<id>).
+[confbridge-dynamic]
+exten => _conf_.,1,ConfBridge(${EXTEN})
+ same => n,Hangup()
+"""
+
+_OUTBOUND_WITH_TRUNK = r"""[outbound]
+exten => _X.,1,Set(DIALED_NUMBER=${EXTEN})
+ same => n,Set(REC_FILE=${UNIQUEID}.wav)
+ same => n,Set(SIPCALLID=)
+ same => n,GotoIf($["${CHANNEL(channeltype)}" != "PJSIP"]?rec)
+ same => n,Set(SIPCALLID=${FILTER(a-zA-Z0-9@._-,${CHANNEL(pjsip,call-id)})})
+ same => n(rec),MixMonitor(/var/spool/asterisk/recording/${REC_FILE},b)
+ same => n,Set(CHANNEL(hangup_handler_push)=echodesk-recording,s,1)
+ same => n,Dial(PJSIP/${EXTEN}@@@TRUNK@@,60)
+ same => n,Hangup()
+exten => _+X.,1,Goto(outbound,${EXTEN:1},1)"""
+
+_OUTBOUND_NO_TRUNK = r"""; No active provider trunk existed in EchoDesk when this dialplan was generated,
+; so outbound calls play "no service". Create the trunk (Settings -> PBX -> Trunks)
+; and then re-pull this file (see the header) or re-run the install command.
+[outbound]
+exten => _X.,1,NoOp(EchoDesk: no provider trunk configured, outbound ${EXTEN} refused - re-pull the dialplan after creating one)
+ same => n,Answer()
+ same => n,Playback(ss-noservice)
+ same => n,Hangup()
+exten => _+X.,1,Goto(outbound,${EXTEN:1},1)"""
+
+_FORWARD_WITH_TRUNK = r""" same => n(fwd),Dial(PJSIP/${FORWARD_NUMBER}@@@TRUNK@@,30)
+ same => n,Hangup()"""
+
+_FORWARD_NO_TRUNK = r""" ; after-hours forwarding needs a provider trunk: none was configured at generation time
+ same => n(fwd),NoOp(EchoDesk: no provider trunk configured, cannot forward to ${FORWARD_NUMBER} - re-pull the dialplan after creating one)
+ same => n,Hangup()"""
+
+
+def _render_dialplan(pbx, schema: str, trunk_endpoint: str, api_base: str) -> str:
+    """The EchoDesk-managed dialplan (``/etc/asterisk/extensions_echodesk.conf``).
+
+    Pure text: no secrets. The API URL and the PBX token are read at load
+    time from the environment the systemd drop-in sets, so the same file
+    is valid on every server of the tenant. ``trunk_endpoint`` is the PJSIP
+    endpoint outbound calls use (``""`` when the tenant has no trunk yet).
+    ``schema`` is the tenant schema the contexts are named after.
+    """
+    recording_base = (getattr(pbx, "recording_base_url", "") or "").strip()
+    if recording_base and not recording_base.endswith("/"):
+        recording_base += "/"
+    ext_prefix = f"{schema}_" if getattr(pbx, "use_tenant_prefix", False) else ""
+
+    outbound = _OUTBOUND_WITH_TRUNK if trunk_endpoint else _OUTBOUND_NO_TRUNK
+    forward = _FORWARD_WITH_TRUNK if trunk_endpoint else _FORWARD_NO_TRUNK
+    text = (
+        _DIALPLAN_TEMPLATE
+        .replace("@@OUTBOUND_BODY@@", outbound)
+        .replace("@@FORWARD_BODY@@", forward)
+    )
+    replacements = {
+        "@@SCHEMA@@": schema,
+        "@@PBX_NAME@@": str(getattr(pbx, "name", "") or ""),
+        "@@PBX_FQDN@@": str(getattr(pbx, "fqdn", "") or ""),
+        "@@API_BASE@@": api_base,
+        "@@TRUNK_LABEL@@": trunk_endpoint or "(none — outbound disabled)",
+        "@@TRUNK@@": trunk_endpoint,
+        "@@EXT_PREFIX@@": ext_prefix,
+        "@@RECORDING_BASE@@": recording_base,
+        "@@DIALPLAN_PATH@@": DIALPLAN_PATH,
+        "@@GENERATED@@": timezone.now().isoformat(),
+    }
+    for key, value in replacements.items():
+        text = text.replace(key, value)
+    return text if text.endswith("\n") else text + "\n"
+
+
+def _render_script(pbx, request, schema: str = "", trunk_endpoint: str = "") -> str:
     """Render the bash installer.
 
     Heredoc templating — no external template engine. Keep the script
     idempotent and fail-fast (``set -e``). Uses the same config blocks
     we hand-crafted on pbx2 in Phase 1.
+
+    ``schema`` names the tenant contexts in the generated dialplan (defaults
+    to the schema of the current connection) and ``trunk_endpoint`` is the
+    outbound trunk endpoint (``_active_trunk_endpoint``); callers outside a
+    tenant context pass both explicitly.
     """
     api_base = public_api_base(request)
     ping_url = f"{api_base}/api/pbx/install/{pbx.enrollment_token}/ping/"
+    if not schema:
+        from django.db import connection
+        schema = getattr(connection, "schema_name", "") or "public"
 
     # Shell-escape credentials that may contain special chars.
     import shlex
@@ -170,6 +404,7 @@ def _render_script(pbx, request) -> str:
     db_host, db_port = _public_db_endpoint(pbx)
     ami_permit_lines = _ami_permit_lines()
     agi_script = _agi_script_source()
+    dialplan = _render_dialplan(pbx, schema, trunk_endpoint, api_base)
 
     return f"""#!/bin/bash
 # EchoDesk BYO Asterisk install script
@@ -199,7 +434,7 @@ apt-get install -y -qq postgresql-client curl python3 python3-requests
 
 # --- 3. Backups -----------------------------------------------------------
 TS=$(date +%Y%m%d-%H%M%S)
-for f in res_pgsql.conf sorcery.conf extconfig.conf modules.conf; do
+for f in res_pgsql.conf sorcery.conf extconfig.conf modules.conf extensions.conf; do
   if [ -f /etc/asterisk/$f ]; then
     cp /etc/asterisk/$f /etc/asterisk/$f.bak.$TS
   fi
@@ -315,6 +550,11 @@ sed -i 's/^[[:space:]]*noload[[:space:]]*=>[[:space:]]*res_config_pgsql\\.so/;& 
 if ! grep -q "preload => res_config_pgsql.so" /etc/asterisk/modules.conf; then
   sed -i "/^\\[modules\\]/a preload => res_config_pgsql.so" /etc/asterisk/modules.conf
 fi
+# The EchoDesk dialplan's [globals] uses ${{ENV(ECHODESK_API_URL)}}; pbx_config
+# parses it before func_env would autoload, so preload that too.
+if ! grep -q "preload => func_env.so" /etc/asterisk/modules.conf; then
+  sed -i "/^\\[modules\\]/a preload => func_env.so" /etc/asterisk/modules.conf
+fi
 
 # --- 8. systemd drop-ins for SSL + safety ---------------------------------
 mkdir -p /etc/systemd/system/asterisk.service.d
@@ -347,6 +587,27 @@ CACHE_DIR=$(sed -n 's/^[[:space:]]*astcachedir[[:space:]]*=>*[[:space:]]*//p' /e
 CACHE_DIR=${{CACHE_DIR:-/var/cache/asterisk}}
 mkdir -p "$CACHE_DIR"
 chown asterisk:asterisk "$CACHE_DIR"
+
+# --- 8c. Dialplan: EchoDesk-managed contexts ------------------------------
+# Written to its own file and #included from extensions.conf, so a hand-
+# written extensions.conf is never rewritten. No secrets inside: the API
+# URL and token are read from the drop-in (step 8) at load time.
+if [ -f {DIALPLAN_PATH} ]; then
+  cp {DIALPLAN_PATH} {DIALPLAN_PATH}.bak.$TS
+fi
+cat > {DIALPLAN_PATH} <<'DIALPLANEOF'
+{dialplan}DIALPLANEOF
+chown asterisk:asterisk {DIALPLAN_PATH}
+chmod 640 {DIALPLAN_PATH}
+mkdir -p /var/spool/asterisk/recording
+chown asterisk:asterisk /var/spool/asterisk/recording
+touch /etc/asterisk/extensions.conf
+if ! grep -q '{DIALPLAN_INCLUDE}' /etc/asterisk/extensions.conf; then
+  printf '\\n%s\\n' '{DIALPLAN_INCLUDE}' >> /etc/asterisk/extensions.conf
+fi
+# Pick the new contexts up right away when Asterisk is already running; the
+# restart in step 10 loads them otherwise.
+asterisk -rx 'dialplan reload' >/dev/null 2>&1 || true
 
 # --- 9. AMI user ---------------------------------------------------------
 mkdir -p /etc/asterisk/manager.d
@@ -392,3 +653,36 @@ curl -fsSL -X POST -H 'Content-Type: application/json' \\
   {shlex.quote(ping_url)} >/dev/null
 echo "==> EchoDesk install complete."
 """
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def install_dialplan(request, token: str):
+    """Return the rendered ``extensions_echodesk.conf`` for this PBX.
+
+    Same token as the install script. The outbound trunk's endpoint name is
+    baked into the dialplan, so after adding or renaming a trunk in EchoDesk
+    the admin re-pulls it::
+
+        curl -fsSL https://<tenant>.api.echodesk.ge/api/pbx/install/<token>/dialplan/ \\
+          > /etc/asterisk/extensions_echodesk.conf && asterisk -rx 'dialplan reload'
+    """
+    schema, pbx_id = _find_pbx_by_token(token)
+    if not schema:
+        return HttpResponse("; Invalid or expired enrollment token\n",
+                            status=404, content_type="text/plain")
+
+    from tenant_schemas.utils import schema_context
+    with schema_context(schema):
+        from crm.models import PbxServer
+        pbx = PbxServer.objects.filter(id=pbx_id).first()
+        if pbx is None or (
+            pbx.enrollment_expires_at and pbx.enrollment_expires_at < timezone.now()
+        ):
+            return HttpResponse("; Token expired — regenerate in EchoDesk\n",
+                                status=410, content_type="text/plain")
+        dialplan = _render_dialplan(
+            pbx, schema, _active_trunk_endpoint(pbx, schema), public_api_base(request),
+        )
+
+    return HttpResponse(dialplan, content_type="text/plain; charset=utf-8")
