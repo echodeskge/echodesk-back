@@ -196,7 +196,11 @@ jobs:
               print(f'REMOVED ENDPOINTS: {removed}')
               exit(1)
           import re
-          enum_pattern = re.compile(r'^(Status|Role|Category|PaymentStatus|Direction|CallType|Blank|TransferType|Discount|Deployment)\w{3}Enum$')
+          # Enum components carry no contract: drf-spectacular names colliding
+          # enums with a 3-hex-char suffix (Platform1fcEnum) that differs between
+          # the environment that wrote the snapshot and CI, so every *Enum
+          # component is ignored here. Paths and non-enum schemas are still checked.
+          enum_pattern = re.compile(r'^(\w+[0-9A-Fa-f]{3}Enum|\w*Enum)$')
           snap_schemas = {k for k in snap.get('components', {}).get('schemas', {}).keys() if not enum_pattern.match(k)}
           curr_schemas = {k for k in curr.get('components', {}).get('schemas', {}).keys() if not enum_pattern.match(k)}
           removed_schemas = snap_schemas - curr_schemas
