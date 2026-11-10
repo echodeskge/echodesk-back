@@ -500,14 +500,14 @@ class TestSharedSipPassword(CrmTestCase):
             created_by=self.owner, is_default=True, username='trunk-login',
             password='TRUNK-SECRET',
         )
-        self.agent = self.create_user(email='sh-agent@test.com')
+        self.agent = self.create_user(email='sh-agent@test.com', can_make_calls=True)
         self.create_phone_assignment(user=self.agent, sip_config=self.config, extension='300',
                                      extension_password='AGENT-PW')
         # Non-staff PBX admins: manage_settings flag, or the admin role.
         self.settings_admin = self.create_user(email='sh-settings@test.com',
                                                can_manage_settings=True)
         self.role_admin = self.create_user(email='sh-role@test.com', role='admin')
-        self.loner = self.create_user(email='sh-loner@test.com')
+        self.loner = self.create_user(email='sh-loner@test.com', can_make_calls=True)
 
     def _webrtc(self, user):
         return self.api_get(f'/api/sip-configurations/{self.config.id}/webrtc_config/', user=user)

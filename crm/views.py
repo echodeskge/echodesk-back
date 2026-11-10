@@ -26,7 +26,7 @@ from .serializers import (
 )
 from .permissions import (
     HasIpCallingFeature, IsPbxAdmin, IsPbxAdminOrReadOnly, CanViewCallStats,
-    is_pbx_admin,
+    CanMakeCalls, is_pbx_admin,
 )
 from .pbx_auth import pbx_authenticated
 from .filters import CallLogFilter, UserPhoneAssignmentFilter
@@ -229,6 +229,9 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
         perms = super().get_permissions()
         if self.action in ('set_default', 'test_connection'):
             perms.append(IsPbxAdmin())
+        elif self.action in ('my_config', 'webrtc_config'):
+            # Softphone credentials only for users allowed to make calls.
+            perms.append(CanMakeCalls())
         return perms
 
     def get_queryset(self):
@@ -452,6 +455,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
             perms.append(IsPbxAdmin())
         elif self.action == 'statistics':
             perms.append(CanViewCallStats())
+        elif self.action in ('initiate_call', 'log_incoming_call'):
+            # The softphone logs its own calls: make_calls holders only.
+            perms.append(CanMakeCalls())
         return perms
 
     def get_queryset(self):
@@ -931,7 +937,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def add_event(self, request, pk=None):
         """Add an event to a call"""
         call_log = self.get_object()
-        
+        if not self._may_change_call(call_log):
+            return self._forbidden_call_change()
+
         event_data = request.data.copy()
         event_data['call_log'] = call_log.id
         
@@ -1066,7 +1074,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def start_recording(self, request, pk=None):
         """Start recording for a call"""
         call_log = self.get_object()
-        
+        if not self._may_change_call(call_log):
+            return self._forbidden_call_change()
+
         # Check if call is active
         if call_log.status not in ['answered', 'on_hold']:
             return Response(
@@ -1115,7 +1125,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def stop_recording(self, request, pk=None):
         """Stop recording for a call"""
         call_log = self.get_object()
-        
+        if not self._may_change_call(call_log):
+            return self._forbidden_call_change()
+
         # Check if recording exists
         if not hasattr(call_log, 'recording'):
             return Response(
@@ -1170,6 +1182,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def transfer_call(self, request, pk=None):
         """Transfer call to another number"""
         call_log = self.get_object()
+        if not self._may_change_call(call_log):
+            return self._forbidden_call_change()
         transfer_to = request.data.get('transfer_to')
         
         if not transfer_to:
@@ -1229,6 +1243,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def initiate_consultation(self, request, pk=None):
         """Initiate a consultation call for an attended (warm) transfer."""
         original_call = self.get_object()
+        if not self._may_change_call(original_call):
+            return self._forbidden_call_change()
 
         serializer = ConsultationInitiateSerializer(data=request.data)
         if not serializer.is_valid():
@@ -1316,6 +1332,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def complete_attended_transfer(self, request, pk=None):
         """Complete an attended (warm) transfer."""
         original_call = self.get_object()
+        if not self._may_change_call(original_call):
+            return self._forbidden_call_change()
 
         consultation_log_id = request.data.get('consultation_log_id')
         target_number = request.data.get('target_number')
@@ -1333,6 +1351,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 {'error': 'Consultation log not found for this call'},
                 status=status.HTTP_404_NOT_FOUND,
             )
+        if not self._may_change_call(consultation_log):
+            return self._forbidden_call_change()
 
         now = timezone.now()
 
@@ -1393,6 +1413,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def cancel_consultation(self, request, pk=None):
         """Cancel a consultation call and resume the original call."""
         original_call = self.get_object()
+        if not self._may_change_call(original_call):
+            return self._forbidden_call_change()
 
         consultation_log_id = request.data.get('consultation_log_id')
         if not consultation_log_id:
@@ -1408,6 +1430,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 {'error': 'Consultation log not found for this call'},
                 status=status.HTTP_404_NOT_FOUND,
             )
+        if not self._may_change_call(consultation_log):
+            return self._forbidden_call_change()
 
         now = timezone.now()
 
@@ -1461,6 +1485,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def merge_conference(self, request, pk=None):
         """Merge an attended-transfer consultation into a 3-way conference via Asterisk AMI."""
         original_call = self.get_object()
+        if not self._may_change_call(original_call):
+            return self._forbidden_call_change()
 
         serializer = MergeConferenceSerializer(data=request.data)
         if not serializer.is_valid():
@@ -1491,6 +1517,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 {"error": "Consultation log not found for this call"},
                 status=status.HTTP_404_NOT_FOUND,
             )
+        if not self._may_change_call(consultation_log):
+            return self._forbidden_call_change()
 
         # --- Resolve this tenant's PbxServer for AMI creds --------------
         from crm.asterisk_db import get_active_pbx_for_current_tenant
@@ -1651,7 +1679,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def toggle_hold(self, request, pk=None):
         """Toggle hold status for a call"""
         call_log = self.get_object()
-        
+        if not self._may_change_call(call_log):
+            return self._forbidden_call_change()
+
         if call_log.status == 'answered':
             new_status = 'on_hold'
             event_type = 'hold'

@@ -79,3 +79,26 @@ class CanViewCallStats(permissions.BasePermission):
 
     def has_permission(self, request, view):
         return can_view_call_stats(request.user)
+
+
+def can_make_calls(user):
+    """PBX admins (staff, superuser, ``manage_settings``) plus ``make_calls``
+    holders (the ``can_make_calls`` flag, or managers/admins by role;
+    tenant groups carry feature keys, not permissions)."""
+    if is_pbx_admin(user):
+        return True
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return False
+    return _has_perm(user, 'make_calls')
+
+
+class CanMakeCalls(permissions.BasePermission):
+    """Softphone use: the endpoints that hand out SIP credentials and log
+    the softphone's own calls (``my_config``, ``webrtc_config``,
+    ``initiate_call``, ``log_incoming_call``). Reading call logs is not
+    gated by this."""
+
+    message = 'You do not have permission to make calls.'
+
+    def has_permission(self, request, view):
+        return can_make_calls(request.user)

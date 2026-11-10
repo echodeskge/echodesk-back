@@ -399,8 +399,8 @@ class TestSoftphoneCredentials(CrmTestCase):
     def setUp(self):
         super().setUp()
         self.admin = self.create_admin(email='sp-admin@test.com')
-        self.agent = self.create_user(email='sp-agent@test.com')
-        self.colleague = self.create_user(email='sp-colleague@test.com')
+        self.agent = self.create_user(email='sp-agent@test.com', can_make_calls=True)
+        self.colleague = self.create_user(email='sp-colleague@test.com', can_make_calls=True)
         self.config = self.create_sip_config(
             created_by=self.admin, is_default=True, username='shared',
             password='TRUNK-SECRET', turn_server='turn:t.test', turn_username='tu',
@@ -436,7 +436,7 @@ class TestSoftphoneCredentials(CrmTestCase):
         self.assertNotIn('TRUNK-SECRET', body)
 
     def test_my_config_no_shared_account_for_agent_once_extensions_exist(self):
-        loner = self.create_user(email='sp-loner@test.com')
+        loner = self.create_user(email='sp-loner@test.com', can_make_calls=True)
         resp = self.api_get('/api/sip-configurations/my_config/', user=loner)
         self.assertEqual(resp.status_code, 404)
         self.assertNotIn('TRUNK-SECRET', _body(resp))
@@ -461,7 +461,7 @@ class TestSoftphoneCredentials(CrmTestCase):
         # account may be the trunk login, so agents never get it; the
         # webrtc_config shape stays the same with sip_enabled false.
         UserPhoneAssignment.objects.all().delete()
-        loner = self.create_user(email='sp-loner3@test.com')
+        loner = self.create_user(email='sp-loner3@test.com', can_make_calls=True)
         resp = self.api_get('/api/sip-configurations/my_config/', user=loner)
         self.assertEqual(resp.status_code, 404)
         self.assertNotIn('TRUNK-SECRET', _body(resp))
@@ -473,7 +473,7 @@ class TestSoftphoneCredentials(CrmTestCase):
 
     def test_my_config_404_without_any_config(self):
         SipConfiguration.objects.update(is_default=False)
-        loner = self.create_user(email='sp-loner2@test.com')
+        loner = self.create_user(email='sp-loner2@test.com', can_make_calls=True)
         resp = self.api_get('/api/sip-configurations/my_config/', user=loner)
         self.assertEqual(resp.status_code, 404)
 
