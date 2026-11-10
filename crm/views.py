@@ -2275,7 +2275,15 @@ def recording_webhook(request):
                 {'error': 'call_id and status are required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+        # The URL is mirrored onto CallLog.recording_url, which
+        # stream_recording fetches server-side: same allow-list as the
+        # recording-url webhook (blind-SSRF guard).
+        if file_url and not is_allowed_recording_url(file_url):
+            return Response(
+                {'file_url': ['Recording URL must be on one of the tenant\'s PBX hosts.']},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # Find call log
         try:
             call_log = CallLog.objects.get(call_id=call_id)

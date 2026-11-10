@@ -786,21 +786,47 @@ class TestRecordingWebhook(CrmTestCase):
     def test_recording_completed(self):
         admin = self.create_admin()
         call = self.create_call_log(handled_by=admin)
+        headers = self.pbx_headers()  # creates the tenant's PbxServer (fqdn pbx.tenant.test)
+        file_url = 'https://pbx.tenant.test/recordings/recording.wav'
         resp = self.api_post(
             '/api/webhooks/recording/',
             {
                 'call_id': str(call.call_id),
                 'status': 'completed',
-                'file_url': 'https://storage.example.com/recording.wav',
+                'file_url': file_url,
                 'file_size': 1024000,
                 'duration': 120,
             },
-            **self.pbx_headers(),
+            **headers,
         )
         self.assertEqual(resp.status_code, 200)
         recording = CallRecording.objects.get(call_log=call)
         self.assertEqual(recording.status, 'completed')
-        self.assertEqual(recording.file_url, 'https://storage.example.com/recording.wav')
+        self.assertEqual(recording.file_url, file_url)
+        call.refresh_from_db()
+        self.assertEqual(call.recording_url, file_url)
+
+    def test_recording_file_url_must_be_on_a_pbx_host(self):
+        """``file_url`` is mirrored onto CallLog.recording_url, which the
+        play button fetches server-side: a URL off the tenant's PBX hosts
+        is refused and nothing is written (same rule as the
+        recording-url webhook)."""
+        admin = self.create_admin()
+        call = self.create_call_log(handled_by=admin)
+        headers = self.pbx_headers()
+        for bad in ('https://storage.example.com/recording.wav',
+                    'http://169.254.169.254/latest/meta-data/',
+                    'file:///etc/passwd'):
+            resp = self.api_post(
+                '/api/webhooks/recording/',
+                {'call_id': str(call.call_id), 'status': 'completed', 'file_url': bad},
+                **headers,
+            )
+            self.assertEqual(resp.status_code, 400, bad)
+            self.assertIn('file_url', resp.data)
+        self.assertFalse(CallRecording.objects.filter(call_log=call).exists())
+        call.refresh_from_db()
+        self.assertFalse(call.recording_url)
 
     def test_recording_webhook_missing_fields(self):
         resp = self.api_post('/api/webhooks/recording/', {'status': 'started'}, **self.pbx_headers())
