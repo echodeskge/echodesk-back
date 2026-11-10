@@ -7,7 +7,7 @@ from django.utils import timezone
 from users.tests.conftest import EchoDeskTenantTestCase
 from crm.models import (
     SipConfiguration, UserPhoneAssignment, CallLog, CallEvent,
-    CallRecording, PbxSettings, Client,
+    CallRecording, PbxSettings, PbxServer, Client,
 )
 
 
@@ -179,3 +179,26 @@ class CrmTestCase(EchoDeskTenantTestCase):
             sip_configuration=sip_config,
             **defaults,
         )
+
+    # ── PBX server (BYO Asterisk) ──
+
+    def create_pbx_server(self, **kwargs):
+        defaults = {
+            'name': 'Test PBX',
+            'fqdn': 'pbx.tenant.test',
+            'realtime_db_host': 'db.tenant.test',
+            'realtime_db_name': 'asterisk_test',
+            'realtime_db_user': 'asterisk_rw_test',
+            'status': PbxServer.STATUS_ACTIVE,
+        }
+        defaults.update(kwargs)
+        return PbxServer.objects.create(**defaults)
+
+    def pbx_headers(self, pbx=None):
+        """``X-PBX-Token`` header kwargs for a webhook / call-routing request
+        from this tenant's PBX (created on first use)."""
+        if pbx is None:
+            pbx = getattr(self, '_pbx_for_headers', None)
+            if pbx is None:
+                pbx = self._pbx_for_headers = self.create_pbx_server()
+        return {'HTTP_X_PBX_TOKEN': pbx.api_token}

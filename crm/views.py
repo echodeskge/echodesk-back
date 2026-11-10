@@ -2,7 +2,7 @@ import logging
 import socket
 
 from rest_framework import serializers as drf_serializers, viewsets, permissions, status, filters
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.decorators import action, api_view, authentication_classes, permission_classes
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
@@ -28,6 +28,7 @@ from .permissions import (
     HasIpCallingFeature, IsPbxAdmin, IsPbxAdminOrReadOnly, CanViewCallStats,
     is_pbx_admin,
 )
+from .pbx_auth import pbx_authenticated
 from .filters import CallLogFilter, UserPhoneAssignmentFilter
 from .recording_hosts import (
     UnsafeRecordingURL,
@@ -1903,12 +1904,15 @@ class ClientViewSet(viewsets.ModelViewSet):
     responses={200: "Event processed successfully"}
 )
 @api_view(['POST'])
+@authentication_classes([])
 @permission_classes([])
 @csrf_exempt
+@pbx_authenticated
 def sip_webhook(request):
     """
     Webhook endpoint for receiving SIP call events
     This endpoint should be called by your SIP server to update call status
+    (``X-PBX-Token`` of the tenant's PbxServer; see :mod:`crm.pbx_auth`).
     """
     try:
         data = request.data
@@ -2010,10 +2014,11 @@ def sip_webhook(request):
             'call_id': str(call_log.call_id),
             'status': call_log.status
         })
-        
-    except Exception as e:
+
+    except Exception:
+        logger.exception('sip_webhook failed (tenant=%s)', getattr(request, 'pbx_schema', None))
         return Response(
-            {'error': f'Error processing webhook: {str(e)}'},
+            {'error': 'Error processing webhook'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
@@ -2039,11 +2044,14 @@ def sip_webhook(request):
     responses={200: "Recording update processed successfully"}
 )
 @api_view(['POST'])
+@authentication_classes([])
 @permission_classes([])
 @csrf_exempt
+@pbx_authenticated
 def recording_webhook(request):
     """
     Webhook endpoint for receiving call recording updates
+    (``X-PBX-Token`` of the tenant's PbxServer; see :mod:`crm.pbx_auth`).
     """
     try:
         data = request.data
@@ -2120,21 +2128,25 @@ def recording_webhook(request):
             'recording_id': str(recording.recording_id),
             'status': recording.status
         })
-        
-    except Exception as e:
+
+    except Exception:
+        logger.exception('recording_webhook failed (tenant=%s)', getattr(request, 'pbx_schema', None))
         return Response(
-            {'error': f'Error processing recording webhook: {str(e)}'},
+            {'error': 'Error processing recording webhook'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
 
 @api_view(['POST'])
+@authentication_classes([])
 @permission_classes([])
 @csrf_exempt
+@pbx_authenticated
 def call_rating_webhook(request):
     """
     Webhook endpoint for receiving call ratings from PBX.
     Called by Asterisk after the customer rates the call (1-5).
+    (``X-PBX-Token`` of the tenant's PbxServer; see :mod:`crm.pbx_auth`.)
     """
     try:
         data = request.data
@@ -2213,9 +2225,10 @@ def call_rating_webhook(request):
             'rating': rating,
         })
 
-    except Exception as e:
+    except Exception:
+        logger.exception('call_rating_webhook failed (tenant=%s)', getattr(request, 'pbx_schema', None))
         return Response(
-            {'error': f'Error processing rating: {str(e)}'},
+            {'error': 'Error processing rating'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
@@ -2410,38 +2423,92 @@ def extension_status(request):
         return Response({'extensions': []})
 
 
+@extend_schema(
+    summary="Call recording URL webhook (dialplan hangup handler)",
+    description=(
+        "Attach a recording URL to a call log. Auth: ``X-PBX-Token`` of the "
+        "tenant's PbxServer. The URL must be on one of the tenant's PBX hosts "
+        "(400 otherwise). The call is matched by ``pbx_call_id`` (Asterisk "
+        "LINKEDID; the answered leg wins), then ``sip_call_id``, then the "
+        "most recent call whose caller / recipient number ends with the "
+        "last 7 digits of ``caller_number``."
+    ),
+    request={
+        "application/json": {
+            "type": "object",
+            "properties": {
+                "caller_number": {"type": "string"},
+                "recording_url": {"type": "string"},
+                "pbx_call_id": {"type": "string"},
+                "sip_call_id": {"type": "string"},
+            },
+            "required": ["recording_url"],
+        }
+    },
+    responses={200: OpenApiTypes.OBJECT, 400: OpenApiTypes.OBJECT, 401: OpenApiTypes.OBJECT,
+               404: OpenApiTypes.OBJECT},
+)
 @api_view(['POST'])
+@authentication_classes([])
 @permission_classes([])
 @csrf_exempt
+@pbx_authenticated
 def call_recording_url_webhook(request):
-    """Save recording URL to the most recent call from a caller number."""
+    """Save a recording URL on the call it belongs to."""
+    from django.db.models import F
+
     try:
         data = request.data
-        caller_number = data.get('caller_number', '').strip()
-        recording_url = data.get('recording_url', '').strip()
 
-        if not caller_number or not recording_url:
+        def _text(key, limit):
+            value = data.get(key, '')
+            return (str(value) if value is not None else '').strip()[:limit]
+
+        caller_number = _text('caller_number', 64)
+        recording_url = _text('recording_url', 2048)
+        pbx_call_id = _text('pbx_call_id', 64)
+        sip_call_id = _text('sip_call_id', 255)
+
+        if not recording_url or not (caller_number or pbx_call_id or sip_call_id):
             return Response(
-                {'error': 'caller_number and recording_url are required'},
+                {'error': 'recording_url and one of pbx_call_id, sip_call_id, caller_number are required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        if not is_allowed_recording_url(recording_url):
+            return Response(
+                {'recording_url': ['Recording URL must be on one of the tenant\'s PBX hosts.']},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        clean_number = caller_number.replace('+', '').replace(' ', '')
-        last_digits = clean_number[-7:] if len(clean_number) >= 7 else clean_number
+        call_log = None
+        if pbx_call_id:
+            # Every agent leg of one call shares the LINKEDID: the recording
+            # belongs to the leg that was answered (ring-all siblings are
+            # cancelled); fall back to the latest leg.
+            call_log = (
+                CallLog.objects.filter(pbx_call_id=pbx_call_id)
+                .order_by(F('answered_at').desc(nulls_last=True), '-started_at')
+                .first()
+            )
+        if call_log is None and sip_call_id:
+            call_log = CallLog.objects.filter(sip_call_id=sip_call_id).order_by('-started_at').first()
 
-        call_log = CallLog.objects.filter(
-            caller_number__endswith=last_digits
-        ).order_by('-started_at').first()
-
-        if not call_log:
-            # Also check recipient number for outbound calls
-            call_log = CallLog.objects.filter(
-                recipient_number__endswith=last_digits
-            ).order_by('-started_at').first()
+        if call_log is None and caller_number:
+            clean_number = ''.join(ch for ch in caller_number if ch.isdigit())
+            last_digits = clean_number[-7:] if len(clean_number) >= 7 else clean_number
+            if last_digits:
+                call_log = CallLog.objects.filter(
+                    caller_number__endswith=last_digits
+                ).order_by('-started_at').first()
+                if not call_log:
+                    # Also check recipient number for outbound calls
+                    call_log = CallLog.objects.filter(
+                        recipient_number__endswith=last_digits
+                    ).order_by('-started_at').first()
 
         if not call_log:
             return Response(
-                {'error': f'No call found for {caller_number}'},
+                {'error': 'No matching call found'},
                 status=status.HTTP_404_NOT_FOUND
             )
 
@@ -2453,9 +2520,11 @@ def call_recording_url_webhook(request):
             'call_id': str(call_log.call_id),
         })
 
-    except Exception as e:
+    except Exception:
+        logger.exception('call_recording_url_webhook failed (tenant=%s)',
+                         getattr(request, 'pbx_schema', None))
         return Response(
-            {'error': f'Error: {str(e)}'},
+            {'error': 'Error processing recording URL'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
@@ -2657,51 +2726,6 @@ def pbx_settings_remove_sound(request, sip_config_id):
 # ============================================================================
 
 
-_PBX_TOKEN_CACHE_PREFIX = "pbx_token_tenant:"
-_PBX_TOKEN_CACHE_TTL = 60 * 10  # 10 minutes
-
-
-def _resolve_tenant_by_pbx_token(token: str):
-    """Return the tenant schema_name bound to a PbxServer ``enrollment_token``.
-
-    PbxServer rows live in tenant schemas, so we have to iterate the
-    registry until we find a match. Results are cached in Django's cache
-    keyed by the token so subsequent AGI hits hit the cache (critical on
-    high call volumes — every inbound ring fires this endpoint).
-
-    Returns ``None`` if no active PbxServer matches the token.
-    """
-    from django.core.cache import cache
-    from tenant_schemas.utils import schema_context
-    from tenants.models import Tenant
-
-    if not token:
-        return None
-
-    cache_key = f"{_PBX_TOKEN_CACHE_PREFIX}{token}"
-    cached = cache.get(cache_key)
-    if cached:
-        return cached  # schema_name string
-
-    try:
-        tenants = list(Tenant.objects.exclude(schema_name='public'))
-    except Exception:  # noqa: BLE001
-        return None
-
-    for tenant in tenants:
-        try:
-            with schema_context(tenant.schema_name):
-                from crm.models import PbxServer
-                pbx = PbxServer.objects.filter(enrollment_token=token).first()
-                if pbx is None:
-                    continue
-                cache.set(cache_key, tenant.schema_name, _PBX_TOKEN_CACHE_TTL)
-                return tenant.schema_name
-        except Exception:  # noqa: BLE001
-            continue
-    return None
-
-
 def _resolve_routing_for_tenant(tenant_schema: str, did: str):
     """Run the DID → InboundRoute resolution inside ``tenant_schema``.
 
@@ -2840,7 +2864,9 @@ def _resolve_routing_for_tenant(tenant_schema: str, did: str):
 
 @csrf_exempt
 @api_view(['GET'])
+@authentication_classes([])
 @permission_classes([])
+@pbx_authenticated
 def call_routing(request):
     """
     Lightweight endpoint for Asterisk to query on each incoming call.
@@ -2850,84 +2876,31 @@ def call_routing(request):
         did: The DID/phone number that was called (e.g., +995322421219)
         pbx_token: (optional) Tenant-scoping token; fallback for the header.
 
-    Headers:
-        X-PBX-Token: (optional) When set, resolves tenant via
-            ``PbxServer.enrollment_token`` for O(1) routing — Asterisk's
-            install script bakes this in so we don't have to iterate every
-            tenant on every call.
-        Authorization: Bearer <PBX_SHARED_SECRET> — legacy shared secret,
-            still accepted for backwards compat during the BYO migration.
+    Auth (see :mod:`crm.pbx_auth`): ``X-PBX-Token`` = the PbxServer's
+    ``api_token`` (its ``enrollment_token`` is still accepted for active
+    servers as a legacy identifier), or ``Authorization: Bearer
+    <PBX_SHARED_SECRET>`` on a tenant host while that setting is set.
+    The tenant is the token's tenant; routing never looks at other tenants.
     """
-    from django.conf import settings as django_settings
-    from tenants.models import Tenant
-
-    # Authenticate via shared secret (legacy). When X-PBX-Token is present
-    # we treat the token itself as sufficient auth — the token is a 64+ char
-    # secret minted by EchoDesk at enrollment time.
-    pbx_token = (
-        request.META.get('HTTP_X_PBX_TOKEN', '')
-        or request.GET.get('pbx_token', '')
-    ).strip()
-
-    auth_header = request.META.get('HTTP_AUTHORIZATION', '')
-    expected_shared_secret = getattr(django_settings, 'PBX_SHARED_SECRET', '')
-    if not pbx_token:
-        # Legacy path: require the shared secret.
-        if expected_shared_secret and not auth_header.endswith(expected_shared_secret):
-            return Response(
-                {'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED
-            )
-
     did = request.GET.get('did', '').strip()
     if not did:
         return Response({'error': 'did parameter required'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # ------------------------------------------------------------------
-    # Fast path: X-PBX-Token identifies the tenant without scanning all.
-    # ------------------------------------------------------------------
-    if pbx_token:
-        tenant_schema = _resolve_tenant_by_pbx_token(pbx_token)
-        if tenant_schema is None:
-            return Response(
-                {'error': 'Unknown X-PBX-Token'},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
-        try:
-            resolved = _resolve_routing_for_tenant(tenant_schema, did)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "call_routing: resolution failed for tenant=%s did=%s",
-                tenant_schema, did,
-            )
-            resolved = None
-        if resolved is not None:
-            return Response(resolved)
-        # Fall through to the legacy scan as a last resort so a
-        # mis-wired DID doesn't 404 when the tenant actually exists.
-
-    # ------------------------------------------------------------------
-    # Legacy all-tenant scan. Kept for backwards compatibility until every
-    # deployed Asterisk install script includes X-PBX-Token. Emits a
-    # warning so we notice if we accidentally regress to the slow path.
-    # ------------------------------------------------------------------
-    logger.warning(
-        "call_routing called without X-PBX-Token — O(N) fallback (did=%s)", did,
-    )
-    tenants = Tenant.objects.exclude(schema_name='public')
-    for tenant in tenants:
-        try:
-            resolved = _resolve_routing_for_tenant(tenant.schema_name, did)
-        except Exception:  # noqa: BLE001
-            continue
-        if resolved is not None:
-            return Response(resolved)
-
-    # DID not found in any tenant — default to open
-    return Response({
-        'is_working_hours': True,
-        'action': 'queue',
-        'sounds': {},
-        'extensions': [],
-        'voicemail_enabled': False,
-        'after_hours_action': 'announcement',
-    })
+    tenant_schema = request.pbx_schema
+    try:
+        resolved = _resolve_routing_for_tenant(tenant_schema, did)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "call_routing: resolution failed for tenant=%s did=%s",
+            tenant_schema, did,
+        )
+        return Response(
+            {'error': 'Routing resolution failed'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    if resolved is None:
+        return Response(
+            {'error': 'No SIP configuration for this PBX\'s tenant'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+    return Response(resolved)

@@ -359,7 +359,7 @@ class TestCallRouting(CrmTestCase):
         )
         resp = self.client.get(
             '/api/pbx/call-routing/?did=+995322421219',
-            HTTP_HOST='tenant.test.com',
+            HTTP_HOST='tenant.test.com', **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.data['is_working_hours'])
@@ -376,7 +376,7 @@ class TestCallRouting(CrmTestCase):
         )
         resp = self.client.get(
             '/api/pbx/call-routing/?did=+995322421219',
-            HTTP_HOST='tenant.test.com',
+            HTTP_HOST='tenant.test.com', **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 200)
         self.assertFalse(resp.data['is_working_hours'])
@@ -387,7 +387,7 @@ class TestCallRouting(CrmTestCase):
         self._create_routing_setup(working_hours_enabled=False)
         resp = self.client.get(
             '/api/pbx/call-routing/?did=+995322421219',
-            HTTP_HOST='tenant.test.com',
+            HTTP_HOST='tenant.test.com', **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 200)
         self.assertIn('sounds', resp.data)
@@ -400,7 +400,7 @@ class TestCallRouting(CrmTestCase):
         self._create_routing_setup(working_hours_enabled=False)
         resp = self.client.get(
             '/api/pbx/call-routing/?did=+995322421219',
-            HTTP_HOST='tenant.test.com',
+            HTTP_HOST='tenant.test.com', **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 200)
         sounds = resp.data['sounds']
@@ -412,7 +412,7 @@ class TestCallRouting(CrmTestCase):
         self._create_routing_setup(working_hours_enabled=False)
         resp = self.client.get(
             '/api/pbx/call-routing/?did=+995322421219',
-            HTTP_HOST='tenant.test.com',
+            HTTP_HOST='tenant.test.com', **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 200)
         self.assertIn('extensions', resp.data)
@@ -422,16 +422,33 @@ class TestCallRouting(CrmTestCase):
         """Returns 400 if did parameter is missing."""
         resp = self.client.get(
             '/api/pbx/call-routing/',
-            HTTP_HOST='tenant.test.com',
+            HTTP_HOST='tenant.test.com', **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 400)
 
     def test_call_routing_unknown_did(self):
-        """Returns default open response for unknown DID."""
+        """An unknown DID in a tenant with a SIP configuration gets that
+        tenant's default (open) routing; never another tenant's."""
+        self._create_routing_setup(working_hours_enabled=False)
         resp = self.client.get(
             '/api/pbx/call-routing/?did=+999999999999',
-            HTTP_HOST='tenant.test.com',
+            HTTP_HOST='tenant.test.com', **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 200)
-        # Default fallback should be open
         self.assertTrue(resp.data['is_working_hours'])
+
+    def test_call_routing_no_sip_configuration_is_404(self):
+        """No SIP configuration in the token's tenant: 404, no scan of
+        other tenants."""
+        resp = self.client.get(
+            '/api/pbx/call-routing/?did=+995322421219',
+            HTTP_HOST='tenant.test.com', **self.pbx_headers(),
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_call_routing_requires_pbx_token(self):
+        resp = self.client.get(
+            '/api/pbx/call-routing/?did=+995322421219',
+            HTTP_HOST='tenant.test.com',
+        )
+        self.assertEqual(resp.status_code, 401)

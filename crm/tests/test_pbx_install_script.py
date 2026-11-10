@@ -18,7 +18,7 @@ def _pbx(**overrides):
         realtime_db_host='pgbouncer', realtime_db_port=5432,
         realtime_db_name='asterisk_acme', realtime_db_user='asterisk_rw_acme',
         realtime_db_password="p'w$d", ami_username='echodesk', ami_password='s3cret',
-        enrollment_token='tok123',
+        enrollment_token='tok123', api_token='api-tok-456',
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -46,7 +46,9 @@ class TestInstallScript(SimpleTestCase):
         script = _render(_pbx())
         self.assertIn('/var/lib/asterisk/agi-bin/echodesk-routing.py', script)
         self.assertIn("headers['X-PBX-Token'] = pbx_token", script)
-        self.assertIn('Environment="ECHODESK_PBX_TOKEN=tok123"', script)
+        # The drop-in carries the long-lived api_token, not the 24h install token.
+        self.assertIn('Environment="ECHODESK_PBX_TOKEN=api-tok-456"', script)
+        self.assertNotIn('ECHODESK_PBX_TOKEN=tok123', script)
         self.assertIn('Environment="ECHODESK_API_URL=https://api.echodesk.ge"', script)
         self.assertIn('manager.d/*.conf', script)
 

@@ -782,7 +782,7 @@ class TestMissedCallNotifications(CrmTestCase):
         call = self.create_call_log(handled_by=self.agent, status='ringing', sip_call_id='abc-123')
         resp = self.client.post('/api/webhooks/sip/', {
             'event_type': 'call_no_answer', 'sip_call_id': 'abc-123',
-        }, format='json', HTTP_HOST='tenant.test.com')
+        }, format='json', HTTP_HOST='tenant.test.com', **self.pbx_headers())
         self.assertEqual(resp.status_code, 200)
         call.refresh_from_db()
         self.assertEqual(call.status, 'no_answer')
