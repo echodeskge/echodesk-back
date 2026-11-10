@@ -158,6 +158,64 @@ def _ami_get_channels(host, username, password, port=5038):
         _ami_logoff(sock)
 
 
+def _ami_list_events(sock, action, event_name, complete_event, timeout=5):
+    """Send a list-style AMI ``action`` and return the ``event_name``
+    events it emits (as dicts of lower-cased keys), reading until
+    ``complete_event`` arrives or the socket goes quiet."""
+    sock.sendall(f"Action: {action}\r\n\r\n".encode("utf-8"))
+    raw = b""
+    sock.settimeout(timeout)
+    complete = complete_event.encode("utf-8")
+    while True:
+        try:
+            chunk = sock.recv(8192)
+            if not chunk:
+                break
+            raw += chunk
+            if complete in raw:
+                break
+        except socket.timeout:
+            break
+    text = raw.decode("utf-8", errors="replace")
+    wanted = f"Event: {event_name}"
+    events = []
+    for block in text.replace("\r\n", "\n").split("\n\n"):
+        lines = block.strip().splitlines()
+        if wanted not in lines:
+            continue
+        info = {}
+        for line in lines:
+            if ": " in line:
+                key, _, value = line.partition(": ")
+                info[key.strip().lower()] = value.strip()
+        events.append(info)
+    return events
+
+
+# PJSIP contact statuses that mean the device is registered and usable.
+_PJSIP_CONTACT_ONLINE = {"reachable", "nonqualified", "created", "unknown"}
+
+
+def _ami_online_extensions(host, username, password, port=5038):
+    """Extensions (PJSIP AORs) with a registered contact, via
+    ``PJSIPShowContacts``. Contacts Asterisk reports ``Unreachable`` /
+    ``Removed`` do not count."""
+    sock = _ami_connect_and_login(host, username, password, port=port)
+    try:
+        contacts = _ami_list_events(sock, "PJSIPShowContacts", "ContactList", "ContactListComplete")
+    finally:
+        _ami_logoff(sock)
+    online = set()
+    for contact in contacts:
+        aor = contact.get("aor") or contact.get("endpoint") or ""
+        if not aor:
+            # ``ObjectName`` is ``<aor>;@<hash>`` when no Aor field is sent.
+            aor = (contact.get("objectname") or "").split(";", 1)[0]
+        if aor and contact.get("status", "").lower() in _PJSIP_CONTACT_ONLINE:
+            online.add(aor)
+    return online
+
+
 def _ami_redirect_to_confbridge(host, channel, conference_room, username, password, port=5038):
     """Redirect a single Asterisk channel into a ConfBridge room.
 
@@ -2382,19 +2440,42 @@ def send_call_review_sms(request):
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated, HasIpCallingFeature])
 def extension_status(request):
-    """Proxy to PBX status API — returns which extensions are online.
+    """Which of the tenant's extensions are online.
 
-    Resolves the tenant's active :class:`PbxServer` first so each tenant
-    gets a response from their own Asterisk. Falls back to the default
-    SipConfiguration when no PbxServer is registered yet, keeping the
-    legacy shared-pbx2 path alive during the BYO migration window.
+    With an active :class:`PbxServer` that has AMI credentials the answer
+    comes from that Asterisk's ``PJSIPShowContacts`` (every active
+    extension is listed, ``online`` when it has a registered contact,
+    ``offline`` otherwise). Without AMI credentials the legacy ``:8081``
+    status sidecar is proxied, resolved from the PbxServer host or, when
+    no PbxServer is registered yet, the default SipConfiguration.
     """
     import requests as http_requests
     from django.core.cache import cache
+    from django.db import connection
     from crm.asterisk_db import get_active_pbx_for_current_tenant
 
     try:
         pbx = get_active_pbx_for_current_tenant()
+        if pbx is not None and pbx.ami_username and pbx.ami_password and (pbx.ami_host or pbx.fqdn):
+            cache_key = f'pbx_extension_status:ami:{connection.schema_name}:{pbx.pk}'
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return Response(cached)
+            online = _ami_online_extensions(
+                pbx.ami_host or pbx.fqdn, pbx.ami_username, pbx.ami_password,
+                port=pbx.ami_port or 5038,
+            )
+            extensions = (
+                UserPhoneAssignment.objects.filter(is_active=True)
+                .order_by('extension').values_list('extension', flat=True).distinct()
+            )
+            data = {'extensions': [
+                {'extension': ext, 'status': 'online' if ext in online else 'offline'}
+                for ext in extensions
+            ]}
+            cache.set(cache_key, data, timeout=5)
+            return Response(data)
+
         if pbx is not None:
             pbx_host = pbx.ami_host or pbx.fqdn
         else:
@@ -2422,6 +2503,7 @@ def extension_status(request):
         cache.set(cache_key, data, timeout=5)
         return Response(data)
     except Exception:
+        logger.debug('extension_status lookup failed', exc_info=True)
         return Response({'extensions': []})
 
 

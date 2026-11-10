@@ -631,6 +631,112 @@ class TestSoftphoneTransport(CrmTestCase):
 
 
 # ============================================================================
+# Extension status via AMI
+# ============================================================================
+
+
+class _FakeAmiSocket:
+    def __init__(self, payload):
+        self._chunks = [payload]
+        self.sent = b''
+
+    def sendall(self, data):
+        self.sent += data
+
+    def settimeout(self, *_):
+        pass
+
+    def recv(self, *_):
+        return self._chunks.pop(0) if self._chunks else b''
+
+    def close(self):
+        pass
+
+
+class TestExtensionStatusAmi(CrmTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='es-admin@test.com')
+        self.agent = self.create_user(email='es-agent@test.com')
+        self.config = self.create_sip_config(created_by=self.admin, is_default=True,
+                                             sip_server='pbx-status.test')
+        self.create_phone_assignment(user=self.agent, sip_config=self.config, extension='100')
+        self.create_phone_assignment(user=self.admin, sip_config=self.config, extension='101')
+        self.create_phone_assignment(user=self.create_user(email='es-x@test.com'),
+                                     sip_config=self.config, extension='102', is_active=False)
+        from django.core.cache import cache
+        cache.clear()
+
+    def _pbx(self, **kwargs):
+        defaults = {
+            'name': 'PBX', 'fqdn': 'pbx.test.com', 'realtime_db_host': 'db',
+            'realtime_db_name': 'asterisk_test', 'realtime_db_user': 'rw',
+            'status': PbxServer.STATUS_ACTIVE, 'ami_host': '10.0.0.5', 'ami_port': 5039,
+            'ami_username': 'echodesk', 'ami_password': 'AMI-PW',
+        }
+        defaults.update(kwargs)
+        return PbxServer.objects.create(**defaults)
+
+    @patch('requests.get')
+    @patch('crm.views._ami_online_extensions', return_value={'100'})
+    def test_ami_used_when_pbx_server_has_credentials(self, ami, http_get):
+        self._pbx()
+        resp = self.api_get('/api/extensions/status/', user=self.agent)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, {'extensions': [
+            {'extension': '100', 'status': 'online'},
+            {'extension': '101', 'status': 'offline'},
+        ]})
+        ami.assert_called_once_with('10.0.0.5', 'echodesk', 'AMI-PW', port=5039)
+        http_get.assert_not_called()
+        # Cached briefly: a second poll does not hit AMI again.
+        self.api_get('/api/extensions/status/', user=self.agent)
+        ami.assert_called_once()
+
+    @patch('requests.get')
+    @patch('crm.views._ami_online_extensions', side_effect=ConnectionError('AMI login failed'))
+    def test_ami_failure_degrades_to_empty(self, ami, http_get):
+        self._pbx()
+        resp = self.api_get('/api/extensions/status/', user=self.agent)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, {'extensions': []})
+        self.assertNotIn('AMI login failed', _body(resp))
+
+    @patch('crm.views._ami_online_extensions')
+    @patch('requests.get')
+    def test_sidecar_fallback_without_ami_credentials(self, http_get, ami):
+        http_get.return_value.json.return_value = {'extensions': [{'extension': '100', 'status': 'online'}]}
+        self._pbx(ami_username='', ami_password='')
+        resp = self.api_get('/api/extensions/status/', user=self.agent)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['extensions'][0]['extension'], '100')
+        ami.assert_not_called()
+        self.assertIn('http://10.0.0.5:8081/api/extensions/status', http_get.call_args.args[0])
+
+    def test_pjsip_show_contacts_parsing(self):
+        from crm.views import _ami_online_extensions
+
+        payload = (
+            b'Response: Success\r\nEventList: start\r\nMessage: A listing of Contacts follows\r\n\r\n'
+            b'Event: ContactList\r\nObjectType: contact\r\nObjectName: 100;@abc\r\nAor: 100\r\n'
+            b'Status: Reachable\r\nRoundtripUsec: 12\r\n\r\n'
+            b'Event: ContactList\r\nObjectType: contact\r\nObjectName: 101;@def\r\nAor: 101\r\n'
+            b'Status: Unreachable\r\n\r\n'
+            b'Event: ContactList\r\nObjectType: contact\r\nObjectName: 103;@ghi\r\n'
+            b'Status: NonQualified\r\n\r\n'
+            b'Event: ContactListComplete\r\nEventList: Complete\r\nListItems: 3\r\n\r\n'
+        )
+        sock = _FakeAmiSocket(payload)
+        with patch('crm.views._ami_connect_and_login', return_value=sock) as login:
+            online = _ami_online_extensions('h', 'u', 'p', port=5038)
+        login.assert_called_once_with('h', 'u', 'p', port=5038)
+        self.assertEqual(online, {'100', '103'})
+        self.assertIn(b'Action: PJSIPShowContacts', sock.sent)
+        self.assertIn(b'Action: Logoff', sock.sent)
+
+
+# ============================================================================
 # PBX admin writes
 # ============================================================================
 
