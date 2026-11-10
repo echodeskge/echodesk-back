@@ -24,7 +24,7 @@ from django.utils import timezone
 
 from crm.call_notifications import find_answered_sibling, relabel_legs_answered_elsewhere
 from crm.models import CallEvent, CallLog
-from crm.tests.conftest import CrmTestCase
+from crm.tests.conftest import CrmTestCase, without_call_events
 from users.models import Notification
 
 LOG_URL = '/api/call-logs/log_incoming_call/'
@@ -213,7 +213,7 @@ class TestEndCall(_CallsMixin, CrmTestCase):
             resp = self.end(leg_a)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data['status'], 'cancelled')
-        self.assertEqual(len(callbacks), 0)
+        self.assertEqual(without_call_events(callbacks), [])
         self.assertEqual(Notification.objects.filter(notification_type='call_missed').count(), 0)
 
     def test_end_call_matches_exact_sibling_before_the_heuristic(self, mock_push):
@@ -232,7 +232,7 @@ class TestEndCall(_CallsMixin, CrmTestCase):
             resp = self.end(leg_a)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data['status'], 'cancelled')
-        self.assertEqual(len(callbacks), 0)
+        self.assertEqual(without_call_events(callbacks), [])
 
     def test_relabel_also_covers_legs_that_already_timed_out(self, mock_push):
         leg_a = self.create_call_log(handled_by=self.agent_a, pbx_call_id='1700.7',

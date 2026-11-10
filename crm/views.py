@@ -20,7 +20,7 @@ from .serializers import (
     CallLogDetailSerializer, CallEventSerializer, CallRecordingSerializer,
     UserPhoneAssignmentSerializer, UserPhoneAssignmentDetailSerializer,
     PbxSettingsSerializer, ConsultationInitiateSerializer, MergeConferenceSerializer,
-    CallRatingSerializer, MySoftphoneConfigSerializer, SOFTPHONE_CONTEXT_KEY,
+    MySoftphoneConfigSerializer, SOFTPHONE_CONTEXT_KEY,
     SoftphoneSipConfigurationSerializer,
     CallEndSerializer,
 )
@@ -159,6 +159,64 @@ def _ami_get_channels(host, username, password, port=5038):
         _ami_logoff(sock)
 
 
+def _ami_list_events(sock, action, event_name, complete_event, timeout=5):
+    """Send a list-style AMI ``action`` and return the ``event_name``
+    events it emits (as dicts of lower-cased keys), reading until
+    ``complete_event`` arrives or the socket goes quiet."""
+    sock.sendall(f"Action: {action}\r\n\r\n".encode("utf-8"))
+    raw = b""
+    sock.settimeout(timeout)
+    complete = complete_event.encode("utf-8")
+    while True:
+        try:
+            chunk = sock.recv(8192)
+            if not chunk:
+                break
+            raw += chunk
+            if complete in raw:
+                break
+        except socket.timeout:
+            break
+    text = raw.decode("utf-8", errors="replace")
+    wanted = f"Event: {event_name}"
+    events = []
+    for block in text.replace("\r\n", "\n").split("\n\n"):
+        lines = block.strip().splitlines()
+        if wanted not in lines:
+            continue
+        info = {}
+        for line in lines:
+            if ": " in line:
+                key, _, value = line.partition(": ")
+                info[key.strip().lower()] = value.strip()
+        events.append(info)
+    return events
+
+
+# PJSIP contact statuses that mean the device is registered and usable.
+_PJSIP_CONTACT_ONLINE = {"reachable", "nonqualified", "created", "unknown"}
+
+
+def _ami_online_extensions(host, username, password, port=5038):
+    """Extensions (PJSIP AORs) with a registered contact, via
+    ``PJSIPShowContacts``. Contacts Asterisk reports ``Unreachable`` /
+    ``Removed`` do not count."""
+    sock = _ami_connect_and_login(host, username, password, port=port)
+    try:
+        contacts = _ami_list_events(sock, "PJSIPShowContacts", "ContactList", "ContactListComplete")
+    finally:
+        _ami_logoff(sock)
+    online = set()
+    for contact in contacts:
+        aor = contact.get("aor") or contact.get("endpoint") or ""
+        if not aor:
+            # ``ObjectName`` is ``<aor>;@<hash>`` when no Aor field is sent.
+            aor = (contact.get("objectname") or "").split(";", 1)[0]
+        if aor and contact.get("status", "").lower() in _PJSIP_CONTACT_ONLINE:
+            online.add(aor)
+    return online
+
+
 def _ami_redirect_to_confbridge(host, channel, conference_room, username, password, port=5038):
     """Redirect a single Asterisk channel into a ConfBridge room.
 
@@ -206,9 +264,18 @@ def _may_use_shared_account(user, sip_config):
 
 
 def _softphone_config_data(sip_config, username, password, request):
+    """``SoftphoneSipConfigurationSerializer`` data for ``sip_config`` with
+    the caller's credentials, plus ``wss_url`` / ``ice_servers`` (see
+    :mod:`crm.softphone`). The tenant's active PbxServer supplies
+    ``wss_url`` when it has one."""
+    from crm.asterisk_db import get_active_pbx_for_current_tenant
+    from crm.softphone import softphone_transport
+
+    creds = {'username': username, 'password': password}
+    creds.update(softphone_transport(sip_config, username, get_active_pbx_for_current_tenant()))
     return SoftphoneSipConfigurationSerializer(
         sip_config,
-        context={'request': request, SOFTPHONE_CONTEXT_KEY: {'username': username, 'password': password}},
+        context={'request': request, SOFTPHONE_CONTEXT_KEY: creds},
     ).data
 
 
@@ -259,7 +326,11 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
             "shared account when they have none (staff, superusers and the "
             "configuration's creator only; otherwise both are '' and "
             "``sip_enabled`` is false, so the client skips SIP registration). "
-            "``user_assignments`` is always []."
+            "``user_assignments`` is always []. ``wss_url`` is the SIP "
+            "WebSocket URL (the tenant's PbxServer's when set) and "
+            "``ice_servers`` the STUN/TURN list for the peer connection; with "
+            "a coturn ``turn_auth_secret`` the TURN entry carries ephemeral "
+            "credentials and ``turn_password`` is ''."
         ),
         responses={
             200: SoftphoneSipConfigurationSerializer,
@@ -351,7 +422,9 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
             "account as ``extension``/``extension_password`` and ``id: null``, "
             "but only to staff, superusers and the configuration's creator. "
             "404 otherwise. Never contains other users' credentials. "
-            "``sip_enabled`` is true when the credentials can register."
+            "``sip_enabled`` is true when the credentials can register. "
+            "``sip_configuration.wss_url`` / ``ice_servers`` are the transport "
+            "settings to use (see ``webrtc_config``)."
         ),
         responses={200: MySoftphoneConfigSerializer, 404: OpenApiTypes.OBJECT},
     )
@@ -2515,19 +2588,42 @@ def send_call_review_sms(request):
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated, HasIpCallingFeature])
 def extension_status(request):
-    """Proxy to PBX status API — returns which extensions are online.
+    """Which of the tenant's extensions are online.
 
-    Resolves the tenant's active :class:`PbxServer` first so each tenant
-    gets a response from their own Asterisk. Falls back to the default
-    SipConfiguration when no PbxServer is registered yet, keeping the
-    legacy shared-pbx2 path alive during the BYO migration window.
+    With an active :class:`PbxServer` that has AMI credentials the answer
+    comes from that Asterisk's ``PJSIPShowContacts`` (every active
+    extension is listed, ``online`` when it has a registered contact,
+    ``offline`` otherwise). Without AMI credentials the legacy ``:8081``
+    status sidecar is proxied, resolved from the PbxServer host or, when
+    no PbxServer is registered yet, the default SipConfiguration.
     """
     import requests as http_requests
     from django.core.cache import cache
+    from django.db import connection
     from crm.asterisk_db import get_active_pbx_for_current_tenant
 
     try:
         pbx = get_active_pbx_for_current_tenant()
+        if pbx is not None and pbx.ami_username and pbx.ami_password and (pbx.ami_host or pbx.fqdn):
+            cache_key = f'pbx_extension_status:ami:{connection.schema_name}:{pbx.pk}'
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return Response(cached)
+            online = _ami_online_extensions(
+                pbx.ami_host or pbx.fqdn, pbx.ami_username, pbx.ami_password,
+                port=pbx.ami_port or 5038,
+            )
+            extensions = (
+                UserPhoneAssignment.objects.filter(is_active=True)
+                .order_by('extension').values_list('extension', flat=True).distinct()
+            )
+            data = {'extensions': [
+                {'extension': ext, 'status': 'online' if ext in online else 'offline'}
+                for ext in extensions
+            ]}
+            cache.set(cache_key, data, timeout=5)
+            return Response(data)
+
         if pbx is not None:
             pbx_host = pbx.ami_host or pbx.fqdn
         else:
@@ -2555,6 +2651,7 @@ def extension_status(request):
         cache.set(cache_key, data, timeout=5)
         return Response(data)
     except Exception:
+        logger.debug('extension_status lookup failed', exc_info=True)
         return Response({'extensions': []})
 
 
@@ -2865,29 +2962,34 @@ def _resolve_routing_for_tenant(tenant_schema: str, did: str):
     """Run the DID → InboundRoute resolution inside ``tenant_schema``.
 
     Returns a response dict ready to return from :func:`call_routing`, or
-    ``None`` if no SIP config / routing data was found in this tenant.
+    ``None`` when the DID is unknown to this tenant: no SipConfiguration
+    owns it (by phone-number suffix) and the tenant has no default
+    configuration to fall back to. Resolution only ever reads: a tenant
+    without a ``PbxSettings`` row gets the model defaults, nothing is
+    created on an inbound ring.
     """
-    from django.conf import settings as django_settings
     from tenant_schemas.utils import schema_context
 
-    clean_did = did.replace('+', '').replace(' ', '').replace('-', '')
+    clean_did = ''.join(ch for ch in did if ch.isdigit())
 
     with schema_context(tenant_schema):
         from crm.models import InboundRoute, Queue, Trunk
 
-        # Try matching by phone number first, then fall back to default config
-        sip_config = SipConfiguration.objects.filter(
-            phone_number__endswith=clean_did[-7:]
-        ).first()
+        # The configuration that owns this DID, else the tenant's default.
+        # No "any configuration" fallback: a DID nobody owns is a 404.
+        sip_config = None
+        if len(clean_did) >= 7:
+            sip_config = SipConfiguration.objects.filter(
+                phone_number__endswith=clean_did[-7:]
+            ).first()
         if not sip_config:
             sip_config = SipConfiguration.objects.filter(is_default=True).first()
         if not sip_config:
-            sip_config = SipConfiguration.objects.first()
-        if not sip_config:
             return None
 
-        pbx_settings, _ = PbxSettings.objects.get_or_create(
-            sip_configuration=sip_config
+        pbx_settings = (
+            PbxSettings.objects.filter(sip_configuration=sip_config).first()
+            or PbxSettings(sip_configuration=sip_config)  # unsaved defaults
         )
 
         is_working = pbx_settings.is_working_hours_now()
@@ -2896,11 +2998,11 @@ def _resolve_routing_for_tenant(tenant_schema: str, did: str):
         # Resolve InboundRoute for this DID (exact, then any route whose
         # trunk owns this DID). When matched we can override extensions
         # and action with the route's configured destination.
-        route = InboundRoute.objects.filter(
-            did=did, is_active=True
-        ).first() or InboundRoute.objects.filter(
-            did__endswith=clean_did[-9:], is_active=True
-        ).first()
+        route = InboundRoute.objects.filter(did=did, is_active=True).first()
+        if not route and len(clean_did) >= 7:
+            route = InboundRoute.objects.filter(
+                did__endswith=clean_did[-9:], is_active=True
+            ).first()
         if not route:
             trunk_for_did = Trunk.objects.filter(
                 phone_numbers__contains=[did], is_active=True
@@ -2997,25 +3099,36 @@ def _resolve_routing_for_tenant(tenant_schema: str, did: str):
         }
 
 
+@extend_schema(
+    summary="Call routing for the PBX (AGI)",
+    description=(
+        "Called by the tenant's Asterisk on every inbound call. The tenant "
+        "is the one the PBX token identifies (``X-PBX-Token`` / "
+        "``?pbx_token=``); an unknown token is 401. The DID is resolved "
+        "inside that tenant only: the SipConfiguration owning it (phone "
+        "number suffix) or the tenant's default one, then the matching "
+        "InboundRoute. A DID the tenant does not own is 404; the route of "
+        "another tenant is never returned. Read-only: nothing is created."
+    ),
+    parameters=[OpenApiParameter('did', OpenApiTypes.STR, OpenApiParameter.QUERY, required=True)],
+    responses={200: OpenApiTypes.OBJECT, 400: OpenApiTypes.OBJECT,
+               401: OpenApiTypes.OBJECT, 404: OpenApiTypes.OBJECT},
+)
 @csrf_exempt
 @api_view(['GET'])
-@authentication_classes([])
+@authentication_classes([])  # the PBX presents a token / shared secret, not a user JWT
 @permission_classes([])
 @pbx_authenticated
 def call_routing(request):
-    """
-    Lightweight endpoint for Asterisk to query on each incoming call.
-    Returns working hours status, routing action, and sound URLs.
-
-    Query params:
-        did: The DID/phone number that was called (e.g., +995322421219)
-        pbx_token: (optional) Tenant-scoping token; fallback for the header.
+    """Working-hours state, routing action, sounds and destination
+    extensions for ``?did=`` in the calling PBX's tenant.
 
     Auth (see :mod:`crm.pbx_auth`): ``X-PBX-Token`` = the PbxServer's
     ``api_token`` (its ``enrollment_token`` is still accepted for active
     servers as a legacy identifier), or ``Authorization: Bearer
     <PBX_SHARED_SECRET>`` on a tenant host while that setting is set.
-    The tenant is the token's tenant; routing never looks at other tenants.
+    The tenant is ``request.pbx_schema``; there is no all-tenant
+    fallback: unknown token → 401, unknown DID → 404.
     """
     did = request.GET.get('did', '').strip()
     if not did:
@@ -3026,16 +3139,13 @@ def call_routing(request):
         resolved = _resolve_routing_for_tenant(tenant_schema, did)
     except Exception:  # noqa: BLE001
         logger.exception(
-            "call_routing: resolution failed for tenant=%s did=%s",
-            tenant_schema, did,
+            "call_routing: resolution failed for tenant=%s did=%s", tenant_schema, did,
         )
         return Response(
             {'error': 'Routing resolution failed'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
     if resolved is None:
-        return Response(
-            {'error': 'No SIP configuration for this PBX\'s tenant'},
-            status=status.HTTP_404_NOT_FOUND,
-        )
+        logger.info("call_routing: DID %s is not known to tenant %s", did, tenant_schema)
+        return Response({'error': 'Unknown DID'}, status=status.HTTP_404_NOT_FOUND)
     return Response(resolved)

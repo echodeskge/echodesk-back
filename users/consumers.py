@@ -170,6 +170,16 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             'count': event['count']
         }))
 
+    async def call_event(self, event):
+        """Forward a call status change (``crm.call_realtime``): the
+        ``call`` object carries id, call_id, pbx_call_id, sip_call_id,
+        status, direction, caller/recipient numbers, answered_at,
+        ended_at, handled_by and updated_at."""
+        await self.send(text_data=json.dumps({
+            'type': 'call_event',
+            'call': event['call'],
+        }))
+
     # Database operations
     @database_sync_to_async
     def get_unread_count(self):

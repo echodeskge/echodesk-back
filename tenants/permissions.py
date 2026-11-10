@@ -80,28 +80,22 @@ def has_subscription_feature(request, feature_name):
     import logging
     logger = logging.getLogger(__name__)
 
-    subscription = get_tenant_subscription(request)
-
-    tenant_name = getattr(request.tenant, 'schema_name', 'unknown') if hasattr(request, 'tenant') else 'no-tenant'
-    logger.info(f"[PERMISSION CHECK] Tenant: {tenant_name}, Feature: {feature_name}")
-
-    if not subscription:
-        logger.info(f"[PERMISSION CHECK] No subscription found for tenant {tenant_name}")
+    tenant = getattr(request, 'tenant', None)
+    if tenant is None or tenant.schema_name == get_public_schema_name():
+        logger.debug("[PERMISSION CHECK] no tenant for feature %s", feature_name)
         return False
 
-    # Log subscription details
-    logger.info(f"[PERMISSION CHECK] Subscription ID: {subscription.id}, Is Active: {subscription.is_active}")
-
-    # Check selected_features only (feature-based subscriptions)
-    selected_features_list = list(subscription.selected_features.values_list('key', flat=True))
-    logger.info(f"[PERMISSION CHECK] Selected features: {selected_features_list}")
-
-    has_feature = subscription.selected_features.filter(key=feature_name).exists()
-    if has_feature:
-        logger.info(f"[PERMISSION CHECK] ✅ Feature '{feature_name}' found in selected_features")
-    else:
-        logger.info(f"[PERMISSION CHECK] ❌ Feature '{feature_name}' not found in selected_features")
-
+    # One query: a subscription of this tenant that selected the feature.
+    # Subscriptions are matched regardless of ``is_active`` (as before);
+    # the caller decides what an inactive subscription means.
+    from .models import TenantSubscription
+    has_feature = TenantSubscription.objects.filter(
+        tenant_id=tenant.pk, selected_features__key=feature_name,
+    ).exists()
+    logger.debug(
+        "[PERMISSION CHECK] tenant=%s feature=%s -> %s",
+        tenant.schema_name, feature_name, has_feature,
+    )
     return has_feature
 
 

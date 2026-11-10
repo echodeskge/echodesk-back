@@ -15,6 +15,8 @@ this module. Handlers:
   service method, not re-hook signals.
 * ``m2m_changed`` on ``User.tenant_groups.through`` → resync queue members
   for every queue backed by the affected group.
+* ``post_save`` on :class:`crm.models.CallLog` → ``call_event`` push on
+  the notifications WebSocket (see :mod:`crm.call_realtime`).
 
 All handlers resolve the current tenant via ``connection.schema_name`` (set
 by the tenant-schemas middleware), build an ``AsteriskStateSync`` and call
@@ -30,9 +32,16 @@ from django.db.models.signals import m2m_changed, post_delete, post_save
 from django.dispatch import receiver
 
 from crm.asterisk_sync import AsteriskStateSync, _slugify_trunk
-from crm.models import InboundRoute, Queue, Trunk, UserPhoneAssignment
+from crm.call_realtime import on_call_log_saved
+from crm.models import CallLog, InboundRoute, Queue, Trunk, UserPhoneAssignment
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# CallLog → realtime call_event (create / status change only)
+# ---------------------------------------------------------------------------
+
+post_save.connect(on_call_log_saved, sender=CallLog, dispatch_uid='crm.call_realtime.call_log')
 
 
 def _sync_for_current_tenant() -> AsteriskStateSync | None:

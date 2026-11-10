@@ -21,7 +21,7 @@ from django.db import connection
 from django.utils import timezone
 
 from crm.models import CallLog, InboundRoute, PbxServer, PbxSettings, Queue, QueueMember
-from crm.tests.conftest import CrmTestCase
+from crm.tests.conftest import CrmTestCase, without_call_events
 from users.models import Notification
 
 
@@ -157,8 +157,9 @@ class TestMissedCallOnCommit(CrmTestCase):
         with self.captureOnCommitCallbacks(execute=False) as callbacks:
             self.create_call_log(handled_by=self.agent, status='missed')
             self.assertFalse(self._notifs().exists())
-        self.assertEqual(len(callbacks), 1)
-        callbacks[0]()
+        queued = without_call_events(callbacks)  # the call_event push is scheduled too
+        self.assertEqual(len(queued), 1)
+        queued[0]()
         self.assertEqual(self._notifs().count(), 1)
 
     def test_rolled_back_save_queues_nothing(self, mock_push):

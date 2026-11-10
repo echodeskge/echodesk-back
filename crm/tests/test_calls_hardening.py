@@ -497,6 +497,277 @@ class TestSoftphoneCredentials(CrmTestCase):
 
 
 # ============================================================================
+# Softphone transport: wss_url + ice_servers (+ ephemeral TURN)
+# ============================================================================
+
+
+class TestSoftphoneTransport(CrmTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='tr-admin@test.com')
+        self.agent = self.create_user(email='tr-agent@test.com', can_make_calls=True)
+        self.config = self.create_sip_config(
+            created_by=self.admin, is_default=True, sip_server='pbx.test.com', sip_port=8089,
+            websocket_path='/ws', stun_server='stun:stun.test:3478',
+            turn_server='turn:turn.test:3478?transport=tcp', turn_username='tu',
+            turn_password='TURN-PW',
+        )
+        self.create_phone_assignment(
+            user=self.agent, sip_config=self.config, extension='100', extension_password='PW',
+        )
+
+    def _pbx(self, **kwargs):
+        defaults = {
+            'name': 'PBX', 'fqdn': 'pbx.test.com', 'realtime_db_host': 'db',
+            'realtime_db_name': 'asterisk_test', 'realtime_db_user': 'rw',
+            'status': PbxServer.STATUS_ACTIVE,
+        }
+        defaults.update(kwargs)
+        return PbxServer.objects.create(**defaults)
+
+    def my_config(self):
+        resp = self.api_get('/api/sip-configurations/my_config/', user=self.agent)
+        self.assertEqual(resp.status_code, 200)
+        return resp.data['sip_configuration']
+
+    def webrtc_config(self):
+        resp = self.api_get(f'/api/sip-configurations/{self.config.id}/webrtc_config/',
+                            user=self.agent)
+        self.assertEqual(resp.status_code, 200)
+        return resp.data
+
+    def test_wss_url_built_from_configuration(self):
+        for sip in (self.my_config(), self.webrtc_config()):
+            self.assertEqual(sip['wss_url'], 'wss://pbx.test.com:8089/ws')
+
+    def test_wss_url_path_defaults_and_gets_a_slash(self):
+        self.config.websocket_path = ''
+        self.config.save()
+        self.assertEqual(self.my_config()['wss_url'], 'wss://pbx.test.com:8089/ws')
+        self.config.websocket_path = 'asterisk/ws'
+        self.config.save()
+        self.assertEqual(self.my_config()['wss_url'], 'wss://pbx.test.com:8089/asterisk/ws')
+
+    def test_active_pbx_server_wss_url_wins(self):
+        self._pbx(wss_url='wss://byo.test:8089/ws')
+        self.assertEqual(self.my_config()['wss_url'], 'wss://byo.test:8089/ws')
+        self.assertEqual(self.webrtc_config()['wss_url'], 'wss://byo.test:8089/ws')
+
+    def test_inactive_or_blank_pbx_server_does_not_apply(self):
+        self._pbx(wss_url='wss://pending.test:8089/ws', status=PbxServer.STATUS_PENDING)
+        self.assertEqual(self.my_config()['wss_url'], 'wss://pbx.test.com:8089/ws')
+        self._pbx(name='Blank', wss_url='')
+        self.assertEqual(self.my_config()['wss_url'], 'wss://pbx.test.com:8089/ws')
+
+    def test_plain_ws_only_for_local_hosts(self):
+        for host, expected in (
+            ('localhost', 'ws://localhost:8089/ws'),
+            ('127.0.0.1', 'ws://127.0.0.1:8089/ws'),
+            ('demo.lvh.me', 'ws://demo.lvh.me:8089/ws'),
+            ('pbx2.echodesk.cloud', 'wss://pbx2.echodesk.cloud:8089/ws'),
+            ('notlvh.me', 'wss://notlvh.me:8089/ws'),
+        ):
+            self.config.sip_server = host
+            self.config.save()
+            self.assertEqual(self.my_config()['wss_url'], expected, host)
+
+    def test_ice_servers_static_turn(self):
+        sip = self.my_config()
+        self.assertEqual(sip['ice_servers'], [
+            {'urls': 'stun:stun.test:3478'},
+            {'urls': 'turn:turn.test:3478?transport=tcp', 'username': 'tu', 'credential': 'TURN-PW'},
+        ])
+        # Static credentials: the legacy field stays filled.
+        self.assertEqual(sip['turn_password'], 'TURN-PW')
+        self.assertTrue(sip['has_turn_password'])
+
+    def test_ice_servers_without_stun_or_turn(self):
+        self.config.stun_server = ''
+        self.config.turn_server = ''
+        self.config.save()
+        self.assertEqual(self.my_config()['ice_servers'], [])
+
+    def test_ephemeral_turn_credentials(self):
+        import base64
+        import hashlib
+        import hmac
+        import time
+
+        self.config.turn_auth_secret = 'coturn-shared-secret'
+        self.config.save()
+        before = int(time.time())
+        sip = self.my_config()
+        turn = [s for s in sip['ice_servers'] if s['urls'].startswith('turn:')]
+        self.assertEqual(len(turn), 1)
+        turn = turn[0]
+        expiry_str, _, ext = turn['username'].partition(':')
+        self.assertEqual(ext, '100')
+        expiry = int(expiry_str)
+        self.assertGreaterEqual(expiry, before + 12 * 3600 - 5)
+        self.assertLessEqual(expiry, before + 12 * 3600 + 60)
+        expected = base64.b64encode(hmac.new(
+            b'coturn-shared-secret', turn['username'].encode(), hashlib.sha1,
+        ).digest()).decode()
+        self.assertEqual(turn['credential'], expected)
+        # The static password is withheld (and the secret never sent).
+        self.assertEqual(sip['turn_password'], '')
+        self.assertNotIn('TURN-PW', json.dumps(sip, default=str))
+        self.assertNotIn('coturn-shared-secret', json.dumps(sip, default=str))
+        self.assertNotIn('turn_auth_secret', sip)
+        # ``webrtc_config`` uses the caller's extension too.
+        wsip = self.webrtc_config()
+        self.assertTrue(wsip['ice_servers'][1]['username'].endswith(':100'))
+        self.assertEqual(wsip['turn_password'], '')
+
+    def test_detail_endpoint_has_no_transport_secrets(self):
+        self.config.turn_auth_secret = 'coturn-shared-secret'
+        self.config.save()
+        resp = self.api_get(f'/api/sip-configurations/{self.config.id}/', user=self.admin)
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn('ice_servers', resp.data)
+        self.assertNotIn('coturn-shared-secret', _body(resp))
+        self.assertEqual(resp.data['turn_password'], '')
+
+
+# ============================================================================
+# Extension status via AMI
+# ============================================================================
+
+
+class _FakeAmiSocket:
+    def __init__(self, payload):
+        self._chunks = [payload]
+        self.sent = b''
+
+    def sendall(self, data):
+        self.sent += data
+
+    def settimeout(self, *_):
+        pass
+
+    def recv(self, *_):
+        return self._chunks.pop(0) if self._chunks else b''
+
+    def close(self):
+        pass
+
+
+class TestExtensionStatusAmi(CrmTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='es-admin@test.com')
+        self.agent = self.create_user(email='es-agent@test.com')
+        self.config = self.create_sip_config(created_by=self.admin, is_default=True,
+                                             sip_server='pbx-status.test')
+        self.create_phone_assignment(user=self.agent, sip_config=self.config, extension='100')
+        self.create_phone_assignment(user=self.admin, sip_config=self.config, extension='101')
+        self.create_phone_assignment(user=self.create_user(email='es-x@test.com'),
+                                     sip_config=self.config, extension='102', is_active=False)
+        from django.core.cache import cache
+        cache.clear()
+
+    def _pbx(self, **kwargs):
+        defaults = {
+            'name': 'PBX', 'fqdn': 'pbx.test.com', 'realtime_db_host': 'db',
+            'realtime_db_name': 'asterisk_test', 'realtime_db_user': 'rw',
+            'status': PbxServer.STATUS_ACTIVE, 'ami_host': '10.0.0.5', 'ami_port': 5039,
+            'ami_username': 'echodesk', 'ami_password': 'AMI-PW',
+        }
+        defaults.update(kwargs)
+        return PbxServer.objects.create(**defaults)
+
+    @patch('requests.get')
+    @patch('crm.views._ami_online_extensions', return_value={'100'})
+    def test_ami_used_when_pbx_server_has_credentials(self, ami, http_get):
+        self._pbx()
+        resp = self.api_get('/api/extensions/status/', user=self.agent)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, {'extensions': [
+            {'extension': '100', 'status': 'online'},
+            {'extension': '101', 'status': 'offline'},
+        ]})
+        ami.assert_called_once_with('10.0.0.5', 'echodesk', 'AMI-PW', port=5039)
+        http_get.assert_not_called()
+        # Cached briefly: a second poll does not hit AMI again.
+        self.api_get('/api/extensions/status/', user=self.agent)
+        ami.assert_called_once()
+
+    @patch('requests.get')
+    @patch('crm.views._ami_online_extensions', side_effect=ConnectionError('AMI login failed'))
+    def test_ami_failure_degrades_to_empty(self, ami, http_get):
+        self._pbx()
+        resp = self.api_get('/api/extensions/status/', user=self.agent)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, {'extensions': []})
+        self.assertNotIn('AMI login failed', _body(resp))
+
+    @patch('crm.views._ami_online_extensions')
+    @patch('requests.get')
+    def test_sidecar_fallback_without_ami_credentials(self, http_get, ami):
+        http_get.return_value.json.return_value = {'extensions': [{'extension': '100', 'status': 'online'}]}
+        self._pbx(ami_username='', ami_password='')
+        resp = self.api_get('/api/extensions/status/', user=self.agent)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['extensions'][0]['extension'], '100')
+        ami.assert_not_called()
+        self.assertIn('http://10.0.0.5:8081/api/extensions/status', http_get.call_args.args[0])
+
+    def test_pjsip_show_contacts_parsing(self):
+        from crm.views import _ami_online_extensions
+
+        payload = (
+            b'Response: Success\r\nEventList: start\r\nMessage: A listing of Contacts follows\r\n\r\n'
+            b'Event: ContactList\r\nObjectType: contact\r\nObjectName: 100;@abc\r\nAor: 100\r\n'
+            b'Status: Reachable\r\nRoundtripUsec: 12\r\n\r\n'
+            b'Event: ContactList\r\nObjectType: contact\r\nObjectName: 101;@def\r\nAor: 101\r\n'
+            b'Status: Unreachable\r\n\r\n'
+            b'Event: ContactList\r\nObjectType: contact\r\nObjectName: 103;@ghi\r\n'
+            b'Status: NonQualified\r\n\r\n'
+            b'Event: ContactListComplete\r\nEventList: Complete\r\nListItems: 3\r\n\r\n'
+        )
+        sock = _FakeAmiSocket(payload)
+        with patch('crm.views._ami_connect_and_login', return_value=sock) as login:
+            online = _ami_online_extensions('h', 'u', 'p', port=5038)
+        login.assert_called_once_with('h', 'u', 'p', port=5038)
+        self.assertEqual(online, {'100', '103'})
+        self.assertIn(b'Action: PJSIPShowContacts', sock.sent)
+        self.assertIn(b'Action: Logoff', sock.sent)
+
+
+# ============================================================================
+# has_subscription_feature: one query
+# ============================================================================
+
+
+class TestHasSubscriptionFeatureQueries(CrmTestCase):
+
+    def test_single_exists_query(self):
+        from rest_framework.test import APIRequestFactory
+        from tenants.permissions import has_subscription_feature
+
+        request = APIRequestFactory().get('/')
+        request.tenant = self.tenant
+        # 2 = tenant-schemas' ``SET search_path`` + the single EXISTS query.
+        with self.assertNumQueries(2):
+            self.assertTrue(has_subscription_feature(request, 'ip_calling'))
+        with self.assertNumQueries(2):
+            self.assertFalse(has_subscription_feature(request, 'no_such_feature'))
+        self.set_ip_calling(False)
+        with self.assertNumQueries(2):
+            self.assertFalse(has_subscription_feature(request, 'ip_calling'))
+
+    def test_no_tenant_is_false_without_queries(self):
+        from rest_framework.test import APIRequestFactory
+        from tenants.permissions import has_subscription_feature
+
+        request = APIRequestFactory().get('/')
+        with self.assertNumQueries(0):
+            self.assertFalse(has_subscription_feature(request, 'ip_calling'))
+
+
+# ============================================================================
 # PBX admin writes
 # ============================================================================
 

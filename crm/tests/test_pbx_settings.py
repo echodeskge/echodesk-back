@@ -426,9 +426,10 @@ class TestCallRouting(CrmTestCase):
         )
         self.assertEqual(resp.status_code, 400)
 
-    def test_call_routing_unknown_did(self):
-        """An unknown DID in a tenant with a SIP configuration gets that
-        tenant's default (open) routing; never another tenant's."""
+    def test_call_routing_unknown_did_falls_back_to_tenant_default(self):
+        """A DID no configuration owns resolves to the tenant's *own*
+        default configuration (single-trunk tenants); never another
+        tenant's. See test_call_routing for the 404 when there is no default."""
         self._create_routing_setup(working_hours_enabled=False)
         resp = self.client.get(
             '/api/pbx/call-routing/?did=+999999999999',
@@ -436,6 +437,7 @@ class TestCallRouting(CrmTestCase):
         )
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.data['is_working_hours'])
+        self.assertEqual(resp.data['tenant_schema'], self.tenant.schema_name)
 
     def test_call_routing_no_sip_configuration_is_404(self):
         """No SIP configuration in the token's tenant: 404, no scan of

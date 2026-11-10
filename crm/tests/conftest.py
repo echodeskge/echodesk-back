@@ -11,6 +11,14 @@ from crm.models import (
 )
 
 
+def without_call_events(callbacks):
+    """``captureOnCommitCallbacks`` entries minus the realtime ``call_event``
+    pushes that every CallLog create / status change schedules
+    (:mod:`crm.call_realtime`), for tests that count the missed-call
+    notification tasks queued on commit."""
+    return [cb for cb in callbacks if getattr(cb, '__module__', None) != 'crm.call_realtime']
+
+
 class CrmTestCase(EchoDeskTenantTestCase):
     """
     CRM-specific test case with factory helpers for all CRM models.
