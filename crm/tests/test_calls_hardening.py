@@ -13,7 +13,7 @@ from crm.models import (
     CallLog, CallEvent, InboundRoute, PbxServer, PbxSettings, Queue, QueueMember,
     SipConfiguration, Trunk, UserPhoneAssignment,
 )
-from crm.tests.conftest import CrmTestCase
+from crm.tests.conftest import CrmTestCase, assertAppQueries
 from users.models import Notification
 
 
@@ -749,13 +749,13 @@ class TestHasSubscriptionFeatureQueries(CrmTestCase):
 
         request = APIRequestFactory().get('/')
         request.tenant = self.tenant
-        # 2 = tenant-schemas' ``SET search_path`` + the single EXISTS query.
-        with self.assertNumQueries(2):
+        # The single EXISTS query.
+        with assertAppQueries(self, 1):
             self.assertTrue(has_subscription_feature(request, 'ip_calling'))
-        with self.assertNumQueries(2):
+        with assertAppQueries(self, 1):
             self.assertFalse(has_subscription_feature(request, 'no_such_feature'))
         self.set_ip_calling(False)
-        with self.assertNumQueries(2):
+        with assertAppQueries(self, 1):
             self.assertFalse(has_subscription_feature(request, 'ip_calling'))
 
     def test_no_tenant_is_false_without_queries(self):

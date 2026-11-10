@@ -210,3 +210,35 @@ class CrmTestCase(EchoDeskTenantTestCase):
             if pbx is None:
                 pbx = self._pbx_for_headers = self.create_pbx_server()
         return {'HTTP_X_PBX_TOKEN': pbx.api_token}
+
+
+class assertAppQueries:
+    """Like ``assertNumQueries`` but ignores connection chatter such as
+    tenant-schemas' ``SET search_path`` (present locally, absent on CI), so
+    the count is about the application's own statements only."""
+
+    def __init__(self, test_case, expected, using='default'):
+        from django.db import connections
+        from django.test.utils import CaptureQueriesContext
+
+        self.test_case = test_case
+        self.expected = expected
+        self.ctx = CaptureQueriesContext(connections[using])
+
+    def __enter__(self):
+        self.ctx.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.ctx.__exit__(exc_type, exc, tb)
+        if exc_type is not None:
+            return False
+        app = [
+            q['sql'] for q in self.ctx.captured_queries
+            if not q['sql'].lstrip().upper().startswith(('SET ', 'SHOW ', 'SAVEPOINT', 'RELEASE SAVEPOINT'))
+        ]
+        self.test_case.assertEqual(
+            len(app), self.expected,
+            '%d application queries executed, %d expected:\n%s' % (len(app), self.expected, '\n'.join(app)),
+        )
+        return False

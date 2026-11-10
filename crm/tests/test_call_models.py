@@ -10,7 +10,7 @@ from django.utils import timezone
 from crm.models import (
     CallLog, CallEvent, CallRecording, PbxSettings, SipConfiguration,
 )
-from crm.tests.conftest import CrmTestCase
+from crm.tests.conftest import CrmTestCase, assertAppQueries
 
 
 # ============================================================================
@@ -56,8 +56,8 @@ class TestCallLogClientMatch(CrmTestCase):
         from social_integrations.models import Client as SocialClient
 
         social = SocialClient.objects.create(name='Social', phone='+995555123456')
-        # 2 = tenant-schemas' ``SET search_path`` + the INSERT; no client lookup.
-        with self.assertNumQueries(2):
+        # Only the INSERT; no client lookup.
+        with assertAppQueries(self, 1):
             call = CallLog.objects.create(
                 caller_number='+995555123456', recipient_number='+995322421219',
                 direction='inbound', status='ringing', handled_by=self.agent,
@@ -71,8 +71,8 @@ class TestCallLogClientMatch(CrmTestCase):
         self.assertIsNone(call.client)
         self.create_client(name='Late', phone='+995555000000')
         call.notes = 'n'
-        # 2 = ``SET search_path`` + the UPDATE; no client lookup.
-        with self.assertNumQueries(2):
+        # Only the UPDATE; no client lookup.
+        with assertAppQueries(self, 1):
             call.save(update_fields=['notes'])
         call.refresh_from_db()
         self.assertIsNone(call.client)
