@@ -934,6 +934,10 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
     """
     authentication_classes = [EcommerceClientJWTAuthentication]
     permission_classes = [IsAuthenticated]
+    # Shoppers read their history, place orders and ``cancel`` (a POST action).
+    # No PUT/PATCH/DELETE: OrderSerializer leaves status, total_amount and
+    # admin_notes writable, and a ModelViewSet would expose them.
+    http_method_names = ['get', 'post', 'head', 'options']
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['status']
     ordering_fields = ['created_at', 'total_amount']
