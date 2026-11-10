@@ -400,7 +400,6 @@ def _render_script(pbx, request, schema: str = "", trunk_endpoint: str = "") -> 
     db_pass_q = shlex.quote(pbx.realtime_db_password)
     ami_user_q = shlex.quote(pbx.ami_username or "echodesk")
     ami_pass_q = shlex.quote(pbx.ami_password or "")
-    api_token_q = shlex.quote(pbx.enrollment_token)
     db_host, db_port = _public_db_endpoint(pbx)
     ami_permit_lines = _ami_permit_lines()
     agi_script = _agi_script_source()
