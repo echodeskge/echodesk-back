@@ -335,7 +335,7 @@ class TestCallLogInitiateCall(CrmTestCase):
         self.create_sip_config(created_by=admin, is_default=True)
         resp = self.api_post(
             '/api/call-logs/initiate_call/',
-            {'recipient_number': '123'},
+            {'recipient_number': 'abc'},  # '123' is a valid extension now
             user=admin,
         )
         self.assertEqual(resp.status_code, 400)
