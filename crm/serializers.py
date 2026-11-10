@@ -451,12 +451,25 @@ class CallInitiateSerializer(serializers.Serializer):
     sip_configuration = serializers.IntegerField(required=False)
     
     def validate_recipient_number(self, value):
-        """Validate phone number format"""
-        # Remove common formatting characters
-        clean_number = value.replace('+', '').replace('-', '').replace(' ', '').replace('(', '').replace(')', '')
-        if not clean_number.isdigit() or len(clean_number) < 7:
+        """Accept an external phone number, a PBX extension or a feature code.
+
+        External numbers: at least 7 digits after stripping ``+ - ( )`` and
+        spaces. Extensions: 2-6 digits (internal ext-to-ext calls must be
+        logged too, otherwise they have no history row and cannot be
+        transferred). Feature codes: ``*``/``#`` followed by digits (``*100``).
+        """
+        candidate = value.strip()
+        clean_number = candidate.replace('+', '').replace('-', '').replace(' ', '').replace('(', '').replace(')', '')
+        is_external = clean_number.isdigit() and len(clean_number) >= 7
+        is_extension = candidate.isdigit() and 2 <= len(candidate) <= 6
+        is_feature_code = (
+            candidate[:1] in ('*', '#')
+            and 2 <= len(candidate) <= 12
+            and all(ch.isdigit() or ch in '*#' for ch in candidate)
+        )
+        if not (is_external or is_extension or is_feature_code):
             raise serializers.ValidationError("Please enter a valid phone number")
-        return value
+        return candidate
 
 
 class CallStatusUpdateSerializer(serializers.Serializer):
