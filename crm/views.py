@@ -1275,13 +1275,18 @@ class CallLogViewSet(viewsets.ModelViewSet):
             started_at=timezone.now()
         )
         
-        # Create call event
+        # Create call event; remember what the call was doing so
+        # stop_recording can put it back (answered or on_hold).
+        previous_status = call_log.status
         self._create_call_event(
             call_log,
             'recording_started',
-            metadata={'recording_id': str(recording.recording_id)}
+            metadata={
+                'recording_id': str(recording.recording_id),
+                'previous_status': previous_status,
+            }
         )
-        
+
         # Update call status to indicate recording
         call_log.status = 'recording'
         call_log.save()
@@ -1336,12 +1341,25 @@ class CallLogViewSet(viewsets.ModelViewSet):
             }
         )
         
-        # Update call status back to answered
-        call_log.status = 'answered'
-        call_log.save()
-        
+        # Put the call back where it was before the recording started
+        # (a held call stays on hold); a call that already ended while
+        # "recording" keeps its final status.
+        if call_log.status == 'recording':
+            call_log.status = self._status_before_recording(call_log)
+            call_log.save()
+
         serializer = CallRecordingSerializer(recording, context=self.get_serializer_context())
         return Response(serializer.data)
+
+    @staticmethod
+    def _status_before_recording(call_log):
+        """The status recorded by start_recording, else ``answered``."""
+        started = (
+            CallEvent.objects.filter(call_log=call_log, event_type='recording_started')
+            .order_by('-timestamp', '-id').first()
+        )
+        previous = (started.metadata or {}).get('previous_status') if started else None
+        return previous if previous in ('answered', 'on_hold') else 'answered'
     
     @extend_schema(
         summary="Transfer call",

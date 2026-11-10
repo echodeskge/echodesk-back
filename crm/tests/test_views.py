@@ -516,6 +516,31 @@ class TestCallLogRecording(CrmTestCase):
         recording = CallRecording.objects.get(call_log=call)
         self.assertEqual(recording.status, 'processing')
 
+    def test_stop_recording_restores_the_pre_recording_status(self):
+        """Recording a held call and stopping it must not resume the call
+        on the backend: the status goes back to what start_recording saw."""
+        admin = self.create_admin()
+        for before in ('on_hold', 'answered'):
+            call = self.create_call_log(handled_by=admin, status=before)
+            resp = self.api_post(f'/api/call-logs/{call.id}/start_recording/', user=admin)
+            self.assertEqual(resp.status_code, 201, resp.data)
+            call.refresh_from_db()
+            self.assertEqual(call.status, 'recording')
+            resp = self.api_post(f'/api/call-logs/{call.id}/stop_recording/', user=admin)
+            self.assertEqual(resp.status_code, 200, resp.data)
+            call.refresh_from_db()
+            self.assertEqual(call.status, before)
+
+    def test_stop_recording_keeps_a_final_status(self):
+        """A call that ended while it was recording is not revived."""
+        admin = self.create_admin()
+        call = self.create_call_log(handled_by=admin, status='ended')
+        self.create_call_recording(call, status='recording', started_at=timezone.now())
+        resp = self.api_post(f'/api/call-logs/{call.id}/stop_recording/', user=admin)
+        self.assertEqual(resp.status_code, 200)
+        call.refresh_from_db()
+        self.assertEqual(call.status, 'ended')
+
     def test_stop_recording_no_recording(self):
         admin = self.create_admin()
         call = self.create_call_log(handled_by=admin, status='answered')
