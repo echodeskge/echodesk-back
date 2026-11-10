@@ -884,7 +884,27 @@ class OrderItemSerializer(serializers.ModelSerializer):
         return order_item_variant_details(variant)
 
 
-class OrderListSerializer(serializers.ModelSerializer):
+class OrderSoftDeleteFieldsMixin(serializers.Serializer):
+    """Read-only "clean order list" state shared by the order serializers."""
+    is_deleted = serializers.BooleanField(read_only=True, help_text='Hidden by "clean order list"')
+    deleted_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    deleted_by_name = serializers.SerializerMethodField(
+        help_text='Full name (or e-mail) of the staff user who hid the order; empty when visible or unknown'
+    )
+
+    @extend_schema_field(serializers.CharField())
+    def get_deleted_by_name(self, obj):
+        user = obj.deleted_by if obj.deleted_by_id else None
+        if user is None:
+            return ''
+        name = (user.get_full_name() or '').strip()
+        return name or user.email
+
+
+ORDER_SOFT_DELETE_FIELDS = ['is_deleted', 'deleted_at', 'deleted_by_name']
+
+
+class OrderListSerializer(OrderSoftDeleteFieldsMixin, serializers.ModelSerializer):
     """Lightweight serializer for order lists - excludes nested items for faster list views"""
     client_name = serializers.CharField(source='contact_name', read_only=True)
     client_email = serializers.CharField(source='contact_email', read_only=True)
@@ -896,8 +916,8 @@ class OrderListSerializer(serializers.ModelSerializer):
             'id', 'order_number', 'client', 'client_name', 'client_email',
             'total_items', 'status', 'payment_status', 'payment_method', 'payment_provider',
             'total_amount', 'tracking_number', 'shipping_cost', 'tax_amount', 'subtotal',
-            'discount_amount', 'created_at'
-        ]
+            'discount_amount', 'created_at',
+        ] + ORDER_SOFT_DELETE_FIELDS
         read_only_fields = ['id', 'order_number', 'created_at']
 
     @extend_schema_field(serializers.IntegerField(help_text="Number of line items (detail total_items is the quantity sum)"))
@@ -996,7 +1016,7 @@ class ProductReviewCreateSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
 
 
-class OrderSerializer(serializers.ModelSerializer):
+class OrderSerializer(OrderSoftDeleteFieldsMixin, serializers.ModelSerializer):
     """Serializer for orders with nested items"""
     items = OrderItemSerializer(many=True, read_only=True)
     delivery_address = ClientAddressSerializer(read_only=True)
@@ -1020,8 +1040,8 @@ class OrderSerializer(serializers.ModelSerializer):
             'payment_metadata',
             # Timestamps
             'created_at', 'updated_at', 'paid_at', 'confirmed_at', 'processing_at',
-            'shipped_at', 'delivered_at', 'cancelled_at'
-        ]
+            'shipped_at', 'delivered_at', 'cancelled_at',
+        ] + ORDER_SOFT_DELETE_FIELDS
         read_only_fields = [
             'id', 'order_number', 'public_token', 'created_at', 'updated_at',
             'paid_at', 'payment_provider', 'bog_order_id', 'payment_url', 'payment_metadata'
