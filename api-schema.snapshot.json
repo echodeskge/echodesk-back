@@ -9619,7 +9619,7 @@
         "/api/call-logs/{id}/end_call/": {
             "post": {
                 "operationId": "call_logs_end_call_create",
-                "description": "End an ongoing call and set ``ended_at``/``duration``. No body. An inbound call that was never answered ends as ``missed`` (which queues the ``call_missed`` notification), unless another agent's leg of the same queue attempt was already answered, in which case it ends as ``cancelled`` (answered elsewhere: counted neither as answered nor as missed). A ``missed`` leg is also re-labelled ``cancelled`` later when the queue's next agent answers (sequential strategies such as rrmemory), and then nobody is notified. 400 when the call is already over. Only the call's handling agent (``handled_by``), staff/superusers and PBX admins may end it (403 otherwise).",
+                "description": "End an ongoing call and set ``ended_at``/``duration``. No body. An inbound call that was never answered ends as ``missed`` (which queues the ``call_missed`` notification), unless another agent's leg of the same queue attempt was already answered, in which case it ends as ``cancelled`` (answered elsewhere: counted neither as answered nor as missed). A ``missed`` leg is also re-labelled ``cancelled`` later when the queue's next agent answers (sequential strategies such as rrmemory), and then nobody is notified. Ending a leg that is already ``cancelled`` is a 200 no-op (the softphone may end it after the server relabelled it); 400 when the call is over for any other reason. Only the call's handling agent (``handled_by``), staff/superusers and PBX admins may end it (403 otherwise).",
                 "summary": "End a call",
                 "parameters": [
                     {
@@ -10464,7 +10464,7 @@
         "/api/call-logs/log_incoming_call/": {
             "post": {
                 "operationId": "call_logs_log_incoming_call_create",
-                "description": "Log an incoming call when it starts ringing",
+                "description": "Log an incoming call when it starts ringing. ``sip_call_id`` (the INVITE's Call-ID) is required; ``pbx_call_id`` (the Asterisk LINKEDID from the X-EchoDesk-Call header, shared by every agent leg of one call) is optional. Posting the same ``sip_call_id`` again within 10 minutes returns the existing row with 200 instead of logging a second leg.",
                 "summary": "Log an incoming call",
                 "tags": [
                     "call-logs"
@@ -10473,17 +10473,17 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "$ref": "#/components/schemas/CallLogCreateRequest"
+                                "$ref": "#/components/schemas/LogIncomingCallRequest"
                             }
                         },
                         "application/x-www-form-urlencoded": {
                             "schema": {
-                                "$ref": "#/components/schemas/CallLogCreateRequest"
+                                "$ref": "#/components/schemas/LogIncomingCallRequest"
                             }
                         },
                         "multipart/form-data": {
                             "schema": {
-                                "$ref": "#/components/schemas/CallLogCreateRequest"
+                                "$ref": "#/components/schemas/LogIncomingCallRequest"
                             }
                         }
                     },
@@ -10504,6 +10504,16 @@
                     }
                 ],
                 "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/CallLog"
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
                     "201": {
                         "content": {
                             "application/json": {
@@ -43316,27 +43326,70 @@
         "/api/pbx/call-routing/": {
             "get": {
                 "operationId": "pbx_call_routing_retrieve",
-                "description": "Lightweight endpoint for Asterisk to query on each incoming call.\nReturns working hours status, routing action, and sound URLs.\n\nQuery params:\n    did: The DID/phone number that was called (e.g., +995322421219)\n    pbx_token: (optional) Tenant-scoping token; fallback for the header.\n\nHeaders:\n    X-PBX-Token: (optional) When set, resolves tenant via\n        ``PbxServer.enrollment_token`` for O(1) routing — Asterisk's\n        install script bakes this in so we don't have to iterate every\n        tenant on every call.\n    Authorization: Bearer <PBX_SHARED_SECRET> — legacy shared secret,\n        still accepted for backwards compat during the BYO migration.",
+                "description": "Called by the tenant's Asterisk on every inbound call. The tenant is the one the PBX token identifies (``X-PBX-Token`` / ``?pbx_token=``); an unknown token is 401. The DID is resolved inside that tenant only: the SipConfiguration owning it (phone number suffix) or the tenant's default one, then the matching InboundRoute. A DID the tenant does not own is 404; the route of another tenant is never returned. Read-only: nothing is created.",
+                "summary": "Call routing for the PBX (AGI)",
+                "parameters": [
+                    {
+                        "in": "query",
+                        "name": "did",
+                        "schema": {
+                            "type": "string"
+                        },
+                        "required": true
+                    }
+                ],
                 "tags": [
                     "pbx"
                 ],
                 "security": [
-                    {
-                        "jwtAuth": []
-                    },
-                    {
-                        "cookieAuth": []
-                    },
-                    {
-                        "tokenAuth": []
-                    },
                     {
                         "tokenAuth": []
                     }
                 ],
                 "responses": {
                     "200": {
-                        "description": "No response body"
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                }
+                            }
+                        },
+                        "description": ""
                     }
                 }
             }
@@ -43344,27 +43397,102 @@
         "/api/pbx/send-review-sms/": {
             "post": {
                 "operationId": "pbx_send_review_sms_create",
-                "description": "Called by PBX scripts to send SMS review for a caller.\nFinds the most recent call by caller_number and sends an SMS review link.\n\nAuth: Bearer token via PBX_SHARED_SECRET env var.\n\nPOST body:\n    caller_number: The caller's phone number\n    did: (optional) The DID that was called, to locate the tenant/SIP config",
+                "description": "Called by the tenant's PBX after a call. Auth: ``X-PBX-Token`` of the tenant's PbxServer (the SMS goes out in that tenant only), or the legacy ``Authorization: Bearer <PBX_SHARED_SECRET>`` while that setting is set (then every tenant is searched for the caller, as before). Anything else is 401.",
+                "summary": "Send a review SMS for the caller's last call (PBX)",
                 "tags": [
                     "pbx"
                 ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "caller_number": {
+                                        "type": "string"
+                                    },
+                                    "did": {
+                                        "type": "string"
+                                    }
+                                },
+                                "required": [
+                                    "caller_number"
+                                ]
+                            }
+                        }
+                    }
+                },
                 "security": [
-                    {
-                        "jwtAuth": []
-                    },
-                    {
-                        "cookieAuth": []
-                    },
-                    {
-                        "tokenAuth": []
-                    },
                     {
                         "tokenAuth": []
                     }
                 ],
                 "responses": {
                     "200": {
-                        "description": "No response body"
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "429": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "502": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                }
+                            }
+                        },
+                        "description": ""
                     }
                 }
             }
@@ -45760,7 +45888,7 @@
         "/api/sip-configurations/{id}/webrtc_config/": {
             "get": {
                 "operationId": "sip_configurations_webrtc_config_retrieve",
-                "description": "The SIP / ICE settings a softphone needs for this configuration. ``username``/``password`` are the caller's own credentials: their active extension on this configuration, or the configuration's shared account when they have none (staff, superusers and the configuration's creator only; otherwise both are '' and ``sip_enabled`` is false, so the client skips SIP registration). ``user_assignments`` is always [].",
+                "description": "The SIP / ICE settings a softphone needs for this configuration. ``username``/``password`` are the caller's own credentials: their active extension on this configuration, or the configuration's shared account when they have none (staff, superusers and the configuration's creator only; otherwise both are '' and ``sip_enabled`` is false, so the client skips SIP registration). ``user_assignments`` is always []. ``wss_url`` is the SIP WebSocket URL (the tenant's PbxServer's when set) and ``ice_servers`` the STUN/TURN list for the peer connection; with a coturn ``turn_auth_secret`` the TURN entry carries ephemeral credentials and ``turn_password`` is ''.",
                 "summary": "Get WebRTC configuration for calling",
                 "parameters": [
                     {
@@ -45829,7 +45957,7 @@
         "/api/sip-configurations/my_config/": {
             "get": {
                 "operationId": "sip_configurations_my_config_retrieve",
-                "description": "The caller's own primary active extension with the SIP / ICE settings to register it. When the caller has no extension, the tenant's default active configuration is returned with its shared account as ``extension``/``extension_password`` and ``id: null``, but only to staff, superusers and the configuration's creator. 404 otherwise. Never contains other users' credentials. ``sip_enabled`` is true when the credentials can register.",
+                "description": "The caller's own primary active extension with the SIP / ICE settings to register it. When the caller has no extension, the tenant's default active configuration is returned with its shared account as ``extension``/``extension_password`` and ``id: null``, but only to staff, superusers and the configuration's creator. 404 otherwise. Never contains other users' credentials. ``sip_enabled`` is true when the credentials can register. ``sip_configuration.wss_url`` / ``ice_servers`` are the transport settings to use (see ``webrtc_config``).",
                 "summary": "My softphone configuration",
                 "tags": [
                     "sip-configurations"
@@ -65282,20 +65410,11 @@
         "/api/webhooks/call-rating/": {
             "post": {
                 "operationId": "webhooks_call_rating_create",
-                "description": "Webhook endpoint for receiving call ratings from PBX.\nCalled by Asterisk after the customer rates the call (1-5).",
+                "description": "Webhook endpoint for receiving call ratings from PBX.\nCalled by Asterisk after the customer rates the call (1-5).\n(``X-PBX-Token`` of the tenant's PbxServer; see :mod:`crm.pbx_auth`.)",
                 "tags": [
                     "webhooks"
                 ],
                 "security": [
-                    {
-                        "jwtAuth": []
-                    },
-                    {
-                        "cookieAuth": []
-                    },
-                    {
-                        "tokenAuth": []
-                    },
                     {
                         "tokenAuth": []
                     }
@@ -65310,27 +65429,86 @@
         "/api/webhooks/call-recording-url/": {
             "post": {
                 "operationId": "webhooks_call_recording_url_create",
-                "description": "Save recording URL to the most recent call from a caller number.",
+                "description": "Attach a recording URL to a call log. Auth: ``X-PBX-Token`` of the tenant's PbxServer. The URL must be on one of the tenant's PBX hosts (400 otherwise). The call is matched by ``pbx_call_id`` (Asterisk LINKEDID; the answered leg wins), then ``sip_call_id``, then the most recent call whose caller / recipient number ends with the last 7 digits of ``caller_number``.",
+                "summary": "Call recording URL webhook (dialplan hangup handler)",
                 "tags": [
                     "webhooks"
                 ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "caller_number": {
+                                        "type": "string"
+                                    },
+                                    "recording_url": {
+                                        "type": "string"
+                                    },
+                                    "pbx_call_id": {
+                                        "type": "string"
+                                    },
+                                    "sip_call_id": {
+                                        "type": "string"
+                                    }
+                                },
+                                "required": [
+                                    "recording_url"
+                                ]
+                            }
+                        }
+                    }
+                },
                 "security": [
-                    {
-                        "jwtAuth": []
-                    },
-                    {
-                        "cookieAuth": []
-                    },
-                    {
-                        "tokenAuth": []
-                    },
                     {
                         "tokenAuth": []
                     }
                 ],
                 "responses": {
                     "200": {
-                        "description": "No response body"
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": {}
+                                }
+                            }
+                        },
+                        "description": ""
                     }
                 }
             }
@@ -65386,15 +65564,6 @@
                     }
                 },
                 "security": [
-                    {
-                        "jwtAuth": []
-                    },
-                    {
-                        "cookieAuth": []
-                    },
-                    {
-                        "tokenAuth": []
-                    },
                     {
                         "tokenAuth": []
                     }
@@ -65468,15 +65637,6 @@
                     }
                 },
                 "security": [
-                    {
-                        "jwtAuth": []
-                    },
-                    {
-                        "cookieAuth": []
-                    },
-                    {
-                        "tokenAuth": []
-                    },
                     {
                         "tokenAuth": []
                     }
@@ -70895,7 +71055,7 @@
                     "recipient_number": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 20
+                        "maxLength": 64
                     },
                     "call_type": {
                         "allOf": [
@@ -70928,11 +71088,11 @@
                     },
                     "caller_number": {
                         "type": "string",
-                        "maxLength": 20
+                        "maxLength": 64
                     },
                     "recipient_number": {
                         "type": "string",
-                        "maxLength": 20
+                        "maxLength": 64
                     },
                     "direction": {
                         "$ref": "#/components/schemas/DirectionEnum"
@@ -71095,11 +71255,11 @@
                 "properties": {
                     "caller_number": {
                         "type": "string",
-                        "maxLength": 20
+                        "maxLength": 64
                     },
                     "recipient_number": {
                         "type": "string",
-                        "maxLength": 20
+                        "maxLength": 64
                     },
                     "direction": {
                         "$ref": "#/components/schemas/DirectionEnum"
@@ -71133,12 +71293,12 @@
                     "caller_number": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 20
+                        "maxLength": 64
                     },
                     "recipient_number": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 20
+                        "maxLength": 64
                     },
                     "direction": {
                         "$ref": "#/components/schemas/DirectionEnum"
@@ -71180,11 +71340,11 @@
                     },
                     "caller_number": {
                         "type": "string",
-                        "maxLength": 20
+                        "maxLength": 64
                     },
                     "recipient_number": {
                         "type": "string",
-                        "maxLength": 20
+                        "maxLength": 64
                     },
                     "direction": {
                         "$ref": "#/components/schemas/DirectionEnum"
@@ -71366,12 +71526,12 @@
                     "caller_number": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 20
+                        "maxLength": 64
                     },
                     "recipient_number": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 20
+                        "maxLength": 64
                     },
                     "direction": {
                         "$ref": "#/components/schemas/DirectionEnum"
@@ -80602,6 +80762,24 @@
                     "superadmin_bypass_whitelist"
                 ]
             },
+            "IceServer": {
+                "type": "object",
+                "description": "One ``RTCIceServer``: ``urls`` plus TURN credentials when needed.",
+                "properties": {
+                    "urls": {
+                        "type": "string"
+                    },
+                    "username": {
+                        "type": "string"
+                    },
+                    "credential": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "urls"
+                ]
+            },
             "InboundRoute": {
                 "type": "object",
                 "description": "Serializer for ``InboundRoute`` with destination-consistency validation.",
@@ -85840,6 +86018,27 @@
                 ],
                 "type": "string",
                 "description": "* `ka` - Georgian\n* `en` - English"
+            },
+            "LogIncomingCallRequest": {
+                "type": "object",
+                "properties": {
+                    "caller_number": {
+                        "type": "string"
+                    },
+                    "recipient_number": {
+                        "type": "string"
+                    },
+                    "sip_call_id": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "pbx_call_id": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "sip_call_id"
+                ]
             },
             "ManualPayment": {
                 "type": "object",
@@ -92110,12 +92309,12 @@
                     "caller_number": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 20
+                        "maxLength": 64
                     },
                     "recipient_number": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 20
+                        "maxLength": 64
                     },
                     "direction": {
                         "$ref": "#/components/schemas/DirectionEnum"
@@ -94350,8 +94549,7 @@
                     "sms_api_key": {
                         "type": "string",
                         "writeOnly": true,
-                        "description": "sender.ge API key",
-                        "maxLength": 255
+                        "description": "sender.ge API key (encrypted at rest)"
                     },
                     "sms_rating_template_ka": {
                         "type": "string",
@@ -96149,8 +96347,7 @@
                     "password": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "SIP password",
-                        "maxLength": 255
+                        "description": "SIP password (encrypted at rest)"
                     },
                     "realm": {
                         "type": "string",
@@ -96207,8 +96404,7 @@
                     "extension_password": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "PBX extension password",
-                        "maxLength": 255
+                        "description": "PBX extension password (encrypted at rest)"
                     },
                     "phone_number": {
                         "type": "string",
@@ -103186,7 +103382,7 @@
             },
             "SoftphoneSipConfiguration": {
                 "type": "object",
-                "description": "``SipConfigurationDetail`` as the softphone endpoints return it\n(``webrtc_config``, ``my_config.sip_configuration``), plus\n``sip_enabled``: true when ``username``/``password`` hold credentials\nthe caller may register with, false when they are blank (no extension\nof their own), so the client can skip SIP registration.",
+                "description": "``SipConfigurationDetail`` as the softphone endpoints return it\n(``webrtc_config``, ``my_config.sip_configuration``), plus:\n\n* ``sip_enabled``: true when ``username``/``password`` hold credentials\n  the caller may register with, false when they are blank (no extension\n  of their own), so the client can skip SIP registration.\n* ``wss_url``: the SIP WebSocket URL to connect to (the tenant's active\n  PbxServer's ``wss_url`` when set, else built from ``sip_server`` /\n  ``sip_port`` / ``websocket_path``; ``ws://`` only for localhost /\n  ``*.lvh.me``).\n* ``ice_servers``: ``[{urls, username?, credential?}]`` for the peer\n  connection. When the configuration has a coturn ``turn_auth_secret``\n  the TURN entry carries ephemeral credentials (12 h) and\n  ``turn_password`` is ``''``; otherwise the static ``turn_username`` /\n  ``turn_password`` pair is used in both places.",
                 "properties": {
                     "id": {
                         "type": "integer",
@@ -103283,11 +103479,23 @@
                     "sip_enabled": {
                         "type": "boolean",
                         "readOnly": true
+                    },
+                    "wss_url": {
+                        "type": "string",
+                        "readOnly": true
+                    },
+                    "ice_servers": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/components/schemas/IceServer"
+                        },
+                        "readOnly": true
                     }
                 },
                 "required": [
                     "has_password",
                     "has_turn_password",
+                    "ice_servers",
                     "id",
                     "name",
                     "password",
@@ -103295,7 +103503,8 @@
                     "sip_server",
                     "turn_password",
                     "user_assignments",
-                    "username"
+                    "username",
+                    "wss_url"
                 ]
             },
             "SoundTypeEnum": {
@@ -109381,8 +109590,7 @@
                     },
                     "password": {
                         "type": "string",
-                        "description": "SIP password",
-                        "maxLength": 255
+                        "description": "SIP password (encrypted at rest)"
                     },
                     "has_password": {
                         "type": "boolean",
@@ -109508,8 +109716,7 @@
                     "password": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "SIP password",
-                        "maxLength": 255
+                        "description": "SIP password (encrypted at rest)"
                     },
                     "realm": {
                         "type": "string",
@@ -110300,8 +110507,7 @@
                     },
                     "extension_password": {
                         "type": "string",
-                        "description": "PBX extension password",
-                        "maxLength": 255
+                        "description": "PBX extension password (encrypted at rest)"
                     },
                     "has_extension_password": {
                         "type": "boolean",
@@ -110376,8 +110582,7 @@
                     },
                     "extension_password": {
                         "type": "string",
-                        "description": "PBX extension password",
-                        "maxLength": 255
+                        "description": "PBX extension password (encrypted at rest)"
                     },
                     "has_extension_password": {
                         "type": "boolean",
@@ -110432,8 +110637,7 @@
                     "extension_password": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "PBX extension password",
-                        "maxLength": 255
+                        "description": "PBX extension password (encrypted at rest)"
                     },
                     "phone_number": {
                         "type": "string",
