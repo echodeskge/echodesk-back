@@ -2,7 +2,7 @@ import logging
 import socket
 
 from rest_framework import serializers as drf_serializers, viewsets, permissions, status, filters
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.decorators import action, api_view, authentication_classes, permission_classes
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
@@ -26,8 +26,9 @@ from .serializers import (
 )
 from .permissions import (
     HasIpCallingFeature, IsPbxAdmin, IsPbxAdminOrReadOnly, CanViewCallStats,
-    is_pbx_admin,
+    CanMakeCalls, is_pbx_admin,
 )
+from .pbx_auth import pbx_authenticated
 from .filters import CallLogFilter, UserPhoneAssignmentFilter
 from .recording_hosts import (
     UnsafeRecordingURL,
@@ -228,6 +229,9 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
         perms = super().get_permissions()
         if self.action in ('set_default', 'test_connection'):
             perms.append(IsPbxAdmin())
+        elif self.action in ('my_config', 'webrtc_config'):
+            # Softphone credentials only for users allowed to make calls.
+            perms.append(CanMakeCalls())
         return perms
 
     def get_queryset(self):
@@ -451,6 +455,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
             perms.append(IsPbxAdmin())
         elif self.action == 'statistics':
             perms.append(CanViewCallStats())
+        elif self.action in ('initiate_call', 'log_incoming_call'):
+            # The softphone logs its own calls: make_calls holders only.
+            perms.append(CanMakeCalls())
         return perms
 
     def get_queryset(self):
@@ -521,7 +528,42 @@ class CallLogViewSet(viewsets.ModelViewSet):
             {'error': 'Only the agent handling this call or a PBX administrator can change it.'},
             status=status.HTTP_403_FORBIDDEN,
         )
-    
+
+    # Legal status moves for update_status. Any live status may move to a
+    # final one (FINAL_STATUSES); a final status never moves again (409);
+    # repeating the current status is an idempotent no-op (200).
+    STATUS_TRANSITIONS = {
+        'initiated': frozenset({'ringing', 'answered'}),
+        'ringing': frozenset({'answered'}),
+        'answered': frozenset({'on_hold', 'recording'}),
+        'on_hold': frozenset({'answered'}),
+        'recording': frozenset({'answered', 'on_hold'}),
+    }
+
+    @classmethod
+    def _transition_allowed(cls, old_status, new_status):
+        if old_status == new_status:
+            return True
+        if old_status in FINAL_STATUSES:
+            return False
+        if new_status in FINAL_STATUSES:
+            return True
+        return new_status in cls.STATUS_TRANSITIONS.get(old_status, frozenset())
+
+    @staticmethod
+    def _illegal_transition(old_status, new_status):
+        return Response(
+            {
+                'error': f'Cannot change a call from {old_status} to {new_status}.',
+                'status': old_status,
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    # A browser re-posting the same ringing INVITE (two tabs, a retry after a
+    # timeout) within this window gets its existing row back.
+    INCOMING_DEDUPE_WINDOW = timedelta(minutes=10)
+
     def _create_call_event(self, call_log, event_type, metadata=None, user=None):
         """Helper method to create call events"""
         CallEvent.objects.create(
@@ -646,64 +688,111 @@ class CallLogViewSet(viewsets.ModelViewSet):
     
     @extend_schema(
         summary="Log an incoming call",
-        description="Log an incoming call when it starts ringing",
-        request=CallLogCreateSerializer,
+        description=(
+            "Log an incoming call when it starts ringing. ``sip_call_id`` (the "
+            "INVITE's Call-ID) is required; ``pbx_call_id`` (the Asterisk "
+            "LINKEDID from the X-EchoDesk-Call header, shared by every agent "
+            "leg of one call) is optional. Posting the same ``sip_call_id`` "
+            "again within 10 minutes returns the existing row with 200 instead "
+            "of logging a second leg."
+        ),
+        request=inline_serializer(
+            name='LogIncomingCall',
+            fields={
+                'caller_number': drf_serializers.CharField(required=False, allow_blank=True),
+                'recipient_number': drf_serializers.CharField(required=False, allow_blank=True),
+                'sip_call_id': drf_serializers.CharField(),
+                'pbx_call_id': drf_serializers.CharField(required=False, allow_blank=True),
+            },
+        ),
         responses={
+            200: CallLogSerializer,
             201: CallLogSerializer,
             400: OpenApiTypes.OBJECT
         }
     )
     @action(detail=False, methods=['post'])
     def log_incoming_call(self, request):
-        """Log an incoming call"""
-        # Extract data from request
-        caller_number = request.data.get('caller_number', '')
-        recipient_number = request.data.get('recipient_number', '')
-        sip_call_id = request.data.get('sip_call_id', '')
-        
+        """Log an incoming call (one row per agent leg, deduped per INVITE)."""
+        from django.db import transaction
+
+        def _text(key, limit):
+            value = request.data.get(key, '')
+            return (str(value) if value is not None else '').strip()[:limit]
+
+        caller_number = _text('caller_number', 64)
+        recipient_number = _text('recipient_number', 64)
+        sip_call_id = _text('sip_call_id', 255)
+        pbx_call_id = _text('pbx_call_id', 64)
+
+        if not sip_call_id:
+            return Response(
+                {'sip_call_id': ['This field is required.']},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # Get default SIP configuration
         sip_config = SipConfiguration.objects.filter(
             is_default=True,
             is_active=True
         ).first()
-        
+
         if not sip_config:
             return Response(
-                {'error': 'No default SIP configuration found'}, 
+                {'error': 'No default SIP configuration found'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        # Auto-match client by caller phone number
-        crm_client, social_client = self._match_client(caller_number)
 
-        # Create call log for incoming call
-        call_log = CallLog.objects.create(
-            caller_number=caller_number,
-            recipient_number=recipient_number,
-            direction='inbound',
-            call_type='voice',
-            status='ringing',
-            handled_by=request.user,
-            sip_configuration=sip_config,
-            sip_call_id=sip_call_id,
-            client=crm_client,
-            social_client=social_client,
-            started_at=timezone.now()
-        )
-        
-        # Create initial call event
-        self._create_call_event(
-            call_log,
-            'ringing',
-            metadata={
-                'caller': caller_number,
-                'recipient': recipient_number,
-                'sip_call_id': sip_call_id
-            }
-        )
-        
+        with transaction.atomic():
+            existing = (
+                CallLog.objects.select_for_update()
+                .filter(
+                    sip_call_id=sip_call_id,
+                    handled_by=request.user,
+                    started_at__gte=timezone.now() - self.INCOMING_DEDUPE_WINDOW,
+                )
+                .order_by('-started_at')
+                .first()
+            )
+            if existing is not None:
+                if pbx_call_id and not existing.pbx_call_id:
+                    existing.pbx_call_id = pbx_call_id
+                    existing.save(update_fields=['pbx_call_id'])
+                return Response(self._out(existing), status=status.HTTP_200_OK)
+
+            # Auto-match client by caller phone number
+            crm_client, social_client = self._match_client(caller_number)
+
+            # Create call log for incoming call
+            call_log = CallLog.objects.create(
+                caller_number=caller_number,
+                recipient_number=recipient_number,
+                direction='inbound',
+                call_type='voice',
+                status='ringing',
+                handled_by=request.user,
+                sip_configuration=sip_config,
+                sip_call_id=sip_call_id,
+                pbx_call_id=pbx_call_id,
+                client=crm_client,
+                social_client=social_client,
+                started_at=timezone.now()
+            )
+
+            # Create initial call event
+            self._create_call_event(
+                call_log,
+                'ringing',
+                metadata={
+                    'caller': caller_number,
+                    'recipient': recipient_number,
+                    'sip_call_id': sip_call_id,
+                    'pbx_call_id': pbx_call_id,
+                }
+            )
+
         return Response(self._out(call_log), status=status.HTTP_201_CREATED)
-    
+
     @extend_schema(
         summary="Update call status",
         description=(
@@ -722,11 +811,13 @@ class CallLogViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['patch'])
     def update_status(self, request, pk=None):
         """Update call status"""
+        from django.db import transaction
+
         call_log = self.get_object()
         if not self._may_change_call(call_log):
             return self._forbidden_call_change()
         serializer = CallStatusUpdateSerializer(data=request.data)
-        
+
         if serializer.is_valid():
             recording_url = serializer.validated_data.get('recording_url')
             if recording_url and not is_allowed_recording_url(recording_url):
@@ -734,49 +825,56 @@ class CallLogViewSet(viewsets.ModelViewSet):
                     {'recording_url': ['Recording URL must be on one of the tenant\'s PBX hosts.']},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            old_status = call_log.status
             new_status = serializer.validated_data['status']
-            
-            # Update call status
-            call_log.status = new_status
-            
-            # Set answered_at if call is answered
-            if new_status == 'answered' and not call_log.answered_at:
-                call_log.answered_at = timezone.now()
-            
-            # Set ended_at and calculate duration if call ended
-            if new_status in ['ended', 'missed', 'failed', 'cancelled']:
-                if not call_log.ended_at:
-                    call_log.ended_at = timezone.now()
-                    if call_log.answered_at:
-                        call_log.duration = call_log.ended_at - call_log.answered_at
-                    else:
-                        call_log.duration = timedelta(seconds=0)
-            
-            # Update optional fields
-            if 'notes' in serializer.validated_data:
-                call_log.notes = serializer.validated_data['notes']
-            if 'call_quality_score' in serializer.validated_data:
-                call_log.call_quality_score = serializer.validated_data['call_quality_score']
-            if 'recording_url' in serializer.validated_data:
-                call_log.recording_url = serializer.validated_data['recording_url']
-            
-            call_log.save()
-            
-            # Create call event for status change
-            event_metadata = {
-                'old_status': old_status,
-                'new_status': new_status
-            }
-            if 'notes' in serializer.validated_data:
-                event_metadata['notes'] = serializer.validated_data['notes']
-            if 'call_quality_score' in serializer.validated_data:
-                event_metadata['quality_score'] = serializer.validated_data['call_quality_score']
-            
-            self._create_call_event(call_log, new_status, metadata=event_metadata)
-            
+
+            with transaction.atomic():
+                # Re-read under a row lock: the softphone's end_call / a
+                # webhook / a colleague's answer may be racing this update.
+                call_log = CallLog.objects.select_for_update().get(pk=call_log.pk)
+                old_status = call_log.status
+                if not self._transition_allowed(old_status, new_status):
+                    return self._illegal_transition(old_status, new_status)
+
+                # Update call status
+                call_log.status = new_status
+
+                # Set answered_at if call is answered
+                if new_status == 'answered' and not call_log.answered_at:
+                    call_log.answered_at = timezone.now()
+
+                # Set ended_at and calculate duration if call ended
+                if new_status in FINAL_STATUSES:
+                    if not call_log.ended_at:
+                        call_log.ended_at = timezone.now()
+                        if call_log.answered_at:
+                            call_log.duration = call_log.ended_at - call_log.answered_at
+                        else:
+                            call_log.duration = timedelta(seconds=0)
+
+                # Update optional fields
+                if 'notes' in serializer.validated_data:
+                    call_log.notes = serializer.validated_data['notes']
+                if 'call_quality_score' in serializer.validated_data:
+                    call_log.call_quality_score = serializer.validated_data['call_quality_score']
+                if 'recording_url' in serializer.validated_data:
+                    call_log.recording_url = serializer.validated_data['recording_url']
+
+                call_log.save()
+
+                # Create call event for status change
+                event_metadata = {
+                    'old_status': old_status,
+                    'new_status': new_status
+                }
+                if 'notes' in serializer.validated_data:
+                    event_metadata['notes'] = serializer.validated_data['notes']
+                if 'call_quality_score' in serializer.validated_data:
+                    event_metadata['quality_score'] = serializer.validated_data['call_quality_score']
+
+                self._create_call_event(call_log, new_status, metadata=event_metadata)
+
             return Response(self._out(call_log))
-        
+
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
     @extend_schema(
@@ -790,7 +888,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
             "neither as answered nor as missed). A ``missed`` leg is also "
             "re-labelled ``cancelled`` later when the queue's next agent "
             "answers (sequential strategies such as rrmemory), and then nobody "
-            "is notified. 400 when the call is already over. "
+            "is notified. Ending a leg that is already ``cancelled`` is a "
+            "200 no-op (the softphone may end it after the server relabelled "
+            "it); 400 when the call is over for any other reason. "
             "Only the call's handling agent (``handled_by``), staff/superusers "
             "and PBX admins may end it (403 otherwise)."
         ),
@@ -805,43 +905,54 @@ class CallLogViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def end_call(self, request, pk=None):
         """End an ongoing call"""
+        from django.db import transaction
+
         from .call_notifications import find_answered_sibling
 
         call_log = self.get_object()
         if not self._may_change_call(call_log):
             return self._forbidden_call_change()
 
-        if call_log.status in FINAL_STATUSES:
-            return Response(
-                {'error': 'Call has already ended'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        with transaction.atomic():
+            # Row lock: the relabel of a ring-all sibling (answered elsewhere)
+            # or a concurrent update_status may be writing this row.
+            call_log = CallLog.objects.select_for_update().get(pk=call_log.pk)
 
-        call_log.ended_at = timezone.now()
-        outcome = 'ended'
-        if call_log.answered_at:
-            call_log.duration = call_log.ended_at - call_log.answered_at
-        else:
-            call_log.duration = timedelta(seconds=0)
-            if call_log.direction == 'inbound':
-                outcome = 'answered_elsewhere' if find_answered_sibling(call_log) else 'missed'
+            if call_log.status == ANSWERED_ELSEWHERE_STATUS:
+                # Already relabelled "answered elsewhere" by the colleague's
+                # answer: the softphone ending its leg is a no-op.
+                return Response(self._out(call_log))
+            if call_log.status in FINAL_STATUSES:
+                return Response(
+                    {'error': 'Call has already ended'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
-        if outcome == 'missed':
-            call_log.status = 'missed'
-        elif outcome == 'answered_elsewhere':
-            call_log.status = ANSWERED_ELSEWHERE_STATUS
-        else:
-            call_log.status = 'ended'
-        call_log.save()
+            call_log.ended_at = timezone.now()
+            outcome = 'ended'
+            if call_log.answered_at:
+                call_log.duration = call_log.ended_at - call_log.answered_at
+            else:
+                call_log.duration = timedelta(seconds=0)
+                if call_log.direction == 'inbound':
+                    outcome = 'answered_elsewhere' if find_answered_sibling(call_log) else 'missed'
 
-        # Create call event for call end
-        metadata = {
-            'duration_seconds': call_log.duration.total_seconds() if call_log.duration else 0,
-            'ended_by': 'user',
-        }
-        if outcome != 'ended':
-            metadata['outcome'] = outcome
-        self._create_call_event(call_log, 'ended', metadata=metadata)
+            if outcome == 'missed':
+                call_log.status = 'missed'
+            elif outcome == 'answered_elsewhere':
+                call_log.status = ANSWERED_ELSEWHERE_STATUS
+            else:
+                call_log.status = 'ended'
+            call_log.save()
+
+            # Create call event for call end
+            metadata = {
+                'duration_seconds': call_log.duration.total_seconds() if call_log.duration else 0,
+                'ended_by': 'user',
+            }
+            if outcome != 'ended':
+                metadata['outcome'] = outcome
+            self._create_call_event(call_log, 'ended', metadata=metadata)
 
         return Response(self._out(call_log))
 
@@ -930,7 +1041,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def add_event(self, request, pk=None):
         """Add an event to a call"""
         call_log = self.get_object()
-        
+        if not self._may_change_call(call_log):
+            return self._forbidden_call_change()
+
         event_data = request.data.copy()
         event_data['call_log'] = call_log.id
         
@@ -1065,7 +1178,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def start_recording(self, request, pk=None):
         """Start recording for a call"""
         call_log = self.get_object()
-        
+        if not self._may_change_call(call_log):
+            return self._forbidden_call_change()
+
         # Check if call is active
         if call_log.status not in ['answered', 'on_hold']:
             return Response(
@@ -1114,7 +1229,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def stop_recording(self, request, pk=None):
         """Stop recording for a call"""
         call_log = self.get_object()
-        
+        if not self._may_change_call(call_log):
+            return self._forbidden_call_change()
+
         # Check if recording exists
         if not hasattr(call_log, 'recording'):
             return Response(
@@ -1169,6 +1286,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def transfer_call(self, request, pk=None):
         """Transfer call to another number"""
         call_log = self.get_object()
+        if not self._may_change_call(call_log):
+            return self._forbidden_call_change()
         transfer_to = request.data.get('transfer_to')
         
         if not transfer_to:
@@ -1228,6 +1347,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def initiate_consultation(self, request, pk=None):
         """Initiate a consultation call for an attended (warm) transfer."""
         original_call = self.get_object()
+        if not self._may_change_call(original_call):
+            return self._forbidden_call_change()
 
         serializer = ConsultationInitiateSerializer(data=request.data)
         if not serializer.is_valid():
@@ -1315,6 +1436,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def complete_attended_transfer(self, request, pk=None):
         """Complete an attended (warm) transfer."""
         original_call = self.get_object()
+        if not self._may_change_call(original_call):
+            return self._forbidden_call_change()
 
         consultation_log_id = request.data.get('consultation_log_id')
         target_number = request.data.get('target_number')
@@ -1332,6 +1455,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 {'error': 'Consultation log not found for this call'},
                 status=status.HTTP_404_NOT_FOUND,
             )
+        if not self._may_change_call(consultation_log):
+            return self._forbidden_call_change()
 
         now = timezone.now()
 
@@ -1392,6 +1517,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def cancel_consultation(self, request, pk=None):
         """Cancel a consultation call and resume the original call."""
         original_call = self.get_object()
+        if not self._may_change_call(original_call):
+            return self._forbidden_call_change()
 
         consultation_log_id = request.data.get('consultation_log_id')
         if not consultation_log_id:
@@ -1407,6 +1534,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 {'error': 'Consultation log not found for this call'},
                 status=status.HTTP_404_NOT_FOUND,
             )
+        if not self._may_change_call(consultation_log):
+            return self._forbidden_call_change()
 
         now = timezone.now()
 
@@ -1460,6 +1589,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def merge_conference(self, request, pk=None):
         """Merge an attended-transfer consultation into a 3-way conference via Asterisk AMI."""
         original_call = self.get_object()
+        if not self._may_change_call(original_call):
+            return self._forbidden_call_change()
 
         serializer = MergeConferenceSerializer(data=request.data)
         if not serializer.is_valid():
@@ -1490,6 +1621,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 {"error": "Consultation log not found for this call"},
                 status=status.HTTP_404_NOT_FOUND,
             )
+        if not self._may_change_call(consultation_log):
+            return self._forbidden_call_change()
 
         # --- Resolve this tenant's PbxServer for AMI creds --------------
         from crm.asterisk_db import get_active_pbx_for_current_tenant
@@ -1650,7 +1783,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
     def toggle_hold(self, request, pk=None):
         """Toggle hold status for a call"""
         call_log = self.get_object()
-        
+        if not self._may_change_call(call_log):
+            return self._forbidden_call_change()
+
         if call_log.status == 'answered':
             new_status = 'on_hold'
             event_type = 'hold'
@@ -1903,12 +2038,15 @@ class ClientViewSet(viewsets.ModelViewSet):
     responses={200: "Event processed successfully"}
 )
 @api_view(['POST'])
+@authentication_classes([])
 @permission_classes([])
 @csrf_exempt
+@pbx_authenticated
 def sip_webhook(request):
     """
     Webhook endpoint for receiving SIP call events
     This endpoint should be called by your SIP server to update call status
+    (``X-PBX-Token`` of the tenant's PbxServer; see :mod:`crm.pbx_auth`).
     """
     try:
         data = request.data
@@ -1936,11 +2074,12 @@ def sip_webhook(request):
         }
         
         call_status = event_status_map.get(event_type, 'ringing')
-        
-        # Try to find existing call log by SIP call ID
-        try:
-            call_log = CallLog.objects.get(sip_call_id=sip_call_id)
-            
+
+        # Find the existing call log by SIP call ID. sip_call_id is not
+        # unique (a retried INVITE / an older leg may share it): take the
+        # latest leg instead of letting MultipleObjectsReturned 500.
+        call_log = CallLog.objects.filter(sip_call_id=sip_call_id).order_by('-started_at').first()
+        if call_log is not None:
             # Update existing call
             old_status = call_log.status
             call_log.status = call_status
@@ -1968,8 +2107,8 @@ def sip_webhook(request):
                     **metadata
                 }
             )
-            
-        except CallLog.DoesNotExist:
+
+        else:
             # Create new call log for incoming calls
             if event_type in ['call_initiated', 'call_ringing']:
                 # Get default SIP configuration
@@ -2010,10 +2149,11 @@ def sip_webhook(request):
             'call_id': str(call_log.call_id),
             'status': call_log.status
         })
-        
-    except Exception as e:
+
+    except Exception:
+        logger.exception('sip_webhook failed (tenant=%s)', getattr(request, 'pbx_schema', None))
         return Response(
-            {'error': f'Error processing webhook: {str(e)}'},
+            {'error': 'Error processing webhook'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
@@ -2039,11 +2179,14 @@ def sip_webhook(request):
     responses={200: "Recording update processed successfully"}
 )
 @api_view(['POST'])
+@authentication_classes([])
 @permission_classes([])
 @csrf_exempt
+@pbx_authenticated
 def recording_webhook(request):
     """
     Webhook endpoint for receiving call recording updates
+    (``X-PBX-Token`` of the tenant's PbxServer; see :mod:`crm.pbx_auth`).
     """
     try:
         data = request.data
@@ -2120,21 +2263,25 @@ def recording_webhook(request):
             'recording_id': str(recording.recording_id),
             'status': recording.status
         })
-        
-    except Exception as e:
+
+    except Exception:
+        logger.exception('recording_webhook failed (tenant=%s)', getattr(request, 'pbx_schema', None))
         return Response(
-            {'error': f'Error processing recording webhook: {str(e)}'},
+            {'error': 'Error processing recording webhook'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
 
 @api_view(['POST'])
+@authentication_classes([])
 @permission_classes([])
 @csrf_exempt
+@pbx_authenticated
 def call_rating_webhook(request):
     """
     Webhook endpoint for receiving call ratings from PBX.
     Called by Asterisk after the customer rates the call (1-5).
+    (``X-PBX-Token`` of the tenant's PbxServer; see :mod:`crm.pbx_auth`.)
     """
     try:
         data = request.data
@@ -2213,9 +2360,10 @@ def call_rating_webhook(request):
             'rating': rating,
         })
 
-    except Exception as e:
+    except Exception:
+        logger.exception('call_rating_webhook failed (tenant=%s)', getattr(request, 'pbx_schema', None))
         return Response(
-            {'error': f'Error processing rating: {str(e)}'},
+            {'error': 'Error processing rating'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
@@ -2410,38 +2558,92 @@ def extension_status(request):
         return Response({'extensions': []})
 
 
+@extend_schema(
+    summary="Call recording URL webhook (dialplan hangup handler)",
+    description=(
+        "Attach a recording URL to a call log. Auth: ``X-PBX-Token`` of the "
+        "tenant's PbxServer. The URL must be on one of the tenant's PBX hosts "
+        "(400 otherwise). The call is matched by ``pbx_call_id`` (Asterisk "
+        "LINKEDID; the answered leg wins), then ``sip_call_id``, then the "
+        "most recent call whose caller / recipient number ends with the "
+        "last 7 digits of ``caller_number``."
+    ),
+    request={
+        "application/json": {
+            "type": "object",
+            "properties": {
+                "caller_number": {"type": "string"},
+                "recording_url": {"type": "string"},
+                "pbx_call_id": {"type": "string"},
+                "sip_call_id": {"type": "string"},
+            },
+            "required": ["recording_url"],
+        }
+    },
+    responses={200: OpenApiTypes.OBJECT, 400: OpenApiTypes.OBJECT, 401: OpenApiTypes.OBJECT,
+               404: OpenApiTypes.OBJECT},
+)
 @api_view(['POST'])
+@authentication_classes([])
 @permission_classes([])
 @csrf_exempt
+@pbx_authenticated
 def call_recording_url_webhook(request):
-    """Save recording URL to the most recent call from a caller number."""
+    """Save a recording URL on the call it belongs to."""
+    from django.db.models import F
+
     try:
         data = request.data
-        caller_number = data.get('caller_number', '').strip()
-        recording_url = data.get('recording_url', '').strip()
 
-        if not caller_number or not recording_url:
+        def _text(key, limit):
+            value = data.get(key, '')
+            return (str(value) if value is not None else '').strip()[:limit]
+
+        caller_number = _text('caller_number', 64)
+        recording_url = _text('recording_url', 2048)
+        pbx_call_id = _text('pbx_call_id', 64)
+        sip_call_id = _text('sip_call_id', 255)
+
+        if not recording_url or not (caller_number or pbx_call_id or sip_call_id):
             return Response(
-                {'error': 'caller_number and recording_url are required'},
+                {'error': 'recording_url and one of pbx_call_id, sip_call_id, caller_number are required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        if not is_allowed_recording_url(recording_url):
+            return Response(
+                {'recording_url': ['Recording URL must be on one of the tenant\'s PBX hosts.']},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        clean_number = caller_number.replace('+', '').replace(' ', '')
-        last_digits = clean_number[-7:] if len(clean_number) >= 7 else clean_number
+        call_log = None
+        if pbx_call_id:
+            # Every agent leg of one call shares the LINKEDID: the recording
+            # belongs to the leg that was answered (ring-all siblings are
+            # cancelled); fall back to the latest leg.
+            call_log = (
+                CallLog.objects.filter(pbx_call_id=pbx_call_id)
+                .order_by(F('answered_at').desc(nulls_last=True), '-started_at')
+                .first()
+            )
+        if call_log is None and sip_call_id:
+            call_log = CallLog.objects.filter(sip_call_id=sip_call_id).order_by('-started_at').first()
 
-        call_log = CallLog.objects.filter(
-            caller_number__endswith=last_digits
-        ).order_by('-started_at').first()
-
-        if not call_log:
-            # Also check recipient number for outbound calls
-            call_log = CallLog.objects.filter(
-                recipient_number__endswith=last_digits
-            ).order_by('-started_at').first()
+        if call_log is None and caller_number:
+            clean_number = ''.join(ch for ch in caller_number if ch.isdigit())
+            last_digits = clean_number[-7:] if len(clean_number) >= 7 else clean_number
+            if last_digits:
+                call_log = CallLog.objects.filter(
+                    caller_number__endswith=last_digits
+                ).order_by('-started_at').first()
+                if not call_log:
+                    # Also check recipient number for outbound calls
+                    call_log = CallLog.objects.filter(
+                        recipient_number__endswith=last_digits
+                    ).order_by('-started_at').first()
 
         if not call_log:
             return Response(
-                {'error': f'No call found for {caller_number}'},
+                {'error': 'No matching call found'},
                 status=status.HTTP_404_NOT_FOUND
             )
 
@@ -2453,9 +2655,11 @@ def call_recording_url_webhook(request):
             'call_id': str(call_log.call_id),
         })
 
-    except Exception as e:
+    except Exception:
+        logger.exception('call_recording_url_webhook failed (tenant=%s)',
+                         getattr(request, 'pbx_schema', None))
         return Response(
-            {'error': f'Error: {str(e)}'},
+            {'error': 'Error processing recording URL'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
@@ -2657,51 +2861,6 @@ def pbx_settings_remove_sound(request, sip_config_id):
 # ============================================================================
 
 
-_PBX_TOKEN_CACHE_PREFIX = "pbx_token_tenant:"
-_PBX_TOKEN_CACHE_TTL = 60 * 10  # 10 minutes
-
-
-def _resolve_tenant_by_pbx_token(token: str):
-    """Return the tenant schema_name bound to a PbxServer ``enrollment_token``.
-
-    PbxServer rows live in tenant schemas, so we have to iterate the
-    registry until we find a match. Results are cached in Django's cache
-    keyed by the token so subsequent AGI hits hit the cache (critical on
-    high call volumes — every inbound ring fires this endpoint).
-
-    Returns ``None`` if no active PbxServer matches the token.
-    """
-    from django.core.cache import cache
-    from tenant_schemas.utils import schema_context
-    from tenants.models import Tenant
-
-    if not token:
-        return None
-
-    cache_key = f"{_PBX_TOKEN_CACHE_PREFIX}{token}"
-    cached = cache.get(cache_key)
-    if cached:
-        return cached  # schema_name string
-
-    try:
-        tenants = list(Tenant.objects.exclude(schema_name='public'))
-    except Exception:  # noqa: BLE001
-        return None
-
-    for tenant in tenants:
-        try:
-            with schema_context(tenant.schema_name):
-                from crm.models import PbxServer
-                pbx = PbxServer.objects.filter(enrollment_token=token).first()
-                if pbx is None:
-                    continue
-                cache.set(cache_key, tenant.schema_name, _PBX_TOKEN_CACHE_TTL)
-                return tenant.schema_name
-        except Exception:  # noqa: BLE001
-            continue
-    return None
-
-
 def _resolve_routing_for_tenant(tenant_schema: str, did: str):
     """Run the DID → InboundRoute resolution inside ``tenant_schema``.
 
@@ -2840,7 +2999,9 @@ def _resolve_routing_for_tenant(tenant_schema: str, did: str):
 
 @csrf_exempt
 @api_view(['GET'])
+@authentication_classes([])
 @permission_classes([])
+@pbx_authenticated
 def call_routing(request):
     """
     Lightweight endpoint for Asterisk to query on each incoming call.
@@ -2850,84 +3011,31 @@ def call_routing(request):
         did: The DID/phone number that was called (e.g., +995322421219)
         pbx_token: (optional) Tenant-scoping token; fallback for the header.
 
-    Headers:
-        X-PBX-Token: (optional) When set, resolves tenant via
-            ``PbxServer.enrollment_token`` for O(1) routing — Asterisk's
-            install script bakes this in so we don't have to iterate every
-            tenant on every call.
-        Authorization: Bearer <PBX_SHARED_SECRET> — legacy shared secret,
-            still accepted for backwards compat during the BYO migration.
+    Auth (see :mod:`crm.pbx_auth`): ``X-PBX-Token`` = the PbxServer's
+    ``api_token`` (its ``enrollment_token`` is still accepted for active
+    servers as a legacy identifier), or ``Authorization: Bearer
+    <PBX_SHARED_SECRET>`` on a tenant host while that setting is set.
+    The tenant is the token's tenant; routing never looks at other tenants.
     """
-    from django.conf import settings as django_settings
-    from tenants.models import Tenant
-
-    # Authenticate via shared secret (legacy). When X-PBX-Token is present
-    # we treat the token itself as sufficient auth — the token is a 64+ char
-    # secret minted by EchoDesk at enrollment time.
-    pbx_token = (
-        request.META.get('HTTP_X_PBX_TOKEN', '')
-        or request.GET.get('pbx_token', '')
-    ).strip()
-
-    auth_header = request.META.get('HTTP_AUTHORIZATION', '')
-    expected_shared_secret = getattr(django_settings, 'PBX_SHARED_SECRET', '')
-    if not pbx_token:
-        # Legacy path: require the shared secret.
-        if expected_shared_secret and not auth_header.endswith(expected_shared_secret):
-            return Response(
-                {'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED
-            )
-
     did = request.GET.get('did', '').strip()
     if not did:
         return Response({'error': 'did parameter required'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # ------------------------------------------------------------------
-    # Fast path: X-PBX-Token identifies the tenant without scanning all.
-    # ------------------------------------------------------------------
-    if pbx_token:
-        tenant_schema = _resolve_tenant_by_pbx_token(pbx_token)
-        if tenant_schema is None:
-            return Response(
-                {'error': 'Unknown X-PBX-Token'},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
-        try:
-            resolved = _resolve_routing_for_tenant(tenant_schema, did)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "call_routing: resolution failed for tenant=%s did=%s",
-                tenant_schema, did,
-            )
-            resolved = None
-        if resolved is not None:
-            return Response(resolved)
-        # Fall through to the legacy scan as a last resort so a
-        # mis-wired DID doesn't 404 when the tenant actually exists.
-
-    # ------------------------------------------------------------------
-    # Legacy all-tenant scan. Kept for backwards compatibility until every
-    # deployed Asterisk install script includes X-PBX-Token. Emits a
-    # warning so we notice if we accidentally regress to the slow path.
-    # ------------------------------------------------------------------
-    logger.warning(
-        "call_routing called without X-PBX-Token — O(N) fallback (did=%s)", did,
-    )
-    tenants = Tenant.objects.exclude(schema_name='public')
-    for tenant in tenants:
-        try:
-            resolved = _resolve_routing_for_tenant(tenant.schema_name, did)
-        except Exception:  # noqa: BLE001
-            continue
-        if resolved is not None:
-            return Response(resolved)
-
-    # DID not found in any tenant — default to open
-    return Response({
-        'is_working_hours': True,
-        'action': 'queue',
-        'sounds': {},
-        'extensions': [],
-        'voicemail_enabled': False,
-        'after_hours_action': 'announcement',
-    })
+    tenant_schema = request.pbx_schema
+    try:
+        resolved = _resolve_routing_for_tenant(tenant_schema, did)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "call_routing: resolution failed for tenant=%s did=%s",
+            tenant_schema, did,
+        )
+        return Response(
+            {'error': 'Routing resolution failed'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    if resolved is None:
+        return Response(
+            {'error': 'No SIP configuration for this PBX\'s tenant'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+    return Response(resolved)

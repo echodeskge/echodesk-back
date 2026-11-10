@@ -29,36 +29,9 @@ from django.views.decorators.http import require_http_methods
 log = logging.getLogger(__name__)
 
 
-def _find_pbx_by_token(token: str):
-    """Walk every tenant schema looking for a PbxServer with this token.
-
-    Cached for 10 minutes to avoid repeated O(N) scans on every AGI call.
-    Returns ``(tenant_schema, pbx_id)`` or ``(None, None)``.
-    """
-    if not token:
-        return None, None
-    from django.core.cache import cache
-    from tenant_schemas.utils import schema_context
-    from tenants.models import Tenant
-
-    cache_key = f"pbx_token_lookup:{token}"
-    cached = cache.get(cache_key)
-    if cached:
-        return cached
-
-    for tenant in Tenant.objects.exclude(schema_name="public"):
-        try:
-            with schema_context(tenant.schema_name):
-                from crm.models import PbxServer
-                pbx = PbxServer.objects.filter(enrollment_token=token).first()
-                if pbx is not None:
-                    result = (tenant.schema_name, pbx.id)
-                    cache.set(cache_key, result, 600)
-                    return result
-        except Exception:  # noqa: BLE001
-            continue
-
-    return None, None
+# Token → tenant lookup lives in crm.pbx_auth (one scanner for the AGI /
+# webhook token and the install token; cached by the token's SHA-256).
+from crm.pbx_auth import find_pbx_by_enrollment_token as _find_pbx_by_token
 
 
 @csrf_exempt
@@ -349,7 +322,7 @@ cat > /etc/systemd/system/asterisk.service.d/echodesk.conf <<UNIT
 [Service]
 Environment="PGSSLMODE=require"
 Environment="ECHODESK_API_URL={api_base}"
-Environment="ECHODESK_PBX_TOKEN={pbx.enrollment_token}"
+Environment="ECHODESK_PBX_TOKEN={pbx.api_token}"
 TimeoutStartSec=300
 UNIT
 chmod 640 /etc/systemd/system/asterisk.service.d/echodesk.conf

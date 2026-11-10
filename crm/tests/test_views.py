@@ -709,6 +709,7 @@ class TestSipWebhook(CrmTestCase):
                 'event_type': 'call_answered',
                 'sip_call_id': 'sip-123',
             },
+            **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 200)
         call.refresh_from_db()
@@ -725,6 +726,7 @@ class TestSipWebhook(CrmTestCase):
                 'caller_number': '+995555111111',
                 'recipient_number': '+995555222222',
             },
+            **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(CallLog.objects.filter(sip_call_id='sip-new-456').exists())
@@ -741,6 +743,7 @@ class TestSipWebhook(CrmTestCase):
                 'event_type': 'call_ended',
                 'sip_call_id': 'sip-end-789',
             },
+            **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 200)
         call.refresh_from_db()
@@ -748,7 +751,7 @@ class TestSipWebhook(CrmTestCase):
         self.assertIsNotNone(call.duration)
 
     def test_webhook_missing_fields(self):
-        resp = self.api_post('/api/webhooks/sip/', {'event_type': 'call_answered'})
+        resp = self.api_post('/api/webhooks/sip/', {'event_type': 'call_answered'}, **self.pbx_headers())
         self.assertEqual(resp.status_code, 400)
 
     def test_webhook_call_not_found(self):
@@ -758,6 +761,7 @@ class TestSipWebhook(CrmTestCase):
                 'event_type': 'call_ended',
                 'sip_call_id': 'nonexistent-id',
             },
+            **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 404)
 
@@ -773,6 +777,7 @@ class TestRecordingWebhook(CrmTestCase):
                 'call_id': str(call.call_id),
                 'status': 'started',
             },
+            **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 200)
         recording = CallRecording.objects.get(call_log=call)
@@ -790,6 +795,7 @@ class TestRecordingWebhook(CrmTestCase):
                 'file_size': 1024000,
                 'duration': 120,
             },
+            **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 200)
         recording = CallRecording.objects.get(call_log=call)
@@ -797,7 +803,7 @@ class TestRecordingWebhook(CrmTestCase):
         self.assertEqual(recording.file_url, 'https://storage.example.com/recording.wav')
 
     def test_recording_webhook_missing_fields(self):
-        resp = self.api_post('/api/webhooks/recording/', {'status': 'started'})
+        resp = self.api_post('/api/webhooks/recording/', {'status': 'started'}, **self.pbx_headers())
         self.assertEqual(resp.status_code, 400)
 
     def test_recording_webhook_call_not_found(self):
@@ -808,6 +814,7 @@ class TestRecordingWebhook(CrmTestCase):
                 'call_id': str(uuid.uuid4()),
                 'status': 'started',
             },
+            **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 404)
 
@@ -824,19 +831,21 @@ class TestCallRatingWebhook(CrmTestCase):
         resp = self.api_post(
             '/api/webhooks/call-rating/',
             {'caller_number': '+995555123456', 'rating': 5},
+            **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 200)
         call.refresh_from_db()
         self.assertEqual(call.call_quality_score, 5.0)
 
     def test_rate_call_missing_fields(self):
-        resp = self.api_post('/api/webhooks/call-rating/', {'caller_number': '+99555'})
+        resp = self.api_post('/api/webhooks/call-rating/', {'caller_number': '+99555'}, **self.pbx_headers())
         self.assertEqual(resp.status_code, 400)
 
     def test_rate_call_invalid_rating(self):
         resp = self.api_post(
             '/api/webhooks/call-rating/',
             {'caller_number': '+995555123456', 'rating': 10},
+            **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 400)
 
@@ -844,6 +853,7 @@ class TestCallRatingWebhook(CrmTestCase):
         resp = self.api_post(
             '/api/webhooks/call-rating/',
             {'caller_number': '+999999999999', 'rating': 3},
+            **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 404)
 
@@ -859,17 +869,19 @@ class TestCallRecordingUrlWebhook(CrmTestCase):
             '/api/webhooks/call-recording-url/',
             {
                 'caller_number': '+995555123456',
-                'recording_url': 'https://storage.example.com/rec.wav',
+                'recording_url': 'https://pbx.tenant.test/rec.wav',
             },
+            **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 200)
         call.refresh_from_db()
-        self.assertEqual(call.recording_url, 'https://storage.example.com/rec.wav')
+        self.assertEqual(call.recording_url, 'https://pbx.tenant.test/rec.wav')
 
     def test_save_recording_url_missing_fields(self):
         resp = self.api_post(
             '/api/webhooks/call-recording-url/',
             {'caller_number': '+995555123456'},
+            **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 400)
 
@@ -878,8 +890,9 @@ class TestCallRecordingUrlWebhook(CrmTestCase):
             '/api/webhooks/call-recording-url/',
             {
                 'caller_number': '+999999999999',
-                'recording_url': 'https://storage.example.com/rec.wav',
+                'recording_url': 'https://pbx.tenant.test/rec.wav',
             },
+            **self.pbx_headers(),
         )
         self.assertEqual(resp.status_code, 404)
 

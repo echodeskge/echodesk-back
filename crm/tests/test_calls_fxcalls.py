@@ -284,6 +284,47 @@ class TestRingallAnsweredElsewhere(_QueueCallMixin, CrmTestCase):
         self.assertEqual(self.missed_notifs().count(), 0)
         self.assert_one_served_call(answered_by=self.agent_b, other=self.agent_a)
 
+    def test_exact_pbx_call_id_cancels_the_sibling_when_answered(self, mock_push):
+        """Both legs carry the Asterisk LINKEDID (``X-EchoDesk-Call``): B's
+        answer relabels A at once, without the timing heuristic, so A's leg
+        is ``cancelled`` with ``ended_at`` before A's softphone even reacts."""
+        leg_a = self.leg(self.agent_a, pbx_call_id='1700000000.42', sip_call_id='inv-a@a')
+        leg_b = self.leg(self.agent_b, pbx_call_id='1700000000.42', sip_call_id='inv-b@b')
+        # Another call from the same caller, still ringing A: not touched.
+        unrelated = self.leg(self.agent_a, pbx_call_id='1700000000.99', sip_call_id='inv-c@c')
+
+        with patch('crm.call_notifications.missed_call_state') as heuristic:
+            resp = self.api_patch(f'/api/call-logs/{leg_b.id}/update_status/',
+                                  {'status': 'answered'}, user=self.agent_b)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        heuristic.assert_not_called()
+
+        leg_a.refresh_from_db()
+        self.assertEqual(leg_a.status, 'cancelled')
+        self.assertIsNotNone(leg_a.ended_at)
+        self.assertEqual(leg_a.duration, timedelta(0))
+        self.assertEqual(leg_a.events.filter(event_type='ended').count(), 1)
+        self.assertEqual(
+            leg_a.events.get(event_type='ended').metadata['answered_call_log_id'], leg_b.id)
+        unrelated.refresh_from_db()
+        self.assertEqual(unrelated.status, 'ringing')
+
+        # A's softphone ends its leg afterwards: idempotent 200, no missed-call
+        # task is scheduled, nobody is notified.
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            resp = self.api_post(f'/api/call-logs/{leg_a.id}/end_call/', {}, user=self.agent_a)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data['status'], 'cancelled')
+        self.assertEqual(len(callbacks), 0)
+        self.assertEqual(leg_a.events.filter(event_type='ended').count(), 1)
+
+        self.api_post(f'/api/call-logs/{leg_b.id}/end_call/', {}, user=self.agent_b)
+        # Drop the unrelated (still ringing) leg so the stats below count
+        # this one call only.
+        CallLog.objects.filter(pk=unrelated.pk).delete()
+        self.assertEqual(self.missed_notifs().count(), 0)
+        self.assert_one_served_call(answered_by=self.agent_b, other=self.agent_a)
+
 
 # ============================================================================
 # 2. Blind transfer to a colleague who does not answer
@@ -500,14 +541,14 @@ class TestSharedSipPassword(CrmTestCase):
             created_by=self.owner, is_default=True, username='trunk-login',
             password='TRUNK-SECRET',
         )
-        self.agent = self.create_user(email='sh-agent@test.com')
+        self.agent = self.create_user(email='sh-agent@test.com', can_make_calls=True)
         self.create_phone_assignment(user=self.agent, sip_config=self.config, extension='300',
                                      extension_password='AGENT-PW')
         # Non-staff PBX admins: manage_settings flag, or the admin role.
         self.settings_admin = self.create_user(email='sh-settings@test.com',
                                                can_manage_settings=True)
         self.role_admin = self.create_user(email='sh-role@test.com', role='admin')
-        self.loner = self.create_user(email='sh-loner@test.com')
+        self.loner = self.create_user(email='sh-loner@test.com', can_make_calls=True)
 
     def _webrtc(self, user):
         return self.api_get(f'/api/sip-configurations/{self.config.id}/webrtc_config/', user=user)
@@ -640,6 +681,165 @@ class TestCallStatusOwnership(CrmTestCase):
         # The creator can then drive their own call.
         resp = self.api_post(f'/api/call-logs/{created.id}/end_call/', {}, user=self.colleague)
         self.assertEqual(resp.status_code, 200)
+
+    # Every action that changes a call, with a body its handler could send.
+    GUARDED_ACTIONS = (
+        ('add_event', {'event_type': 'muted'}),
+        ('start_recording', {}),
+        ('stop_recording', {}),
+        ('transfer_call', {'transfer_to': '102'}),
+        ('initiate_consultation', {'target_number': '102'}),
+        ('complete_attended_transfer', {'consultation_log_id': 1, 'target_number': '102'}),
+        ('cancel_consultation', {'consultation_log_id': 1}),
+        ('merge_conference', {'consultation_log_id': 1}),
+        ('toggle_hold', {}),
+    )
+
+    def _act(self, action, body, user, call=None):
+        call = call or self.call
+        return self.api_post(f'/api/call-logs/{call.id}/{action}/', body, user=user)
+
+    def test_colleague_gets_403_on_every_guarded_action(self):
+        for action, body in self.GUARDED_ACTIONS:
+            resp = self._act(action, body, self.colleague)
+            self.assertEqual(resp.status_code, 403, (action, resp.data))
+        self.call.refresh_from_db()
+        self.assertEqual(self.call.status, 'answered')
+        self.assertFalse(self.call.events.exists())
+        self.assertFalse(hasattr(self.call, 'recording'))
+        self.assertFalse(CallLog.objects.filter(parent_call=self.call).exists())
+
+    def test_unowned_call_guarded_actions_only_admins(self):
+        CallLog.objects.filter(pk=self.call.pk).update(handled_by=None)
+        for action, body in self.GUARDED_ACTIONS:
+            resp = self._act(action, body, self.colleague)
+            self.assertEqual(resp.status_code, 403, action)
+        admin = self.create_user(email='own-settings2@test.com', can_manage_settings=True)
+        resp = self._act('toggle_hold', {}, admin)
+        self.assertEqual(resp.status_code, 200, resp.data)
+
+    def test_handler_and_pbx_admins_pass_the_guard(self):
+        admins = [
+            self.handler,
+            self.create_user(email='own-staff2@test.com', is_staff=True),
+            self.create_user(email='own-super2@test.com', is_superuser=True),
+            self.create_user(email='own-settings3@test.com', can_manage_settings=True),
+            self.create_user(email='own-role2@test.com', role='admin'),
+        ]
+        for user in admins:
+            resp = self._act('add_event', {'event_type': 'muted'}, user)
+            self.assertEqual(resp.status_code, 201, (user.email, resp.data))
+            # answered -> on_hold -> answered
+            self.assertEqual(self._act('toggle_hold', {}, user).status_code, 200, user.email)
+            self.assertEqual(self._act('toggle_hold', {}, user).status_code, 200, user.email)
+        self.call.refresh_from_db()
+        self.assertEqual(self.call.status, 'answered')
+
+    def _foreign_consultation(self):
+        """A consultation leg attached to the handler's call but driven by
+        another agent: the handler owns the original, not the leg."""
+        other = self.create_user(email='own-other@test.com')
+        CallLog.objects.filter(pk=self.call.pk).update(status='on_hold', transfer_type='attended')
+        return CallLog.objects.create(
+            caller_number='+995555222222', recipient_number='102', direction='outbound',
+            call_type='voice', status='answered', answered_at=timezone.now(),
+            handled_by=other, parent_call=self.call, sip_configuration=self.config,
+        )
+
+    def test_consultation_leg_handled_by_someone_else_is_403(self):
+        leg = self._foreign_consultation()
+        cases = (
+            ('complete_attended_transfer', {'consultation_log_id': leg.id, 'target_number': '102'}),
+            ('cancel_consultation', {'consultation_log_id': leg.id}),
+            ('merge_conference', {'consultation_log_id': leg.id}),
+        )
+        for action, body in cases:
+            resp = self._act(action, body, self.handler)
+            self.assertEqual(resp.status_code, 403, (action, resp.data))
+        leg.refresh_from_db()
+        self.call.refresh_from_db()
+        self.assertEqual(leg.status, 'answered')
+        self.assertEqual(self.call.status, 'on_hold')
+        self.assertIsNone(self.call.ended_at)
+
+    def test_pbx_admin_may_drive_a_foreign_consultation_leg(self):
+        leg = self._foreign_consultation()
+        admin = self.create_user(email='own-settings4@test.com', can_manage_settings=True)
+        resp = self._act('cancel_consultation', {'consultation_log_id': leg.id}, admin)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        leg.refresh_from_db()
+        self.assertEqual(leg.status, 'ended')
+
+    def test_handler_may_drive_their_own_consultation_leg(self):
+        leg = self._foreign_consultation()
+        CallLog.objects.filter(pk=leg.pk).update(handled_by=self.handler)
+        resp = self._act('cancel_consultation', {'consultation_log_id': leg.id}, self.handler)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.call.refresh_from_db()
+        self.assertEqual(self.call.status, 'answered')
+
+
+# ============================================================================
+# 5b. Who may use the softphone at all (make_calls)
+# ============================================================================
+
+
+class TestMakeCallsPermission(CrmTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='mc-admin@test.com')
+        self.config = self.create_sip_config(
+            created_by=self.admin, is_default=True, sip_server='pbx.tenant.test',
+        )
+        self.plain = self.create_user(email='mc-plain@test.com')
+        self.create_phone_assignment(user=self.plain, sip_config=self.config, extension='401')
+
+    def _softphone_calls(self, user, sip_call_id):
+        return (
+            ('initiate_call', self.api_post('/api/call-logs/initiate_call/',
+                                            {'recipient_number': '+995599000001'}, user=user)),
+            ('log_incoming_call', self.api_post(
+                '/api/call-logs/log_incoming_call/',
+                {'caller_number': '+995599000002', 'recipient_number': '401',
+                 'sip_call_id': sip_call_id}, user=user)),
+            ('my_config', self.api_get('/api/sip-configurations/my_config/', user=user)),
+            ('webrtc_config', self.api_get(
+                f'/api/sip-configurations/{self.config.id}/webrtc_config/', user=user)),
+        )
+
+    def test_plain_agent_is_403_on_the_softphone_endpoints(self):
+        for name, resp in self._softphone_calls(self.plain, 'mc-plain@x'):
+            self.assertEqual(resp.status_code, 403, (name, resp.data))
+            self.assertEqual(resp.data['detail'], 'You do not have permission to make calls.')
+        self.assertFalse(CallLog.objects.exists())
+
+    def test_plain_agent_can_still_read_call_logs(self):
+        self.create_call_log(handled_by=self.plain, sip_config=self.config)
+        resp = self.api_get('/api/call-logs/', user=self.plain)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data['results']), 1)
+
+    def test_make_calls_holders_and_pbx_admins_are_allowed(self):
+        allowed = [
+            self.create_user(email='mc-flag@test.com', can_make_calls=True),
+            self.create_manager(email='mc-manager@test.com'),
+            self.create_user(email='mc-settings@test.com', can_manage_settings=True),
+            self.create_user(email='mc-staff@test.com', is_staff=True),
+            self.create_user(email='mc-super@test.com', is_superuser=True),
+            self.create_user(email='mc-role@test.com', role='admin'),
+        ]
+        for i, user in enumerate(allowed):
+            self.create_phone_assignment(user=user, sip_config=self.config, extension=f'41{i}')
+            for name, resp in self._softphone_calls(user, f'mc-{i}@x'):
+                self.assertNotEqual(resp.status_code, 403, (user.email, name, resp.data))
+                self.assertIn(resp.status_code, (200, 201), (user.email, name, resp.data))
+
+    def test_viewer_role_is_403(self):
+        viewer = self.create_viewer(email='mc-viewer@test.com')
+        self.create_phone_assignment(user=viewer, sip_config=self.config, extension='430')
+        for name, resp in self._softphone_calls(viewer, 'mc-viewer@x'):
+            self.assertEqual(resp.status_code, 403, (name, resp.data))
 
 
 # ============================================================================
