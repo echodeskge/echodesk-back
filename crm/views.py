@@ -736,6 +736,8 @@ class CallLogViewSet(viewsets.ModelViewSet):
                 status='initiated',
                 handled_by=request.user,
                 sip_configuration=sip_config,
+                sip_call_id=serializer.validated_data.get('sip_call_id', '') or '',
+                pbx_call_id=serializer.validated_data.get('pbx_call_id', '') or '',
                 client=crm_client,
                 social_client=social_client,
                 started_at=timezone.now()
@@ -1409,11 +1411,19 @@ class CallLogViewSet(viewsets.ModelViewSet):
             metadata={'transfer_to': transfer_to}
         )
         
-        # In a real implementation, you would initiate the SIP transfer here
-        # For now, just update the status and create completion event
-        
+        # The SIP REFER happens in the softphone; this is the bookkeeping for
+        # a blind transfer: who it went to, when, and the agent owning that
+        # extension when the target is one of ours.
+        now = timezone.now()
         call_log.status = 'transferred'
-        call_log.ended_at = timezone.now()
+        call_log.ended_at = now
+        call_log.transferred_to = str(transfer_to)[:30]
+        call_log.transferred_at = now
+        call_log.transfer_type = 'blind'
+        target = UserPhoneAssignment.objects.filter(
+            extension=str(transfer_to).strip(), is_active=True,
+        ).select_related('user').first()
+        call_log.transferred_to_user = target.user if target else None
         if call_log.answered_at:
             call_log.duration = call_log.ended_at - call_log.answered_at
         call_log.save()

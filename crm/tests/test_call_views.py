@@ -884,3 +884,71 @@ class TestMergeConference(CrmTestCase):
             user=admin,
         )
         self.assertEqual(resp.status_code, 503)
+
+
+# ============================================================================
+# Outbound leg ids and blind-transfer bookkeeping (calls integration)
+# ============================================================================
+
+
+class TestOutboundIdsAndTransferBookkeeping(CrmTestCase):
+
+    def test_initiate_call_stores_sip_and_pbx_call_ids(self):
+        admin = self.create_admin()
+        self.create_sip_config(is_default=True)
+        resp = self.api_post(
+            '/api/call-logs/initiate_call/',
+            {'recipient_number': '102', 'sip_call_id': 'abc-123@sip', 'pbx_call_id': '1700000000.42'},
+            user=admin,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        call = CallLog.objects.get(pk=resp.data['id'])
+        self.assertEqual(call.sip_call_id, 'abc-123@sip')
+        self.assertEqual(call.pbx_call_id, '1700000000.42')
+        self.assertEqual(call.recipient_number, '102')
+
+    def test_initiate_call_ids_are_optional(self):
+        admin = self.create_admin()
+        self.create_sip_config(is_default=True)
+        resp = self.api_post(
+            '/api/call-logs/initiate_call/', {'recipient_number': '+995555123456'}, user=admin,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        call = CallLog.objects.get(pk=resp.data['id'])
+        self.assertEqual(call.sip_call_id, '')
+        self.assertEqual(call.pbx_call_id, '')
+
+    def test_blind_transfer_records_target_and_owner(self):
+        admin = self.create_admin()
+        sip = self.create_sip_config(is_default=True)
+        agent = self.create_user(email="agent-102@test.com")
+        self.create_phone_assignment(user=agent, sip_config=sip, extension='102')
+        call = self.create_call_log(
+            handled_by=admin, status='answered',
+            answered_at=timezone.now() - timedelta(minutes=1),
+        )
+        resp = self.api_post(
+            f'/api/call-logs/{call.id}/transfer_call/', {'transfer_to': '102'}, user=admin,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        call.refresh_from_db()
+        self.assertEqual(call.status, 'transferred')
+        self.assertEqual(call.transferred_to, '102')
+        self.assertEqual(call.transfer_type, 'blind')
+        self.assertIsNotNone(call.transferred_at)
+        self.assertEqual(call.transferred_to_user_id, agent.id)
+
+    def test_blind_transfer_to_external_number_has_no_owner(self):
+        admin = self.create_admin()
+        call = self.create_call_log(
+            handled_by=admin, status='answered',
+            answered_at=timezone.now() - timedelta(minutes=1),
+        )
+        resp = self.api_post(
+            f'/api/call-logs/{call.id}/transfer_call/', {'transfer_to': '+995555999999'}, user=admin,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        call.refresh_from_db()
+        self.assertEqual(call.transferred_to, '+995555999999')
+        self.assertEqual(call.transfer_type, 'blind')
+        self.assertIsNone(call.transferred_to_user)

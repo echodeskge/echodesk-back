@@ -449,7 +449,12 @@ class CallInitiateSerializer(serializers.Serializer):
         default='voice'
     )
     sip_configuration = serializers.IntegerField(required=False)
-    
+    # The softphone dials first and logs after, so it knows the SIP Call-ID
+    # (and the PBX linked id once the first response carries it); storing
+    # them lets recordings and transfers match the outbound leg exactly.
+    sip_call_id = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    pbx_call_id = serializers.CharField(max_length=64, required=False, allow_blank=True)
+
     def validate_recipient_number(self, value):
         """Accept an external phone number, a PBX extension or a feature code.
 
