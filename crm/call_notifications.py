@@ -141,6 +141,23 @@ def missed_call_state(call_log, now=None):
     if not digits or not call_log.started_at or call_log.answered_at:
         return 'missed', None
 
+    if call_log.pbx_call_id:
+        # The dialplan stamped the PBX linked id on every leg of this
+        # attempt, so the attempt is exactly the legs sharing it. Never fall
+        # back to the caller-number heuristic here: an unrelated earlier call
+        # from the same number would make a real miss look "answered
+        # elsewhere".
+        exact = _exact_answered_sibling(call_log)
+        if exact is not None:
+            return 'answered_elsewhere', exact
+        other_ringing = (
+            CallLog.objects.filter(pbx_call_id=call_log.pbx_call_id, ended_at__isnull=True)
+            .exclude(pk=call_log.pk)
+            .exclude(status__in=FINAL_STATUSES)
+            .exists()
+        )
+        return ('pending', None) if other_ringing else ('missed', None)
+
     start = call_log.started_at
     own_end = call_log.ended_at or now
     queue_map = _agent_queue_map([call_log.handled_by_id])
@@ -210,9 +227,9 @@ def find_answered_sibling(call_log):
     ``pbx_call_id`` match wins; otherwise the timing heuristic decides."""
     if call_log.answered_at:
         return None
-    exact = _exact_answered_sibling(call_log)
-    if exact is not None:
-        return exact
+    if call_log.pbx_call_id:
+        # Exact ids only; see missed_call_state.
+        return _exact_answered_sibling(call_log)
     state, sibling = missed_call_state(call_log)
     return sibling if state == 'answered_elsewhere' else None
 
