@@ -33,6 +33,7 @@ urlpatterns = [
     # BYO Asterisk install endpoints
     path('api/pbx/install/<str:token>/', views_pbx_install.install_script, name='pbx-install-script'),
     path('api/pbx/install/<str:token>/ping/', views_pbx_install.install_ping, name='pbx-install-ping'),
+    path('api/pbx/install/<str:token>/dialplan/', views_pbx_install.install_dialplan, name='pbx-install-dialplan'),
     # PBX Settings (working hours + sounds)
     path('api/pbx-settings/<int:sip_config_id>/', pbx_settings_detail, name='pbx-settings-detail'),
     path('api/pbx-settings/<int:sip_config_id>/upload-sound/', pbx_settings_upload_sound, name='pbx-settings-upload-sound'),
