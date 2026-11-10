@@ -995,6 +995,23 @@ class Order(models.Model):
     delivered_at = models.DateTimeField(null=True, blank=True)
     cancelled_at = models.DateTimeField(null=True, blank=True)
 
+    # "Clean order list": a reversible, cosmetic soft delete. Hidden orders
+    # drop out of the admin list/detail/export, analytics and the storefront
+    # but keep their row, items, order number, stock reservation and promo
+    # use. Nothing else changes: see ``visible()`` for who filters on it.
+    is_deleted = models.BooleanField(
+        default=False, db_index=True,
+        help_text="Hidden from the order list, statistics and the storefront (reversible)",
+    )
+    deleted_at = models.DateTimeField(null=True, blank=True, help_text="When the order was hidden")
+    deleted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='+',
+        help_text="Staff user who hid the order",
+    )
+
     class Meta:
         ordering = ['-created_at']
         verbose_name = 'Order'
@@ -1006,6 +1023,23 @@ class Order(models.Model):
             models.Index(fields=['payment_status', '-created_at']),
             models.Index(fields=['bog_order_id']),
         ]
+
+    @classmethod
+    def visible(cls):
+        """Orders that are not soft-deleted ("cleaned").
+
+        The default manager (``Order.objects``) is deliberately left
+        unfiltered: payment webhooks (BOG/TBC/Flitt), the Quickshipper
+        courier webhook, the Celery tasks (order e-mails, courier booking,
+        the unpaid-order sweeper), ``select_for_update`` sites and the
+        signal handlers must keep finding hidden orders so a late payment
+        or courier callback still applies and abandoned hidden orders are
+        still restocked. Use ``visible()`` at the read sites that face
+        staff or customers: the admin list/detail/export, analytics,
+        bulk status updates, the open-orders delete guard, the storefront
+        order history and the public-token lookup.
+        """
+        return cls.objects.filter(is_deleted=False)
 
     def __str__(self):
         return f"Order {self.order_number} - {self.contact_name}"

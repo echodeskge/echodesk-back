@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import viewsets, filters, status, serializers
 from rest_framework.decorators import action, api_view, permission_classes, authentication_classes
 from rest_framework.response import Response
@@ -62,8 +64,10 @@ OPEN_ORDER_STATUSES = ('pending', 'confirmed', 'processing', 'shipped')
 def _open_orders_conflict(**item_filter):
     """409 response listing the open orders whose lines match ``item_filter``
     (e.g. ``product=p``), or None when nothing blocks the delete."""
+    # Hidden ("cleaned") open orders don't block: the lines are SET_NULL and
+    # keep their snapshot, so nothing is lost if the product goes.
     numbers = list(
-        Order.objects.filter(status__in=OPEN_ORDER_STATUSES, **{f'items__{k}': v for k, v in item_filter.items()})
+        Order.visible().filter(status__in=OPEN_ORDER_STATUSES, **{f'items__{k}': v for k, v in item_filter.items()})
         .order_by('created_at').values_list('order_number', flat=True).distinct()[:20]
     )
     if not numbers:
@@ -2120,10 +2124,22 @@ class OrderFilter(FilterSet):
     created_after = CharFilter(method='filter_created_after', help_text='ISO date or datetime (inclusive)')
     created_before = CharFilter(method='filter_created_before', help_text='ISO date or datetime (inclusive when a date)')
     has_tracking = BooleanFilter(method='filter_has_tracking', help_text='true: tracking number set; false: none')
+    cleaned = BooleanFilter(
+        method='filter_cleaned',
+        help_text='true: only orders hidden by "clean order list"; false/omitted (default): only visible orders',
+    )
 
     class Meta:
         model = Order
         fields = ['client', 'status', 'payment_status', 'payment_method', 'payment_provider']
+
+    def filter_cleaned(self, queryset, name, value):
+        # OrderViewSet.get_queryset already picks the visible/cleaned side
+        # from the same parameter (so it applies without a filterset too);
+        # re-applying here is idempotent.
+        if value is None:
+            return queryset
+        return queryset.filter(is_deleted=bool(value))
 
     @staticmethod
     def _csv(value):
@@ -2185,6 +2201,60 @@ class OrderFilter(FilterSet):
 
 _ORDER_ERROR = inline_serializer('EcommerceOrderError', fields={'error': serializers.CharField()})
 
+logger = logging.getLogger(__name__)
+
+
+def _end_of_day(day):
+    """First instant after ``day`` in the server timezone (``created_at < this``
+    takes every order placed on that date or earlier)."""
+    from datetime import datetime, time, timedelta
+    from django.utils import timezone
+    return timezone.make_aware(datetime.combine(day + timedelta(days=1), time.min))
+
+
+class OrderCleanRequestSerializer(serializers.Serializer):
+    """Body of ``POST /admin/orders/clean/``. Every filter is optional; with
+    none, every visible order is hidden."""
+    status = serializers.ListField(
+        child=serializers.ChoiceField(choices=Order.STATUS_CHOICES),
+        required=False, allow_empty=True,
+        help_text='Only hide orders in these statuses (omitted or empty: any status)',
+    )
+    created_before = serializers.DateField(
+        required=False, allow_null=True,
+        help_text=(
+            'ISO date (YYYY-MM-DD), inclusive: hides orders created on that day or earlier '
+            '(created_at < the next day 00:00 in the server timezone). Omitted: any date.'
+        ),
+    )
+    dry_run = serializers.BooleanField(
+        required=False, default=False,
+        help_text='true: only count the orders that would be hidden; nothing changes',
+    )
+
+
+class OrderRestoreRequestSerializer(serializers.Serializer):
+    """Body of ``POST /admin/orders/restore/``: ``ids`` or ``all``."""
+    ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1), required=False, allow_empty=True,
+        help_text='Order ids to bring back (ids that are not hidden are ignored)',
+    )
+    all = serializers.BooleanField(required=False, default=False, help_text='true: restore every hidden order')
+
+    def validate(self, attrs):
+        if not attrs.get('all') and not attrs.get('ids'):
+            raise serializers.ValidationError({'ids': 'Send a non-empty "ids" list or "all": true.'})
+        return attrs
+
+
+_ORDER_CLEAN_RESULT = inline_serializer('OrderCleanResponse', fields={
+    'cleaned': serializers.IntegerField(required=False, help_text='Orders hidden by this call (absent on dry_run)'),
+    'count': serializers.IntegerField(required=False, help_text='Orders that would be hidden (dry_run only)'),
+})
+_ORDER_RESTORE_RESULT = inline_serializer('OrderRestoreResponse', fields={
+    'restored': serializers.IntegerField(help_text='Orders made visible again by this call'),
+})
+
 
 class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin, viewsets.ModelViewSet):
     """ViewSet for managing orders (Admin only)"""
@@ -2195,6 +2265,9 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
         'update', 'partial_update', 'destroy',
         'refund', 'mark_paid', 'initiate_payment',
     )
+    # "Clean order list" and its undo are store configuration (Settings →
+    # E-commerce), so they need the admin level like the settings endpoints.
+    admin_actions = ('clean', 'restore_many', 'restore')
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['order_number', 'client__first_name', 'client__last_name', 'client__email',
                      'customer_first_name', 'customer_last_name', 'customer_email', 'customer_phone']
@@ -2202,11 +2275,27 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
     ordering_fields = ['created_at', 'total_amount', 'status']
     ordering = ['-created_at']
 
+    @staticmethod
+    def _wants_cleaned(request):
+        return (request.query_params.get('cleaned') or '').strip().lower() in ('true', '1', 'yes')
+
     def get_queryset(self):
-        """Optimize queryset with select_related and prefetch_related"""
-        queryset = super().get_queryset().select_related(
+        """Visible orders by default; ``?cleaned=true`` lists the hidden ones.
+
+        ``retrieve`` and ``restore`` see both sides so an admin can open and
+        bring back a cleaned order. Every mutation (update, destroy,
+        update_status, mark_paid, refund, initiate_payment) and the export
+        stay visible-only, so they 404 on a hidden order.
+        """
+        queryset = super().get_queryset()
+        if self.action == 'list':
+            queryset = queryset.filter(is_deleted=self._wants_cleaned(self.request))
+        elif self.action not in ('retrieve', 'restore'):
+            queryset = queryset.filter(is_deleted=False)
+        queryset = queryset.select_related(
             'client',
-            'delivery_address'
+            'delivery_address',
+            'deleted_by',
         )
         # Only prefetch items for detail views. For the list, annotate the item
         # count so the serializer doesn't fire a COUNT per order row.
@@ -2654,7 +2743,7 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
         month_ago = today - timedelta(days=30)
         prev_month_start = today - timedelta(days=60)
 
-        orders = Order.objects.exclude(status='cancelled')
+        orders = Order.visible().exclude(status='cancelled')
         paid_orders = orders.filter(payment_status='paid')
 
         # Revenue by period
@@ -2701,7 +2790,9 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
         # Top products
         top_products = list(
             # Lines of deleted products have no product row to group by.
-            OrderItem.objects.filter(product__isnull=False).values('product__name').annotate(
+            # Same population as the counts above: no cleaned, no cancelled.
+            OrderItem.objects.filter(product__isnull=False, order__is_deleted=False)
+            .exclude(order__status='cancelled').values('product__name').annotate(
                 sold=Sum('quantity'),
                 revenue=Sum(F('price') * F('quantity'))
             ).order_by('-sold')[:10]
@@ -2738,7 +2829,10 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
         ).count()
         # Returning = customers with more than 1 order
         returning_customers = EcommerceClient.objects.annotate(
-            order_count=Count('orders', filter=Q(orders__status__in=['confirmed', 'processing', 'shipped', 'delivered']))
+            order_count=Count('orders', filter=Q(
+                orders__is_deleted=False,
+                orders__status__in=['confirmed', 'processing', 'shipped', 'delivered'],
+            ))
         ).filter(order_count__gt=1).count()
 
         # Revenue by payment method
@@ -2857,7 +2951,7 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
         except (TypeError, ValueError):
             return Response({'error': 'order_ids must be integers'}, status=status.HTTP_400_BAD_REQUEST)
 
-        orders = list(Order.objects.filter(id__in=order_ids))
+        orders = list(Order.visible().filter(id__in=order_ids))
         if len(orders) != len(order_ids):
             found_ids = {o.id for o in orders}
             missing = [oid for oid in order_ids if oid not in found_ids]
@@ -2943,6 +3037,119 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
                 order.payment_method,
             ])
         return response
+
+    # ── "Clean order list" (reversible soft delete) ─────────────────────
+
+    @extend_schema(
+        tags=['Ecommerce Admin - Orders'],
+        summary='Clean the order list (hide orders, reversible)',
+        description=(
+            'Hides visible orders from the order list, statistics, exports and the '
+            'storefront without deleting anything (store admins only). Optional filters: '
+            '`status` (list of order statuses) and `created_before` (ISO date, inclusive: '
+            'orders created on that day or earlier, i.e. created_at < next day 00:00 in the '
+            'server timezone). `dry_run: true` only reports how many orders match. Stock '
+            'reservations and promo-code uses are untouched; hidden orders still receive '
+            'payment and courier webhooks. Undo with the restore endpoints.'
+        ),
+        request=OrderCleanRequestSerializer,
+        responses={
+            200: OpenApiResponse(
+                response=_ORDER_CLEAN_RESULT,
+                description='`{"cleaned": n}`, or `{"count": n}` when dry_run is true',
+            ),
+            400: OpenApiResponse(description='Invalid status or date'),
+            403: OpenApiResponse(response=_ORDER_ERROR, description='Store admin rights required'),
+        },
+    )
+    @action(detail=False, methods=['post'], url_path='clean')
+    def clean(self, request):
+        """Soft-delete the visible orders matching the optional filters."""
+        from django.db import transaction
+        from django.utils import timezone
+
+        ser = OrderCleanRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        statuses = data.get('status') or []
+        created_before = data.get('created_before')
+
+        orders = Order.visible()
+        if statuses:
+            orders = orders.filter(status__in=statuses)
+        if created_before:
+            orders = orders.filter(created_at__lt=_end_of_day(created_before))
+
+        if data.get('dry_run'):
+            return Response({'count': orders.count()})
+
+        with transaction.atomic():
+            cleaned = orders.update(is_deleted=True, deleted_at=timezone.now(), deleted_by=request.user)
+        logger.info(
+            'ecommerce orders cleaned: user_id=%s status=%s created_before=%s count=%s',
+            request.user.id, statuses or 'any', created_before.isoformat() if created_before else 'any', cleaned,
+        )
+        return Response({'cleaned': cleaned})
+
+    @extend_schema(
+        operation_id='ecommerce_admin_orders_restore_many',
+        tags=['Ecommerce Admin - Orders'],
+        summary='Restore cleaned orders',
+        description=(
+            'Makes hidden ("cleaned") orders visible again (store admins only). Send '
+            '`{"ids": [..]}` for specific orders (ids that are not hidden are ignored) or '
+            '`{"all": true}` for every hidden order.'
+        ),
+        request=OrderRestoreRequestSerializer,
+        responses={
+            200: _ORDER_RESTORE_RESULT,
+            400: OpenApiResponse(description='Neither ids nor all given, or invalid ids'),
+            403: OpenApiResponse(response=_ORDER_ERROR, description='Store admin rights required'),
+        },
+    )
+    @action(detail=False, methods=['post'], url_path='restore')
+    def restore_many(self, request):
+        """Bulk undo of ``clean``."""
+        from django.db import transaction
+
+        ser = OrderRestoreRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        orders = Order.objects.filter(is_deleted=True)
+        if not data.get('all'):
+            orders = orders.filter(id__in=data['ids'])
+        with transaction.atomic():
+            restored = orders.update(is_deleted=False, deleted_at=None, deleted_by=None)
+        logger.info(
+            'ecommerce orders restored: user_id=%s all=%s ids=%s count=%s',
+            request.user.id, bool(data.get('all')), 'all' if data.get('all') else data['ids'], restored,
+        )
+        return Response({'restored': restored})
+
+    @extend_schema(
+        tags=['Ecommerce Admin - Orders'],
+        summary='Restore one cleaned order',
+        description='Makes a hidden ("cleaned") order visible again and returns it (store admins only). '
+                    'A no-op on an order that is already visible.',
+        request=None,
+        responses={
+            200: OrderSerializer,
+            403: OpenApiResponse(response=_ORDER_ERROR, description='Store admin rights required'),
+            404: OpenApiResponse(description='No such order'),
+        },
+    )
+    @action(detail=True, methods=['post'], url_path='restore')
+    def restore(self, request, pk=None):
+        """Undo ``clean`` for one order."""
+        order = self.get_object()  # get_queryset lets ``restore`` see hidden orders
+        if order.is_deleted:
+            order.is_deleted = False
+            order.deleted_at = None
+            order.deleted_by = None
+            order.save(update_fields=['is_deleted', 'deleted_at', 'deleted_by', 'updated_at'])
+            logger.info('ecommerce order restored: user_id=%s order_id=%s', request.user.id, order.id)
+        return Response(OrderSerializer(order, context=self.get_serializer_context()).data)
 
     @extend_schema(
         tags=['Ecommerce Admin - Orders'],
