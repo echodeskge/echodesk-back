@@ -167,7 +167,7 @@ class TestInstallerDialplan(SimpleTestCase):
         self.assertIn('exten => _+X.,1,Goto(outbound,${EXTEN},1)', text)
         self.assertIn('exten => _+X.,1,Goto(outbound,${EXTEN:1},1)', text)
         self.assertIn('Dial(PJSIP/${EXTEN},30,b(echodesk-predial^s^1))', text)
-        self.assertIn('Set(PJSIP_HEADER(add,X-EchoDesk-Call)=${LINKEDID})', text)
+        self.assertIn('Set(PJSIP_HEADER(add,X-EchoDesk-Call)=${CHANNEL(linkedid)})', text)
         self.assertIn('Set(REC_FILE=${UNIQUEID}.wav)', text)
         self.assertIn('MixMonitor(/var/spool/asterisk/recording/${REC_FILE},b)', text)
         self.assertIn('Set(CHANNEL(hangup_handler_push)=echodesk-recording,s,1)', text)
@@ -201,7 +201,7 @@ class TestInstallerDialplan(SimpleTestCase):
         for field in ('"caller_number":"${FILTER(+0-9,${CALLERID(num)})}"',
                       '"recipient_number":"${FILTER(+0-9,${DIALED_NUMBER})}"',
                       '"recording_url":"${RECORDING_BASE}${REC_FILE}"',
-                      '"pbx_call_id":"${LINKEDID}"', '"sip_call_id":"${SIPCALLID}"'):
+                      '"pbx_call_id":"${CHANNEL(linkedid)}"', '"sip_call_id":"${SIPCALLID}"'):
             self.assertIn(field, curl)
         # Only the HTTP status is logged (the smoke greps this line), never the token.
         self.assertIn('NoOp(EchoDesk recording webhook -> HTTP ${WEBHOOK_HTTP} for ${RECORDING_BASE}${REC_FILE})', handler)

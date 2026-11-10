@@ -152,7 +152,7 @@ the end state with the token.
 
       ```asterisk
       [echodesk-predial]
-      exten => s,1,Set(PJSIP_HEADER(add,X-EchoDesk-Call)=${LINKEDID})
+      exten => s,1,Set(PJSIP_HEADER(add,X-EchoDesk-Call)=${CHANNEL(linkedid)})
        same => n,Return()
 
       [confbridge-dynamic]
@@ -186,7 +186,7 @@ the end state with the token.
 
       ; [echodesk-recording] — ARG1/ARG2 are what pbx2 already passes (caller, dialed number).
       ; $ECHODESK_PBX_TOKEN (no braces) is expanded by the shell, not by Asterisk.
-      same => n,Set(WEBHOOK_HTTP=${SHELL(curl -s -o /dev/null -w '%{http_code}' -m 10 -X POST -H 'Content-Type: application/json' -H "X-PBX-Token: $ECHODESK_PBX_TOKEN" -d '{"caller_number":"${FILTER(+0-9,${ARG1})}","recipient_number":"${FILTER(+0-9,${ARG2})}","recording_url":"${RECORDING_BASE}/${REC_FILE}","pbx_call_id":"${LINKEDID}","sip_call_id":"${SIPCALLID}"}' ${ECHODESK_API}/api/webhooks/call-recording-url/)})
+      same => n,Set(WEBHOOK_HTTP=${SHELL(curl -s -o /dev/null -w '%{http_code}' -m 10 -X POST -H 'Content-Type: application/json' -H "X-PBX-Token: $ECHODESK_PBX_TOKEN" -d '{"caller_number":"${FILTER(+0-9,${ARG1})}","recipient_number":"${FILTER(+0-9,${ARG2})}","recording_url":"${RECORDING_BASE}/${REC_FILE}","pbx_call_id":"${CHANNEL(linkedid)}","sip_call_id":"${SIPCALLID}"}' ${ECHODESK_API}/api/webhooks/call-recording-url/)})
       same => n,NoOp(EchoDesk recording webhook -> HTTP ${WEBHOOK_HTTP} for ${RECORDING_BASE}/${REC_FILE})
       ```
 

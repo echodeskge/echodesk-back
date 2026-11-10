@@ -226,7 +226,8 @@ exten => _X.,1,Dial(PJSIP/@@EXT_PREFIX@@${EXTEN},30,b(echodesk-predial^s^1))
 ; INVITE goes out: the browser reads X-EchoDesk-Call and posts it as
 ; pbx_call_id so sibling ringall legs are matched exactly.
 [echodesk-predial]
-exten => s,1,Set(PJSIP_HEADER(add,X-EchoDesk-Call)=${LINKEDID})
+; CHANNEL(linkedid): the old LINKEDID channel variable is empty on Asterisk 12+.
+exten => s,1,Set(PJSIP_HEADER(add,X-EchoDesk-Call)=${CHANNEL(linkedid)})
  same => n,Return()
 
 @@OUTBOUND_BODY@@
@@ -296,10 +297,10 @@ exten => _[+s0-9]!,1,Answer()
 ; token-filtered: they end up on a shell command line.
 ; ---------------------------------------------------------------------------
 [echodesk-recording]
-exten => s,1,NoOp(EchoDesk: recording ${REC_FILE} for linkedid ${LINKEDID})
+exten => s,1,NoOp(EchoDesk: recording ${REC_FILE} for linkedid ${CHANNEL(linkedid)})
  same => n,GotoIf($["${SIPCALLID}" != "" | "${CHANNEL(channeltype)}" != "PJSIP"]?post)
  same => n,Set(SIPCALLID=${FILTER(a-zA-Z0-9@._-,${CHANNEL(pjsip,call-id)})})
- same => n(post),Set(WEBHOOK_HTTP=${SHELL(curl -s -o /dev/null -w '%{http_code}' -m 10 -X POST -H 'Content-Type: application/json' -H "X-PBX-Token: $ECHODESK_PBX_TOKEN" -d '{"caller_number":"${FILTER(+0-9,${CALLERID(num)})}","recipient_number":"${FILTER(+0-9,${DIALED_NUMBER})}","recording_url":"${RECORDING_BASE}${REC_FILE}","pbx_call_id":"${LINKEDID}","sip_call_id":"${SIPCALLID}"}' ${ECHODESK_API}/api/webhooks/call-recording-url/)})
+ same => n(post),Set(WEBHOOK_HTTP=${SHELL(curl -s -o /dev/null -w '%{http_code}' -m 10 -X POST -H 'Content-Type: application/json' -H "X-PBX-Token: $ECHODESK_PBX_TOKEN" -d '{"caller_number":"${FILTER(+0-9,${CALLERID(num)})}","recipient_number":"${FILTER(+0-9,${DIALED_NUMBER})}","recording_url":"${RECORDING_BASE}${REC_FILE}","pbx_call_id":"${CHANNEL(linkedid)}","sip_call_id":"${SIPCALLID}"}' ${ECHODESK_API}/api/webhooks/call-recording-url/)})
  same => n,NoOp(EchoDesk recording webhook -> HTTP ${WEBHOOK_HTTP} for ${RECORDING_BASE}${REC_FILE})
  same => n,Return()
 
