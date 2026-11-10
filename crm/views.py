@@ -2449,35 +2449,65 @@ def call_rating_webhook(request):
         )
 
 
+@extend_schema(
+    summary="Send a review SMS for the caller's last call (PBX)",
+    description=(
+        "Called by the tenant's PBX after a call. Auth: ``X-PBX-Token`` of "
+        "the tenant's PbxServer (the SMS goes out in that tenant only), or "
+        "the legacy ``Authorization: Bearer <PBX_SHARED_SECRET>`` while that "
+        "setting is set (then every tenant is searched for the caller, as "
+        "before). Anything else is 401."
+    ),
+    request={
+        "application/json": {
+            "type": "object",
+            "properties": {
+                "caller_number": {"type": "string"},
+                "did": {"type": "string"},
+            },
+            "required": ["caller_number"],
+        }
+    },
+    responses={200: OpenApiTypes.OBJECT, 400: OpenApiTypes.OBJECT, 401: OpenApiTypes.OBJECT,
+               404: OpenApiTypes.OBJECT, 429: OpenApiTypes.OBJECT, 502: OpenApiTypes.OBJECT},
+)
 @csrf_exempt
 @api_view(['POST'])
+@authentication_classes([])  # the PBX presents a token / shared secret, not a user JWT
 @permission_classes([])
 def send_call_review_sms(request):
     """
     Called by PBX scripts to send SMS review for a caller.
     Finds the most recent call by caller_number and sends an SMS review link.
 
-    Auth: Bearer token via PBX_SHARED_SECRET env var.
+    Auth (see :mod:`crm.pbx_auth`): ``X-PBX-Token`` identifies the tenant;
+    the shared secret (legacy, constant-time compare) keeps the old
+    all-tenant search because those scripts post to the shared API host.
 
     POST body:
         caller_number: The caller's phone number
-        did: (optional) The DID that was called, to locate the tenant/SIP config
+        did: (optional) The DID that was called, to locate the SIP config
     """
     import secrets
-    from django.conf import settings as django_settings
-    from django.db import connection
     from tenant_schemas.utils import schema_context
     from tenants.models import Tenant
+    from . import pbx_auth
     from .sms_utils import send_sms
 
-    # Authenticate via shared secret
-    auth_header = request.META.get('HTTP_AUTHORIZATION', '')
-    expected_token = getattr(django_settings, 'PBX_SHARED_SECRET', '')
-    if expected_token and not auth_header.endswith(expected_token):
+    if pbx_auth._token_from_request(request):
+        auth = pbx_auth.resolve_pbx(request)
+        if auth is None:
+            return Response({'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
+        schemas = [auth.schema]
+    elif pbx_auth.shared_secret_ok(request):
+        schemas = list(
+            Tenant.objects.exclude(schema_name='public').values_list('schema_name', flat=True)
+        )
+    else:
         return Response({'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
 
-    caller_number = request.data.get('caller_number', '').strip()
-    did = request.data.get('did', '').strip()
+    caller_number = str(request.data.get('caller_number', '') or '').strip()
+    did = str(request.data.get('did', '') or '').strip()
 
     if not caller_number:
         return Response({'error': 'caller_number is required'}, status=status.HTTP_400_BAD_REQUEST)
@@ -2486,11 +2516,9 @@ def send_call_review_sms(request):
     last_digits = clean_caller[-7:] if len(clean_caller) >= 7 else clean_caller
     clean_did = did.replace('+', '').replace(' ', '').replace('-', '') if did else ''
 
-    # Search across tenants
-    tenants = Tenant.objects.exclude(schema_name='public')
-    for tenant in tenants:
+    for schema_name in schemas:
         try:
-            with schema_context(tenant.schema_name):
+            with schema_context(schema_name):
                 # Find matching SIP config
                 sip_config = None
                 if clean_did:
@@ -2536,7 +2564,7 @@ def send_call_review_sms(request):
                 # Generate token and send SMS
                 token = secrets.token_urlsafe(48)
                 expires = timezone.now() + timedelta(days=7)
-                link = f"https://{tenant.schema_name}.echodesk.ge/review?token={token}&type=call"
+                link = f"https://{schema_name}.echodesk.ge/review?token={token}&type=call"
 
                 template = pbx_settings.sms_rating_template_ka or pbx_settings.sms_rating_template_en
                 message = template.replace('{link}', link)
@@ -2560,10 +2588,10 @@ def send_call_review_sms(request):
                 return Response({
                     'status': 'sent',
                     'message_id': result.get('messageId'),
-                    'tenant': tenant.schema_name,
+                    'tenant': schema_name,
                 })
-        except Exception as exc:
-            logger.error(f"send_call_review_sms error in tenant {tenant.schema_name}: {exc}")
+        except Exception:
+            logger.exception("send_call_review_sms failed in tenant %s", schema_name)
             continue
 
     return Response(

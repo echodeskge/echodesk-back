@@ -180,7 +180,10 @@ def find_pbx_by_enrollment_token(token: str):
     return schema, pbx.pk
 
 
-def _shared_secret_ok(request) -> bool:
+def shared_secret_ok(request) -> bool:
+    """True when the request carries ``Authorization: Bearer <PBX_SHARED_SECRET>``
+    and that setting is non-empty (constant-time compare). The host is not
+    looked at here; :func:`resolve_pbx` adds the tenant-host requirement."""
     secret = getattr(settings, 'PBX_SHARED_SECRET', '') or ''
     if not secret:
         return False
@@ -217,7 +220,7 @@ def resolve_pbx(request) -> Optional[PbxAuth]:
             )
         return PbxAuth(schema=schema, pbx=pbx, via=field)
 
-    if _shared_secret_ok(request):
+    if shared_secret_ok(request):
         schema = getattr(connection, 'schema_name', None)
         if not schema or schema == 'public':
             logger.warning('pbx_auth: shared secret presented without a tenant host')

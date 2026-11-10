@@ -281,3 +281,86 @@ class TestWebhookErrorBodies(_PbxAuthMixin, CrmTestCase):
         first.refresh_from_db()
         self.assertEqual(latest.status, 'answered')
         self.assertEqual(first.status, 'ended')
+
+
+REVIEW_SMS = '/api/pbx/send-review-sms/'
+
+
+class TestReviewSms(_PbxAuthMixin, CrmTestCase):
+    """``/api/pbx/send-review-sms/`` authenticates through ``crm.pbx_auth``
+    too: the old view compared ``Authorization.endswith(secret)`` and ran
+    behind DRF's default authenticators, which rejected the Bearer header
+    before the view could see it."""
+
+    def setUp(self):
+        super().setUp()
+        self.create_pbx_settings(sip_config=self.config, review_method='sms',
+                                 sms_api_key='sender-key', review_cooldown_hours=24)
+        self.call = self.create_call_log(
+            handled_by=self.admin, direction='inbound', caller_number='+995599123456',
+        )
+
+    def post(self, data=None, **headers):
+        return self.api_post(REVIEW_SMS, data or {'caller_number': '+995599123456'}, **headers)
+
+    def test_no_credentials_is_401_and_sends_nothing(self):
+        with patch('crm.sms_utils.send_sms') as send:
+            self.assertEqual(self.post().status_code, 401)
+            self.assertEqual(self.post(HTTP_AUTHORIZATION='Bearer not-a-jwt').status_code, 401)
+        send.assert_not_called()
+
+    def test_api_token_sends_in_the_tokens_tenant(self):
+        with patch('crm.sms_utils.send_sms', return_value={'messageId': 'm-1'}) as send:
+            resp = self.post(HTTP_X_PBX_TOKEN=self.pbx.api_token)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data['tenant'], self.tenant.schema_name)
+        self.assertEqual(resp.data['message_id'], 'm-1')
+        send.assert_called_once()
+        self.assertEqual(send.call_args[0][0], 'sender-key')
+        self.assertEqual(send.call_args[0][1], '+995599123456')
+        rating = self.call.call_ratings.get()
+        self.assertEqual(rating.review_method, 'sms')
+        self.assertEqual(rating.sms_message_id, 'm-1')
+
+    def test_unknown_token_is_401(self):
+        with patch('crm.sms_utils.send_sms') as send:
+            resp = self.post(HTTP_X_PBX_TOKEN='nope')
+        self.assertEqual(resp.status_code, 401)
+        send.assert_not_called()
+
+    @override_settings(PBX_SHARED_SECRET='legacy-secret')
+    def test_shared_secret_is_exact_and_constant_time_not_endswith(self):
+        with patch('crm.sms_utils.send_sms', return_value={'messageId': 'm-2'}) as send:
+            for header in ('Bearer junklegacy-secret', 'Bearer legacy-secretX', 'legacy-secret',
+                           'Basic legacy-secret', 'Bearer '):
+                self.assertEqual(self.post(HTTP_AUTHORIZATION=header).status_code, 401, header)
+            send.assert_not_called()
+            resp = self.post(HTTP_AUTHORIZATION='Bearer legacy-secret')
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data['tenant'], self.tenant.schema_name)
+
+    @override_settings(PBX_SHARED_SECRET='')
+    def test_empty_secret_disables_the_legacy_path(self):
+        with patch('crm.sms_utils.send_sms') as send:
+            resp = self.post(HTTP_AUTHORIZATION='Bearer ')
+        self.assertEqual(resp.status_code, 401)
+        send.assert_not_called()
+
+    def test_validation_and_not_found_after_auth(self):
+        with patch('crm.sms_utils.send_sms') as send:
+            resp = self.post({'caller_number': ''}, HTTP_X_PBX_TOKEN=self.pbx.api_token)
+            self.assertEqual(resp.status_code, 400)
+            resp = self.post({'caller_number': '+995599000000'}, HTTP_X_PBX_TOKEN=self.pbx.api_token)
+            self.assertEqual(resp.status_code, 404)
+        send.assert_not_called()
+
+    def test_token_path_stays_in_its_tenant(self):
+        """The token identifies the tenant; the all-tenant search of the
+        legacy path is not run."""
+        auth = pbx_auth.PbxAuth(schema=self.tenant.schema_name, pbx=self.pbx, via='api_token')
+        with patch('crm.sms_utils.send_sms', return_value={'messageId': 'm-3'}), \
+                patch('crm.pbx_auth.resolve_pbx', return_value=auth), \
+                patch('tenants.models.Tenant.objects.exclude') as scan:
+            resp = self.post(HTTP_X_PBX_TOKEN=self.pbx.api_token)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        scan.assert_not_called()
