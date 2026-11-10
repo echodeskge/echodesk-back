@@ -188,9 +188,31 @@ def missed_call_state(call_log, now=None):
     return 'missed', None
 
 
+def _exact_answered_sibling(call_log):
+    """The answered leg sharing this leg's ``pbx_call_id`` (Asterisk
+    LINKEDID, stamped on every agent leg by the dialplan), or None. Exact,
+    no heuristic: only when both legs carry the id."""
+    from .models import CallLog
+
+    if not call_log.pbx_call_id:
+        return None
+    return (
+        CallLog.objects.filter(pbx_call_id=call_log.pbx_call_id, answered_at__isnull=False)
+        .exclude(pk=call_log.pk)
+        .order_by('answered_at', 'pk')
+        .first()
+    )
+
+
 def find_answered_sibling(call_log):
     """Another leg of the same queue attempt that somebody answered after
-    this leg started (see the module docstring), or None."""
+    this leg started (see the module docstring), or None. An exact
+    ``pbx_call_id`` match wins; otherwise the timing heuristic decides."""
+    if call_log.answered_at:
+        return None
+    exact = _exact_answered_sibling(call_log)
+    if exact is not None:
+        return exact
     state, sibling = missed_call_state(call_log)
     return sibling if state == 'answered_elsewhere' else None
 
@@ -215,17 +237,87 @@ def _mark_answered_elsewhere(call_log, sibling):
     return bool(updated)
 
 
+def _broadcast_call_event(call_log):
+    """Push the relabelled leg to its agent's socket (``call_event``), when
+    the realtime module is on this branch. Never raises."""
+    try:
+        from .call_realtime import broadcast_call_event
+    except ImportError:
+        return
+    try:
+        broadcast_call_event(call_log)
+    except Exception:  # noqa: BLE001 - realtime is best effort
+        logger.exception('call_event broadcast failed for call %s', call_log.pk)
+
+
+def _relabel_exact_siblings(answered_leg):
+    """Ring-all legs that share ``answered_leg.pbx_call_id`` and were not
+    answered (still ringing, or already timed out as missed) are answered
+    elsewhere: set ``cancelled`` + ``ended_at`` and tell their agents.
+    Returns how many legs were re-labelled."""
+    from django.utils import timezone
+
+    from .models import CallEvent, CallLog
+
+    if not answered_leg.pbx_call_id:
+        return 0
+    legs = list(
+        CallLog.objects.filter(
+            pbx_call_id=answered_leg.pbx_call_id,
+            direction='inbound',
+            answered_at__isnull=True,
+        )
+        .exclude(pk=answered_leg.pk)
+        .exclude(status=ANSWERED_ELSEWHERE_STATUS)
+        .exclude(status__in=[s for s in FINAL_STATUSES if s not in MISSED_STATUSES])
+        .order_by('started_at')[:_MAX_CANDIDATES]
+    )
+    count = 0
+    now = timezone.now()
+    for leg in legs:
+        previous_status = leg.status
+        # queryset.update() so the post_save signal does not fire again.
+        updated = CallLog.objects.filter(
+            pk=leg.pk, answered_at__isnull=True,
+        ).exclude(status=ANSWERED_ELSEWHERE_STATUS).update(
+            status=ANSWERED_ELSEWHERE_STATUS,
+            ended_at=leg.ended_at or now,
+            duration=leg.duration if leg.duration is not None else timedelta(0),
+        )
+        if not updated:
+            continue
+        CallEvent.objects.create(
+            call_log=leg,
+            event_type='ended',
+            metadata={
+                'answered_elsewhere': True,
+                'answered_call_log_id': answered_leg.pk,
+                'previous_status': previous_status,
+                'pbx_call_id': answered_leg.pbx_call_id,
+            },
+        )
+        leg.refresh_from_db()
+        _broadcast_call_event(leg)
+        count += 1
+    return count
+
+
 def relabel_legs_answered_elsewhere(answered_leg):
     """``answered_leg`` was just answered: re-label the unanswered legs of
-    the same queue attempt that already went ``missed``/``no_answer``
-    (rrmemory: agents whose leg timed out before this one rang). Returns
-    how many legs were re-labelled."""
+    the same call. Legs that carry the same ``pbx_call_id`` are matched
+    exactly (ringall: still ringing; rrmemory: already timed out). Then the
+    timing heuristic re-labels legs of the same queue attempt that already
+    went ``missed``/``no_answer`` without an id. Returns how many legs were
+    re-labelled."""
     from .models import CallLog
 
-    digits = last_digits(answered_leg.caller_number)
-    if (answered_leg.direction != 'inbound' or not digits
-            or not answered_leg.answered_at or not answered_leg.started_at):
+    if answered_leg.direction != 'inbound' or not answered_leg.answered_at:
         return 0
+    count = _relabel_exact_siblings(answered_leg)
+
+    digits = last_digits(answered_leg.caller_number)
+    if not digits or not answered_leg.started_at:
+        return count
     _, span = _attempt_timing(
         _agent_queue_map([answered_leg.handled_by_id]).get(answered_leg.handled_by_id, set())
     )
@@ -239,7 +331,6 @@ def relabel_legs_answered_elsewhere(answered_leg):
         ),
         answered_leg, digits,
     ).exclude(pk=answered_leg.pk).order_by('started_at')[:_MAX_CANDIDATES]
-    count = 0
     for leg in legs:
         sibling = find_answered_sibling(leg)
         if sibling is not None and _mark_answered_elsewhere(leg, sibling):

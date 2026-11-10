@@ -528,7 +528,42 @@ class CallLogViewSet(viewsets.ModelViewSet):
             {'error': 'Only the agent handling this call or a PBX administrator can change it.'},
             status=status.HTTP_403_FORBIDDEN,
         )
-    
+
+    # Legal status moves for update_status. Any live status may move to a
+    # final one (FINAL_STATUSES); a final status never moves again (409);
+    # repeating the current status is an idempotent no-op (200).
+    STATUS_TRANSITIONS = {
+        'initiated': frozenset({'ringing', 'answered'}),
+        'ringing': frozenset({'answered'}),
+        'answered': frozenset({'on_hold', 'recording'}),
+        'on_hold': frozenset({'answered'}),
+        'recording': frozenset({'answered', 'on_hold'}),
+    }
+
+    @classmethod
+    def _transition_allowed(cls, old_status, new_status):
+        if old_status == new_status:
+            return True
+        if old_status in FINAL_STATUSES:
+            return False
+        if new_status in FINAL_STATUSES:
+            return True
+        return new_status in cls.STATUS_TRANSITIONS.get(old_status, frozenset())
+
+    @staticmethod
+    def _illegal_transition(old_status, new_status):
+        return Response(
+            {
+                'error': f'Cannot change a call from {old_status} to {new_status}.',
+                'status': old_status,
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    # A browser re-posting the same ringing INVITE (two tabs, a retry after a
+    # timeout) within this window gets its existing row back.
+    INCOMING_DEDUPE_WINDOW = timedelta(minutes=10)
+
     def _create_call_event(self, call_log, event_type, metadata=None, user=None):
         """Helper method to create call events"""
         CallEvent.objects.create(
@@ -653,64 +688,111 @@ class CallLogViewSet(viewsets.ModelViewSet):
     
     @extend_schema(
         summary="Log an incoming call",
-        description="Log an incoming call when it starts ringing",
-        request=CallLogCreateSerializer,
+        description=(
+            "Log an incoming call when it starts ringing. ``sip_call_id`` (the "
+            "INVITE's Call-ID) is required; ``pbx_call_id`` (the Asterisk "
+            "LINKEDID from the X-EchoDesk-Call header, shared by every agent "
+            "leg of one call) is optional. Posting the same ``sip_call_id`` "
+            "again within 10 minutes returns the existing row with 200 instead "
+            "of logging a second leg."
+        ),
+        request=inline_serializer(
+            name='LogIncomingCall',
+            fields={
+                'caller_number': drf_serializers.CharField(required=False, allow_blank=True),
+                'recipient_number': drf_serializers.CharField(required=False, allow_blank=True),
+                'sip_call_id': drf_serializers.CharField(),
+                'pbx_call_id': drf_serializers.CharField(required=False, allow_blank=True),
+            },
+        ),
         responses={
+            200: CallLogSerializer,
             201: CallLogSerializer,
             400: OpenApiTypes.OBJECT
         }
     )
     @action(detail=False, methods=['post'])
     def log_incoming_call(self, request):
-        """Log an incoming call"""
-        # Extract data from request
-        caller_number = request.data.get('caller_number', '')
-        recipient_number = request.data.get('recipient_number', '')
-        sip_call_id = request.data.get('sip_call_id', '')
-        
+        """Log an incoming call (one row per agent leg, deduped per INVITE)."""
+        from django.db import transaction
+
+        def _text(key, limit):
+            value = request.data.get(key, '')
+            return (str(value) if value is not None else '').strip()[:limit]
+
+        caller_number = _text('caller_number', 64)
+        recipient_number = _text('recipient_number', 64)
+        sip_call_id = _text('sip_call_id', 255)
+        pbx_call_id = _text('pbx_call_id', 64)
+
+        if not sip_call_id:
+            return Response(
+                {'sip_call_id': ['This field is required.']},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # Get default SIP configuration
         sip_config = SipConfiguration.objects.filter(
             is_default=True,
             is_active=True
         ).first()
-        
+
         if not sip_config:
             return Response(
-                {'error': 'No default SIP configuration found'}, 
+                {'error': 'No default SIP configuration found'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        # Auto-match client by caller phone number
-        crm_client, social_client = self._match_client(caller_number)
 
-        # Create call log for incoming call
-        call_log = CallLog.objects.create(
-            caller_number=caller_number,
-            recipient_number=recipient_number,
-            direction='inbound',
-            call_type='voice',
-            status='ringing',
-            handled_by=request.user,
-            sip_configuration=sip_config,
-            sip_call_id=sip_call_id,
-            client=crm_client,
-            social_client=social_client,
-            started_at=timezone.now()
-        )
-        
-        # Create initial call event
-        self._create_call_event(
-            call_log,
-            'ringing',
-            metadata={
-                'caller': caller_number,
-                'recipient': recipient_number,
-                'sip_call_id': sip_call_id
-            }
-        )
-        
+        with transaction.atomic():
+            existing = (
+                CallLog.objects.select_for_update()
+                .filter(
+                    sip_call_id=sip_call_id,
+                    handled_by=request.user,
+                    started_at__gte=timezone.now() - self.INCOMING_DEDUPE_WINDOW,
+                )
+                .order_by('-started_at')
+                .first()
+            )
+            if existing is not None:
+                if pbx_call_id and not existing.pbx_call_id:
+                    existing.pbx_call_id = pbx_call_id
+                    existing.save(update_fields=['pbx_call_id'])
+                return Response(self._out(existing), status=status.HTTP_200_OK)
+
+            # Auto-match client by caller phone number
+            crm_client, social_client = self._match_client(caller_number)
+
+            # Create call log for incoming call
+            call_log = CallLog.objects.create(
+                caller_number=caller_number,
+                recipient_number=recipient_number,
+                direction='inbound',
+                call_type='voice',
+                status='ringing',
+                handled_by=request.user,
+                sip_configuration=sip_config,
+                sip_call_id=sip_call_id,
+                pbx_call_id=pbx_call_id,
+                client=crm_client,
+                social_client=social_client,
+                started_at=timezone.now()
+            )
+
+            # Create initial call event
+            self._create_call_event(
+                call_log,
+                'ringing',
+                metadata={
+                    'caller': caller_number,
+                    'recipient': recipient_number,
+                    'sip_call_id': sip_call_id,
+                    'pbx_call_id': pbx_call_id,
+                }
+            )
+
         return Response(self._out(call_log), status=status.HTTP_201_CREATED)
-    
+
     @extend_schema(
         summary="Update call status",
         description=(
@@ -729,11 +811,13 @@ class CallLogViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['patch'])
     def update_status(self, request, pk=None):
         """Update call status"""
+        from django.db import transaction
+
         call_log = self.get_object()
         if not self._may_change_call(call_log):
             return self._forbidden_call_change()
         serializer = CallStatusUpdateSerializer(data=request.data)
-        
+
         if serializer.is_valid():
             recording_url = serializer.validated_data.get('recording_url')
             if recording_url and not is_allowed_recording_url(recording_url):
@@ -741,49 +825,56 @@ class CallLogViewSet(viewsets.ModelViewSet):
                     {'recording_url': ['Recording URL must be on one of the tenant\'s PBX hosts.']},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            old_status = call_log.status
             new_status = serializer.validated_data['status']
-            
-            # Update call status
-            call_log.status = new_status
-            
-            # Set answered_at if call is answered
-            if new_status == 'answered' and not call_log.answered_at:
-                call_log.answered_at = timezone.now()
-            
-            # Set ended_at and calculate duration if call ended
-            if new_status in ['ended', 'missed', 'failed', 'cancelled']:
-                if not call_log.ended_at:
-                    call_log.ended_at = timezone.now()
-                    if call_log.answered_at:
-                        call_log.duration = call_log.ended_at - call_log.answered_at
-                    else:
-                        call_log.duration = timedelta(seconds=0)
-            
-            # Update optional fields
-            if 'notes' in serializer.validated_data:
-                call_log.notes = serializer.validated_data['notes']
-            if 'call_quality_score' in serializer.validated_data:
-                call_log.call_quality_score = serializer.validated_data['call_quality_score']
-            if 'recording_url' in serializer.validated_data:
-                call_log.recording_url = serializer.validated_data['recording_url']
-            
-            call_log.save()
-            
-            # Create call event for status change
-            event_metadata = {
-                'old_status': old_status,
-                'new_status': new_status
-            }
-            if 'notes' in serializer.validated_data:
-                event_metadata['notes'] = serializer.validated_data['notes']
-            if 'call_quality_score' in serializer.validated_data:
-                event_metadata['quality_score'] = serializer.validated_data['call_quality_score']
-            
-            self._create_call_event(call_log, new_status, metadata=event_metadata)
-            
+
+            with transaction.atomic():
+                # Re-read under a row lock: the softphone's end_call / a
+                # webhook / a colleague's answer may be racing this update.
+                call_log = CallLog.objects.select_for_update().get(pk=call_log.pk)
+                old_status = call_log.status
+                if not self._transition_allowed(old_status, new_status):
+                    return self._illegal_transition(old_status, new_status)
+
+                # Update call status
+                call_log.status = new_status
+
+                # Set answered_at if call is answered
+                if new_status == 'answered' and not call_log.answered_at:
+                    call_log.answered_at = timezone.now()
+
+                # Set ended_at and calculate duration if call ended
+                if new_status in FINAL_STATUSES:
+                    if not call_log.ended_at:
+                        call_log.ended_at = timezone.now()
+                        if call_log.answered_at:
+                            call_log.duration = call_log.ended_at - call_log.answered_at
+                        else:
+                            call_log.duration = timedelta(seconds=0)
+
+                # Update optional fields
+                if 'notes' in serializer.validated_data:
+                    call_log.notes = serializer.validated_data['notes']
+                if 'call_quality_score' in serializer.validated_data:
+                    call_log.call_quality_score = serializer.validated_data['call_quality_score']
+                if 'recording_url' in serializer.validated_data:
+                    call_log.recording_url = serializer.validated_data['recording_url']
+
+                call_log.save()
+
+                # Create call event for status change
+                event_metadata = {
+                    'old_status': old_status,
+                    'new_status': new_status
+                }
+                if 'notes' in serializer.validated_data:
+                    event_metadata['notes'] = serializer.validated_data['notes']
+                if 'call_quality_score' in serializer.validated_data:
+                    event_metadata['quality_score'] = serializer.validated_data['call_quality_score']
+
+                self._create_call_event(call_log, new_status, metadata=event_metadata)
+
             return Response(self._out(call_log))
-        
+
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
     @extend_schema(
@@ -797,7 +888,9 @@ class CallLogViewSet(viewsets.ModelViewSet):
             "neither as answered nor as missed). A ``missed`` leg is also "
             "re-labelled ``cancelled`` later when the queue's next agent "
             "answers (sequential strategies such as rrmemory), and then nobody "
-            "is notified. 400 when the call is already over. "
+            "is notified. Ending a leg that is already ``cancelled`` is a "
+            "200 no-op (the softphone may end it after the server relabelled "
+            "it); 400 when the call is over for any other reason. "
             "Only the call's handling agent (``handled_by``), staff/superusers "
             "and PBX admins may end it (403 otherwise)."
         ),
@@ -812,43 +905,54 @@ class CallLogViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def end_call(self, request, pk=None):
         """End an ongoing call"""
+        from django.db import transaction
+
         from .call_notifications import find_answered_sibling
 
         call_log = self.get_object()
         if not self._may_change_call(call_log):
             return self._forbidden_call_change()
 
-        if call_log.status in FINAL_STATUSES:
-            return Response(
-                {'error': 'Call has already ended'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        with transaction.atomic():
+            # Row lock: the relabel of a ring-all sibling (answered elsewhere)
+            # or a concurrent update_status may be writing this row.
+            call_log = CallLog.objects.select_for_update().get(pk=call_log.pk)
 
-        call_log.ended_at = timezone.now()
-        outcome = 'ended'
-        if call_log.answered_at:
-            call_log.duration = call_log.ended_at - call_log.answered_at
-        else:
-            call_log.duration = timedelta(seconds=0)
-            if call_log.direction == 'inbound':
-                outcome = 'answered_elsewhere' if find_answered_sibling(call_log) else 'missed'
+            if call_log.status == ANSWERED_ELSEWHERE_STATUS:
+                # Already relabelled "answered elsewhere" by the colleague's
+                # answer: the softphone ending its leg is a no-op.
+                return Response(self._out(call_log))
+            if call_log.status in FINAL_STATUSES:
+                return Response(
+                    {'error': 'Call has already ended'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
-        if outcome == 'missed':
-            call_log.status = 'missed'
-        elif outcome == 'answered_elsewhere':
-            call_log.status = ANSWERED_ELSEWHERE_STATUS
-        else:
-            call_log.status = 'ended'
-        call_log.save()
+            call_log.ended_at = timezone.now()
+            outcome = 'ended'
+            if call_log.answered_at:
+                call_log.duration = call_log.ended_at - call_log.answered_at
+            else:
+                call_log.duration = timedelta(seconds=0)
+                if call_log.direction == 'inbound':
+                    outcome = 'answered_elsewhere' if find_answered_sibling(call_log) else 'missed'
 
-        # Create call event for call end
-        metadata = {
-            'duration_seconds': call_log.duration.total_seconds() if call_log.duration else 0,
-            'ended_by': 'user',
-        }
-        if outcome != 'ended':
-            metadata['outcome'] = outcome
-        self._create_call_event(call_log, 'ended', metadata=metadata)
+            if outcome == 'missed':
+                call_log.status = 'missed'
+            elif outcome == 'answered_elsewhere':
+                call_log.status = ANSWERED_ELSEWHERE_STATUS
+            else:
+                call_log.status = 'ended'
+            call_log.save()
+
+            # Create call event for call end
+            metadata = {
+                'duration_seconds': call_log.duration.total_seconds() if call_log.duration else 0,
+                'ended_by': 'user',
+            }
+            if outcome != 'ended':
+                metadata['outcome'] = outcome
+            self._create_call_event(call_log, 'ended', metadata=metadata)
 
         return Response(self._out(call_log))
 
@@ -1970,11 +2074,12 @@ def sip_webhook(request):
         }
         
         call_status = event_status_map.get(event_type, 'ringing')
-        
-        # Try to find existing call log by SIP call ID
-        try:
-            call_log = CallLog.objects.get(sip_call_id=sip_call_id)
-            
+
+        # Find the existing call log by SIP call ID. sip_call_id is not
+        # unique (a retried INVITE / an older leg may share it): take the
+        # latest leg instead of letting MultipleObjectsReturned 500.
+        call_log = CallLog.objects.filter(sip_call_id=sip_call_id).order_by('-started_at').first()
+        if call_log is not None:
             # Update existing call
             old_status = call_log.status
             call_log.status = call_status
@@ -2002,8 +2107,8 @@ def sip_webhook(request):
                     **metadata
                 }
             )
-            
-        except CallLog.DoesNotExist:
+
+        else:
             # Create new call log for incoming calls
             if event_type in ['call_initiated', 'call_ringing']:
                 # Get default SIP configuration
