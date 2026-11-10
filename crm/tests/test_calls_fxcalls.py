@@ -36,7 +36,7 @@ from crm.recording_hosts import (
     resolve_public_addresses,
     safe_recording_content_type,
 )
-from crm.tests.conftest import CrmTestCase
+from crm.tests.conftest import CrmTestCase, without_call_events
 from users.models import Notification
 
 DID = '+995322777000'
@@ -126,7 +126,7 @@ class TestRrmemoryAnsweredElsewhere(_QueueCallMixin, CrmTestCase):
         self.assertEqual(resp.status_code, 200)
         # Nobody has answered yet, so it is a missed leg for now.
         self.assertEqual(resp.data['status'], 'missed')
-        self.assertEqual(len(delayed), 1)
+        self.assertEqual(len(without_call_events(delayed)), 1)
         _set(leg_a, ended_at=now - timedelta(seconds=45))
 
         leg_b = _set(self.leg(self.agent_b), started_at=now - timedelta(seconds=40))
@@ -279,7 +279,7 @@ class TestRingallAnsweredElsewhere(_QueueCallMixin, CrmTestCase):
         with self.captureOnCommitCallbacks(execute=True) as callbacks:
             resp = self.api_post(f'/api/call-logs/{leg_a.id}/end_call/', {}, user=self.agent_a)
         self.assertEqual(resp.data['status'], 'cancelled')
-        self.assertEqual(len(callbacks), 0)
+        self.assertEqual(without_call_events(callbacks), [])
         self.api_post(f'/api/call-logs/{leg_b.id}/end_call/', {}, user=self.agent_b)
         self.assertEqual(self.missed_notifs().count(), 0)
         self.assert_one_served_call(answered_by=self.agent_b, other=self.agent_a)
