@@ -787,7 +787,7 @@ class CallLogViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['post'])
     def log_incoming_call(self, request):
         """Log an incoming call (one row per agent leg, deduped per INVITE)."""
-        from django.db import transaction
+        from django.db import connection, transaction
 
         def _text(key, limit):
             value = request.data.get(key, '')
@@ -817,6 +817,15 @@ class CallLogViewSet(viewsets.ModelViewSet):
             )
 
         with transaction.atomic():
+            # Serialise same-INVITE posts from this user for the length of
+            # the transaction: a row lock cannot cover a row that does not
+            # exist yet, so two concurrent posts (two tabs, a retry) would
+            # both miss the lookup below and both insert.
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    'SELECT pg_advisory_xact_lock(hashtext(%s))',
+                    [f'log_incoming_call:{request.user.pk}:{sip_call_id}'],
+                )
             existing = (
                 CallLog.objects.select_for_update()
                 .filter(
