@@ -398,7 +398,7 @@ class CallLogCreateSerializer(serializers.ModelSerializer):
 
 class CallInitiateSerializer(serializers.Serializer):
     """Serializer for initiating outbound calls"""
-    recipient_number = serializers.CharField(max_length=20)
+    recipient_number = serializers.CharField(max_length=64)
     call_type = serializers.ChoiceField(
         choices=CallLog.CALL_TYPE_CHOICES, 
         default='voice'

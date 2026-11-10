@@ -13,7 +13,7 @@ class SipConfiguration(models.Model):
     sip_server = models.CharField(max_length=255, help_text="SIP server hostname/IP")
     sip_port = models.IntegerField(default=5060, help_text="SIP server port")
     username = models.CharField(max_length=100, help_text="SIP username")
-    password = models.CharField(max_length=255, help_text="SIP password")
+    password = EncryptedCharField(help_text="SIP password (encrypted at rest)")
     realm = models.CharField(max_length=255, blank=True, help_text="SIP realm/domain")
     proxy = models.CharField(max_length=255, blank=True, help_text="Outbound proxy")
     phone_number = models.CharField(max_length=30, blank=True, help_text="Trunk phone number (e.g., +995322421219)")
@@ -33,7 +33,11 @@ class SipConfiguration(models.Model):
     )
     turn_server = models.CharField(max_length=255, blank=True, help_text="TURN server")
     turn_username = models.CharField(max_length=100, blank=True)
-    turn_password = models.CharField(max_length=255, blank=True)
+    turn_password = EncryptedCharField(blank=True, default='', help_text="Static TURN credential (encrypted at rest)")
+    turn_auth_secret = EncryptedCharField(
+        blank=True, default='',
+        help_text="coturn static-auth-secret; when set the softphone gets ephemeral TURN credentials instead of turn_password",
+    )
     
     # Settings
     is_active = models.BooleanField(default=True)
@@ -44,7 +48,9 @@ class SipConfiguration(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name='created_sip_configs'
     )
     
@@ -77,7 +83,7 @@ class UserPhoneAssignment(models.Model):
         help_text="The SIP trunk/server this extension belongs to"
     )
     extension = models.CharField(max_length=20, help_text="PBX extension number (e.g., 100)")
-    extension_password = models.CharField(max_length=255, help_text="PBX extension password")
+    extension_password = EncryptedCharField(help_text="PBX extension password (encrypted at rest)")
     phone_number = models.CharField(max_length=30, help_text="Display phone number (e.g., +995322421219)")
     display_name = models.CharField(max_length=100, blank=True, help_text="Caller ID display name")
     is_primary = models.BooleanField(default=True, help_text="Primary number for this user")
@@ -151,8 +157,8 @@ class CallLog(models.Model):
     
     # Basic call information
     call_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
-    caller_number = models.CharField(max_length=20)
-    recipient_number = models.CharField(max_length=20)
+    caller_number = models.CharField(max_length=64)
+    recipient_number = models.CharField(max_length=64)
     direction = models.CharField(max_length=10, choices=DIRECTION_CHOICES, default='inbound')
     call_type = models.CharField(max_length=15, choices=CALL_TYPE_CHOICES, default='voice')
     
@@ -168,6 +174,10 @@ class CallLog(models.Model):
     
     # SIP-specific fields
     sip_call_id = models.CharField(max_length=255, blank=True, help_text="SIP Call-ID header")
+    pbx_call_id = models.CharField(
+        max_length=64, blank=True, default='', db_index=True,
+        help_text="Asterisk LINKEDID shared by every leg of one call (from the X-EchoDesk-Call header)",
+    )
     sip_configuration = models.ForeignKey(
         SipConfiguration, 
         on_delete=models.SET_NULL, 
@@ -469,7 +479,7 @@ class PbxSettings(models.Model):
         choices=[('callback', 'Phone Callback'), ('sms', 'SMS Link'), ('both', 'Both'), ('none', 'Disabled')],
         help_text="How to collect post-call ratings"
     )
-    sms_api_key = models.CharField(max_length=255, blank=True, default='', help_text="sender.ge API key")
+    sms_api_key = EncryptedCharField(blank=True, default='', help_text="sender.ge API key (encrypted at rest)")
     sms_rating_template_ka = models.TextField(
         blank=True,
         default='გმადლობთ დაკავშირებისთვის! გთხოვთ შეაფასეთ ჩვენი მომსახურება: {link}',
@@ -596,7 +606,7 @@ class Trunk(models.Model):
     sip_server = models.CharField(max_length=255, help_text="SIP server hostname/IP")
     sip_port = models.IntegerField(default=5060, help_text="SIP server port")
     username = models.CharField(max_length=100, help_text="SIP username")
-    password = models.CharField(max_length=255, help_text="SIP password")
+    password = EncryptedCharField(help_text="SIP password (encrypted at rest)")
     realm = models.CharField(max_length=255, blank=True, help_text="SIP realm/domain")
     proxy = models.CharField(max_length=255, blank=True, help_text="Outbound proxy")
     register = models.BooleanField(default=True, help_text="Whether Asterisk should register against this trunk")
@@ -909,6 +919,11 @@ class PbxServer(models.Model):
         null=True, blank=True,
         help_text="Install token TTL; after this the install endpoint returns 410.",
     )
+    api_token = models.CharField(
+        max_length=64, unique=True, db_index=True,
+        help_text="Long-lived token the PBX sends as X-PBX-Token on webhooks + AGI "
+                  "callbacks. Separate from the 24h enrollment_token.",
+    )
     status = models.CharField(
         max_length=16, choices=STATUS_CHOICES, default=STATUS_PENDING, db_index=True,
     )
@@ -939,6 +954,8 @@ class PbxServer(models.Model):
         if not self.enrollment_token:
             import secrets
             self.enrollment_token = secrets.token_urlsafe(48)
+        if not self.api_token:
+            self.api_token = self._mint_api_token()
         if not self.ami_host:
             self.ami_host = self.fqdn
         if not self.wss_url and self.fqdn:
@@ -950,6 +967,15 @@ class PbxServer(models.Model):
     @property
     def is_active(self) -> bool:
         return self.status == self.STATUS_ACTIVE
+
+    @staticmethod
+    def _mint_api_token() -> str:
+        import secrets
+        return secrets.token_urlsafe(32)
+
+    def regenerate_api_token(self):
+        """Mint a fresh long-lived PBX token; the old one stops authenticating."""
+        self.api_token = self._mint_api_token()
 
     def regenerate_enrollment_token(self, ttl_hours: int = 24):
         """Mint a fresh install token; invalidates any previous one."""
