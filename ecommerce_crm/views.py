@@ -62,8 +62,10 @@ OPEN_ORDER_STATUSES = ('pending', 'confirmed', 'processing', 'shipped')
 def _open_orders_conflict(**item_filter):
     """409 response listing the open orders whose lines match ``item_filter``
     (e.g. ``product=p``), or None when nothing blocks the delete."""
+    # Hidden ("cleaned") open orders don't block: the lines are SET_NULL and
+    # keep their snapshot, so nothing is lost if the product goes.
     numbers = list(
-        Order.objects.filter(status__in=OPEN_ORDER_STATUSES, **{f'items__{k}': v for k, v in item_filter.items()})
+        Order.visible().filter(status__in=OPEN_ORDER_STATUSES, **{f'items__{k}': v for k, v in item_filter.items()})
         .order_by('created_at').values_list('order_number', flat=True).distinct()[:20]
     )
     if not numbers:
@@ -2120,10 +2122,22 @@ class OrderFilter(FilterSet):
     created_after = CharFilter(method='filter_created_after', help_text='ISO date or datetime (inclusive)')
     created_before = CharFilter(method='filter_created_before', help_text='ISO date or datetime (inclusive when a date)')
     has_tracking = BooleanFilter(method='filter_has_tracking', help_text='true: tracking number set; false: none')
+    cleaned = BooleanFilter(
+        method='filter_cleaned',
+        help_text='true: only orders hidden by "clean order list"; false/omitted (default): only visible orders',
+    )
 
     class Meta:
         model = Order
         fields = ['client', 'status', 'payment_status', 'payment_method', 'payment_provider']
+
+    def filter_cleaned(self, queryset, name, value):
+        # OrderViewSet.get_queryset already picks the visible/cleaned side
+        # from the same parameter (so it applies without a filterset too);
+        # re-applying here is idempotent.
+        if value is None:
+            return queryset
+        return queryset.filter(is_deleted=bool(value))
 
     @staticmethod
     def _csv(value):
@@ -2202,9 +2216,24 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
     ordering_fields = ['created_at', 'total_amount', 'status']
     ordering = ['-created_at']
 
+    @staticmethod
+    def _wants_cleaned(request):
+        return (request.query_params.get('cleaned') or '').strip().lower() in ('true', '1', 'yes')
+
     def get_queryset(self):
-        """Optimize queryset with select_related and prefetch_related"""
-        queryset = super().get_queryset().select_related(
+        """Visible orders by default; ``?cleaned=true`` lists the hidden ones.
+
+        ``retrieve`` and ``restore`` see both sides so an admin can open and
+        bring back a cleaned order. Every mutation (update, destroy,
+        update_status, mark_paid, refund, initiate_payment) and the export
+        stay visible-only, so they 404 on a hidden order.
+        """
+        queryset = super().get_queryset()
+        if self.action == 'list':
+            queryset = queryset.filter(is_deleted=self._wants_cleaned(self.request))
+        elif self.action not in ('retrieve', 'restore'):
+            queryset = queryset.filter(is_deleted=False)
+        queryset = queryset.select_related(
             'client',
             'delivery_address'
         )
@@ -2654,7 +2683,7 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
         month_ago = today - timedelta(days=30)
         prev_month_start = today - timedelta(days=60)
 
-        orders = Order.objects.exclude(status='cancelled')
+        orders = Order.visible().exclude(status='cancelled')
         paid_orders = orders.filter(payment_status='paid')
 
         # Revenue by period
@@ -2701,7 +2730,9 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
         # Top products
         top_products = list(
             # Lines of deleted products have no product row to group by.
-            OrderItem.objects.filter(product__isnull=False).values('product__name').annotate(
+            # Same population as the counts above: no cleaned, no cancelled.
+            OrderItem.objects.filter(product__isnull=False, order__is_deleted=False)
+            .exclude(order__status='cancelled').values('product__name').annotate(
                 sold=Sum('quantity'),
                 revenue=Sum(F('price') * F('quantity'))
             ).order_by('-sold')[:10]
@@ -2738,7 +2769,10 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
         ).count()
         # Returning = customers with more than 1 order
         returning_customers = EcommerceClient.objects.annotate(
-            order_count=Count('orders', filter=Q(orders__status__in=['confirmed', 'processing', 'shipped', 'delivered']))
+            order_count=Count('orders', filter=Q(
+                orders__is_deleted=False,
+                orders__status__in=['confirmed', 'processing', 'shipped', 'delivered'],
+            ))
         ).filter(order_count__gt=1).count()
 
         # Revenue by payment method
@@ -2857,7 +2891,7 @@ class OrderViewSet(NoCacheMixin, EcommercePermissionMixin, ProtectedDestroyMixin
         except (TypeError, ValueError):
             return Response({'error': 'order_ids must be integers'}, status=status.HTTP_400_BAD_REQUEST)
 
-        orders = list(Order.objects.filter(id__in=order_ids))
+        orders = list(Order.visible().filter(id__in=order_ids))
         if len(orders) != len(order_ids):
             found_ids = {o.id for o in orders}
             missing = [oid for oid in order_ids if oid not in found_ids]

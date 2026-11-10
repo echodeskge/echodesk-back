@@ -940,8 +940,8 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
     ordering = ['-created_at']
 
     def get_queryset(self):
-        """Return only orders belonging to the authenticated client"""
-        return Order.objects.filter(client=self.request.user).select_related('client', 'delivery_address').prefetch_related('items', 'items__product', 'items__variant__attribute_values__attribute')
+        """Return only orders belonging to the authenticated client (cleaned ones are hidden)"""
+        return Order.visible().filter(client=self.request.user).select_related('client', 'delivery_address').prefetch_related('items', 'items__product', 'items__variant__attribute_values__attribute')
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -1990,7 +1990,7 @@ def get_order_by_public_token(request):
         return Response({'error': 'token is required'}, status=status.HTTP_400_BAD_REQUEST)
     try:
         order = (
-            Order.objects
+            Order.visible()  # a cleaned order's guest link 404s like an unknown token
             .select_related('client', 'delivery_address')
             .prefetch_related('items', 'items__product', 'items__variant')
             .get(public_token=token)
