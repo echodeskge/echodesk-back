@@ -2,7 +2,7 @@ import logging
 import socket
 
 from rest_framework import serializers as drf_serializers, viewsets, permissions, status, filters
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.decorators import action, api_view, authentication_classes, permission_classes
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
@@ -2706,29 +2706,34 @@ def _resolve_routing_for_tenant(tenant_schema: str, did: str):
     """Run the DID → InboundRoute resolution inside ``tenant_schema``.
 
     Returns a response dict ready to return from :func:`call_routing`, or
-    ``None`` if no SIP config / routing data was found in this tenant.
+    ``None`` when the DID is unknown to this tenant: no SipConfiguration
+    owns it (by phone-number suffix) and the tenant has no default
+    configuration to fall back to. Resolution only ever reads: a tenant
+    without a ``PbxSettings`` row gets the model defaults, nothing is
+    created on an inbound ring.
     """
-    from django.conf import settings as django_settings
     from tenant_schemas.utils import schema_context
 
-    clean_did = did.replace('+', '').replace(' ', '').replace('-', '')
+    clean_did = ''.join(ch for ch in did if ch.isdigit())
 
     with schema_context(tenant_schema):
         from crm.models import InboundRoute, Queue, Trunk
 
-        # Try matching by phone number first, then fall back to default config
-        sip_config = SipConfiguration.objects.filter(
-            phone_number__endswith=clean_did[-7:]
-        ).first()
+        # The configuration that owns this DID, else the tenant's default.
+        # No "any configuration" fallback: a DID nobody owns is a 404.
+        sip_config = None
+        if len(clean_did) >= 7:
+            sip_config = SipConfiguration.objects.filter(
+                phone_number__endswith=clean_did[-7:]
+            ).first()
         if not sip_config:
             sip_config = SipConfiguration.objects.filter(is_default=True).first()
         if not sip_config:
-            sip_config = SipConfiguration.objects.first()
-        if not sip_config:
             return None
 
-        pbx_settings, _ = PbxSettings.objects.get_or_create(
-            sip_configuration=sip_config
+        pbx_settings = (
+            PbxSettings.objects.filter(sip_configuration=sip_config).first()
+            or PbxSettings(sip_configuration=sip_config)  # unsaved defaults
         )
 
         is_working = pbx_settings.is_working_hours_now()
@@ -2737,11 +2742,11 @@ def _resolve_routing_for_tenant(tenant_schema: str, did: str):
         # Resolve InboundRoute for this DID (exact, then any route whose
         # trunk owns this DID). When matched we can override extensions
         # and action with the route's configured destination.
-        route = InboundRoute.objects.filter(
-            did=did, is_active=True
-        ).first() or InboundRoute.objects.filter(
-            did__endswith=clean_did[-9:], is_active=True
-        ).first()
+        route = InboundRoute.objects.filter(did=did, is_active=True).first()
+        if not route and len(clean_did) >= 7:
+            route = InboundRoute.objects.filter(
+                did__endswith=clean_did[-9:], is_active=True
+            ).first()
         if not route:
             trunk_for_did = Trunk.objects.filter(
                 phone_numbers__contains=[did], is_active=True
@@ -2838,96 +2843,91 @@ def _resolve_routing_for_tenant(tenant_schema: str, did: str):
         }
 
 
-@csrf_exempt
-@api_view(['GET'])
-@permission_classes([])
-def call_routing(request):
-    """
-    Lightweight endpoint for Asterisk to query on each incoming call.
-    Returns working hours status, routing action, and sound URLs.
+def _legacy_routing_tenant(request):
+    """Tenant for :func:`call_routing` on requests that BK-01's
+    ``@pbx_authenticated`` has not identified (``request.pbx_schema``
+    absent): the ``X-PBX-Token`` / ``?pbx_token=`` maps to the PbxServer's
+    tenant (unknown token → ``None``, never a scan of other tenants'
+    routes); without a token the legacy ``Authorization`` shared secret
+    is required when configured, and the tenant is the request's own
+    schema. Returns ``None`` when the request must be rejected.
 
-    Query params:
-        did: The DID/phone number that was called (e.g., +995322421219)
-        pbx_token: (optional) Tenant-scoping token; fallback for the header.
-
-    Headers:
-        X-PBX-Token: (optional) When set, resolves tenant via
-            ``PbxServer.enrollment_token`` for O(1) routing — Asterisk's
-            install script bakes this in so we don't have to iterate every
-            tenant on every call.
-        Authorization: Bearer <PBX_SHARED_SECRET> — legacy shared secret,
-            still accepted for backwards compat during the BYO migration.
+    Superseded by ``crm.pbx_auth`` once that lands; delete together with
+    :func:`_resolve_tenant_by_pbx_token`.
     """
+    import hmac
+
     from django.conf import settings as django_settings
-    from tenants.models import Tenant
+    from django.db import connection
 
-    # Authenticate via shared secret (legacy). When X-PBX-Token is present
-    # we treat the token itself as sufficient auth — the token is a 64+ char
-    # secret minted by EchoDesk at enrollment time.
     pbx_token = (
         request.META.get('HTTP_X_PBX_TOKEN', '')
         or request.GET.get('pbx_token', '')
     ).strip()
+    if pbx_token:
+        return _resolve_tenant_by_pbx_token(pbx_token)
 
-    auth_header = request.META.get('HTTP_AUTHORIZATION', '')
     expected_shared_secret = getattr(django_settings, 'PBX_SHARED_SECRET', '')
-    if not pbx_token:
-        # Legacy path: require the shared secret.
-        if expected_shared_secret and not auth_header.endswith(expected_shared_secret):
-            return Response(
-                {'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED
-            )
+    if expected_shared_secret:
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        scheme, _, presented = auth_header.partition(' ')
+        if scheme.lower() != 'bearer' or not hmac.compare_digest(
+            presented.strip(), expected_shared_secret
+        ):
+            return None
+    schema = getattr(connection, 'schema_name', None)
+    if not schema or schema == 'public':
+        return None
+    return schema
 
+
+@extend_schema(
+    summary="Call routing for the PBX (AGI)",
+    description=(
+        "Called by the tenant's Asterisk on every inbound call. The tenant "
+        "is the one the PBX token identifies (``X-PBX-Token`` / "
+        "``?pbx_token=``); an unknown token is 401. The DID is resolved "
+        "inside that tenant only: the SipConfiguration owning it (phone "
+        "number suffix) or the tenant's default one, then the matching "
+        "InboundRoute. A DID the tenant does not own is 404; the route of "
+        "another tenant is never returned. Read-only: nothing is created."
+    ),
+    parameters=[OpenApiParameter('did', OpenApiTypes.STR, OpenApiParameter.QUERY, required=True)],
+    responses={200: OpenApiTypes.OBJECT, 400: OpenApiTypes.OBJECT,
+               401: OpenApiTypes.OBJECT, 404: OpenApiTypes.OBJECT},
+)
+@csrf_exempt
+@api_view(['GET'])
+@authentication_classes([])  # the PBX presents a token / shared secret, not a user JWT
+@permission_classes([])
+def call_routing(request):
+    """Working-hours state, routing action, sounds and destination
+    extensions for ``?did=`` in the calling PBX's tenant.
+
+    The tenant comes from ``request.pbx_schema`` when the PBX
+    authentication layer set it, else from the legacy token / shared
+    secret handling in :func:`_legacy_routing_tenant`. There is no
+    all-tenant fallback: unknown token → 401, unknown DID → 404.
+    """
     did = request.GET.get('did', '').strip()
     if not did:
         return Response({'error': 'did parameter required'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # ------------------------------------------------------------------
-    # Fast path: X-PBX-Token identifies the tenant without scanning all.
-    # ------------------------------------------------------------------
-    if pbx_token:
-        tenant_schema = _resolve_tenant_by_pbx_token(pbx_token)
-        if tenant_schema is None:
-            return Response(
-                {'error': 'Unknown X-PBX-Token'},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
-        try:
-            resolved = _resolve_routing_for_tenant(tenant_schema, did)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "call_routing: resolution failed for tenant=%s did=%s",
-                tenant_schema, did,
-            )
-            resolved = None
-        if resolved is not None:
-            return Response(resolved)
-        # Fall through to the legacy scan as a last resort so a
-        # mis-wired DID doesn't 404 when the tenant actually exists.
+    tenant_schema = getattr(request, 'pbx_schema', None) or _legacy_routing_tenant(request)
+    if not tenant_schema:
+        return Response({'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
 
-    # ------------------------------------------------------------------
-    # Legacy all-tenant scan. Kept for backwards compatibility until every
-    # deployed Asterisk install script includes X-PBX-Token. Emits a
-    # warning so we notice if we accidentally regress to the slow path.
-    # ------------------------------------------------------------------
-    logger.warning(
-        "call_routing called without X-PBX-Token — O(N) fallback (did=%s)", did,
-    )
-    tenants = Tenant.objects.exclude(schema_name='public')
-    for tenant in tenants:
-        try:
-            resolved = _resolve_routing_for_tenant(tenant.schema_name, did)
-        except Exception:  # noqa: BLE001
-            continue
-        if resolved is not None:
-            return Response(resolved)
-
-    # DID not found in any tenant — default to open
-    return Response({
-        'is_working_hours': True,
-        'action': 'queue',
-        'sounds': {},
-        'extensions': [],
-        'voicemail_enabled': False,
-        'after_hours_action': 'announcement',
-    })
+    try:
+        resolved = _resolve_routing_for_tenant(tenant_schema, did)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "call_routing: resolution failed for tenant=%s did=%s", tenant_schema, did,
+        )
+        return Response(
+            {'error': 'Routing resolution failed'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    if resolved is None:
+        logger.info("call_routing: DID %s is not known to tenant %s", did, tenant_schema)
+        return Response({'error': 'Unknown DID'}, status=status.HTTP_404_NOT_FOUND)
+    return Response(resolved)

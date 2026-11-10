@@ -426,12 +426,22 @@ class TestCallRouting(CrmTestCase):
         )
         self.assertEqual(resp.status_code, 400)
 
-    def test_call_routing_unknown_did(self):
-        """Returns default open response for unknown DID."""
+    def test_call_routing_unknown_did_falls_back_to_tenant_default(self):
+        """A DID no configuration owns resolves to the tenant's *own*
+        default configuration (single-trunk tenants); see
+        test_call_routing for the 404 when there is no default."""
+        self._create_routing_setup(working_hours_enabled=False)
         resp = self.client.get(
             '/api/pbx/call-routing/?did=+999999999999',
             HTTP_HOST='tenant.test.com',
         )
         self.assertEqual(resp.status_code, 200)
-        # Default fallback should be open
         self.assertTrue(resp.data['is_working_hours'])
+        self.assertEqual(resp.data['tenant_schema'], self.tenant.schema_name)
+
+    def test_call_routing_unknown_did_without_config_is_404(self):
+        resp = self.client.get(
+            '/api/pbx/call-routing/?did=+999999999999',
+            HTTP_HOST='tenant.test.com',
+        )
+        self.assertEqual(resp.status_code, 404)
