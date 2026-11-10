@@ -497,6 +497,140 @@ class TestSoftphoneCredentials(CrmTestCase):
 
 
 # ============================================================================
+# Softphone transport: wss_url + ice_servers (+ ephemeral TURN)
+# ============================================================================
+
+
+class TestSoftphoneTransport(CrmTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.create_admin(email='tr-admin@test.com')
+        self.agent = self.create_user(email='tr-agent@test.com')
+        self.config = self.create_sip_config(
+            created_by=self.admin, is_default=True, sip_server='pbx.test.com', sip_port=8089,
+            websocket_path='/ws', stun_server='stun:stun.test:3478',
+            turn_server='turn:turn.test:3478?transport=tcp', turn_username='tu',
+            turn_password='TURN-PW',
+        )
+        self.create_phone_assignment(
+            user=self.agent, sip_config=self.config, extension='100', extension_password='PW',
+        )
+
+    def _pbx(self, **kwargs):
+        defaults = {
+            'name': 'PBX', 'fqdn': 'pbx.test.com', 'realtime_db_host': 'db',
+            'realtime_db_name': 'asterisk_test', 'realtime_db_user': 'rw',
+            'status': PbxServer.STATUS_ACTIVE,
+        }
+        defaults.update(kwargs)
+        return PbxServer.objects.create(**defaults)
+
+    def my_config(self):
+        resp = self.api_get('/api/sip-configurations/my_config/', user=self.agent)
+        self.assertEqual(resp.status_code, 200)
+        return resp.data['sip_configuration']
+
+    def webrtc_config(self):
+        resp = self.api_get(f'/api/sip-configurations/{self.config.id}/webrtc_config/',
+                            user=self.agent)
+        self.assertEqual(resp.status_code, 200)
+        return resp.data
+
+    def test_wss_url_built_from_configuration(self):
+        for sip in (self.my_config(), self.webrtc_config()):
+            self.assertEqual(sip['wss_url'], 'wss://pbx.test.com:8089/ws')
+
+    def test_wss_url_path_defaults_and_gets_a_slash(self):
+        self.config.websocket_path = ''
+        self.config.save()
+        self.assertEqual(self.my_config()['wss_url'], 'wss://pbx.test.com:8089/ws')
+        self.config.websocket_path = 'asterisk/ws'
+        self.config.save()
+        self.assertEqual(self.my_config()['wss_url'], 'wss://pbx.test.com:8089/asterisk/ws')
+
+    def test_active_pbx_server_wss_url_wins(self):
+        self._pbx(wss_url='wss://byo.test:8089/ws')
+        self.assertEqual(self.my_config()['wss_url'], 'wss://byo.test:8089/ws')
+        self.assertEqual(self.webrtc_config()['wss_url'], 'wss://byo.test:8089/ws')
+
+    def test_inactive_or_blank_pbx_server_does_not_apply(self):
+        self._pbx(wss_url='wss://pending.test:8089/ws', status=PbxServer.STATUS_PENDING)
+        self.assertEqual(self.my_config()['wss_url'], 'wss://pbx.test.com:8089/ws')
+        self._pbx(name='Blank', wss_url='')
+        self.assertEqual(self.my_config()['wss_url'], 'wss://pbx.test.com:8089/ws')
+
+    def test_plain_ws_only_for_local_hosts(self):
+        for host, expected in (
+            ('localhost', 'ws://localhost:8089/ws'),
+            ('127.0.0.1', 'ws://127.0.0.1:8089/ws'),
+            ('demo.lvh.me', 'ws://demo.lvh.me:8089/ws'),
+            ('pbx2.echodesk.cloud', 'wss://pbx2.echodesk.cloud:8089/ws'),
+            ('notlvh.me', 'wss://notlvh.me:8089/ws'),
+        ):
+            self.config.sip_server = host
+            self.config.save()
+            self.assertEqual(self.my_config()['wss_url'], expected, host)
+
+    def test_ice_servers_static_turn(self):
+        sip = self.my_config()
+        self.assertEqual(sip['ice_servers'], [
+            {'urls': 'stun:stun.test:3478'},
+            {'urls': 'turn:turn.test:3478?transport=tcp', 'username': 'tu', 'credential': 'TURN-PW'},
+        ])
+        # Static credentials: the legacy field stays filled.
+        self.assertEqual(sip['turn_password'], 'TURN-PW')
+        self.assertTrue(sip['has_turn_password'])
+
+    def test_ice_servers_without_stun_or_turn(self):
+        self.config.stun_server = ''
+        self.config.turn_server = ''
+        self.config.save()
+        self.assertEqual(self.my_config()['ice_servers'], [])
+
+    def test_ephemeral_turn_credentials(self):
+        import base64
+        import hashlib
+        import hmac
+        import time
+
+        self.config.turn_auth_secret = 'coturn-shared-secret'
+        self.config.save()
+        before = int(time.time())
+        sip = self.my_config()
+        turn = [s for s in sip['ice_servers'] if s['urls'].startswith('turn:')]
+        self.assertEqual(len(turn), 1)
+        turn = turn[0]
+        expiry_str, _, ext = turn['username'].partition(':')
+        self.assertEqual(ext, '100')
+        expiry = int(expiry_str)
+        self.assertGreaterEqual(expiry, before + 12 * 3600 - 5)
+        self.assertLessEqual(expiry, before + 12 * 3600 + 60)
+        expected = base64.b64encode(hmac.new(
+            b'coturn-shared-secret', turn['username'].encode(), hashlib.sha1,
+        ).digest()).decode()
+        self.assertEqual(turn['credential'], expected)
+        # The static password is withheld (and the secret never sent).
+        self.assertEqual(sip['turn_password'], '')
+        self.assertNotIn('TURN-PW', json.dumps(sip, default=str))
+        self.assertNotIn('coturn-shared-secret', json.dumps(sip, default=str))
+        self.assertNotIn('turn_auth_secret', sip)
+        # ``webrtc_config`` uses the caller's extension too.
+        wsip = self.webrtc_config()
+        self.assertTrue(wsip['ice_servers'][1]['username'].endswith(':100'))
+        self.assertEqual(wsip['turn_password'], '')
+
+    def test_detail_endpoint_has_no_transport_secrets(self):
+        self.config.turn_auth_secret = 'coturn-shared-secret'
+        self.config.save()
+        resp = self.api_get(f'/api/sip-configurations/{self.config.id}/', user=self.admin)
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn('ice_servers', resp.data)
+        self.assertNotIn('coturn-shared-secret', _body(resp))
+        self.assertEqual(resp.data['turn_password'], '')
+
+
+# ============================================================================
 # PBX admin writes
 # ============================================================================
 

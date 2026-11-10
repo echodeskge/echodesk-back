@@ -186,7 +186,14 @@ class SipConfigurationDetailSerializer(serializers.ModelSerializer):
 
     @extend_schema_field(serializers.CharField)
     def get_turn_password(self, obj):
-        return obj.turn_password if self._softphone() else ''
+        creds = self._softphone()
+        if not creds:
+            return ''
+        # Withheld when the softphone gets ephemeral TURN credentials
+        # (``ice_servers``) instead of the static password.
+        if not creds.get('static_turn_password', True):
+            return ''
+        return obj.turn_password
 
     @extend_schema_field(serializers.BooleanField)
     def get_has_password(self, obj):
@@ -203,21 +210,59 @@ class SipConfigurationDetailSerializer(serializers.ModelSerializer):
         return data
 
 
+class IceServerSerializer(serializers.Serializer):
+    """One ``RTCIceServer``: ``urls`` plus TURN credentials when needed."""
+    urls = serializers.CharField()
+    username = serializers.CharField(required=False)
+    credential = serializers.CharField(required=False)
+
+
 class SoftphoneSipConfigurationSerializer(SipConfigurationDetailSerializer):
     """``SipConfigurationDetail`` as the softphone endpoints return it
-    (``webrtc_config``, ``my_config.sip_configuration``), plus
-    ``sip_enabled``: true when ``username``/``password`` hold credentials
-    the caller may register with, false when they are blank (no extension
-    of their own), so the client can skip SIP registration."""
+    (``webrtc_config``, ``my_config.sip_configuration``), plus:
+
+    * ``sip_enabled``: true when ``username``/``password`` hold credentials
+      the caller may register with, false when they are blank (no extension
+      of their own), so the client can skip SIP registration.
+    * ``wss_url``: the SIP WebSocket URL to connect to (the tenant's active
+      PbxServer's ``wss_url`` when set, else built from ``sip_server`` /
+      ``sip_port`` / ``websocket_path``; ``ws://`` only for localhost /
+      ``*.lvh.me``).
+    * ``ice_servers``: ``[{urls, username?, credential?}]`` for the peer
+      connection. When the configuration has a coturn ``turn_auth_secret``
+      the TURN entry carries ephemeral credentials (12 h) and
+      ``turn_password`` is ``''``; otherwise the static ``turn_username`` /
+      ``turn_password`` pair is used in both places.
+    """
     sip_enabled = serializers.SerializerMethodField()
+    wss_url = serializers.SerializerMethodField()
+    ice_servers = serializers.SerializerMethodField()
 
     class Meta(SipConfigurationDetailSerializer.Meta):
-        fields = SipConfigurationDetailSerializer.Meta.fields + ['sip_enabled']
+        fields = SipConfigurationDetailSerializer.Meta.fields + [
+            'sip_enabled', 'wss_url', 'ice_servers',
+        ]
 
     @extend_schema_field(serializers.BooleanField)
     def get_sip_enabled(self, obj):
         creds = self._softphone() or {}
         return bool(creds.get('username') and creds.get('password'))
+
+    @extend_schema_field(serializers.CharField)
+    def get_wss_url(self, obj):
+        creds = self._softphone() or {}
+        if 'wss_url' in creds:
+            return creds['wss_url']
+        from .softphone import build_wss_url
+        return build_wss_url(obj)
+
+    @extend_schema_field(IceServerSerializer(many=True))
+    def get_ice_servers(self, obj):
+        creds = self._softphone() or {}
+        if 'ice_servers' in creds:
+            return creds['ice_servers']
+        from .softphone import build_ice_servers
+        return build_ice_servers(obj, creds.get('username') or '')
 
 
 class UserPhoneAssignmentDetailSerializer(SecretFieldsMixin, serializers.ModelSerializer):

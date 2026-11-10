@@ -205,9 +205,18 @@ def _may_use_shared_account(user, sip_config):
 
 
 def _softphone_config_data(sip_config, username, password, request):
+    """``SoftphoneSipConfigurationSerializer`` data for ``sip_config`` with
+    the caller's credentials, plus ``wss_url`` / ``ice_servers`` (see
+    :mod:`crm.softphone`). The tenant's active PbxServer supplies
+    ``wss_url`` when it has one."""
+    from crm.asterisk_db import get_active_pbx_for_current_tenant
+    from crm.softphone import softphone_transport
+
+    creds = {'username': username, 'password': password}
+    creds.update(softphone_transport(sip_config, username, get_active_pbx_for_current_tenant()))
     return SoftphoneSipConfigurationSerializer(
         sip_config,
-        context={'request': request, SOFTPHONE_CONTEXT_KEY: {'username': username, 'password': password}},
+        context={'request': request, SOFTPHONE_CONTEXT_KEY: creds},
     ).data
 
 
@@ -255,7 +264,11 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
             "shared account when they have none (staff, superusers and the "
             "configuration's creator only; otherwise both are '' and "
             "``sip_enabled`` is false, so the client skips SIP registration). "
-            "``user_assignments`` is always []."
+            "``user_assignments`` is always []. ``wss_url`` is the SIP "
+            "WebSocket URL (the tenant's PbxServer's when set) and "
+            "``ice_servers`` the STUN/TURN list for the peer connection; with "
+            "a coturn ``turn_auth_secret`` the TURN entry carries ephemeral "
+            "credentials and ``turn_password`` is ''."
         ),
         responses={
             200: SoftphoneSipConfigurationSerializer,
@@ -347,7 +360,9 @@ class SipConfigurationViewSet(viewsets.ModelViewSet):
             "account as ``extension``/``extension_password`` and ``id: null``, "
             "but only to staff, superusers and the configuration's creator. "
             "404 otherwise. Never contains other users' credentials. "
-            "``sip_enabled`` is true when the credentials can register."
+            "``sip_enabled`` is true when the credentials can register. "
+            "``sip_configuration.wss_url`` / ``ice_servers`` are the transport "
+            "settings to use (see ``webrtc_config``)."
         ),
         responses={200: MySoftphoneConfigSerializer, 404: OpenApiTypes.OBJECT},
     )
