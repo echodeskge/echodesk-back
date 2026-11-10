@@ -10,7 +10,9 @@ Allowed hosts (case-insensitive, port ignored):
 * ``settings.CALL_RECORDING_ALLOWED_HOSTS`` (defaults to the EchoDesk PBX
   hosts);
 * each ``PbxServer``'s ``fqdn``, ``public_ip`` and ``recording_base_url`` host;
-* each ``SipConfiguration``'s ``sip_server`` (legacy single-PBX tenants).
+* each ``SipConfiguration``'s ``sip_server`` (legacy single-PBX tenants);
+* with ``settings.DEBUG`` only, ``localhost`` / ``127.0.0.1`` (the local
+  Asterisk harness), which may then resolve to loopback.
 
 Because PBX admins set those hosts, :func:`open_recording` also refuses a
 host that resolves to any non-public address and serves the bytes with an
@@ -24,6 +26,15 @@ from urllib.parse import urlsplit, urlunsplit
 from django.conf import settings
 
 DEFAULT_ALLOWED_HOSTS = ('pbx2.echodesk.cloud', 'pbx.echodesk.cloud')
+
+# Local development only: the harness Asterisk serves recordings at
+# http://localhost:8088/static/recordings/. Allowed, and allowed to resolve
+# to loopback, when settings.DEBUG is on; never in production.
+LOCAL_DEV_HOSTS = ('localhost', '127.0.0.1')
+
+
+def _is_local_dev_host(host):
+    return bool(settings.DEBUG) and (host or '').lower() in LOCAL_DEV_HOSTS
 
 
 def _host(value):
@@ -50,6 +61,8 @@ def allowed_recording_hosts():
         hosts.update({_host(fqdn), _host(public_ip), _host(base_url)})
     for sip_server in SipConfiguration.objects.values_list('sip_server', flat=True):
         hosts.add(_host(sip_server))
+    if settings.DEBUG:
+        hosts.update(LOCAL_DEV_HOSTS)
     hosts.discard('')
     return hosts
 
@@ -101,7 +114,10 @@ def is_public_ip(value):
 
 def resolve_public_addresses(host, port):
     """Every address ``host`` resolves to; raises UnsafeRecordingURL when it
-    does not resolve or when any address is not public."""
+    does not resolve or when any address is not public. Under
+    ``settings.DEBUG`` the local-dev hosts may resolve to loopback (the
+    harness Asterisk); every other host is still held to public addresses."""
+    allow_loopback = _is_local_dev_host(host)
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except (OSError, UnicodeError) as exc:
@@ -114,9 +130,18 @@ def resolve_public_addresses(host, port):
     if not addresses:
         raise UnsafeRecordingURL(f'cannot resolve {host}')
     for ip in addresses:
+        if allow_loopback and _is_loopback(ip):
+            continue
         if not is_public_ip(ip):
             raise UnsafeRecordingURL(f'{host} resolves to a non-public address')
     return addresses
+
+
+def _is_loopback(value):
+    try:
+        return ipaddress.ip_address(str(value)).is_loopback
+    except ValueError:
+        return False
 
 
 def _pinned_adapter(hostname):

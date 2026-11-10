@@ -1,4 +1,5 @@
-"""seed_local_pbx (the local Asterisk harness seed)."""
+"""seed_local_pbx (the local Asterisk harness seed) and the DEBUG-only
+localhost recording hosts it relies on."""
 from io import StringIO
 from unittest.mock import patch
 
@@ -8,8 +9,18 @@ from django.test import override_settings
 
 from crm.management.commands.seed_local_pbx import DEFAULT_EXT_PASSWORD, EXTENSIONS, NAME
 from crm.models import PbxServer, SipConfiguration, UserPhoneAssignment
+from crm.recording_hosts import (
+    UnsafeRecordingURL,
+    allowed_recording_hosts,
+    is_allowed_recording_url,
+    resolve_public_addresses,
+)
 from crm.tests.conftest import CrmTestCase
 from users.models import User
+
+
+def _addrinfo(*ips):
+    return [(2 if ':' not in ip else 10, 1, 6, '', (ip, 8088)) for ip in ips]
 
 
 class SeedLocalPbxCommandTests(CrmTestCase):
@@ -125,3 +136,41 @@ class SeedLocalPbxCommandTests(CrmTestCase):
         with self.assertRaises(CommandError):
             call_command('seed_local_pbx', '--schema', 'no_such_tenant', stdout=StringIO(), stderr=StringIO())
 
+
+class LocalDevRecordingHostTests(CrmTestCase):
+
+    URL = 'http://localhost:8088/static/recordings/1.wav'
+
+    @override_settings(DEBUG=True)
+    def test_localhost_allowed_under_debug(self):
+        hosts = allowed_recording_hosts()
+        self.assertIn('localhost', hosts)
+        self.assertIn('127.0.0.1', hosts)
+        self.assertTrue(is_allowed_recording_url(self.URL))
+        self.assertTrue(is_allowed_recording_url('http://127.0.0.1:8088/static/recordings/1.wav'))
+
+    @override_settings(DEBUG=False)
+    def test_localhost_refused_without_debug(self):
+        hosts = allowed_recording_hosts()
+        self.assertNotIn('localhost', hosts)
+        self.assertNotIn('127.0.0.1', hosts)
+        self.assertFalse(is_allowed_recording_url(self.URL))
+
+    @override_settings(DEBUG=True)
+    def test_loopback_accepted_for_local_hosts_only_under_debug(self):
+        with patch('crm.recording_hosts.socket.getaddrinfo', return_value=_addrinfo('127.0.0.1', '::1')):
+            self.assertEqual(resolve_public_addresses('localhost', 8088), ['127.0.0.1', '::1'])
+            self.assertEqual(resolve_public_addresses('127.0.0.1', 8088), ['127.0.0.1', '::1'])
+            # any other host that resolves to loopback is still refused
+            with self.assertRaises(UnsafeRecordingURL):
+                resolve_public_addresses('pbx.tenant.test', 8088)
+        # a local host resolving to a private (non-loopback) address is refused
+        with patch('crm.recording_hosts.socket.getaddrinfo', return_value=_addrinfo('10.0.0.7')):
+            with self.assertRaises(UnsafeRecordingURL):
+                resolve_public_addresses('localhost', 8088)
+
+    @override_settings(DEBUG=False)
+    def test_loopback_refused_without_debug(self):
+        with patch('crm.recording_hosts.socket.getaddrinfo', return_value=_addrinfo('127.0.0.1')):
+            with self.assertRaises(UnsafeRecordingURL):
+                resolve_public_addresses('localhost', 8088)
