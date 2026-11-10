@@ -737,6 +737,37 @@ class TestExtensionStatusAmi(CrmTestCase):
 
 
 # ============================================================================
+# has_subscription_feature: one query
+# ============================================================================
+
+
+class TestHasSubscriptionFeatureQueries(CrmTestCase):
+
+    def test_single_exists_query(self):
+        from rest_framework.test import APIRequestFactory
+        from tenants.permissions import has_subscription_feature
+
+        request = APIRequestFactory().get('/')
+        request.tenant = self.tenant
+        # 2 = tenant-schemas' ``SET search_path`` + the single EXISTS query.
+        with self.assertNumQueries(2):
+            self.assertTrue(has_subscription_feature(request, 'ip_calling'))
+        with self.assertNumQueries(2):
+            self.assertFalse(has_subscription_feature(request, 'no_such_feature'))
+        self.set_ip_calling(False)
+        with self.assertNumQueries(2):
+            self.assertFalse(has_subscription_feature(request, 'ip_calling'))
+
+    def test_no_tenant_is_false_without_queries(self):
+        from rest_framework.test import APIRequestFactory
+        from tenants.permissions import has_subscription_feature
+
+        request = APIRequestFactory().get('/')
+        with self.assertNumQueries(0):
+            self.assertFalse(has_subscription_feature(request, 'ip_calling'))
+
+
+# ============================================================================
 # PBX admin writes
 # ============================================================================
 

@@ -255,18 +255,40 @@ class CallLog(models.Model):
         direction_symbol = "→" if self.direction == "outbound" else "←"
         return f"{self.caller_number} {direction_symbol} {self.recipient_number} ({self.status})"
     
+    # A phone number needs at least this many digits before it is matched
+    # against clients; shorter values (extensions, "anonymous") never are.
+    CLIENT_MATCH_MIN_DIGITS = 7
+
+    def _should_match_client(self, update_fields):
+        if self.client_id or self.social_client_id:
+            return False
+        if update_fields is not None and 'client' not in update_fields:
+            # The caller is writing other columns; the lookup would cost a
+            # query whose result could not even be saved.
+            return False
+        return True
+
+    def _match_client(self):
+        """The CRM client whose phone ends with the other party's number
+        (last 7 digits), or ``None``."""
+        number = self.caller_number if self.direction == 'inbound' else self.recipient_number
+        digits = ''.join(ch for ch in (number or '') if ch.isdigit())
+        if len(digits) < self.CLIENT_MATCH_MIN_DIGITS:
+            return None
+        return Client.objects.filter(phone__endswith=digits[-7:]).order_by('id').first()
+
     def save(self, *args, **kwargs):
-        # Auto-associate with client based on phone number
-        if not self.client and (self.caller_number or self.recipient_number):
-            phone_to_check = self.caller_number if self.direction == 'inbound' else self.recipient_number
+        # Auto-associate with a CRM client by phone number, unless a
+        # client (CRM or social) is already set or this save does not
+        # write ``client`` at all.
+        update_fields = kwargs.get('update_fields')
+        if self._should_match_client(update_fields):
             try:
-                # Clean phone number for matching
-                clean_phone = phone_to_check.replace('+', '').replace('-', '').replace(' ', '').replace('(', '').replace(')', '')
-                self.client = Client.objects.filter(
-                    phone__icontains=clean_phone[-7:]  # Match last 7 digits
-                ).first()
-            except:
-                pass
+                matched = self._match_client()
+            except Exception:  # noqa: BLE001 - never block a call log write
+                matched = None
+            if matched is not None:
+                self.client = matched
         super().save(*args, **kwargs)
 
 

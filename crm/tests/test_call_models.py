@@ -14,6 +14,79 @@ from crm.tests.conftest import CrmTestCase
 
 
 # ============================================================================
+# CallLog → CRM client auto-match (BK-03 guard)
+# ============================================================================
+
+
+class TestCallLogClientMatch(CrmTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.agent = self.create_user(email='cm-agent@test.com')
+        # Stored unformatted: the match is ``phone__endswith`` on the raw
+        # column, so a number saved with spaces would not be found.
+        self.client_a = self.create_client(name='A', phone='+995555123456')
+        self.client_b = self.create_client(name='B', phone='+995555999999')
+
+    def test_inbound_matches_caller_by_last_7_digits(self):
+        call = self.create_call_log(handled_by=self.agent, caller_number='0555123456',
+                                    recipient_number='+995322421219')
+        self.assertEqual(call.client, self.client_a)
+
+    def test_outbound_matches_recipient(self):
+        call = self.create_call_log(handled_by=self.agent, direction='outbound',
+                                    caller_number='100', recipient_number='+995555999999')
+        self.assertEqual(call.client, self.client_b)
+
+    def test_endswith_not_contains(self):
+        # The old ``icontains`` matched a client whose number merely
+        # contained the digits somewhere in the middle.
+        self.create_client(name='Mid', phone='+1555123456789')
+        call = self.create_call_log(handled_by=self.agent, caller_number='+995555123456',
+                                    recipient_number='+995322421219')
+        self.assertEqual(call.client, self.client_a)
+
+    def test_short_numbers_never_match(self):
+        for number in ('', '100', 'anonymous', '123456'):
+            call = self.create_call_log(handled_by=self.agent, caller_number=number,
+                                        recipient_number='+995322421219')
+            self.assertIsNone(call.client, number)
+
+    def test_social_client_set_skips_lookup(self):
+        from social_integrations.models import Client as SocialClient
+
+        social = SocialClient.objects.create(name='Social', phone='+995555123456')
+        # 2 = tenant-schemas' ``SET search_path`` + the INSERT; no client lookup.
+        with self.assertNumQueries(2):
+            call = CallLog.objects.create(
+                caller_number='+995555123456', recipient_number='+995322421219',
+                direction='inbound', status='ringing', handled_by=self.agent,
+                social_client=social,
+            )
+        self.assertIsNone(call.client)
+
+    def test_update_fields_without_client_skips_lookup(self):
+        call = self.create_call_log(handled_by=self.agent, caller_number='+995555000000',
+                                    recipient_number='+995322421219')
+        self.assertIsNone(call.client)
+        self.create_client(name='Late', phone='+995555000000')
+        call.notes = 'n'
+        # 2 = ``SET search_path`` + the UPDATE; no client lookup.
+        with self.assertNumQueries(2):
+            call.save(update_fields=['notes'])
+        call.refresh_from_db()
+        self.assertIsNone(call.client)
+        # A full save still matches.
+        call.save()
+        self.assertEqual(call.client.name, 'Late')
+
+    def test_existing_client_is_kept(self):
+        call = self.create_call_log(handled_by=self.agent, caller_number='+995555999999',
+                                    recipient_number='+995322421219', client=self.client_a)
+        self.assertEqual(call.client, self.client_a)
+
+
+# ============================================================================
 # CallLog Duration Calculation
 # ============================================================================
 

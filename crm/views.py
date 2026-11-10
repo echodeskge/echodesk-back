@@ -20,7 +20,7 @@ from .serializers import (
     CallLogDetailSerializer, CallEventSerializer, CallRecordingSerializer,
     UserPhoneAssignmentSerializer, UserPhoneAssignmentDetailSerializer,
     PbxSettingsSerializer, ConsultationInitiateSerializer, MergeConferenceSerializer,
-    CallRatingSerializer, MySoftphoneConfigSerializer, SOFTPHONE_CONTEXT_KEY,
+    MySoftphoneConfigSerializer, SOFTPHONE_CONTEXT_KEY,
     SoftphoneSipConfigurationSerializer,
     CallEndSerializer,
 )
