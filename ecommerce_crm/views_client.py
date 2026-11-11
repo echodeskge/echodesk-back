@@ -427,6 +427,34 @@ class ClientProductAutoSchema(AutoSchema):
         return parameters
 
 
+def with_review_stats(queryset):
+    """Annotate a Product queryset with ``_avg_rating`` / ``_review_count``
+    over approved reviews — the fast path the product serializers read
+    instead of running two aggregate queries per product.
+
+    Correlated subqueries rather than a JOIN + GROUP BY so filters that join
+    attribute_values can't multiply the review rows."""
+    from django.db.models import Avg, Count, FloatField, IntegerField, OuterRef, Subquery
+    from django.db.models.functions import Coalesce
+
+    approved_reviews = ProductReview.objects.filter(
+        product=OuterRef('pk'), is_approved=True,
+    ).order_by().values('product')
+    return queryset.annotate(
+        _avg_rating=Subquery(
+            approved_reviews.annotate(avg=Avg('rating')).values('avg'),
+            output_field=FloatField(),
+        ),
+        _review_count=Coalesce(
+            Subquery(
+                approved_reviews.annotate(cnt=Count('pk')).values('cnt'),
+                output_field=IntegerField(),
+            ),
+            0,
+        ),
+    )
+
+
 class ClientProductViewSet(viewsets.ReadOnlyModelViewSet):
     """
     Client-facing product browsing (read-only, public access)
@@ -454,31 +482,9 @@ class ClientProductViewSet(viewsets.ReadOnlyModelViewSet):
         Also supports price range: ?min_price=10&max_price=100
         And on_sale filter: ?on_sale=true
         """
-        from django.db.models import Q, F, Avg, Count, FloatField, IntegerField, OuterRef, Subquery
-        from django.db.models.functions import Coalesce
+        from django.db.models import Q, F
 
-        queryset = super().get_queryset()
-
-        # Rating aggregates as correlated subqueries (read by the serializers'
-        # ``_avg_rating`` / ``_review_count`` fast path). Subqueries rather
-        # than a JOIN + GROUP BY so the attribute filters below, which join
-        # attribute_values, can't multiply the review rows.
-        approved_reviews = ProductReview.objects.filter(
-            product=OuterRef('pk'), is_approved=True,
-        ).order_by().values('product')
-        queryset = queryset.annotate(
-            _avg_rating=Subquery(
-                approved_reviews.annotate(avg=Avg('rating')).values('avg'),
-                output_field=FloatField(),
-            ),
-            _review_count=Coalesce(
-                Subquery(
-                    approved_reviews.annotate(cnt=Count('pk')).values('cnt'),
-                    output_field=IntegerField(),
-                ),
-                0,
-            ),
-        )
+        queryset = with_review_stats(super().get_queryset())
         # Only the detail serializer renders variants.
         if self.action != 'list':
             queryset = queryset.prefetch_related('variants__attribute_values__attribute')
@@ -779,7 +785,19 @@ class ClientFavoriteViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return only favorites belonging to the authenticated client"""
-        return FavoriteProduct.objects.filter(client=self.request.user).select_related('product', 'client').prefetch_related('product__images')
+        from django.db.models import Prefetch
+
+        # The nested ProductListSerializer reads review stats, images and
+        # attribute values: load them with the products, not per favorite
+        # (that was 4 queries per product — N+1, ECHODESK-BACKEND-6W).
+        products = with_review_stats(Product.objects.all()).prefetch_related(
+            'images', 'attribute_values__attribute',
+        )
+        return (
+            FavoriteProduct.objects.filter(client=self.request.user)
+            .select_related('client')
+            .prefetch_related(Prefetch('product', queryset=products))
+        )
 
     def get_serializer_class(self):
         if self.action == 'create':
