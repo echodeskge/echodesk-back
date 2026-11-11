@@ -310,22 +310,25 @@ def send_staff_booking_reminders():
     for tenant in Tenant.objects.exclude(schema_name='public'):
         try:
             with schema_context(tenant.schema_name):
-                total += _send_staff_reminders_for_tenant()
+                total += _send_staff_reminders_for_tenant(tenant=tenant)
         except Exception:
             logger.exception('Error sending staff booking reminders for tenant %s', tenant.schema_name)
     return total
 
 
-def _send_staff_reminders_for_tenant(minutes=STAFF_REMINDER_MINUTES):
+def _send_staff_reminders_for_tenant(minutes=STAFF_REMINDER_MINUTES, tenant=None):
     """Notify each assigned staff member once about a booking starting within
-    `minutes` (on the business's clock). Returns how many were notified."""
+    `minutes` (on the business's clock). Returns how many were notified.
+
+    ``tenant`` (the Tenant row the caller is iterating) saves re-reading it
+    by schema name for every tenant (flagged as N+1, ECHODESK-BACKEND-88)."""
     from booking_management.models import Booking
     from booking_management.staff_notifications import notify_assigned_staff
     from booking_management.utils import get_booking_settings, tenant_now
 
     from django.db.models import Q
 
-    now = tenant_now(get_booking_settings())
+    now = tenant_now(get_booking_settings(tenant))
     horizon = now + timedelta(minutes=minutes)
     # (now, horizon] as a datetime window: just before midnight it also
     # covers bookings early the next day.
@@ -337,26 +340,52 @@ def _send_staff_reminders_for_tenant(minutes=STAFF_REMINDER_MINUTES):
             | Q(date__gt=now.date(), date__lt=horizon.date())
             | Q(date=horizon.date(), start_time__lte=horizon.time())
         )
-    bookings = Booking.objects.filter(
+    bookings = list(Booking.objects.filter(
         window,
         status__in=['pending', 'confirmed'],
         staff__isnull=False,
         staff_reminder_sent=False,
-    ).select_related('client', 'service', 'staff', 'staff__user')
+    ).select_related('client', 'service', 'staff', 'staff__user'))
+    if not bookings:
+        return 0
+
+    # Flag the whole batch first, in one statement: a failing push must not
+    # repeat on every run. (Per-booking work below is wrapped so one bad
+    # booking cannot stop the others.)
+    Booking.objects.filter(pk__in=[b.pk for b in bookings]).update(staff_reminder_sent=True)
+
+    # Per-recipient lookups done once for the batch instead of once per
+    # booking: notification preferences and the tenant's fallback language.
+    from users.notification_texts import DEFAULT_LANGUAGE, normalize_language, tenant_language
+    from users.notification_utils import notification_preferences
+
+    staff_users = {b.staff.user for b in bookings if b.staff.user_id}
+    prefs = notification_preferences(staff_users, 'booking_reminder')
+    if tenant is not None:
+        # The beat task hands over the Tenant row it just read: no second
+        # lookup by schema name (ECHODESK-BACKEND-88).
+        fallback_language = normalize_language(getattr(tenant, 'preferred_language', None)) or DEFAULT_LANGUAGE
+    else:
+        fallback_language = tenant_language()
 
     self_booked_since = timezone.now() - timedelta(minutes=STAFF_REMINDER_SELF_BOOKED_MINUTES)
     sent = 0
     for booking in bookings:
         try:
-            # Flag first: a failing push must not repeat on every run.
-            Booking.objects.filter(pk=booking.pk).update(staff_reminder_sent=True)
             if (booking.created_by_id and booking.created_by_id == booking.staff.user_id
                     and booking.created_at and booking.created_at >= self_booked_since):
                 # The staff member just booked this client themselves (a
                 # walk-in): they know it's coming.
                 continue
             starts_in = int((datetime.combine(booking.date, booking.start_time) - now).total_seconds() // 60)
-            if notify_assigned_staff(booking, 'reminder', minutes=max(starts_in, 1)):
+            user = booking.staff.user
+            language = (
+                normalize_language(getattr(user, 'preferred_language', None)) or fallback_language
+            )
+            if notify_assigned_staff(
+                booking, 'reminder', minutes=max(starts_in, 1),
+                language=language, preference=prefs.get(getattr(user, 'pk', None)),
+            ):
                 sent += 1
         except Exception:
             logger.exception('Error sending staff reminder for booking %s', booking.booking_number)

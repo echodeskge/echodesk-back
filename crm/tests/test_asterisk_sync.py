@@ -204,3 +204,71 @@ class TestSyncTrunk(SimpleTestCase):
         self.assertEqual(
             reg_call.kwargs["defaults"]["server_uri"], "sip:sip.magti.ge:5060"
         )
+
+
+class TestRunClassifiesFailures(SimpleTestCase):
+    """Sentry ECHODESK-BACKEND-7V: the realtime DB could not be resolved
+    (``could not translate host name ...``) while a user was created. The
+    product write succeeded and the sync is swallowed by design; a
+    connection-level failure of the *other* DB host is infrastructure, so it
+    is a warning with a resync hint, not an error with a traceback. Anything
+    else — including an OperationalError that carries a SQLSTATE such as a
+    deadlock — still logs at error."""
+
+    def _run(self, exc):
+        def boom():
+            raise exc
+
+        sync = _make_sync()
+        with self.assertLogs("crm.asterisk_sync", level="WARNING") as cm:
+            self.assertIsNone(sync._run("sync_queue_members", boom))
+        self.assertEqual(len(cm.records), 1)
+        return cm.records[0]
+
+    def test_dns_failure_is_a_warning_with_resync_hint(self):
+        import psycopg2
+        from django.db import OperationalError
+
+        cause = psycopg2.OperationalError(
+            'could not translate host name "db.example.com" to address: Name or service not known'
+        )
+        exc = OperationalError(str(cause))
+        exc.__cause__ = cause
+
+        record = self._run(exc)
+        self.assertEqual(record.levelname, "WARNING")
+        self.assertIn("realtime DB unreachable", record.getMessage())
+        self.assertIn("sync_tenant_asterisk testschema", record.getMessage())
+        self.assertIsNone(record.exc_info)
+
+    def test_interface_error_is_a_warning(self):
+        import psycopg2
+        from django.db import InterfaceError
+
+        cause = psycopg2.InterfaceError("connection already closed")
+        exc = InterfaceError(str(cause))
+        exc.__cause__ = cause
+
+        self.assertEqual(self._run(exc).levelname, "WARNING")
+
+    def test_deadlock_keeps_the_error_and_traceback(self):
+        import psycopg2
+        from django.db import OperationalError
+
+        # ``pgcode`` is a read-only libpq field; a driver-raised deadlock
+        # carries 40P01, which a constructed error cannot, so shadow it.
+        class Deadlock(psycopg2.OperationalError):
+            pgcode = "40P01"
+
+        cause = Deadlock("deadlock detected")
+        exc = OperationalError(str(cause))
+        exc.__cause__ = cause
+
+        record = self._run(exc)
+        self.assertEqual(record.levelname, "ERROR")
+        self.assertIsNotNone(record.exc_info)
+
+    def test_other_exceptions_keep_the_error_and_traceback(self):
+        record = self._run(KeyError("queue"))
+        self.assertEqual(record.levelname, "ERROR")
+        self.assertIsNotNone(record.exc_info)

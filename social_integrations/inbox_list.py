@@ -8,8 +8,11 @@ requested page are enriched (names, avatars, unread counts, assignment,
 archive and AI state), so the number of queries does not depend on how many
 conversations the tenant has.
 """
+import hashlib
 from dataclasses import dataclass
 
+from django.core.cache import cache
+from django.db import connection
 from django.db.models import (
     Case, CharField, Count, Exists, F, Func, OuterRef, Q, Subquery, Value, When,
 )
@@ -19,8 +22,9 @@ from tenant_schemas.utils import schema_context
 
 from .models import (
     ChatAssignment, ConversationArchive, EmailConnection, EmailMessage,
-    FacebookMessage, InstagramMessage, SocialAccount, TelegramMessage,
-    WhatsAppMessage, WidgetMessage, WidgetSession,
+    FacebookMessage, FacebookPageConnection, InstagramAccountConnection,
+    InstagramMessage, SocialAccount, TelegramMessage, WhatsAppMessage,
+    WidgetMessage, WidgetSession,
 )
 
 ACTIVE_ASSIGNMENT_STATUSES = ('active', 'in_session')
@@ -108,37 +112,97 @@ def hide_assigned_applies(request):
     return bool(settings_obj and settings_obj.hide_assigned_chats)
 
 
-def _assigned_conversation_ids(platform, ctx):
-    """For the "Assigned to me" tab: the caller's active conversation ids on
-    ``platform``, so the DISTINCT ON head scan only reads those senders
-    instead of every message in the table (that full scan was a 1s+ query
-    on busy tenants). ``None`` when the tab isn't "assigned"."""
+def _assigned_keys(platform, ctx):
+    """For the "Assigned to me" tab: the caller's active assignments on
+    ``platform`` as ``(account_ids, conversation_ids)``, so the DISTINCT ON
+    head scan only reads those accounts' senders instead of every message in
+    the table. Narrowing by sender alone could not use the
+    (connection, sender, -timestamp) index — Postgres had to walk the whole
+    index/table for ``sender_id IN (...)`` and the count took up to 5s on busy
+    tenants (ECHODESK-BACKEND-7W/83/89/8A). ``None`` when the tab isn't
+    "assigned"."""
     if not ctx.assigned_only:
         return None
-    return list(
-        ChatAssignment.objects.filter(
-            platform=platform,
-            assigned_user=ctx.user,
-            status__in=ACTIVE_ASSIGNMENT_STATUSES,
-        ).values_list('conversation_id', flat=True).distinct()
+    account_ids, conversation_ids = set(), set()
+    rows = ChatAssignment.objects.filter(
+        platform=platform,
+        assigned_user=ctx.user,
+        status__in=ACTIVE_ASSIGNMENT_STATUSES,
+    ).values_list('account_id', 'conversation_id').distinct()
+    for account_id, conversation_id in rows:
+        account_ids.add(account_id)
+        conversation_ids.add(conversation_id)
+    return sorted(account_ids), sorted(conversation_ids)
+
+
+# How long a platform's conversation total is reused. Counting heads costs a
+# full DISTINCT ON scan of the platform's messages (the same scan the page
+# query runs), which on busy tenants was the slowest statement of every
+# inbox poll. The total only drives ``count`` / ``next`` in the response.
+COUNT_CACHE_TTL = 30
+
+
+def _count_cache_key(platform, ctx, extra):
+    parts = (
+        connection.schema_name, ctx.user.pk, platform, ctx.is_admin, ctx.hide_assigned,
+        ctx.assigned_only, ctx.archived_only, ctx.search, tuple(extra),
     )
+    digest = hashlib.sha1(repr(parts).encode('utf-8')).hexdigest()
+    return f'social_inbox_count:{connection.schema_name}:{ctx.user.pk}:{platform}:{digest}'
 
 
-def _take(qs, ctx, order=('-timestamp', '-id')):
-    return qs.count(), list(qs.order_by(*order)[:ctx.need])
+def _take(qs, ctx, order=('-timestamp', '-id'), *, platform, extra=()):
+    """``(total, rows)`` for one platform: the newest ``ctx.need`` heads and
+    how many heads there are in all.
+
+    When fewer than ``ctx.need`` rows come back that is the exact total, no
+    COUNT needed. Otherwise the total is counted at most once per
+    ``COUNT_CACHE_TTL`` per user and filter set (``extra`` carries the
+    platform-specific filters, e.g. the email folder)."""
+    rows = list(qs.order_by(*order)[:ctx.need])
+    if len(rows) < ctx.need:
+        return len(rows), rows
+    key = _count_cache_key(platform, ctx, extra)
+    total = cache.get(key)
+    if total is None:
+        total = qs.count()
+        cache.set(key, total, COUNT_CACHE_TTL)
+    return total, rows
 
 
 # ── Per-platform head queries ───────────────────────────────────────────────
+#
+# The DISTINCT ON head scans are ordered exactly like the (connection,
+# sender, -timestamp) index of each message table so Postgres reads the
+# index in order with no sort step. There is deliberately no ``-id``
+# tie-breaker: Meta timestamps are millisecond-precise, so two messages of
+# one conversation sharing a timestamp is rare and only decides which of
+# the two shows as the preview, while the extra sort key cost an
+# incremental sort over every message on every poll.
 
 def _facebook_heads(ctx):
-    base = FacebookMessage.objects.filter(is_deleted=False)
-    assigned_ids = _assigned_conversation_ids('facebook', ctx)
-    if assigned_ids is not None:
+    # Scoping the scan to the tenant's pages gives Postgres an index
+    # condition on the leading column (and skips the scan when there are
+    # no pages at all).
+    pages = dict(FacebookPageConnection.objects.values_list('id', 'page_id'))
+    if not pages:
+        return 0, []
+    connection_ids = list(pages)
+    assigned = _assigned_keys('facebook', ctx)
+    if assigned is not None:
         # Narrowing only; _apply_visibility still checks the account match.
-        base = base.filter(sender_id__in=assigned_ids)
+        # Both columns of the (page_connection, sender_id, -timestamp) index
+        # are pinned, so the head scan is a handful of index lookups.
+        page_meta_ids, sender_ids = assigned
+        connection_ids = [pk for pk, page_id in pages.items() if page_id in page_meta_ids]
+        base = FacebookMessage.objects.filter(
+            page_connection_id__in=connection_ids, sender_id__in=sender_ids, is_deleted=False,
+        )
+    else:
+        base = FacebookMessage.objects.filter(page_connection_id__in=connection_ids, is_deleted=False)
     heads = (
         base
-        .order_by('page_connection_id', 'sender_id', '-timestamp', '-id')
+        .order_by('page_connection_id', 'sender_id', '-timestamp')
         .distinct('page_connection_id', 'sender_id')
         .values('id')
     )
@@ -151,18 +215,28 @@ def _facebook_heads(ctx):
             sender_id=OuterRef('sender_id'),
             is_deleted=False,
         ).filter(Q(sender_name__icontains=ctx.search) | Q(message_text__icontains=ctx.search))))
-    return _take(_apply_visibility(qs, 'facebook', ctx), ctx)
+    return _take(_apply_visibility(qs, 'facebook', ctx), ctx, platform='facebook')
 
 
 def _instagram_heads(ctx):
-    base = InstagramMessage.objects.filter(is_deleted=False)
-    assigned_ids = _assigned_conversation_ids('instagram', ctx)
-    if assigned_ids is not None:
-        # Narrowing only; _apply_visibility still checks the account match.
-        base = base.filter(sender_id__in=assigned_ids)
+    accounts = dict(InstagramAccountConnection.objects.values_list('id', 'instagram_account_id'))
+    if not accounts:
+        return 0, []
+    connection_ids = list(accounts)
+    assigned = _assigned_keys('instagram', ctx)
+    if assigned is not None:
+        # Narrowing only; _apply_visibility still checks the account match
+        # (see _facebook_heads for why both index columns are pinned).
+        ig_account_ids, sender_ids = assigned
+        connection_ids = [pk for pk, ig_id in accounts.items() if ig_id in ig_account_ids]
+        base = InstagramMessage.objects.filter(
+            account_connection_id__in=connection_ids, sender_id__in=sender_ids, is_deleted=False,
+        )
+    else:
+        base = InstagramMessage.objects.filter(account_connection_id__in=connection_ids, is_deleted=False)
     heads = (
         base
-        .order_by('account_connection_id', 'sender_id', '-timestamp', '-id')
+        .order_by('account_connection_id', 'sender_id', '-timestamp')
         .distinct('account_connection_id', 'sender_id')
         .values('id')
     )
@@ -179,7 +253,7 @@ def _instagram_heads(ctx):
             | Q(sender_username__icontains=ctx.search)
             | Q(message_text__icontains=ctx.search)
         )))
-    return _take(_apply_visibility(qs, 'instagram', ctx), ctx)
+    return _take(_apply_visibility(qs, 'instagram', ctx), ctx, platform='instagram')
 
 
 def _whatsapp_heads(ctx):
@@ -226,7 +300,7 @@ def _whatsapp_heads(ctx):
                 Q(contact_name__icontains=ctx.search) | Q(message_text__icontains=ctx.search)
             ))
         )
-    return _take(_apply_visibility(qs, 'whatsapp', ctx), ctx)
+    return _take(_apply_visibility(qs, 'whatsapp', ctx), ctx, platform='whatsapp')
 
 
 EMAIL_EXCLUDED_FROM_ALL = ('Trash', 'Junk')
@@ -262,7 +336,7 @@ def _email_heads(ctx, connection_ids, folder):
     # Archive / assignment rules only apply to the inbox (and "all folders").
     if (folder and folder.upper() == 'INBOX') or all_folders:
         qs = _apply_visibility(qs, 'email', ctx)
-    return _take(qs, ctx)
+    return _take(qs, ctx, platform='email', extra=(folder, tuple(sorted(connection_ids))))
 
 
 def _widget_heads(ctx, connection_ids):
@@ -294,7 +368,8 @@ def _widget_heads(ctx, connection_ids):
     # Assignments for widget chats are keyed by visitor id (what the
     # dashboard sends); legacy rows may use the session id.
     qs = _apply_visibility(qs, 'widget', ctx, assignment_keys=('visitor_id', 'session_id'))
-    return _take(qs, ctx, order=('-_last_ts', '-pk'))
+    return _take(qs, ctx, order=('-_last_ts', '-pk'), platform='widget',
+                 extra=tuple(sorted(connection_ids)))
 
 
 def _telegram_heads(ctx):
@@ -316,7 +391,7 @@ def _telegram_heads(ctx):
             | Q(peer_username__icontains=ctx.search)
             | Q(message_text__icontains=ctx.search)
         )))
-    return _take(_apply_visibility(qs, 'telegram', ctx), ctx)
+    return _take(_apply_visibility(qs, 'telegram', ctx), ctx, platform='telegram')
 
 
 # ── Page-row builders (only for rows on the requested page) ────────────────
@@ -708,7 +783,6 @@ def _tenant_schema(request):
     tenant = getattr(request, 'tenant', None)
     if tenant is not None:
         return tenant.schema_name
-    from django.db import connection
     return connection.schema_name
 
 

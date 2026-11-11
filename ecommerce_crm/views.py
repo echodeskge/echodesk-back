@@ -3538,6 +3538,17 @@ def ecommerce_payment_webhook(request):
         logger.warning(f'Payment failed: order_number={external_order_id}, code={response_code}')
         from django.db import transaction
 
+        external_order_id = external_order_id or ''
+        if external_order_id.startswith('card_'):
+            # A declined card-validation charge (order id card_{client}_{rand}
+            # from add_client_card). No Order and no ClientCard exist for it:
+            # the card is only saved when BOG confirms the charge, so there
+            # is nothing to update — the customer simply retries.
+            logger.info(
+                'Card validation rejected: order_id=%s, code=%s', external_order_id, response_code
+            )
+            return Response({'status': 'received', 'action': 'card_validation_rejected'})
+
         try:
             with transaction.atomic():
                 order = Order.objects.select_for_update().get(order_number=external_order_id)
@@ -3561,8 +3572,10 @@ def ecommerce_payment_webhook(request):
             # oversell. Never-paid orders are restocked by the cancel_unpaid_orders
             # sweeper after a grace period.
         except Order.DoesNotExist:
-            logger.error(f'Order not found for failed payment: {external_order_id}')
-    
+            # Nothing of ours to update (an order created elsewhere or
+            # already purged); BOG gets a 200 so it stops retrying.
+            logger.warning(f'Order not found for failed payment: {external_order_id}')
+
     # Handle other statuses
     else:
         logger.info(f'Webhook received with status: {bog_status}, code: {response_code}')
@@ -3890,6 +3903,18 @@ def flitt_payment_webhook(request):
     return Response({'status': 'received'})
 
 
+def _reset_missing_vercel_project(settings_obj):
+    """Forget a Vercel project id that no longer exists on Vercel.
+
+    Same reset as a completed undeploy: no project id, no storefront URL,
+    status back to 'pending' so the admin UI offers a fresh deployment.
+    """
+    settings_obj.vercel_project_id = None
+    settings_obj.ecommerce_frontend_url = None
+    settings_obj.deployment_status = 'pending'
+    settings_obj.save(update_fields=['vercel_project_id', 'ecommerce_frontend_url', 'deployment_status'])
+
+
 class EcommerceSettingsViewSet(NoCacheMixin, viewsets.ModelViewSet):
     """ViewSet for managing ecommerce settings including BOG payment configuration"""
     serializer_class = EcommerceSettingsSerializer
@@ -4192,6 +4217,19 @@ class EcommerceSettingsViewSet(NoCacheMixin, viewsets.ModelViewSet):
                         tenant_domains.append(domain)
                 result["domains"] = tenant_domains
                 return Response(result, status=status.HTTP_200_OK)
+            elif result.get("code") == VercelDeploymentService.PROJECT_NOT_FOUND:
+                # The project behind the stored id is gone (deleted on
+                # Vercel): forget it so the UI stops polling a dead id and
+                # offers a fresh deployment instead.
+                _reset_missing_vercel_project(settings)
+                logger.warning(
+                    'Vercel project missing for tenant %s; deployment reset', tenant.schema_name
+                )
+                return Response({
+                    "success": False,
+                    "error": "vercel_project_missing",
+                    "message": "The Vercel project for this storefront no longer exists. Deploy the frontend again.",
+                }, status=status.HTTP_409_CONFLICT)
             else:
                 return Response({
                     "success": False,

@@ -110,7 +110,7 @@ def notify_staff_of_booking(booking, kind, client_label=''):
     try:
         from django.db.models import Q
         from users.models import User
-        from users.notification_utils import create_notification
+        from users.notification_utils import create_notification, notification_preferences
 
         from users.notification_texts import LazyText
 
@@ -126,7 +126,9 @@ def notify_staff_of_booking(booking, kind, client_label=''):
         recipients = Q(is_staff=True) | Q(is_superuser=True)
         if booking.staff_id:
             recipients |= Q(pk=booking.staff.user_id)
-        for user in User.objects.filter(recipients, is_active=True).distinct():
+        users = list(User.objects.filter(recipients, is_active=True).distinct())
+        prefs = notification_preferences(users, NOTIFICATION_TYPES[kind])
+        for user in users:
             create_notification(
                 user,
                 NOTIFICATION_TYPES[kind],
@@ -134,12 +136,19 @@ def notify_staff_of_booking(booking, kind, client_label=''):
                 message,
                 metadata=_metadata(booking),
                 link_url=f'/bookings/bookings/{booking.id}',
+                preference=prefs.get(user.pk),
             )
     except Exception:
         logger.exception('Could not notify staff about booking %s (%s)', getattr(booking, 'id', None), kind)
 
 
-def notify_assigned_staff(booking, kind, actor=None, staff=None, **extra):
+# ``preference`` default for notify_assigned_staff: let create_notification
+# look the row up.
+_LOOKUP = object()
+
+
+def notify_assigned_staff(booking, kind, actor=None, staff=None, *, language=None,
+                          preference=_LOOKUP, **extra):
     """Tell a booking's staff member that their agenda changed.
 
     kind: 'created' | 'confirmed' | 'cancelled' | 'rescheduled' | 'assigned' |
@@ -147,6 +156,10 @@ def notify_assigned_staff(booking, kind, actor=None, staff=None, **extra):
     assigned staff). actor: the user who made the change; they are never
     notified about their own action. extra: template values ('other' for
     'unassigned', 'minutes' for 'reminder').
+
+    Batch callers (the reminder task) pass ``language`` and ``preference``
+    (the recipient's NotificationPreference row or None) they resolved once
+    for the whole batch; otherwise both are looked up per call.
     Returns True when a notification was created.
     """
     try:
@@ -173,6 +186,7 @@ def notify_assigned_staff(booking, kind, actor=None, staff=None, **extra):
         metadata = _metadata(booking, kind=kind)
         if booking.cancelled_by and kind == 'cancelled':
             metadata['cancelled_by'] = booking.cancelled_by
+        batch_kwargs = {} if preference is _LOOKUP else {'preference': preference}
         notification = create_notification(
             user,
             STAFF_NOTIFICATION_TYPES[kind],
@@ -180,6 +194,8 @@ def notify_assigned_staff(booking, kind, actor=None, staff=None, **extra):
             message,
             metadata=metadata,
             link_url=f'/bookings/bookings/{booking.id}',
+            language=language,
+            **batch_kwargs,
         )
         return notification is not None
     except Exception:
