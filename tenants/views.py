@@ -567,7 +567,11 @@ def _compute_permissions_efficiently(user, prefetched_groups):
 @extend_schema(
     operation_id='get_subscription_me',
     summary='Get Current Subscription',
-    description='Get the current tenant subscription information including features, limits, and usage.',
+    description=(
+        'Get the current tenant subscription information including features, limits, and usage. '
+        'For a free trial (`subscription.is_trial`), `trial_ends_at` / `trial_days_remaining` say when it ends '
+        'and `has_saved_card` whether a card was added for the first charge.'
+    ),
     responses={
         200: OpenApiResponse(
             description='Subscription information',
@@ -586,6 +590,14 @@ def _compute_permissions_efficiently(user, prefetched_groups):
                             'subscription_type': {'type': 'string'},
                             'is_trial': {'type': 'boolean'},
                             'trial_ends_at': {'type': 'string', 'format': 'date-time', 'nullable': True},
+                            'trial_days_remaining': {
+                                'type': 'integer', 'minimum': 0,
+                                'description': 'Whole days left in the free trial (0 when not a trial or already ended).',
+                            },
+                            'has_saved_card': {
+                                'type': 'boolean',
+                                'description': 'A card is saved for automatic billing (the trial converts to paid at trial_ends_at).',
+                            },
                             'next_billing_date': {'type': 'string', 'format': 'date-time', 'nullable': True},
                         }
                     },

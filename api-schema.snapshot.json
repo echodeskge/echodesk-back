@@ -44685,8 +44685,8 @@
         "/api/register/": {
             "post": {
                 "operationId": "register_tenant",
-                "description": "Register a new tenant with admin user creation and package selection. Only available from the main domain.",
-                "summary": "Register New Tenant",
+                "description": "Register a new tenant on a 30-day free trial with no card. Creates the tenant, its admin user and a trial subscription (`is_trial`, `trial_ends_at` = now + 30 days). The workspace schema is provisioned in the background (`deployment_status` = \"deploying\"; the welcome email is sent when it is ready). A card is added later in-app (POST /api/payments/saved-card/add/); at `trial_ends_at` the saved card is charged and the subscription converts to paid, or it is deactivated when no card was added. Only available from the main domain.",
+                "summary": "Register New Tenant (30-day free trial, no card)",
                 "tags": [
                     "Tenant Management"
                 ],
@@ -44735,16 +44735,92 @@
                                             "type": "string"
                                         },
                                         "tenant": {
-                                            "type": "object"
+                                            "type": "object",
+                                            "properties": {
+                                                "id": {
+                                                    "type": "integer"
+                                                },
+                                                "name": {
+                                                    "type": "string"
+                                                },
+                                                "domain_url": {
+                                                    "type": "string"
+                                                },
+                                                "schema": {
+                                                    "type": "string"
+                                                },
+                                                "admin_email": {
+                                                    "type": "string"
+                                                },
+                                                "preferred_language": {
+                                                    "type": "string"
+                                                },
+                                                "deployment_status": {
+                                                    "type": "string"
+                                                },
+                                                "frontend_url": {
+                                                    "type": "string"
+                                                }
+                                            }
                                         },
                                         "subscription": {
-                                            "type": "object"
+                                            "type": "object",
+                                            "properties": {
+                                                "package_name": {
+                                                    "type": "string"
+                                                },
+                                                "pricing_model": {
+                                                    "type": "string"
+                                                },
+                                                "monthly_cost": {
+                                                    "type": "number"
+                                                },
+                                                "agent_count": {
+                                                    "type": "integer"
+                                                },
+                                                "is_trial": {
+                                                    "type": "boolean"
+                                                },
+                                                "trial_ends_at": {
+                                                    "type": "string",
+                                                    "format": "date-time"
+                                                },
+                                                "trial_expires": {
+                                                    "type": "string",
+                                                    "format": "date-time"
+                                                },
+                                                "limits": {
+                                                    "type": "object"
+                                                }
+                                            }
                                         },
-                                        "frontend_url": {
+                                        "trial_ends_at": {
+                                            "type": "string",
+                                            "format": "date-time"
+                                        },
+                                        "domain_url": {
+                                            "type": "string"
+                                        },
+                                        "admin_email": {
+                                            "type": "string"
+                                        },
+                                        "preferred_language": {
+                                            "type": "string"
+                                        },
+                                        "login_url": {
                                             "type": "string"
                                         },
                                         "api_url": {
                                             "type": "string"
+                                        },
+                                        "frontend_url": {
+                                            "type": "string"
+                                        },
+                                        "deployment_status": {
+                                            "type": "string"
+                                        },
+                                        "credentials": {
+                                            "type": "object"
                                         }
                                     }
                                 }
@@ -57552,7 +57628,7 @@
         "/api/subscription/agent-count/": {
             "put": {
                 "operationId": "subscription_agent_count_update",
-                "description": "Staff or superuser only.",
+                "description": "Staff or superuser only. Minimum 5 agents, in increments of 5.",
                 "summary": "Change the subscription agent count",
                 "tags": [
                     "Subscription"
@@ -57838,7 +57914,7 @@
         "/api/subscription/me/": {
             "get": {
                 "operationId": "get_subscription_me",
-                "description": "Get the current tenant subscription information including features, limits, and usage.",
+                "description": "Get the current tenant subscription information including features, limits, and usage. For a free trial (`subscription.is_trial`), `trial_ends_at` / `trial_days_remaining` say when it ends and `has_saved_card` whether a card was added for the first charge.",
                 "summary": "Get Current Subscription",
                 "tags": [
                     "Subscription"
@@ -57898,6 +57974,15 @@
                                                     "type": "string",
                                                     "format": "date-time",
                                                     "nullable": true
+                                                },
+                                                "trial_days_remaining": {
+                                                    "type": "integer",
+                                                    "minimum": 0,
+                                                    "description": "Whole days left in the free trial (0 when not a trial or already ended)."
+                                                },
+                                                "has_saved_card": {
+                                                    "type": "boolean",
+                                                    "description": "A card is saved for automatic billing (the trial converts to paid at trial_ends_at)."
                                                 },
                                                 "next_billing_date": {
                                                     "type": "string",
@@ -107011,9 +107096,9 @@
                     },
                     "agent_count": {
                         "type": "integer",
-                        "minimum": 10,
-                        "default": 10,
-                        "description": "Number of agents (required for agent-based pricing)"
+                        "minimum": 5,
+                        "default": 5,
+                        "description": "Number of agents (minimum 5, in increments of 5; required for agent-based pricing)"
                     },
                     "admin_email": {
                         "type": "string",
@@ -110391,7 +110476,7 @@
                 "properties": {
                     "agent_count": {
                         "type": "integer",
-                        "minimum": 1
+                        "minimum": 5
                     }
                 },
                 "required": [

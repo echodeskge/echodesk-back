@@ -16,7 +16,9 @@ Usage:
         ...
 """
 
+import math
 from functools import wraps
+from django.utils import timezone
 from django.http import JsonResponse
 from rest_framework.response import Response
 from rest_framework import status
@@ -175,6 +177,14 @@ def _refresh_user_count(subscription):
         )
 
 
+def _trial_days_remaining(subscription):
+    """Whole days left in the trial (counting a started day), never negative; 0 when not a trial."""
+    if not subscription.is_trial or not subscription.trial_ends_at:
+        return 0
+    remaining = (subscription.trial_ends_at - timezone.now()).total_seconds()
+    return max(0, math.ceil(remaining / 86400))
+
+
 def get_subscription_info(request):
     """
     Get complete subscription information for the tenant
@@ -206,6 +216,8 @@ def get_subscription_info(request):
         'subscription_type': subscription.subscription_type,
         'is_trial': subscription.is_trial,
         'trial_ends_at': subscription.trial_ends_at,
+        'trial_days_remaining': _trial_days_remaining(subscription),
+        'has_saved_card': bool(subscription.parent_order_id),
         'next_billing_date': subscription.next_billing_date,
     }
 
