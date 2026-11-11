@@ -71,8 +71,13 @@ class Command(BaseCommand):
 
         # 3. Find subscriptions expired but within grace period
         grace_cutoff = now - timedelta(days=grace_days)
+        # Free trials are settled by process_trial_expirations on
+        # trial_ends_at (= expires_at): converted when a card is saved,
+        # deactivated otherwise. Until that run they must not get the paid
+        # "payment required / suspension" mails or be suspended here.
         in_grace_period = TenantSubscription.objects.filter(
             is_active=True,
+            is_trial=False,
             expires_at__lt=now,
             expires_at__gte=grace_cutoff,
             tenant__is_active=True
@@ -91,6 +96,7 @@ class Command(BaseCommand):
         # 4. Find subscriptions past grace period (suspend)
         past_grace = TenantSubscription.objects.filter(
             is_active=True,
+            is_trial=False,
             expires_at__lt=grace_cutoff,
             tenant__is_active=True
         ).exclude(

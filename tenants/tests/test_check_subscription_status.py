@@ -65,6 +65,21 @@ class TestCheckSubscriptionStatus(EchoDeskTenantTestCase):
         self.assertEqual(len(mail.outbox), 1)
         self.assertIn('Payment Required', mail.outbox[0].subject)
 
+    def test_expired_trial_is_left_to_the_trial_job(self):
+        # A trial that signed up after 09:00 ends after process_trial_expirations'
+        # daily run; the 03:00 status check next morning must not send the paid
+        # "Payment Required" mail or suspend it before the trial job settles it.
+        sub = self._subscription(
+            expires_in_days=-1, is_trial=True, subscription_type='trial',
+            trial_ends_at=timezone.now() - timedelta(hours=12),
+        )
+        self._run()
+        sub.refresh_from_db()
+        self.tenant.refresh_from_db()
+        self.assertTrue(sub.is_active)
+        self.assertTrue(self.tenant.is_active)
+        self.assertEqual(len(mail.outbox), 0)
+
     def test_past_grace_suspends(self):
         sub = self._subscription(expires_in_days=-30)
         self._run()
