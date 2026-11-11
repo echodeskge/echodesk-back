@@ -139,10 +139,13 @@ class Command(BaseCommand):
         return f'{users} users, {features} features'
 
     def _send_expiration_reminder(self, subscription, days):
-        """Send reminder email about upcoming expiration"""
+        """Send reminder email about upcoming expiration (or trial end)"""
         tenant = subscription.tenant
-        subject = f'EchoDesk: Your subscription expires in {days} days'
-        message = f"""
+        if subscription.is_trial:
+            subject, message = self._trial_reminder(subscription, days)
+        else:
+            subject = f'EchoDesk: Your subscription expires in {days} days'
+            message = f"""
 Hello {tenant.admin_name},
 
 Your EchoDesk subscription ({self._plan_summary(subscription)}) will expire in {days} days.
@@ -170,6 +173,44 @@ EchoDesk Team
             logger.info(f'Expiration reminder sent to {tenant.admin_email}')
         except Exception as e:
             logger.error(f'Failed to send reminder to {tenant.admin_email}: {e}')
+
+    def _trial_reminder(self, subscription, days):
+        """Subject + body for a free trial ending in ``days`` days."""
+        tenant = subscription.tenant
+        trial_end = (subscription.trial_ends_at or subscription.expires_at).strftime('%Y-%m-%d')
+        settings_url = f'https://{tenant.domain_url}/settings/subscription'
+        monthly = subscription.monthly_cost
+        if subscription.parent_order_id:
+            subject = f'EchoDesk: Your free trial ends in {days} days'
+            message = f"""
+Hello {tenant.admin_name},
+
+Your EchoDesk free trial ({self._plan_summary(subscription)}) ends in {days} days, on {trial_end}.
+
+Your saved card will be charged {monthly} GEL automatically on that day and your subscription will continue without interruption. Nothing to do.
+
+Manage your plan or card: {settings_url}
+
+Thank you,
+EchoDesk Team
+        """
+        else:
+            subject = f'EchoDesk: Your free trial ends in {days} days - add a card to keep your workspace'
+            message = f"""
+Hello {tenant.admin_name},
+
+Your EchoDesk free trial ({self._plan_summary(subscription)}) ends in {days} days, on {trial_end}.
+
+No card is on file yet. To keep using EchoDesk after the trial, please add a card before {trial_end}. The first payment of {monthly} GEL is taken on that day, and every 30 days after that; nothing is charged before the trial ends.
+
+If no card is added, your workspace is deactivated when the trial ends.
+
+Add a card: {settings_url}
+
+Thank you,
+EchoDesk Team
+        """
+        return subject, message
 
     def _send_grace_period_warning(self, subscription, days_overdue, total_grace_days):
         """Send warning during grace period"""

@@ -16,7 +16,10 @@ from django.utils import timezone
 from datetime import datetime, timedelta
 from tenants.models import TenantSubscription, PaymentOrder, Tenant
 from tenants.bog_payment import bog_service
+from tenants.payment_views import create_subscription_event
 import logging
+
+BILLING_PERIOD_DAYS = 30
 
 logger = logging.getLogger(__name__)
 
@@ -73,10 +76,19 @@ class Command(BaseCommand):
             if not subscription.parent_order_id:
                 self.stdout.write(self.style.ERROR(f"  ❌ No saved card found - cannot charge"))
                 failed += 1
-                # Deactivate subscription
+                # No card at trial end: deactivate. The subscription
+                # middleware then attaches nothing, exactly as for an
+                # expired paid subscription that was suspended.
                 if not dry_run:
                     subscription.is_active = False
+                    subscription.payment_status = 'no_card'
                     subscription.save()
+                    create_subscription_event(
+                        subscription=subscription,
+                        event_type='trial_expired',
+                        description='Trial ended without a saved card; subscription deactivated',
+                        metadata={'trial_ends_at': subscription.trial_ends_at.isoformat()},
+                    )
                     self.stdout.write(f"  Subscription deactivated")
                 continue
 
@@ -126,13 +138,29 @@ class Command(BaseCommand):
 
                 self.stdout.write(self.style.SUCCESS(f"  ✓ Charge initiated: {charge_result['order_id']}"))
 
-                # Mark trial as converted
+                # Mark trial as converted: a paid subscription billed every
+                # 30 days from now by process_recurring_payments. The webhook
+                # for this order ('trial_conversion') settles the payment.
+                now = timezone.now()
                 subscription.trial_converted = True
                 subscription.is_trial = False
-                subscription.last_billed_at = timezone.now()
-                subscription.next_billing_date = timezone.now() + timedelta(days=30)
-                subscription.expires_at = timezone.now() + timedelta(days=30)
+                subscription.subscription_type = 'paid'
+                subscription.last_billed_at = now
+                subscription.next_billing_date = now + timedelta(days=BILLING_PERIOD_DAYS)
+                subscription.expires_at = now + timedelta(days=BILLING_PERIOD_DAYS)
                 subscription.save()
+
+                create_subscription_event(
+                    subscription=subscription,
+                    event_type='trial_converted',
+                    payment_order=payment_order,
+                    description=f'Trial ended; charged {amount} GEL on the saved card',
+                    metadata={
+                        'amount': str(amount),
+                        'agent_count': subscription.agent_count,
+                        'next_billing_date': subscription.next_billing_date.isoformat(),
+                    },
+                )
 
                 self.stdout.write(self.style.SUCCESS(f"  ✓ Trial converted to paid subscription"))
                 processed += 1
@@ -144,6 +172,7 @@ class Command(BaseCommand):
 
                 # Deactivate subscription on payment failure
                 subscription.is_active = False
+                subscription.payment_status = 'failed'
                 subscription.save()
                 self.stdout.write(f"  Subscription deactivated due to payment failure")
 
