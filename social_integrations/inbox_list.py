@@ -112,20 +112,27 @@ def hide_assigned_applies(request):
     return bool(settings_obj and settings_obj.hide_assigned_chats)
 
 
-def _assigned_conversation_ids(platform, ctx):
-    """For the "Assigned to me" tab: the caller's active conversation ids on
-    ``platform``, so the DISTINCT ON head scan only reads those senders
-    instead of every message in the table (that full scan was a 1s+ query
-    on busy tenants). ``None`` when the tab isn't "assigned"."""
+def _assigned_keys(platform, ctx):
+    """For the "Assigned to me" tab: the caller's active assignments on
+    ``platform`` as ``(account_ids, conversation_ids)``, so the DISTINCT ON
+    head scan only reads those accounts' senders instead of every message in
+    the table. Narrowing by sender alone could not use the
+    (connection, sender, -timestamp) index — Postgres had to walk the whole
+    index/table for ``sender_id IN (...)`` and the count took up to 5s on busy
+    tenants (ECHODESK-BACKEND-7W/83/89/8A). ``None`` when the tab isn't
+    "assigned"."""
     if not ctx.assigned_only:
         return None
-    return list(
-        ChatAssignment.objects.filter(
-            platform=platform,
-            assigned_user=ctx.user,
-            status__in=ACTIVE_ASSIGNMENT_STATUSES,
-        ).values_list('conversation_id', flat=True).distinct()
-    )
+    account_ids, conversation_ids = set(), set()
+    rows = ChatAssignment.objects.filter(
+        platform=platform,
+        assigned_user=ctx.user,
+        status__in=ACTIVE_ASSIGNMENT_STATUSES,
+    ).values_list('account_id', 'conversation_id').distinct()
+    for account_id, conversation_id in rows:
+        account_ids.add(account_id)
+        conversation_ids.add(conversation_id)
+    return sorted(account_ids), sorted(conversation_ids)
 
 
 # How long a platform's conversation total is reused. Counting heads costs a
@@ -177,14 +184,22 @@ def _facebook_heads(ctx):
     # Scoping the scan to the tenant's pages gives Postgres an index
     # condition on the leading column (and skips the scan when there are
     # no pages at all).
-    page_ids = list(FacebookPageConnection.objects.values_list('id', flat=True))
-    if not page_ids:
+    pages = dict(FacebookPageConnection.objects.values_list('id', 'page_id'))
+    if not pages:
         return 0, []
-    base = FacebookMessage.objects.filter(page_connection_id__in=page_ids, is_deleted=False)
-    assigned_ids = _assigned_conversation_ids('facebook', ctx)
-    if assigned_ids is not None:
+    connection_ids = list(pages)
+    assigned = _assigned_keys('facebook', ctx)
+    if assigned is not None:
         # Narrowing only; _apply_visibility still checks the account match.
-        base = base.filter(sender_id__in=assigned_ids)
+        # Both columns of the (page_connection, sender_id, -timestamp) index
+        # are pinned, so the head scan is a handful of index lookups.
+        page_meta_ids, sender_ids = assigned
+        connection_ids = [pk for pk, page_id in pages.items() if page_id in page_meta_ids]
+        base = FacebookMessage.objects.filter(
+            page_connection_id__in=connection_ids, sender_id__in=sender_ids, is_deleted=False,
+        )
+    else:
+        base = FacebookMessage.objects.filter(page_connection_id__in=connection_ids, is_deleted=False)
     heads = (
         base
         .order_by('page_connection_id', 'sender_id', '-timestamp')
@@ -204,14 +219,21 @@ def _facebook_heads(ctx):
 
 
 def _instagram_heads(ctx):
-    account_ids = list(InstagramAccountConnection.objects.values_list('id', flat=True))
-    if not account_ids:
+    accounts = dict(InstagramAccountConnection.objects.values_list('id', 'instagram_account_id'))
+    if not accounts:
         return 0, []
-    base = InstagramMessage.objects.filter(account_connection_id__in=account_ids, is_deleted=False)
-    assigned_ids = _assigned_conversation_ids('instagram', ctx)
-    if assigned_ids is not None:
-        # Narrowing only; _apply_visibility still checks the account match.
-        base = base.filter(sender_id__in=assigned_ids)
+    connection_ids = list(accounts)
+    assigned = _assigned_keys('instagram', ctx)
+    if assigned is not None:
+        # Narrowing only; _apply_visibility still checks the account match
+        # (see _facebook_heads for why both index columns are pinned).
+        ig_account_ids, sender_ids = assigned
+        connection_ids = [pk for pk, ig_id in accounts.items() if ig_id in ig_account_ids]
+        base = InstagramMessage.objects.filter(
+            account_connection_id__in=connection_ids, sender_id__in=sender_ids, is_deleted=False,
+        )
+    else:
+        base = InstagramMessage.objects.filter(account_connection_id__in=connection_ids, is_deleted=False)
     heads = (
         base
         .order_by('account_connection_id', 'sender_id', '-timestamp')

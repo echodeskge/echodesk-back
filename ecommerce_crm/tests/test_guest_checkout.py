@@ -301,6 +301,26 @@ class TestGuestContactDetails(GuestCheckoutTestMixin, EchoDeskTenantTestCase):
         order.refresh_from_db()
         self.assertTrue(order.payment_metadata['quickshipper']['confirmed'])
 
+    def test_retried_courier_failure_is_a_warning_not_an_error(self):
+        """A failed attempt that will be retried ("Not enough balance" until
+        the merchant tops up) must not page as an error on every retry
+        (ECHODESK-BACKEND-78); only the final attempt is an error."""
+        from ecommerce_crm.tasks import book_quickshipper_courier
+        from ecommerce_crm.services.quickshipper import QuickshipperError
+
+        order = self._booked_order()
+        courier = MagicMock()
+        courier.create_order.side_effect = QuickshipperError('Not enough balance')
+        with patch('ecommerce_crm.services.quickshipper.client_from_settings', return_value=courier), \
+                self.assertLogs('ecommerce_crm.tasks', level='WARNING') as logs, \
+                self.assertRaises(QuickshipperError):
+            # Called directly (no worker): retry() re-raises the original error.
+            book_quickshipper_courier.run(self.tenant.schema_name, order.id)
+        self.assertEqual(
+            [r.levelname for r in logs.records if 'book_quickshipper_courier failed' in r.getMessage()],
+            ['WARNING'],
+        )
+
 
 class QuickshipperConfirmClientTest(EchoDeskTenantTestCase):
     def test_confirm_posts_order_id(self):

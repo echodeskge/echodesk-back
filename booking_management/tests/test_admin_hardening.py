@@ -9,6 +9,8 @@ from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from rest_framework import status
 
 from booking_management.models import Booking, BookingStaff, RecurringBooking, Service
@@ -726,6 +728,33 @@ class TestStaffReminders(HardeningBase):
             total = tasks.send_staff_booking_reminders()
         self.assertGreaterEqual(inner.call_count, 1)
         self.assertEqual(total, 2 * inner.call_count)
+
+    def test_tenant_passed_in_is_not_read_again(self):
+        """The beat task already iterates Tenant rows; the per-tenant pass must
+        not re-read the tenant by schema name (ECHODESK-BACKEND-88 N+1)."""
+        from booking_management import tasks
+        self.booking(status='confirmed', start_time=time(12, 0), end_time=time(13, 0))  # outside the window
+        now = datetime.combine(self.day, time(9, 40))
+        with patch('booking_management.utils.tenant_now', return_value=now):
+            with CaptureQueriesContext(connection) as ctx:
+                sent = tasks._send_staff_reminders_for_tenant(tenant=self.tenant)
+        self.assertEqual(sent, 0)
+        tenant_reads = [q['sql'] for q in ctx.captured_queries if 'FROM "tenants_tenant"' in q['sql']]
+        self.assertEqual(tenant_reads, [])
+
+    def test_tenant_passed_in_is_not_read_again_when_sending(self):
+        """Same as above on the path that sends: the tenant's fallback language
+        comes from the row passed in, not from another tenants_tenant read."""
+        from booking_management import tasks
+        soon = self.booking(status='confirmed')  # 10:00, inside the 30 min window
+        now = datetime.combine(self.day, time(9, 40))
+        with patch('booking_management.utils.tenant_now', return_value=now):
+            with CaptureQueriesContext(connection) as ctx:
+                sent = tasks._send_staff_reminders_for_tenant(tenant=self.tenant)
+        self.assertEqual(sent, 1)
+        self.assertEqual(self.notes(self.staff_user, 'booking_reminder')[0].metadata['booking_id'], soon.id)
+        tenant_reads = [q['sql'] for q in ctx.captured_queries if 'FROM "tenants_tenant"' in q['sql']]
+        self.assertEqual(tenant_reads, [])
 
 
 # ============================================================================

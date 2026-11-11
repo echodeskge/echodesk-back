@@ -550,7 +550,19 @@ def book_quickshipper_courier(self, schema_name, order_id):
             if qs_order_id is not None:
                 _confirm_quickshipper_order(order, client, QuickshipperError)
     except Exception as exc:
-        logger.error('book_quickshipper_courier failed: %s', exc)
+        # A failed attempt that will be retried (courier API down, "Not
+        # enough balance" until the merchant tops up) is a warning; only the
+        # last attempt is an error worth paging on (ECHODESK-BACKEND-78).
+        if self.request.retries < self.max_retries:
+            logger.warning(
+                'book_quickshipper_courier failed (attempt %s/%s), retrying: %s',
+                self.request.retries + 1, self.max_retries + 1, exc,
+            )
+        else:
+            logger.error(
+                'book_quickshipper_courier failed after %s attempts: %s',
+                self.max_retries + 1, exc,
+            )
         raise self.retry(exc=exc)
 
 

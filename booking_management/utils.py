@@ -22,12 +22,16 @@ FINAL_BOOKING_STATUSES = ['completed', 'cancelled', 'no_show']
 # Tenant settings / clock
 # ---------------------------------------------------------------------------
 
-def get_booking_settings():
-    """Return the current tenant's BookingSettings row, or None."""
+def get_booking_settings(tenant=None):
+    """Return the current tenant's BookingSettings row, or None.
+
+    Pass ``tenant`` when the caller already holds the Tenant (cross-tenant
+    beat tasks do) to skip the lookup by schema name."""
     try:
-        from django.db import connection
-        from tenants.models import Tenant
-        tenant = Tenant.objects.get(schema_name=connection.schema_name)
+        if tenant is None:
+            from django.db import connection
+            from tenants.models import Tenant
+            tenant = Tenant.objects.get(schema_name=connection.schema_name)
         return BookingSettings.objects.filter(tenant=tenant).first()
     except Exception:
         return None
