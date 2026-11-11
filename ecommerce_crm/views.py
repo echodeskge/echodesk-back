@@ -3538,6 +3538,17 @@ def ecommerce_payment_webhook(request):
         logger.warning(f'Payment failed: order_number={external_order_id}, code={response_code}')
         from django.db import transaction
 
+        external_order_id = external_order_id or ''
+        if external_order_id.startswith('card_'):
+            # A declined card-validation charge (order id card_{client}_{rand}
+            # from add_client_card). No Order and no ClientCard exist for it:
+            # the card is only saved when BOG confirms the charge, so there
+            # is nothing to update — the customer simply retries.
+            logger.info(
+                'Card validation rejected: order_id=%s, code=%s', external_order_id, response_code
+            )
+            return Response({'status': 'received', 'action': 'card_validation_rejected'})
+
         try:
             with transaction.atomic():
                 order = Order.objects.select_for_update().get(order_number=external_order_id)
@@ -3561,8 +3572,10 @@ def ecommerce_payment_webhook(request):
             # oversell. Never-paid orders are restocked by the cancel_unpaid_orders
             # sweeper after a grace period.
         except Order.DoesNotExist:
-            logger.error(f'Order not found for failed payment: {external_order_id}')
-    
+            # Nothing of ours to update (an order created elsewhere or
+            # already purged); BOG gets a 200 so it stops retrying.
+            logger.warning(f'Order not found for failed payment: {external_order_id}')
+
     # Handle other statuses
     else:
         logger.info(f'Webhook received with status: {bog_status}, code: {response_code}')

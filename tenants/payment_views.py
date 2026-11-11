@@ -1361,6 +1361,13 @@ def bog_webhook(request):
     elif bog_status == 'rejected':
         logger.warning(f'Payment failed: external_order_id={external_order_id}, code={response_code}')
 
+        if (external_order_id or '').startswith('RETRY-'):
+            # A declined automatic retry charge. Its id is not a PaymentOrder
+            # (execute_retry charges the original order under a RETRY- id):
+            # the failure belongs to the retry schedule and its attempt.
+            _record_rejected_retry(external_order_id, bog_order_id, response_code, body)
+            return Response({'status': 'received'})
+
         # Update payment order status if exists
         try:
             payment_order = PaymentOrder.objects.get(order_id=external_order_id)
@@ -1422,13 +1429,80 @@ def bog_webhook(request):
                     logger.warning(f'Payment failed with no saved card for retry: {external_order_id}')
 
         except PaymentOrder.DoesNotExist:
-            logger.error(f'Payment order not found for failed payment: {external_order_id}')
+            # Nothing of ours to update; BOG gets a 200 so it stops retrying.
+            logger.warning(f'Payment order not found for failed payment: {external_order_id}')
 
     # Handle other statuses
     else:
         logger.info(f'Webhook received with status: {bog_status}, code: {response_code}')
 
     return Response({'status': 'received'})
+
+
+def _record_rejected_retry(external_order_id, bog_order_id, response_code, body):
+    """Record a declined automatic retry charge (id ``RETRY-{schedule}-{order}``).
+
+    Marks the schedule's pending PaymentAttempt and the schedule itself as
+    failed and logs a ``retry_failed`` subscription event. The remaining
+    scheduled retries stay as they are; the subscription's failure counter
+    moves like for any other declined charge. Never raises: a malformed or
+    unknown id is logged and acknowledged.
+    """
+    try:
+        retry_id = int(external_order_id.split('-', 2)[1])
+    except (IndexError, ValueError):
+        logger.warning('Malformed retry order id in rejected webhook: %s', external_order_id)
+        return
+
+    retry_schedule = (
+        PaymentRetrySchedule.objects
+        .select_related('subscription', 'payment_order', 'retry_attempt', 'tenant')
+        .filter(id=retry_id).first()
+    )
+    if retry_schedule is None:
+        logger.warning('Retry schedule not found for rejected retry charge: %s', external_order_id)
+        return
+
+    now = timezone.now()
+    reason = body.get('message', 'Payment rejected by BOG')
+    attempt = retry_schedule.retry_attempt
+    if attempt is not None and attempt.status != 'success':
+        attempt.status = 'failed'
+        attempt.bog_order_id = bog_order_id or attempt.bog_order_id
+        attempt.completed_at = now
+        attempt.failed_reason = reason
+        attempt.bog_error_code = response_code or ''
+        attempt.bog_response = body
+        attempt.save(update_fields=[
+            'status', 'bog_order_id', 'completed_at', 'failed_reason', 'bog_error_code', 'bog_response',
+        ])
+
+    if retry_schedule.status in ('succeeded', 'failed'):
+        logger.info('Rejected webhook for already-settled retry %s ignored', external_order_id)
+        return
+
+    retry_schedule.status = 'failed'
+    retry_schedule.skip_reason = reason
+    retry_schedule.save(update_fields=['status', 'skip_reason'])
+
+    subscription = retry_schedule.subscription
+    create_subscription_event(
+        subscription=subscription,
+        event_type='retry_failed',
+        payment_order=retry_schedule.payment_order,
+        payment_attempt=attempt,
+        description=f'Retry #{retry_schedule.retry_number} failed: {reason}',
+        metadata={
+            'retry_number': retry_schedule.retry_number,
+            'error_code': response_code,
+            'bog_order_id': bog_order_id,
+        },
+    )
+    subscription.mark_payment_failed()
+    logger.warning(
+        'Retry #%s for %s rejected by BOG (code=%s)',
+        retry_schedule.retry_number, subscription.tenant.name, response_code,
+    )
 
 
 @extend_schema(
