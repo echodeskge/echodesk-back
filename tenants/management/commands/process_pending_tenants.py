@@ -133,6 +133,17 @@ class Command(BaseCommand):
 
     def run_migrations(self, tenant):
         """Run Django migrations for the tenant schema"""
+        # tenant_schemas' introspection lacks get_sequences(), which Django 4.2's
+        # migration framework calls when a migration alters a primary-key column
+        # type (e.g. token_blacklist 0008 AutoField -> BigAutoField). A brand new
+        # schema runs every migration from scratch and hit NotImplementedError
+        # there, leaving the tenant 'failed'. Borrow the stock PostgreSQL
+        # implementation (same patch as the test suite / seed_demo_tenant).
+        from django.db.backends.postgresql.introspection import DatabaseIntrospection as _PGIntrospection
+        from tenant_schemas.postgresql_backend.introspection import DatabaseSchemaIntrospection
+        if 'get_sequences' not in DatabaseSchemaIntrospection.__dict__:
+            DatabaseSchemaIntrospection.get_sequences = _PGIntrospection.get_sequences
+
         call_command(
             'migrate_schemas',
             schema_name=tenant.schema_name,
