@@ -271,7 +271,7 @@ class TestPatchTotal(FxBase):
     def test_total_below_paid_is_rejected(self):
         booking = self.booking(status='confirmed', total_amount=Decimal('80.00'),
                                paid_amount=Decimal('50.00'), payment_status='deposit_paid')
-        resp = self.api_patch(f'{ADMIN_BOOKING_URL}{booking.id}/', {'total_amount': '40.00'}, user=self.agent)
+        resp = self.api_patch(f'{ADMIN_BOOKING_URL}{booking.id}/', {'total_amount': '40.00'}, user=self.admin)
         self.assertEqual(resp.status_code, 400)
         self.assertIn('total_amount', resp.data)
         booking.refresh_from_db()
@@ -284,7 +284,7 @@ class TestPatchTotal(FxBase):
     def test_total_equal_to_paid_marks_fully_paid(self):
         booking = self.booking(status='confirmed', total_amount=Decimal('80.00'),
                                paid_amount=Decimal('50.00'), payment_status='deposit_paid')
-        resp = self.api_patch(f'{ADMIN_BOOKING_URL}{booking.id}/', {'total_amount': '50.00'}, user=self.agent)
+        resp = self.api_patch(f'{ADMIN_BOOKING_URL}{booking.id}/', {'total_amount': '50.00'}, user=self.manager)
         self.assertEqual(resp.status_code, 200, resp.data)
         self.assertEqual(resp.data['payment_status'], 'fully_paid')
         self.assertEqual(resp.data['remaining_amount'], 0.0)
@@ -292,19 +292,19 @@ class TestPatchTotal(FxBase):
     def test_raising_total_after_full_payment_leaves_something_owed(self):
         booking = self.booking(status='confirmed', total_amount=Decimal('50.00'),
                                paid_amount=Decimal('50.00'), payment_status='fully_paid')
-        resp = self.api_patch(f'{ADMIN_BOOKING_URL}{booking.id}/', {'total_amount': '70.00'}, user=self.agent)
+        resp = self.api_patch(f'{ADMIN_BOOKING_URL}{booking.id}/', {'total_amount': '70.00'}, user=self.admin)
         self.assertEqual(resp.status_code, 200, resp.data)
         self.assertEqual(resp.data['payment_status'], 'deposit_paid')
         self.assertEqual(resp.data['remaining_amount'], 20.0)
 
     def test_unpaid_and_refunded_status_untouched(self):
         unpaid = self.booking(status='confirmed', total_amount=Decimal('80.00'))
-        resp = self.api_patch(f'{ADMIN_BOOKING_URL}{unpaid.id}/', {'total_amount': '60.00'}, user=self.agent)
+        resp = self.api_patch(f'{ADMIN_BOOKING_URL}{unpaid.id}/', {'total_amount': '60.00'}, user=self.admin)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data['payment_status'], 'pending')
         refunded = self.booking(status='cancelled', total_amount=Decimal('80.00'), paid_amount=Decimal('10.00'),
                                 payment_status='refunded', start_time=time(12, 0), end_time=time(13, 0))
-        resp = self.api_patch(f'{ADMIN_BOOKING_URL}{refunded.id}/', {'total_amount': '90.00'}, user=self.agent)
+        resp = self.api_patch(f'{ADMIN_BOOKING_URL}{refunded.id}/', {'total_amount': '90.00'}, user=self.admin)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data['payment_status'], 'refunded')
 

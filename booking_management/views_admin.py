@@ -32,6 +32,7 @@ from .serializers import (
 )
 from .permissions import (
     HasBookingManagementFeature, IsBookingAdmin, IsBookingAdminForDestroy, IsBookingAdminForWrites,
+    is_booking_admin,
 )
 from .staff_notifications import notify_assigned_staff
 from .utils import (
@@ -860,6 +861,11 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop('partial', False)
         booking = self.get_object()
+        if 'total_amount' in request.data and not is_booking_admin(request.user):
+            # Notes may be edited by anyone working the booking; the price only
+            # by a booking admin (the UI hides the editor for everyone else).
+            return Response({'total_amount': 'Only admins and managers can change the price.'},
+                            status=status.HTTP_403_FORBIDDEN)
         serializer = self.get_serializer(booking, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
         serializer.save()

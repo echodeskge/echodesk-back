@@ -122,6 +122,25 @@ class TestRecordPaymentGate(HardeningBase):
         self.assertEqual(resp.data['payment_status'], 'fully_paid')
         self.assertEqual(resp.data['manual_payments'][0]['recorded_by'], self.manager.id)
 
+    def test_agent_cannot_change_the_price(self):
+        booking = self.booking(status='confirmed', total_amount=Decimal('80.00'), staff_notes='')
+        url = f'{ADMIN_BOOKING_URL}{booking.id}/'
+        resp = self.api_patch(url, {'total_amount': '999.00'}, user=self.agent)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        resp = self.api_patch(url, {'total_amount': '999.00', 'staff_notes': 'x'}, user=self.staff_user)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        booking.refresh_from_db()
+        self.assertEqual(booking.total_amount, Decimal('80.00'))
+        self.assertEqual(booking.staff_notes, '')
+        # Notes stay editable by whoever works the booking
+        resp = self.api_patch(url, {'staff_notes': 'bring the invoice'}, user=self.agent)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data['staff_notes'], 'bring the invoice')
+        # Admins and managers change the price
+        resp = self.api_patch(url, {'total_amount': '90.00'}, user=self.manager)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(Decimal(str(resp.data['total_amount'])), Decimal('90.00'))
+
     def test_agent_still_works_the_booking(self):
         booking = self.booking(status='pending')
         resp = self.api_post(f'{ADMIN_BOOKING_URL}{booking.id}/confirm/', {}, user=self.agent)
