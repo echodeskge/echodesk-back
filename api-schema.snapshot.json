@@ -3464,7 +3464,7 @@
         "/api/bookings/admin/availability/": {
             "get": {
                 "operationId": "bookings_admin_availability_list",
-                "description": "Admin staff availability management",
+                "description": "Staff weekly hours: everyone with the feature reads, booking admins write.",
                 "parameters": [
                     {
                         "in": "query",
@@ -3566,7 +3566,7 @@
             },
             "post": {
                 "operationId": "bookings_admin_availability_create",
-                "description": "Admin staff availability management",
+                "description": "Admins/managers only.",
                 "tags": [
                     "Booking Admin - Staff"
                 ],
@@ -3621,7 +3621,7 @@
         "/api/bookings/admin/availability/{id}/": {
             "get": {
                 "operationId": "bookings_admin_availability_retrieve",
-                "description": "Admin staff availability management",
+                "description": "Staff weekly hours: everyone with the feature reads, booking admins write.",
                 "parameters": [
                     {
                         "in": "path",
@@ -3665,7 +3665,7 @@
             },
             "put": {
                 "operationId": "bookings_admin_availability_update",
-                "description": "Admin staff availability management",
+                "description": "Admins/managers only.",
                 "parameters": [
                     {
                         "in": "path",
@@ -3729,7 +3729,7 @@
             },
             "patch": {
                 "operationId": "bookings_admin_availability_partial_update",
-                "description": "Admin staff availability management",
+                "description": "Admins/managers only.",
                 "parameters": [
                     {
                         "in": "path",
@@ -3792,7 +3792,7 @@
             },
             "delete": {
                 "operationId": "bookings_admin_availability_destroy",
-                "description": "Admin staff availability management",
+                "description": "Admins/managers only.",
                 "parameters": [
                     {
                         "in": "path",
@@ -4730,7 +4730,7 @@
         "/api/bookings/admin/bookings/{id}/record_payment/": {
             "post": {
                 "operationId": "bookings_admin_bookings_record_payment_create",
-                "description": "Record a payment taken by staff (cash at the desk, card terminal, transfer). Adds to paid_amount (at most the remaining amount) and sets payment_status to fully_paid, or deposit_paid while something is still owed. Logged in manual_payments. Not for cancelled bookings.",
+                "description": "Record a payment taken by staff (cash at the desk, card terminal, transfer). Adds to paid_amount (at most the remaining amount) and sets payment_status to fully_paid, or deposit_paid while something is still owed. Logged in manual_payments. Not for cancelled bookings. Admins/managers only.",
                 "parameters": [
                     {
                         "in": "path",
@@ -4791,6 +4791,16 @@
                         "description": ""
                     },
                     "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/BookingError"
+                                }
+                            }
+                        },
+                        "description": "{\"error\": \"...\"}"
+                    },
+                    "403": {
                         "content": {
                             "application/json": {
                                 "schema": {
@@ -5034,6 +5044,90 @@
                             }
                         },
                         "description": ""
+                    }
+                }
+            }
+        },
+        "/api/bookings/admin/calendar/": {
+            "get": {
+                "operationId": "bookings_admin_calendar_retrieve",
+                "description": "Everything the calendar views need for a range of days in one call: every staff member with their weekly hours and the exceptions that fall inside the range, and every booking of the range in any status (the client filters), ordered by date and start time. The range is inclusive and at most 62 days (400 otherwise).",
+                "summary": "Calendar data for a date range",
+                "parameters": [
+                    {
+                        "in": "query",
+                        "name": "date_from",
+                        "schema": {
+                            "type": "string",
+                            "format": "date"
+                        },
+                        "description": "First day (YYYY-MM-DD)",
+                        "required": true
+                    },
+                    {
+                        "in": "query",
+                        "name": "date_to",
+                        "schema": {
+                            "type": "string",
+                            "format": "date"
+                        },
+                        "description": "Last day, inclusive (YYYY-MM-DD); at most 62 days from date_from",
+                        "required": true
+                    },
+                    {
+                        "in": "query",
+                        "name": "lang",
+                        "schema": {
+                            "type": "string"
+                        },
+                        "description": "Language for *_display fields (en / ka; default en)"
+                    },
+                    {
+                        "in": "query",
+                        "name": "staff",
+                        "schema": {
+                            "type": "string"
+                        },
+                        "description": "Comma-separated staff ids (e.g. `3,7`); default every staff member. Bookings without a staff member are left out when given."
+                    }
+                ],
+                "tags": [
+                    "Booking Admin - Dashboard"
+                ],
+                "security": [
+                    {
+                        "jwtAuth": []
+                    },
+                    {
+                        "cookieAuth": []
+                    },
+                    {
+                        "tokenAuth": []
+                    },
+                    {
+                        "tokenAuth": []
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/CalendarRange"
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/BookingError"
+                                }
+                            }
+                        },
+                        "description": "{\"error\": \"...\"}"
                     }
                 }
             }
@@ -5667,7 +5761,7 @@
         "/api/bookings/admin/exceptions/": {
             "get": {
                 "operationId": "bookings_admin_exceptions_list",
-                "description": "Admin staff exception management",
+                "description": "Staff day exceptions: everyone with the feature reads, booking admins write.",
                 "parameters": [
                     {
                         "in": "query",
@@ -5760,7 +5854,7 @@
             },
             "post": {
                 "operationId": "bookings_admin_exceptions_create",
-                "description": "Admin staff exception management",
+                "description": "Admins/managers only.",
                 "tags": [
                     "Booking Admin - Staff"
                 ],
@@ -5815,7 +5909,7 @@
         "/api/bookings/admin/exceptions/{id}/": {
             "get": {
                 "operationId": "bookings_admin_exceptions_retrieve",
-                "description": "Admin staff exception management",
+                "description": "Staff day exceptions: everyone with the feature reads, booking admins write.",
                 "parameters": [
                     {
                         "in": "path",
@@ -5859,7 +5953,7 @@
             },
             "put": {
                 "operationId": "bookings_admin_exceptions_update",
-                "description": "Admin staff exception management",
+                "description": "Admins/managers only.",
                 "parameters": [
                     {
                         "in": "path",
@@ -5923,7 +6017,7 @@
             },
             "patch": {
                 "operationId": "bookings_admin_exceptions_partial_update",
-                "description": "Admin staff exception management",
+                "description": "Admins/managers only.",
                 "parameters": [
                     {
                         "in": "path",
@@ -5986,7 +6080,7 @@
             },
             "delete": {
                 "operationId": "bookings_admin_exceptions_destroy",
-                "description": "Admin staff exception management",
+                "description": "Admins/managers only.",
                 "parameters": [
                     {
                         "in": "path",
@@ -6025,7 +6119,7 @@
         "/api/bookings/admin/recurring-bookings/": {
             "get": {
                 "operationId": "bookings_admin_recurring_bookings_list",
-                "description": "Admin recurring booking management",
+                "description": "Recurring series: everyone with the feature reads, booking admins write.",
                 "parameters": [
                     {
                         "in": "query",
@@ -6137,7 +6231,7 @@
             },
             "post": {
                 "operationId": "bookings_admin_recurring_bookings_create",
-                "description": "Admin recurring booking management",
+                "description": "Admins/managers only.",
                 "tags": [
                     "Booking Admin - Bookings"
                 ],
@@ -6192,7 +6286,7 @@
         "/api/bookings/admin/recurring-bookings/{id}/": {
             "get": {
                 "operationId": "bookings_admin_recurring_bookings_retrieve",
-                "description": "Admin recurring booking management",
+                "description": "Recurring series: everyone with the feature reads, booking admins write.",
                 "parameters": [
                     {
                         "in": "path",
@@ -6236,7 +6330,7 @@
             },
             "put": {
                 "operationId": "bookings_admin_recurring_bookings_update",
-                "description": "Admin recurring booking management",
+                "description": "Admins/managers only.",
                 "parameters": [
                     {
                         "in": "path",
@@ -6300,7 +6394,7 @@
             },
             "patch": {
                 "operationId": "bookings_admin_recurring_bookings_partial_update",
-                "description": "Admin recurring booking management",
+                "description": "Admins/managers only.",
                 "parameters": [
                     {
                         "in": "path",
@@ -6402,7 +6496,7 @@
         "/api/bookings/admin/recurring-bookings/{id}/cancel/": {
             "post": {
                 "operationId": "bookings_admin_recurring_bookings_cancel_create",
-                "description": "Cancel recurring booking",
+                "description": "Admins/managers only.",
                 "parameters": [
                     {
                         "in": "path",
@@ -6448,7 +6542,7 @@
         "/api/bookings/admin/recurring-bookings/{id}/pause/": {
             "post": {
                 "operationId": "bookings_admin_recurring_bookings_pause_create",
-                "description": "Pause recurring booking",
+                "description": "Admins/managers only.",
                 "parameters": [
                     {
                         "in": "path",
@@ -6494,7 +6588,7 @@
         "/api/bookings/admin/recurring-bookings/{id}/resume/": {
             "post": {
                 "operationId": "bookings_admin_recurring_bookings_resume_create",
-                "description": "Resume recurring booking",
+                "description": "Admins/managers only.",
                 "parameters": [
                     {
                         "in": "path",
@@ -70980,6 +71074,360 @@
                 "type": "string",
                 "description": "* `annual` - Annual Allocation\n* `accrual` - Accrual Based\n* `manual` - Manual Assignment"
             },
+            "CalendarAvailability": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "readOnly": true
+                    },
+                    "day_of_week": {
+                        "allOf": [
+                            {
+                                "$ref": "#/components/schemas/DayOfWeekEnum"
+                            }
+                        ],
+                        "readOnly": true,
+                        "description": "0=Monday, 6=Sunday\n\n* `0` - Monday\n* `1` - Tuesday\n* `2` - Wednesday\n* `3` - Thursday\n* `4` - Friday\n* `5` - Saturday\n* `6` - Sunday"
+                    },
+                    "start_time": {
+                        "type": "string",
+                        "format": "time",
+                        "readOnly": true,
+                        "description": "Start of working hours"
+                    },
+                    "end_time": {
+                        "type": "string",
+                        "format": "time",
+                        "readOnly": true,
+                        "description": "End of working hours"
+                    },
+                    "is_available": {
+                        "type": "boolean",
+                        "readOnly": true,
+                        "description": "Available on this day"
+                    },
+                    "break_start": {
+                        "type": "string",
+                        "format": "time",
+                        "readOnly": true,
+                        "nullable": true,
+                        "description": "Break start time"
+                    },
+                    "break_end": {
+                        "type": "string",
+                        "format": "time",
+                        "readOnly": true,
+                        "nullable": true,
+                        "description": "Break end time"
+                    }
+                },
+                "required": [
+                    "break_end",
+                    "break_start",
+                    "day_of_week",
+                    "end_time",
+                    "id",
+                    "is_available",
+                    "start_time"
+                ]
+            },
+            "CalendarBooking": {
+                "type": "object",
+                "description": "One booking on the calendar: the BookingRow fields, with the staff\nmember as `staff_id` (the roster comes once per response) plus staff notes.",
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "readOnly": true
+                    },
+                    "booking_number": {
+                        "type": "string",
+                        "readOnly": true
+                    },
+                    "client": {
+                        "allOf": [
+                            {
+                                "$ref": "#/components/schemas/BookingRowClient"
+                            }
+                        ],
+                        "readOnly": true
+                    },
+                    "service": {
+                        "allOf": [
+                            {
+                                "$ref": "#/components/schemas/CalendarService"
+                            }
+                        ],
+                        "readOnly": true
+                    },
+                    "staff_id": {
+                        "type": "integer",
+                        "readOnly": true,
+                        "nullable": true
+                    },
+                    "date": {
+                        "type": "string",
+                        "format": "date",
+                        "readOnly": true
+                    },
+                    "start_time": {
+                        "type": "string",
+                        "format": "time",
+                        "readOnly": true
+                    },
+                    "end_time": {
+                        "type": "string",
+                        "format": "time",
+                        "readOnly": true
+                    },
+                    "status": {
+                        "allOf": [
+                            {
+                                "$ref": "#/components/schemas/Status308Enum"
+                            }
+                        ],
+                        "readOnly": true
+                    },
+                    "payment_status": {
+                        "allOf": [
+                            {
+                                "$ref": "#/components/schemas/PaymentStatus0acEnum"
+                            }
+                        ],
+                        "readOnly": true
+                    },
+                    "payment_method": {
+                        "allOf": [
+                            {
+                                "$ref": "#/components/schemas/PaymentMethod9aeEnum"
+                            }
+                        ],
+                        "readOnly": true,
+                        "description": "How the customer chose to pay (empty for bookings made before this field existed)\n\n* `cash` - Pay at the venue\n* `card` - Card (online)"
+                    },
+                    "total_amount": {
+                        "type": "string",
+                        "format": "decimal",
+                        "pattern": "^-?\\d{0,8}(?:\\.\\d{0,2})?$",
+                        "readOnly": true,
+                        "description": "Total service price"
+                    },
+                    "deposit_amount": {
+                        "type": "string",
+                        "format": "decimal",
+                        "pattern": "^-?\\d{0,8}(?:\\.\\d{0,2})?$",
+                        "readOnly": true,
+                        "description": "Deposit amount (if applicable)"
+                    },
+                    "paid_amount": {
+                        "type": "string",
+                        "format": "decimal",
+                        "pattern": "^-?\\d{0,8}(?:\\.\\d{0,2})?$",
+                        "readOnly": true,
+                        "description": "Amount paid so far"
+                    },
+                    "client_notes": {
+                        "type": "string",
+                        "readOnly": true,
+                        "description": "Notes from client"
+                    },
+                    "staff_notes": {
+                        "type": "string",
+                        "readOnly": true,
+                        "description": "Internal notes from staff"
+                    },
+                    "created_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "readOnly": true
+                    }
+                },
+                "required": [
+                    "booking_number",
+                    "client",
+                    "client_notes",
+                    "created_at",
+                    "date",
+                    "deposit_amount",
+                    "end_time",
+                    "id",
+                    "paid_amount",
+                    "payment_method",
+                    "payment_status",
+                    "service",
+                    "staff_id",
+                    "staff_notes",
+                    "start_time",
+                    "status",
+                    "total_amount"
+                ]
+            },
+            "CalendarException": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "readOnly": true
+                    },
+                    "date": {
+                        "type": "string",
+                        "format": "date",
+                        "readOnly": true,
+                        "description": "Date of exception"
+                    },
+                    "start_time": {
+                        "type": "string",
+                        "format": "time",
+                        "readOnly": true,
+                        "nullable": true,
+                        "description": "If available, custom start time"
+                    },
+                    "end_time": {
+                        "type": "string",
+                        "format": "time",
+                        "readOnly": true,
+                        "nullable": true,
+                        "description": "If available, custom end time"
+                    },
+                    "is_available": {
+                        "type": "boolean",
+                        "readOnly": true,
+                        "description": "Available on this date (overrides regular schedule)"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "readOnly": true,
+                        "description": "Reason for exception (vacation, sick, etc.)"
+                    }
+                },
+                "required": [
+                    "date",
+                    "end_time",
+                    "id",
+                    "is_available",
+                    "reason",
+                    "start_time"
+                ]
+            },
+            "CalendarRange": {
+                "type": "object",
+                "properties": {
+                    "date_from": {
+                        "type": "string",
+                        "format": "date"
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "format": "date"
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "IANA zone the dates and times are in"
+                    },
+                    "staff": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/components/schemas/CalendarStaff"
+                        }
+                    },
+                    "bookings": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/components/schemas/CalendarBooking"
+                        },
+                        "description": "Every status; ordered by date, start_time"
+                    }
+                },
+                "required": [
+                    "bookings",
+                    "date_from",
+                    "date_to",
+                    "staff",
+                    "timezone"
+                ]
+            },
+            "CalendarService": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "readOnly": true
+                    },
+                    "name_display": {
+                        "type": "string",
+                        "readOnly": true
+                    },
+                    "duration_minutes": {
+                        "type": "integer",
+                        "readOnly": true,
+                        "description": "Service duration in minutes"
+                    },
+                    "buffer_time_minutes": {
+                        "type": "integer",
+                        "readOnly": true,
+                        "description": "Buffer time after service (cleanup, etc.)"
+                    }
+                },
+                "required": [
+                    "buffer_time_minutes",
+                    "duration_minutes",
+                    "id",
+                    "name_display"
+                ]
+            },
+            "CalendarStaff": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "readOnly": true
+                    },
+                    "user_id": {
+                        "type": "integer",
+                        "readOnly": true
+                    },
+                    "full_name": {
+                        "type": "string",
+                        "readOnly": true
+                    },
+                    "profile_image": {
+                        "type": "string",
+                        "format": "uri",
+                        "readOnly": true,
+                        "nullable": true
+                    },
+                    "is_active_for_bookings": {
+                        "type": "boolean",
+                        "readOnly": true,
+                        "description": "Can accept new bookings"
+                    },
+                    "availability": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/components/schemas/CalendarAvailability"
+                        },
+                        "readOnly": true,
+                        "description": "Weekly hours (0 = Monday)"
+                    },
+                    "exceptions": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/components/schemas/CalendarException"
+                        },
+                        "readOnly": true,
+                        "description": "Only days inside the requested range"
+                    }
+                },
+                "required": [
+                    "availability",
+                    "exceptions",
+                    "full_name",
+                    "id",
+                    "is_active_for_bookings",
+                    "profile_image",
+                    "user_id"
+                ]
+            },
             "CallEndRequest": {
                 "type": "object",
                 "description": "Body of ``POST /api/call-logs/{id}/end_call/``. Everything is\noptional and ignored (the server decides ended vs missed); send ``{}``.\n``status`` is accepted only for older clients that still send it.",
@@ -71067,6 +71515,14 @@
                     },
                     "sip_configuration": {
                         "type": "integer"
+                    },
+                    "sip_call_id": {
+                        "type": "string",
+                        "maxLength": 255
+                    },
+                    "pbx_call_id": {
+                        "type": "string",
+                        "maxLength": 64
                     }
                 },
                 "required": [
