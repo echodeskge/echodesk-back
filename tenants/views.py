@@ -1255,11 +1255,22 @@ def register_tenant(request):
                     {'error': 'A tenant with this domain already exists'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            if PendingRegistration.objects.filter(schema_name=schema_name).exists():
+            # Only a paid signup still waiting for its BOG payment (started in
+            # the last 24 h) reserves the domain. Processed rows (the tenant was
+            # provisioned, or later deleted) and abandoned attempts do not.
+            # schema_name is unique on PendingRegistration, so a stale row is
+            # removed before the new one is written.
+            earlier_rows = PendingRegistration.objects.filter(schema_name=schema_name)
+            payment_in_flight = earlier_rows.filter(
+                is_processed=False,
+                created_at__gte=timezone.now() - timedelta(hours=24),
+            ).exists()
+            if payment_in_flight:
                 return Response(
                     {'error': 'A registration for this domain is already pending'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
+            earlier_rows.delete()
 
             now = timezone.now()
             trial_ends_at = now + timedelta(days=TRIAL_DAYS)

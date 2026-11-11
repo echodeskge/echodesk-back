@@ -205,6 +205,43 @@ class TestRegisterTrial(TrialMixin, EchoDeskTenantTestCase):
         self.assertEqual(data['frontend_url'], 'https://trial_co.echodesk.ge')
         self.assertEqual(data['deployment_status'], 'deploying')
 
+    def _old_pending_row(self, processed, age):
+        row = PendingRegistration.objects.create(
+            schema_name='trial_co', name='Old', admin_email='old@trial.example',
+            admin_password='x', admin_first_name='O', admin_last_name='L',
+            agent_count=10, order_id='OLD-1', is_processed=processed,
+        )
+        PendingRegistration.objects.filter(pk=row.pk).update(created_at=timezone.now() - age)
+        return row
+
+    def test_processed_pending_row_of_a_deleted_tenant_does_not_block_the_domain(self):
+        self._old_pending_row(processed=True, age=timedelta(days=3))
+        response, trigger = self._register()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        trigger.assert_called_once_with('trial_co')
+        pending = PendingRegistration.objects.get(schema_name='trial_co')
+        self.assertEqual(pending.admin_email, 'owner@trial.example')  # the stale row was replaced
+        self.assertTrue(pending.order_id.startswith('TRIAL-'))
+
+    def test_abandoned_paid_attempt_does_not_block_the_domain(self):
+        self._old_pending_row(processed=False, age=timedelta(days=2))
+        response, trigger = self._register()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        trigger.assert_called_once_with('trial_co')
+        self.assertEqual(PendingRegistration.objects.filter(schema_name='trial_co').count(), 1)
+
+    def test_paid_signup_awaiting_payment_reserves_the_domain(self):
+        PendingRegistration.objects.create(
+            schema_name='trial_co', name='Paying', admin_email='pay@trial.example',
+            admin_password='x', admin_first_name='P', admin_last_name='A',
+            agent_count=10, order_id='PAY-1', is_processed=False,
+        )
+        response, trigger = self._register()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('already pending', response.data['error'])
+        trigger.assert_not_called()
+        self.assertFalse(Tenant.objects.filter(schema_name='trial_co').exists())
+
     def test_duplicate_domain_rejected(self):
         first, _ = self._register()
         self.assertEqual(first.status_code, status.HTTP_201_CREATED, first.data)
