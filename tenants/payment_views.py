@@ -814,6 +814,12 @@ def bog_webhook(request):
 
                 logger.info(f'Processing card addition for tenant {tenant.schema_name}: {card_type} {masked_card_number}')
 
+                if not card_saved_for_recurring:
+                    logger.warning(
+                        f'Add-card webhook for {tenant.schema_name} without saved_card_type=subscription '
+                        f'(got {saved_card_type!r}); saving the card reference anyway'
+                    )
+
                 # Save the card to SavedCard model
                 with transaction.atomic():
                     saved_card = SavedCard.objects.create(
@@ -822,6 +828,7 @@ def bog_webhook(request):
                         card_type=card_type,
                         masked_card_number=masked_card_number,
                         card_expiry=card_expiry,
+                        transaction_id=transaction_id,
                         is_active=True,
                         is_default=make_default,
                         card_save_type='subscription'  # Fixed amount recurring
@@ -833,10 +840,83 @@ def bog_webhook(request):
                     payment_order.card_saved = True
                     payment_order.save()
 
+                    # Point the subscription at this card so the recurring
+                    # jobs (process_trial_expirations for a no-card trial,
+                    # process_recurring_payments afterwards) can charge it.
+                    # The first card always becomes the billing card; a later
+                    # one only when added as default.
+                    subscription = TenantSubscription.objects.filter(tenant=tenant).first()
+                    if subscription is not None and (make_default or not subscription.parent_order_id):
+                        subscription.parent_order_id = bog_order_id
+                        if subscription.payment_status == 'no_card':
+                            subscription.payment_status = 'current'
+                        subscription.save(update_fields=['parent_order_id', 'payment_status', 'updated_at'])
+                        if not saved_card.is_default:
+                            saved_card.is_default = True
+                            saved_card.save()
+                        logger.info(
+                            f'Subscription parent_order_id set to {bog_order_id} for tenant '
+                            f'{tenant.schema_name} (is_trial={subscription.is_trial})'
+                        )
+
                 return Response({
                     'status': 'success',
                     'action': 'card_added',
                     'card_id': saved_card.id
+                })
+
+            # Trial conversion: the charge process_trial_expirations fired on
+            # the saved card at trial end. The command already flipped the
+            # subscription to paid and advanced the billing dates; here we
+            # only settle the payment. (Without this branch the order fell
+            # through to the legacy package renewal below, which resets
+            # agent_count to 1.)
+            if payment_type == 'trial_conversion':
+                tenant = payment_order.tenant
+                with transaction.atomic():
+                    try:
+                        subscription = TenantSubscription.objects.select_for_update().get(tenant=tenant)
+                    except TenantSubscription.DoesNotExist:
+                        logger.error(f'Subscription not found for trial conversion: {tenant.schema_name}')
+                        return Response({'error': 'Subscription not found'}, status=status.HTTP_404_NOT_FOUND)
+
+                    subscription.is_trial = False
+                    subscription.trial_converted = True
+                    subscription.subscription_type = 'paid'
+                    subscription.is_active = True
+                    subscription.failed_payment_count = 0
+                    subscription.last_payment_failure = None
+                    subscription.payment_status = 'current'
+                    subscription.save()
+
+                    attempt.subscription = subscription
+                    attempt.save(update_fields=['subscription'])
+
+                    create_subscription_event(
+                        subscription=subscription,
+                        event_type='trial_converted',
+                        payment_order=payment_order,
+                        payment_attempt=attempt,
+                        description=f'Trial converted to paid for {tenant.name}',
+                        metadata={
+                            'amount': str(payment_order.amount),
+                            'agent_count': subscription.agent_count,
+                            'next_billing_date': subscription.next_billing_date.isoformat() if subscription.next_billing_date else None,
+                        }
+                    )
+
+                    generate_invoice_for_payment(
+                        payment_order=payment_order,
+                        tenant=tenant,
+                        agent_count=subscription.agent_count,
+                        description=f"EchoDesk Subscription - {tenant.name}"
+                    )
+
+                logger.info(f'Trial conversion payment settled for tenant {tenant.schema_name}')
+                return Response({
+                    'status': 'success',
+                    'action': 'trial_converted',
+                    'subscription_id': subscription.id,
                 })
 
             # Check if this is an ecommerce card addition payment
@@ -2241,12 +2321,24 @@ def add_new_card(request):
             }
         )
 
+        # Ask BOG to save the card on this order for fixed-amount recurring
+        # charges (PUT /orders/{id}/subscriptions). Must happen before the
+        # customer pays; without it the webhook carries no saved card and
+        # the trial can never be charged.
+        bog_order_id = payment_result['order_id']
+        try:
+            card_saving_enabled = bog_service.enable_subscription_card_saving(bog_order_id)
+        except Exception as e:
+            logger.error(f'Failed to enable card saving for order {bog_order_id}: {e}')
+            card_saving_enabled = False
+        if not card_saving_enabled:
+            logger.warning(f'Subscription card saving not enabled for add-card order {bog_order_id}')
+
         # Store payment order in database
         payment_order = PaymentOrder.objects.create(
             order_id=external_order_id,  # Store our external_order_id for webhook lookup
-            bog_order_id=payment_result['order_id'],  # Store BOG's internal order_id
+            bog_order_id=bog_order_id,  # Store BOG's internal order_id
             tenant=request.tenant,
-            package=None,  # No package for card addition
             amount=0.0,
             currency='GEL',
             agent_count=0,
@@ -2255,7 +2347,9 @@ def add_new_card(request):
             metadata={
                 **payment_result.get('metadata', {}),
                 'type': 'add_card',
-                'make_default': make_default
+                'make_default': make_default,
+                'save_card': True,
+                'card_saving_enabled': card_saving_enabled,
             }
         )
 
