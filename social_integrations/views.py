@@ -1261,7 +1261,11 @@ def facebook_oauth_callback(request):
                                 page_connection.webhook_subscribed = True
                                 page_connection.save(update_fields=['webhook_subscribed'])
                         else:
-                            logger.error(f"❌ Failed to subscribe page {page_name} to webhooks: {subscribe_data}")
+                            # Meta answers 4xx when the page's token lacks the
+                            # permission or the app isn't allowed on the page;
+                            # expected during onboarding, surfaced to the user
+                            # via unsubscribed_pages, not an application fault.
+                            logger.warning(f"⚠️ Failed to subscribe page {page_name} to webhooks: {subscribe_data}")
                             unsubscribed_pages.append(page_name)
                             page_connection.webhook_subscribed = False
                             page_connection.save(update_fields=['webhook_subscribed'])
@@ -8386,8 +8390,15 @@ def whatsapp_send_message(request):
         response_data = response.json()
 
         if response.status_code != 200 or 'error' in response_data:
-            error_msg = response_data.get('error', {}).get('message', 'Unknown error')
-            logger.error(f"Failed to send WhatsApp message: {error_msg}")
+            error = response_data.get('error', {})
+            error_msg = error.get('message', 'Unknown error')
+            # A 4xx from Meta (expired/invalid OAuth token, number not
+            # allowed, 24h window closed) is reported back to the agent in
+            # the response; it is not an application fault.
+            logger.warning(
+                "Failed to send WhatsApp message from %s (HTTP %s, Meta code %s): %s",
+                account.waba_id, response.status_code, error.get('code'), error_msg,
+            )
             return Response({
                 'error': f'Failed to send message: {error_msg}'
             }, status=status.HTTP_400_BAD_REQUEST)
