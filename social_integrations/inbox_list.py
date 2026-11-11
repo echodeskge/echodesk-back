@@ -19,7 +19,8 @@ from tenant_schemas.utils import schema_context
 
 from .models import (
     ChatAssignment, ConversationArchive, EmailConnection, EmailMessage,
-    FacebookMessage, InstagramMessage, SocialAccount, TelegramMessage,
+    FacebookMessage, FacebookPageConnection, InstagramAccountConnection,
+    InstagramMessage, SocialAccount, TelegramMessage,
     WhatsAppMessage, WidgetMessage, WidgetSession,
 )
 
@@ -108,20 +109,27 @@ def hide_assigned_applies(request):
     return bool(settings_obj and settings_obj.hide_assigned_chats)
 
 
-def _assigned_conversation_ids(platform, ctx):
-    """For the "Assigned to me" tab: the caller's active conversation ids on
-    ``platform``, so the DISTINCT ON head scan only reads those senders
-    instead of every message in the table (that full scan was a 1s+ query
-    on busy tenants). ``None`` when the tab isn't "assigned"."""
+def _assigned_keys(platform, ctx):
+    """For the "Assigned to me" tab: the caller's active assignments on
+    ``platform`` as ``(account_ids, conversation_ids)``, so the DISTINCT ON
+    head scan only reads those accounts' senders instead of every message in
+    the table. Narrowing by sender alone could not use the
+    (connection, sender, -timestamp) index — Postgres had to walk the whole
+    index/table for ``sender_id IN (...)`` and the count took up to 5s on busy
+    tenants (ECHODESK-BACKEND-7W/83/89/8A). ``None`` when the tab isn't
+    "assigned"."""
     if not ctx.assigned_only:
         return None
-    return list(
-        ChatAssignment.objects.filter(
-            platform=platform,
-            assigned_user=ctx.user,
-            status__in=ACTIVE_ASSIGNMENT_STATUSES,
-        ).values_list('conversation_id', flat=True).distinct()
-    )
+    account_ids, conversation_ids = set(), set()
+    rows = ChatAssignment.objects.filter(
+        platform=platform,
+        assigned_user=ctx.user,
+        status__in=ACTIVE_ASSIGNMENT_STATUSES,
+    ).values_list('account_id', 'conversation_id').distinct()
+    for account_id, conversation_id in rows:
+        account_ids.add(account_id)
+        conversation_ids.add(conversation_id)
+    return sorted(account_ids), sorted(conversation_ids)
 
 
 def _take(qs, ctx, order=('-timestamp', '-id')):
@@ -132,10 +140,16 @@ def _take(qs, ctx, order=('-timestamp', '-id')):
 
 def _facebook_heads(ctx):
     base = FacebookMessage.objects.filter(is_deleted=False)
-    assigned_ids = _assigned_conversation_ids('facebook', ctx)
-    if assigned_ids is not None:
+    assigned = _assigned_keys('facebook', ctx)
+    if assigned is not None:
         # Narrowing only; _apply_visibility still checks the account match.
-        base = base.filter(sender_id__in=assigned_ids)
+        # Both columns of the (page_connection, sender_id, -timestamp) index
+        # are pinned, so the head scan is a handful of index lookups.
+        page_ids, sender_ids = assigned
+        connection_ids = list(
+            FacebookPageConnection.objects.filter(page_id__in=page_ids).values_list('id', flat=True)
+        )
+        base = base.filter(page_connection_id__in=connection_ids, sender_id__in=sender_ids)
     heads = (
         base
         .order_by('page_connection_id', 'sender_id', '-timestamp', '-id')
@@ -156,10 +170,17 @@ def _facebook_heads(ctx):
 
 def _instagram_heads(ctx):
     base = InstagramMessage.objects.filter(is_deleted=False)
-    assigned_ids = _assigned_conversation_ids('instagram', ctx)
-    if assigned_ids is not None:
-        # Narrowing only; _apply_visibility still checks the account match.
-        base = base.filter(sender_id__in=assigned_ids)
+    assigned = _assigned_keys('instagram', ctx)
+    if assigned is not None:
+        # Narrowing only; _apply_visibility still checks the account match
+        # (see _facebook_heads for why both index columns are pinned).
+        ig_account_ids, sender_ids = assigned
+        connection_ids = list(
+            InstagramAccountConnection.objects.filter(
+                instagram_account_id__in=ig_account_ids,
+            ).values_list('id', flat=True)
+        )
+        base = base.filter(account_connection_id__in=connection_ids, sender_id__in=sender_ids)
     heads = (
         base
         .order_by('account_connection_id', 'sender_id', '-timestamp', '-id')
