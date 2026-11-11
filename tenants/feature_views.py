@@ -24,6 +24,7 @@ from .feature_serializers import (
 )
 from .subscription_service import SubscriptionService
 from .bog_payment import bog_service
+from .pricing_rules import AGENT_COUNT_ERROR, MIN_AGENT_COUNT, is_valid_agent_count
 from .security_views import IsStaffOrSuperUser
 import logging
 import uuid
@@ -508,10 +509,10 @@ def remove_feature_from_subscription(request):
 @extend_schema(
     operation_id='subscription_agent_count_update',
     summary='Change the subscription agent count',
-    description='Staff or superuser only.',
+    description='Staff or superuser only. Minimum 5 agents, in increments of 5.',
     request=inline_serializer(
         name='UpdateAgentCount',
-        fields={'agent_count': serializers.IntegerField(min_value=1)},
+        fields={'agent_count': serializers.IntegerField(min_value=MIN_AGENT_COUNT)},
     ),
     responses={
         200: inline_serializer(
@@ -543,9 +544,9 @@ def update_agent_count(request):
     This recalculates the monthly cost based on new agent count
     """
     new_agent_count = request.data.get('agent_count')
-    if not new_agent_count or not isinstance(new_agent_count, int) or new_agent_count < 1:
+    if not is_valid_agent_count(new_agent_count):
         return Response(
-            {'error': 'Valid agent_count (positive integer) is required'},
+            {'error': AGENT_COUNT_ERROR},
             status=status.HTTP_400_BAD_REQUEST
         )
 

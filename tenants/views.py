@@ -15,6 +15,7 @@ from rest_framework import serializers as drf_serializers
 from drf_spectacular.openapi import OpenApiTypes
 from .models import Tenant, PendingRegistration, PaymentOrder, TenantDomain, DashboardAppearanceSettings
 from .feature_models import Feature
+from .pricing_rules import MIN_AGENT_COUNT
 from .serializers import (
     TenantSerializer, TenantCreateSerializer, TenantRegistrationSerializer,
     TenantLoginSerializer, TenantDashboardDataSerializer, DashboardAppearanceSettingsSerializer,
@@ -980,8 +981,8 @@ def register_tenant_with_payment(request):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Feature-based pricing
-            agent_count = validated_data.get('agent_count', 10)
+            # Feature-based pricing (serializer enforces min 5, steps of 5)
+            agent_count = validated_data.get('agent_count', MIN_AGENT_COUNT)
             feature_ids = validated_data.get('feature_ids', [])
             selected_features = Feature.objects.filter(id__in=feature_ids, is_active=True)
 
@@ -1183,7 +1184,7 @@ def register_tenant(request):
 
             feature_ids = validated_data.get('feature_ids', [])
             selected_features = Feature.objects.filter(id__in=feature_ids, is_active=True)
-            agent_count = validated_data.get('agent_count', 10)
+            agent_count = validated_data.get('agent_count', MIN_AGENT_COUNT)
 
             # Create tenant
             domain_name = validated_data['domain']

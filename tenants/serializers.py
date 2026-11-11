@@ -3,6 +3,9 @@ from drf_spectacular.utils import extend_schema_field
 from django.contrib.auth import get_user_model, authenticate
 from rest_framework.authtoken.models import Token
 from .models import Tenant, SavedCard, TenantSubscription, DashboardAppearanceSettings, SecurityLog, TenantIPWhitelist
+from .pricing_rules import (
+    AGENT_COUNT_ERROR, AGENT_COUNT_STEP, MIN_AGENT_COUNT, is_valid_agent_count,
+)
 import re
 from drf_spectacular.utils import extend_schema_field
 
@@ -95,9 +98,12 @@ class TenantRegistrationSerializer(serializers.Serializer):
         help_text="Pricing model preference"
     )
     agent_count = serializers.IntegerField(
-        default=10,
-        min_value=10,
-        help_text="Number of agents (required for agent-based pricing)"
+        default=MIN_AGENT_COUNT,
+        min_value=MIN_AGENT_COUNT,
+        help_text=(
+            f"Number of agents (minimum {MIN_AGENT_COUNT}, in increments of "
+            f"{AGENT_COUNT_STEP}; required for agent-based pricing)"
+        ),
     )
     
     # Admin user information
@@ -123,7 +129,6 @@ class TenantRegistrationSerializer(serializers.Serializer):
 
         feature_ids = attrs.get('feature_ids', [])
         pricing_model = attrs.get('pricing_model')
-        agent_count = attrs.get('agent_count', 10)
 
         # Validate all features exist and are active
         if feature_ids:
@@ -133,15 +138,19 @@ class TenantRegistrationSerializer(serializers.Serializer):
                     'feature_ids': 'One or more invalid or inactive features selected'
                 })
 
-        # Validate agent count for agent-based pricing
-        if pricing_model == 'agent' and agent_count < 10:
-            raise serializers.ValidationError("Agent count must be at least 10 for agent-based pricing")
+        # agent_count (min 5, increments of 5) is checked in validate_agent_count
 
         # For CRM-based pricing, agent_count is not used
         if pricing_model == 'crm':
-            attrs['agent_count'] = 10  # Set default for CRM-based
+            attrs['agent_count'] = MIN_AGENT_COUNT  # Set default for CRM-based
 
         return attrs
+
+    def validate_agent_count(self, value):
+        """Minimum 5 employees, sold in increments of 5 (5, 10, 15, ...)."""
+        if not is_valid_agent_count(value):
+            raise serializers.ValidationError(AGENT_COUNT_ERROR)
+        return value
     
     def validate_domain(self, value):
         """Validate that the domain is unique and follows naming conventions"""
