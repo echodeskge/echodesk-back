@@ -26,6 +26,7 @@ from .permissions import get_subscription_info
 from .security_service import SecurityService
 from users.models import AuthDeviceToken
 from django.contrib.auth.hashers import make_password
+from botocore.exceptions import BotoCoreError, ClientError
 import logging
 import uuid
 
@@ -1890,6 +1891,17 @@ def upload_image(request):
             'url': url,
             'message': 'Image uploaded successfully'
         })
+    except (ClientError, BotoCoreError) as e:
+        # The object store itself failed (503 "Slow Down", a gateway timeout,
+        # a bare BadRequest during an outage): nothing the request did wrong
+        # and nothing a traceback fixes — tell the client to try again.
+        logger.warning(
+            f'Image storage rejected upload for {request.tenant.schema_name}: {str(e)}'
+        )
+        return Response(
+            {'error': 'Image storage is temporarily unavailable. Please try again.'},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
     except Exception as e:
         logger.error(f'Failed to upload image: {str(e)}')
         return Response(

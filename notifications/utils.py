@@ -41,6 +41,27 @@ def get_vapid_keys():
 # Seconds to wait before each retry of a push that failed to connect.
 TRANSIENT_RETRY_DELAYS = (1, 3)
 
+# 404 = subscription not found, 410 = unsubscribed/expired, 403 = endpoint
+# refuses our VAPID identity (key rotated or wrong project). All three are
+# permanent for THIS subscription.
+PERMANENT_PUSH_STATUSES = (403, 404, 410)
+
+
+def _is_permanent_push_failure(status_code, response) -> bool:
+    """True when the push service will never deliver to this endpoint again.
+
+    Besides the 4xx statuses, FCM answers ``500 "permanent internal error
+    encountered, do not retry the request."`` for a registration it has given
+    up on; retrying it on every event just repeats the same 500.
+    """
+    if status_code in PERMANENT_PUSH_STATUSES:
+        return True
+    if status_code and status_code >= 500 and response is not None:
+        text = getattr(response, 'text', None)
+        if isinstance(text, str) and 'do not retry' in text.lower():
+            return True
+    return False
+
 
 def send_push_notification(
     subscription: PushSubscription,
@@ -144,7 +165,8 @@ def send_push_notification(
         # NB: compare against None — a requests.Response with a 4xx/5xx status
         # is falsy, so `if e.response` skipped exactly the cases handled here.
         status_code = getattr(e.response, 'status_code', None) if e.response is not None else None
-        if status_code and 400 <= status_code < 500:
+        permanent = _is_permanent_push_failure(status_code, e.response)
+        if permanent or (status_code and 400 <= status_code < 500):
             logger.warning(
                 f"WebPush {status_code} for subscription {subscription.id}: {str(e)}"
             )
@@ -158,15 +180,27 @@ def send_push_notification(
         log.error_message = str(e)
         log.save()
 
-        # 404 = subscription not found, 410 = unsubscribed/expired, 403 =
-        # endpoint refuses our VAPID identity (key rotated or wrong project).
-        # All three are permanent for THIS subscription — deactivate so it
-        # stops being retried on every event (was generating 9k+ Sentry
-        # events/14d before this guard).
-        if status_code in (403, 404, 410):
+        # Deactivate a dead subscription so it stops being retried on every
+        # event (was generating 9k+ Sentry events/14d before this guard).
+        if permanent:
             subscription.is_active = False
             subscription.save()
             logger.info(f"Marked subscription {subscription.id} as inactive ({status_code})")
+
+        return False
+
+    except (requests.ConnectionError, requests.Timeout) as e:
+        # Every attempt failed to reach the push service: the network is down
+        # (e.g. "Network is unreachable" during a host move), not the code.
+        # The log row records the miss; a traceback has nothing to add.
+        logger.warning(
+            f"Push service unreachable for subscription {subscription.id} "
+            f"after {len(TRANSIENT_RETRY_DELAYS) + 1} attempts: {str(e)}"
+        )
+
+        log.status = 'failed'
+        log.error_message = str(e)
+        log.save()
 
         return False
 

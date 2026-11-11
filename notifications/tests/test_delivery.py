@@ -296,3 +296,97 @@ class TestTransientNetworkErrors(EchoDeskTenantTestCase):
         self.assertTrue(self.sub.is_active)
         log = NotificationLog.objects.filter(subscription=self.sub).latest('created_at')
         self.assertEqual(log.status, 'failed')
+
+
+class TestSendPushNotificationSentryNoise(EchoDeskTenantTestCase):
+    """Sentry ECHODESK-BACKEND-7D (FCM 500 "do not retry") and 7T/7S/7R
+    ("Network is unreachable" after every attempt): neither is a code bug,
+    so neither may reach Sentry as an error-level log."""
+
+    def setUp(self):
+        super().setUp()
+        self.user = self.create_user(email='push-noise@test.com')
+        self.sub = PushSubscription.objects.create(
+            user=self.user,
+            endpoint='https://fcm.googleapis.com/fcm/send/noise',
+            p256dh='test-p256dh',
+            auth='test-auth',
+            is_active=True,
+        )
+
+    @staticmethod
+    def _response(status_code, body=b''):
+        import requests
+
+        response = requests.Response()
+        response.status_code = status_code
+        response._content = body
+        return response
+
+    @staticmethod
+    def _errors(cm):
+        import logging
+
+        return [r for r in cm.records if r.levelno >= logging.ERROR]
+
+    @patch('notifications.utils.get_vapid_keys', return_value=MOCK_VAPID)
+    @patch('notifications.utils.webpush')
+    def test_permanent_500_deactivates_subscription_as_warning(self, mock_wp, mock_keys):
+        from pywebpush import WebPushException
+
+        response = self._response(
+            500, b'permanent internal error encountered, do not retry the request.\n'
+        )
+        mock_wp.side_effect = WebPushException(
+            'Push failed: 500 Internal Server Error', response=response
+        )
+
+        with self.assertLogs('notifications.utils', level='INFO') as cm:
+            result = send_push_notification(subscription=self.sub, title='T', body='B')
+
+        self.assertFalse(result)
+        self.sub.refresh_from_db()
+        self.assertFalse(self.sub.is_active)
+        log = NotificationLog.objects.filter(subscription=self.sub).latest('created_at')
+        self.assertEqual(log.status, 'failed')
+        self.assertEqual(self._errors(cm), [])
+        self.assertTrue(any('WebPush 500' in r.getMessage() for r in cm.records))
+
+    @patch('notifications.utils.get_vapid_keys', return_value=MOCK_VAPID)
+    @patch('notifications.utils.webpush')
+    def test_plain_500_keeps_subscription_and_logs_error(self, mock_wp, mock_keys):
+        from pywebpush import WebPushException
+
+        mock_wp.side_effect = WebPushException(
+            'Push failed: 500 Internal Server Error',
+            response=self._response(500, b'Internal Server Error'),
+        )
+
+        with self.assertLogs('notifications.utils', level='INFO') as cm:
+            result = send_push_notification(subscription=self.sub, title='T', body='B')
+
+        self.assertFalse(result)
+        self.sub.refresh_from_db()
+        self.assertTrue(self.sub.is_active)
+        self.assertEqual(len(self._errors(cm)), 1)
+
+    @patch('notifications.utils.time.sleep')
+    @patch('notifications.utils.get_vapid_keys', return_value=MOCK_VAPID)
+    @patch('notifications.utils.webpush')
+    def test_unreachable_push_service_is_a_warning_after_retries(self, mock_wp, mock_keys, mock_sleep):
+        import requests
+
+        mock_wp.side_effect = requests.ConnectionError('[Errno 101] Network is unreachable')
+
+        with self.assertLogs('notifications.utils', level='INFO') as cm:
+            result = send_push_notification(subscription=self.sub, title='T', body='B')
+
+        self.assertFalse(result)
+        self.assertEqual(mock_wp.call_count, 3)
+        self.sub.refresh_from_db()
+        self.assertTrue(self.sub.is_active)
+        log = NotificationLog.objects.filter(subscription=self.sub).latest('created_at')
+        self.assertEqual(log.status, 'failed')
+        self.assertIn('Network is unreachable', log.error_message)
+        self.assertEqual(self._errors(cm), [])
+        self.assertTrue(any('unreachable' in r.getMessage() for r in cm.records))
