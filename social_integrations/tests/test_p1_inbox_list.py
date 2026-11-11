@@ -2,6 +2,7 @@
 filters and bounded query count (package p1)."""
 from datetime import timedelta
 
+from django.core.cache import cache
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -20,6 +21,8 @@ class InboxListTests(SocialIntegrationTestCase):
 
     def setUp(self):
         super().setUp()
+        # Conversation totals are cached per user for 30 s (inbox_list._take).
+        cache.clear()
         self.agent = self.create_user(email='inbox-agent@test.com')
         self.other = self.create_user(email='inbox-other@test.com')
         self.admin = self.create_admin(email='inbox-admin@test.com')
@@ -123,11 +126,17 @@ class InboxListTests(SocialIntegrationTestCase):
     def test_query_count_is_independent_of_conversation_count(self):
         self._seed_all()
 
+        def app_queries(ctx):
+            # Application statements only: tenant-schemas' SET search_path
+            # chatter is present locally and absent on CI.
+            return [q['sql'] for q in ctx.captured_queries
+                    if not q['sql'].lstrip().upper().startswith(('SET ', 'SHOW '))]
+
         def count_queries():
             with CaptureQueriesContext(connection) as ctx:
                 resp = self.api_get(URL + '?page_size=5', user=self.agent)
             self.assertEqual(resp.status_code, 200)
-            return len(ctx.captured_queries)
+            return len(app_queries(ctx))
 
         baseline = count_queries()
         for i in range(25):
@@ -138,16 +147,19 @@ class InboxListTests(SocialIntegrationTestCase):
                                              visitor_id=f'bv{i}')
             WidgetMessage.objects.create(session=s, message_id=f'bw{i}', message_text='x',
                                          is_from_visitor=True, timestamp=self._ago(40 + i))
-        # 75 more conversations: page 1 (every platform present) costs
-        # exactly the same number of queries.
-        with self.assertNumQueries(baseline):
-            resp = self.api_get(URL + '?page_size=5', user=self.agent)
+        # 75 more conversations: page 1 (every platform present) costs the
+        # same number of queries plus one COUNT per platform that now has a
+        # full page (facebook, whatsapp, widget); that total is cached, so
+        # the next poll is back to the baseline.
+        self.assertEqual(count_queries(), baseline + 3)
+        self.assertEqual(count_queries(), baseline)
+        resp = self.api_get(URL + '?page_size=5', user=self.agent)
         self.assertEqual(resp.data['count'], 80)
         # A deeper page only touches a subset of the platforms.
         with CaptureQueriesContext(connection) as ctx:
             resp = self.api_get(URL + '?page_size=5&page=9', user=self.agent)
         self.assertEqual(len(resp.data['results']), 5)
-        self.assertLessEqual(len(ctx.captured_queries), baseline)
+        self.assertLessEqual(len(app_queries(ctx)), baseline)
 
     def test_archived_filter_and_widget_archive_by_session(self):
         self._seed_all()
