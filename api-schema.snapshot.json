@@ -69728,11 +69728,15 @@
                     "week": {
                         "$ref": "#/components/schemas/DashboardWeek"
                     },
+                    "month": {
+                        "$ref": "#/components/schemas/DashboardMonth"
+                    },
                     "overall": {
                         "$ref": "#/components/schemas/DashboardOverall"
                     }
                 },
                 "required": [
+                    "month",
                     "overall",
                     "today",
                     "week"
@@ -74663,6 +74667,26 @@
                     }
                 }
             },
+            "DashboardMonth": {
+                "type": "object",
+                "properties": {
+                    "total_bookings": {
+                        "type": "integer"
+                    },
+                    "completed": {
+                        "type": "integer"
+                    },
+                    "revenue": {
+                        "type": "number",
+                        "format": "double"
+                    }
+                },
+                "required": [
+                    "completed",
+                    "revenue",
+                    "total_bookings"
+                ]
+            },
             "DashboardOverall": {
                 "type": "object",
                 "properties": {
@@ -74673,12 +74697,17 @@
                         "type": "number",
                         "format": "double"
                     },
+                    "pending": {
+                        "type": "integer",
+                        "description": "Bookings awaiting confirmation, any date"
+                    },
                     "active_staff": {
                         "type": "integer"
                     }
                 },
                 "required": [
                     "active_staff",
+                    "pending",
                     "total_clients",
                     "total_revenue"
                 ]
