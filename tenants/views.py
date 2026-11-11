@@ -8,6 +8,7 @@ from django.http import JsonResponse
 from django.db import transaction
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.contrib.auth import authenticate
+from django.conf import settings
 from tenant_schemas.utils import get_public_schema_name, schema_context
 from django.contrib.auth import get_user_model
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse, inline_serializer
@@ -15,7 +16,7 @@ from rest_framework import serializers as drf_serializers
 from drf_spectacular.openapi import OpenApiTypes
 from .models import Tenant, PendingRegistration, PaymentOrder, TenantDomain, DashboardAppearanceSettings
 from .feature_models import Feature
-from .pricing_rules import MIN_AGENT_COUNT
+from .pricing_rules import MIN_AGENT_COUNT, TRIAL_DAYS
 from .serializers import (
     TenantSerializer, TenantCreateSerializer, TenantRegistrationSerializer,
     TenantLoginSerializer, TenantDashboardDataSerializer, DashboardAppearanceSettingsSerializer,
@@ -23,6 +24,7 @@ from .serializers import (
 )
 from .services import SingleFrontendDeploymentService, TenantConfigAPI
 from .bog_payment import bog_service
+from .payment_views import trigger_tenant_processing
 from .permissions import get_subscription_info
 from .security_service import SecurityService
 from users.models import AuthDeviceToken
@@ -1134,8 +1136,16 @@ def register_tenant_with_payment(request):
 
 @extend_schema(
     operation_id='register_tenant',
-    summary='Register New Tenant',
-    description='Register a new tenant with admin user creation and package selection. Only available from the main domain.',
+    summary='Register New Tenant (30-day free trial, no card)',
+    description=(
+        'Register a new tenant on a 30-day free trial with no card. Creates the tenant, '
+        'its admin user and a trial subscription (`is_trial`, `trial_ends_at` = now + 30 days). '
+        'The workspace schema is provisioned in the background (`deployment_status` = '
+        '"deploying"; the welcome email is sent when it is ready). A card is added later '
+        'in-app (POST /api/payments/saved-card/add/); at `trial_ends_at` the saved card is '
+        'charged and the subscription converts to paid, or it is deactivated when no card '
+        'was added. Only available from the main domain.'
+    ),
     request=TenantRegistrationSerializer,
     responses={
         201: OpenApiResponse(
@@ -1144,10 +1154,41 @@ def register_tenant_with_payment(request):
                 'type': 'object',
                 'properties': {
                     'message': {'type': 'string'},
-                    'tenant': {'type': 'object'},
-                    'subscription': {'type': 'object'},
+                    'tenant': {
+                        'type': 'object',
+                        'properties': {
+                            'id': {'type': 'integer'},
+                            'name': {'type': 'string'},
+                            'domain_url': {'type': 'string'},
+                            'schema': {'type': 'string'},
+                            'admin_email': {'type': 'string'},
+                            'preferred_language': {'type': 'string'},
+                            'deployment_status': {'type': 'string'},
+                            'frontend_url': {'type': 'string'},
+                        },
+                    },
+                    'subscription': {
+                        'type': 'object',
+                        'properties': {
+                            'package_name': {'type': 'string'},
+                            'pricing_model': {'type': 'string'},
+                            'monthly_cost': {'type': 'number'},
+                            'agent_count': {'type': 'integer'},
+                            'is_trial': {'type': 'boolean'},
+                            'trial_ends_at': {'type': 'string', 'format': 'date-time'},
+                            'trial_expires': {'type': 'string', 'format': 'date-time'},
+                            'limits': {'type': 'object'},
+                        },
+                    },
+                    'trial_ends_at': {'type': 'string', 'format': 'date-time'},
+                    'domain_url': {'type': 'string'},
+                    'admin_email': {'type': 'string'},
+                    'preferred_language': {'type': 'string'},
+                    'login_url': {'type': 'string'},
+                    'api_url': {'type': 'string'},
                     'frontend_url': {'type': 'string'},
-                    'api_url': {'type': 'string'}
+                    'deployment_status': {'type': 'string'},
+                    'credentials': {'type': 'object'},
                 }
             }
         ),
@@ -1160,36 +1201,59 @@ def register_tenant_with_payment(request):
 @permission_classes([])  # No authentication required
 def register_tenant(request):
     """
-    Public endpoint for tenant registration with admin user creation and package selection
+    Public endpoint: 30-day free trial, no card (pricing decision D1).
+
+    Provisions exactly like the paid signup's webhook branch, minus the
+    payment: the Tenant row (``deployment_status='deploying'``), a trial
+    TenantSubscription and a processed PendingRegistration carrying the
+    hashed admin password, then ``process_pending_tenants`` (Celery) creates
+    the schema, runs migrations, creates the admin user, syncs features,
+    sets up the frontend and sends the welcome email. The trial machinery
+    (``process_trial_expirations``, ``check_subscription_status``) takes it
+    from there.
     """
     # Only allow access from public schema
     if hasattr(request, 'tenant') and request.tenant.schema_name != get_public_schema_name():
         return Response(
-            {'error': 'This endpoint is only available from the main domain'}, 
+            {'error': 'This endpoint is only available from the main domain'},
             status=status.HTTP_403_FORBIDDEN
         )
-    
+
     serializer = TenantRegistrationSerializer(data=request.data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    
+
     validated_data = serializer.validated_data
-    
+
     try:
         with transaction.atomic():
-            # Get selected features
             from .models import TenantSubscription
-            from datetime import datetime, timedelta
+            from datetime import timedelta
             from django.utils import timezone
 
             feature_ids = validated_data.get('feature_ids', [])
             selected_features = Feature.objects.filter(id__in=feature_ids, is_active=True)
             agent_count = validated_data.get('agent_count', MIN_AGENT_COUNT)
 
-            # Create tenant
             domain_name = validated_data['domain']
             schema_name = domain_name.lower().replace('-', '_')
 
+            if Tenant.objects.filter(schema_name=schema_name).exists():
+                return Response(
+                    {'error': 'A tenant with this domain already exists'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if PendingRegistration.objects.filter(schema_name=schema_name).exists():
+                return Response(
+                    {'error': 'A registration for this domain is already pending'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            now = timezone.now()
+            trial_ends_at = now + timedelta(days=TRIAL_DAYS)
+
+            # Same limits as the paid path (BOG webhook branch): the seat
+            # count is the user limit, 100 GB storage.
             tenant = Tenant.objects.create(
                 schema_name=schema_name,
                 domain_url=f"{domain_name}.api.echodesk.ge",  # Backend API domain
@@ -1199,89 +1263,106 @@ def register_tenant(request):
                 admin_name=f"{validated_data['admin_first_name']} {validated_data['admin_last_name']}",
                 preferred_language=validated_data.get('preferred_language', 'en'),
                 plan='basic',  # Legacy field
-                max_users=1000,  # Default limit
+                max_users=agent_count,
                 max_storage=100 * 1024,  # 100GB in MB
-                deployment_status='deploying'  # Set initial status
+                deployment_status='deploying',  # process_pending_tenants flips it to 'deployed'
+                is_active=True,
             )
+            # Known in advance (single-frontend wildcard subdomain); the
+            # background job re-applies it once the schema exists.
+            tenant.frontend_url = f"https://{tenant.schema_name}.{settings.FRONTEND_BASE_URL}"
+            tenant.save(update_fields=['frontend_url'])
 
-            # Create subscription
+            # Trial subscription: no card yet, billed for the first time at
+            # trial_ends_at by process_trial_expirations.
             subscription = TenantSubscription.objects.create(
                 tenant=tenant,
                 agent_count=agent_count,
                 is_active=True,
-                starts_at=timezone.now(),
-                expires_at=timezone.now() + timedelta(days=30),  # 30-day trial
+                starts_at=now,
+                expires_at=trial_ends_at,
                 current_users=1,  # Admin user will be created
                 whatsapp_messages_used=0,
                 storage_used_gb=0,
-                next_billing_date=timezone.now() + timedelta(days=30)
+                is_trial=True,
+                trial_ends_at=trial_ends_at,
+                trial_converted=False,
+                subscription_type='trial',
+                parent_order_id=None,
+                last_billed_at=None,
+                next_billing_date=trial_ends_at,
             )
-
-            # Add selected features to subscription
             if selected_features:
                 subscription.selected_features.set(selected_features)
 
-            # Create admin user in tenant schema
-            with schema_context(tenant.schema_name):
-                admin_user = User.objects.create_user(
-                    email=validated_data['admin_email'],
-                    password=validated_data['admin_password'],
-                    first_name=validated_data['admin_first_name'],
-                    last_name=validated_data['admin_last_name'],
-                    is_staff=True,
-                    is_superuser=True,
-                    is_active=True
-                )
-            
-            # Setup frontend access (immediate, no deployment needed)
-            deployment_service = SingleFrontendDeploymentService()
-            deployment_result = deployment_service.setup_tenant_frontend(tenant)
-            
-            if deployment_result:
-                return Response({
-                    'message': 'Tenant created successfully! Your frontend is ready.',
-                    'tenant': {
-                        'id': tenant.id,
-                        'name': tenant.name,
-                        'domain_url': tenant.domain_url,
-                        'schema': tenant.schema_name,
-                        'admin_email': tenant.admin_email,
-                        'preferred_language': tenant.preferred_language,
-                        'deployment_status': 'deployed',
-                        'frontend_url': tenant.frontend_url
-                    },
-                    'subscription': {
-                        'package_name': 'Feature-based',  # Package system removed
-                        'pricing_model': 'feature',
-                        'monthly_cost': float(subscription.monthly_cost),
-                        'agent_count': subscription.agent_count,
-                        'trial_expires': subscription.expires_at,
-                        'limits': {
-                            'max_users': None,
-                            'max_whatsapp_messages': None,
-                            'max_storage_gb': None
-                        }
-                    },
-                    'domain_url': tenant.domain_url,
-                    'admin_email': validated_data['admin_email'],
-                    'preferred_language': tenant.preferred_language,
-                    'login_url': f"https://{tenant.domain_url}/admin/",  # API domain admin
-                    'api_url': f"https://{tenant.domain_url}/api/",      # API domain
-                    'frontend_url': tenant.frontend_url,                 # Frontend domain
-                    'deployment_status': 'deployed',
-                    'credentials': {
-                        'email': validated_data['admin_email'],
-                        'note': 'Use the password you provided to login'
-                    }
-                }, status=status.HTTP_201_CREATED)
-            else:
-                return Response({
-                    'error': 'Tenant created but frontend setup failed'
-                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-            
+            # The admin credentials for process_pending_tenants (it reads the
+            # processed PendingRegistration, as it does for paid signups).
+            pending_registration = PendingRegistration.objects.create(
+                schema_name=schema_name,
+                name=validated_data['company_name'],
+                admin_email=validated_data['admin_email'],
+                admin_password=make_password(validated_data['admin_password']),
+                admin_first_name=validated_data['admin_first_name'],
+                admin_last_name=validated_data['admin_last_name'],
+                preferred_language=validated_data.get('preferred_language', 'en'),
+                agent_count=agent_count,
+                order_id=f"TRIAL-{uuid.uuid4().hex[:12].upper()}",
+                is_processed=True,
+            )
+            if selected_features:
+                pending_registration.selected_features.set(selected_features)
+
+        # Outside the transaction so the worker sees the committed rows.
+        trigger_tenant_processing(tenant.schema_name)
+        logger.info(
+            f"Trial registration: {tenant.schema_name}, agents={agent_count}, "
+            f"features={selected_features.count()}, trial_ends_at={trial_ends_at.isoformat()}"
+        )
+
+        return Response({
+            'message': 'Tenant created successfully! Your workspace is being set up.',
+            'tenant': {
+                'id': tenant.id,
+                'name': tenant.name,
+                'domain_url': tenant.domain_url,
+                'schema': tenant.schema_name,
+                'admin_email': tenant.admin_email,
+                'preferred_language': tenant.preferred_language,
+                'deployment_status': tenant.deployment_status,
+                'frontend_url': tenant.frontend_url
+            },
+            'subscription': {
+                'package_name': 'Feature-based',  # Package system removed
+                'pricing_model': 'feature',
+                'monthly_cost': float(subscription.monthly_cost),
+                'agent_count': subscription.agent_count,
+                'is_trial': True,
+                'trial_ends_at': subscription.trial_ends_at,
+                'trial_expires': subscription.expires_at,
+                'limits': {
+                    'max_users': subscription.agent_count,
+                    'max_whatsapp_messages': None,
+                    'max_storage_gb': None
+                }
+            },
+            'trial_ends_at': subscription.trial_ends_at,
+            'domain_url': tenant.domain_url,
+            'admin_email': validated_data['admin_email'],
+            'preferred_language': tenant.preferred_language,
+            'login_url': f"https://{tenant.domain_url}/admin/",  # API domain admin
+            'api_url': f"https://{tenant.domain_url}/api/",      # API domain
+            'frontend_url': tenant.frontend_url,                 # Frontend domain
+            'deployment_status': tenant.deployment_status,
+            'credentials': {
+                'email': validated_data['admin_email'],
+                'note': 'Use the password you provided to login'
+            }
+        }, status=status.HTTP_201_CREATED)
+
     except Exception as e:
+        logger.exception('Trial registration failed')
         return Response(
-            {'error': f'Failed to create tenant: {str(e)}'}, 
+            {'error': f'Failed to create tenant: {str(e)}'},
             status=status.HTTP_400_BAD_REQUEST
         )
 

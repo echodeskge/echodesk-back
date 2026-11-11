@@ -10,6 +10,10 @@ source of truth so the serializer, the views and the tests agree.
 MIN_AGENT_COUNT = 5
 AGENT_COUNT_STEP = 5
 
+# Pricing decision D1: POST /api/register/ is a 30-day free trial with no
+# card; the card is added in-app before the trial ends.
+TRIAL_DAYS = 30
+
 AGENT_COUNT_ERROR = (
     f'Agent count must be at least {MIN_AGENT_COUNT} and a multiple of '
     f'{AGENT_COUNT_STEP} ({MIN_AGENT_COUNT}, {MIN_AGENT_COUNT + AGENT_COUNT_STEP}, '
