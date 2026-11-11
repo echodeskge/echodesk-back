@@ -73,8 +73,32 @@ def reset_unread(user, tenant_schema=None):
 # Core notification creator (moved from tickets/signals.py)
 # ---------------------------------------------------------------------------
 
+# ``preference`` default for create_notification: look the row up.
+_LOOKUP = object()
+
+
+def notification_preferences(users, notification_type):
+    """
+    ``{user_id: NotificationPreference}`` for ``users`` and one type, in a
+    single query. Fan-outs (one message, many recipients) pass each entry as
+    ``create_notification(..., preference=prefs.get(user.id))`` instead of
+    looking the row up once per recipient.
+    """
+    from users.models import NotificationPreference
+
+    user_ids = [getattr(u, 'pk', u) for u in users]
+    if not user_ids:
+        return {}
+    return {
+        pref.user_id: pref
+        for pref in NotificationPreference.objects.filter(
+            user_id__in=user_ids, notification_type=notification_type,
+        )
+    }
+
+
 def create_notification(user, notification_type, title, message, ticket_id=None,
-                        metadata=None, link_url='', language=None):
+                        metadata=None, link_url='', language=None, preference=_LOOKUP):
     """
     Create a Notification row, broadcast it over WebSocket, and send a Web Push.
 
@@ -84,6 +108,10 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
     ``user_language(user)``: User.preferred_language → tenant language →
     'ka'). The stored row, the WebSocket event and the push all carry the
     same rendered texts.
+
+    ``preference`` is the recipient's NotificationPreference for this type
+    (None when they have none) when the caller already fetched it with
+    ``notification_preferences``; by default it is looked up here.
 
     Includes duplicate / batching logic (Phase 5): within a 30-second window for
     the same user + type + ticket, the existing notification is updated rather
@@ -101,9 +129,12 @@ def create_notification(user, notification_type, title, message, ticket_id=None,
     tenant_schema = getattr(connection, 'schema_name', 'public')
 
     # --- Check user notification preferences ---
-    pref = NotificationPreference.objects.filter(
-        user=user, notification_type=notification_type
-    ).first()
+    if preference is _LOOKUP:
+        pref = NotificationPreference.objects.filter(
+            user=user, notification_type=notification_type
+        ).first()
+    else:
+        pref = preference
 
     # Default: all enabled
     should_create_in_app = pref.in_app if pref else True
@@ -520,7 +551,9 @@ def create_social_message_notification(platform, sender_name, message_text,
     link = f'{base_link}?tab=assigned' if assigned_user_id else base_link
 
     created = []
-    for user in social_message_recipients(assigned_user_id):
+    recipients = social_message_recipients(assigned_user_id)
+    prefs = notification_preferences(recipients, 'message_received')
+    for user in recipients:
         notification = create_notification(
             user=user,
             notification_type='message_received',
@@ -529,6 +562,7 @@ def create_social_message_notification(platform, sender_name, message_text,
             ticket_id=None,
             metadata=dict(meta),
             link_url=link,
+            preference=prefs.get(user.pk),
         )
         if notification is not None:
             created.append(notification)
@@ -579,6 +613,7 @@ def create_ai_handoff_notification(platform, conversation_id, account_id,
         assigned_user_id = None
     link = f'{base_link}?tab=assigned' if assigned_user_id else base_link
 
+    prefs = notification_preferences(recipients, 'ai_handoff_requested')
     for user in recipients:
         create_notification(
             user=user,
@@ -588,6 +623,7 @@ def create_ai_handoff_notification(platform, conversation_id, account_id,
             ticket_id=None,
             metadata=dict(meta),
             link_url=link,
+            preference=prefs.get(user.pk),
         )
 
 
