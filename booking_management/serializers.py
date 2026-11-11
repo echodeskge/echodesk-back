@@ -766,15 +766,23 @@ class DashboardWeekSerializer(serializers.Serializer):
     popular_services = DashboardPopularServiceSerializer(many=True)
 
 
+class DashboardMonthSerializer(serializers.Serializer):
+    total_bookings = serializers.IntegerField()
+    completed = serializers.IntegerField()
+    revenue = serializers.FloatField()
+
+
 class DashboardOverallSerializer(serializers.Serializer):
     total_clients = serializers.IntegerField()
     total_revenue = serializers.FloatField()
+    pending = serializers.IntegerField(help_text='Bookings awaiting confirmation, any date')
     active_staff = serializers.IntegerField()
 
 
 class BookingDashboardSerializer(serializers.Serializer):
     today = DashboardTodaySerializer()
     week = DashboardWeekSerializer()
+    month = DashboardMonthSerializer()
     overall = DashboardOverallSerializer()
 
 

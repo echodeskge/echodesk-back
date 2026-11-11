@@ -151,6 +151,14 @@ def dashboard_stats(request):
         payment_status__in=['fully_paid', 'deposit_paid']
     ).aggregate(total=Sum('paid_amount'))['total'] or 0
 
+    # This month (for the dashboard's "completed this month" tile)
+    month_start = today.replace(day=1)
+    month_end = (month_start + timedelta(days=32)).replace(day=1)
+    month_bookings = Booking.objects.filter(date__gte=month_start, date__lt=month_end).exclude(status='cancelled')
+    month_revenue = month_bookings.filter(
+        payment_status__in=['fully_paid', 'deposit_paid']
+    ).aggregate(total=Sum('paid_amount'))['total'] or 0
+
     # Status breakdown
     status_counts = today_bookings.values('status').annotate(count=Count('id'))
 
@@ -173,9 +181,15 @@ def dashboard_stats(request):
             'revenue': float(week_revenue),
             'popular_services': list(popular_services)
         },
+        'month': {
+            'total_bookings': month_bookings.count(),
+            'completed': month_bookings.filter(status='completed').count(),
+            'revenue': float(month_revenue),
+        },
         'overall': {
             'total_clients': Client.objects.count(),
             'total_revenue': float(total_revenue),
+            'pending': Booking.objects.filter(status='pending').count(),
             'active_staff': BookingStaff.objects.filter(is_active_for_bookings=True).count()
         }
     })

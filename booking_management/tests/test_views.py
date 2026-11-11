@@ -511,6 +511,22 @@ class TestDashboardStats(BookingViewTestMixin, BookingTestCase):
         self.assertIn('week', resp.data)
         self.assertIn('overall', resp.data)
 
+    def test_dashboard_month_and_pending_counts(self):
+        service = self.create_service()
+        staff = self.create_staff()
+        client = self.create_client()
+        today = date.today()
+        self.create_booking(service, client=client, staff=staff, date=today, status='completed')
+        self.create_booking(service, client=client, staff=staff, date=today, start_time=time(14, 0), status='pending')
+        self.create_booking(service, client=client, staff=staff, date=today + timedelta(days=40),
+                            status='pending')
+        resp = self.api_get(ADMIN_DASHBOARD_URL, user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['month']['completed'], 1)
+        self.assertEqual(resp.data['month']['total_bookings'], 2)
+        self.assertEqual(resp.data['overall']['pending'], 2)
+        self.assertEqual(resp.data['today']['pending'], 1)
+
     def test_dashboard_stats_empty(self):
         resp = self.api_get(ADMIN_DASHBOARD_URL, user=self.admin)
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
