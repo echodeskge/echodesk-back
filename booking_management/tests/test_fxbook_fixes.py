@@ -48,7 +48,7 @@ class FxBase(HardeningBase):
             bog_order_id='bog-order-fx',
         )
         resp = self.api_post(f'{ADMIN_BOOKING_URL}{booking.id}/record_payment/',
-                             {'amount': '60', 'method': 'cash'}, user=self.agent)
+                             {'amount': '60', 'method': 'cash'}, user=self.admin)
         self.assertEqual(resp.status_code, 200, resp.data)
         self.assertEqual(resp.data['payment_status'], 'fully_paid')
         booking.refresh_from_db()
@@ -119,7 +119,7 @@ class TestRefundOnlineOnly(FxBase):
     def test_cash_only_booking_never_calls_bog(self):
         self.card_settings(refund_policy='full')
         booking = self.booking(status='confirmed', total_amount=Decimal('80.00'))
-        self.api_post(f'{ADMIN_BOOKING_URL}{booking.id}/record_payment/', {'amount': '80'}, user=self.agent)
+        self.api_post(f'{ADMIN_BOOKING_URL}{booking.id}/record_payment/', {'amount': '80'}, user=self.admin)
         with patch(REFUND_PATH) as refund:
             resp = self.api_post(f'{ADMIN_BOOKING_URL}{booking.id}/cancel/', {}, user=self.agent)
         refund.assert_not_called()
@@ -277,7 +277,7 @@ class TestPatchTotal(FxBase):
         booking.refresh_from_db()
         self.assertEqual(booking.total_amount, Decimal('80.00'))
         # record_payment still works afterwards (the review's dead end)
-        resp = self.api_post(f'{ADMIN_BOOKING_URL}{booking.id}/record_payment/', {'amount': '30'}, user=self.agent)
+        resp = self.api_post(f'{ADMIN_BOOKING_URL}{booking.id}/record_payment/', {'amount': '30'}, user=self.admin)
         self.assertEqual(resp.status_code, 200, resp.data)
         self.assertEqual(resp.data['payment_status'], 'fully_paid')
 

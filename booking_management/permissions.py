@@ -42,8 +42,9 @@ def is_booking_admin(user):
     """Runs the business's bookings: staff flag, superuser, or role admin/manager.
 
     Booking staff without one of these may work bookings (view, confirm,
-    check in, complete, cancel, move, take payments) but not delete them
-    or change the catalog (services, categories, staff) or the settings.
+    check in, complete, cancel, move) but not delete them, record payments,
+    change the catalog (services, categories, staff), staff hours and
+    exceptions, recurring series, or the settings.
     """
     if not user or not getattr(user, 'is_authenticated', False):
         return False

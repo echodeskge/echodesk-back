@@ -146,7 +146,7 @@ class TestRoleGate(HardeningBase):
         resp = self.api_delete(f'{ADMIN_RECURRING_URL}{recurring.id}/', user=self.agent)
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
         resp = self.api_post(f'{ADMIN_RECURRING_URL}{recurring.id}/pause/', {}, user=self.agent)
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_staff_without_feature_is_still_refused(self):
         outsider = self.create_user(email='p2-outsider@test.com', role='admin')
@@ -284,7 +284,7 @@ class TestBookingActions(HardeningBase):
     def test_record_payment_partial_then_full(self):
         booking = self.booking(status='confirmed', total_amount=Decimal('80.00'))
         url = f'{ADMIN_BOOKING_URL}{booking.id}/record_payment/'
-        resp = self.api_post(url, {'amount': '30', 'method': 'cash', 'note': 'deposit at desk'}, user=self.agent)
+        resp = self.api_post(url, {'amount': '30', 'method': 'cash', 'note': 'deposit at desk'}, user=self.admin)
         self.assertEqual(resp.status_code, 200, resp.data)
         self.assertEqual(resp.data['payment_status'], 'deposit_paid')
         self.assertEqual(Decimal(resp.data['paid_amount']), Decimal('30'))
@@ -293,13 +293,13 @@ class TestBookingActions(HardeningBase):
         entry = resp.data['manual_payments'][0]
         self.assertEqual(entry['method'], 'cash')
         self.assertEqual(entry['amount'], '30.00')
-        self.assertEqual(entry['recorded_by'], self.agent.id)
+        self.assertEqual(entry['recorded_by'], self.admin.id)
         self.assertEqual(entry['note'], 'deposit at desk')
 
         # More than what is owed
-        resp = self.api_post(url, {'amount': '60'}, user=self.agent)
+        resp = self.api_post(url, {'amount': '60'}, user=self.admin)
         self.assertEqual(resp.status_code, 400)
-        resp = self.api_post(url, {'amount': '50', 'method': 'card'}, user=self.agent)
+        resp = self.api_post(url, {'amount': '50', 'method': 'card'}, user=self.admin)
         self.assertEqual(resp.data['payment_status'], 'fully_paid')
         booking.refresh_from_db()
         self.assertEqual(booking.paid_amount, Decimal('80.00'))
@@ -308,16 +308,16 @@ class TestBookingActions(HardeningBase):
     def test_record_payment_validation(self):
         booking = self.booking(status='cancelled')
         url = f'{ADMIN_BOOKING_URL}{booking.id}/record_payment/'
-        self.assertEqual(self.api_post(url, {'amount': '10'}, user=self.agent).status_code, 400)
+        self.assertEqual(self.api_post(url, {'amount': '10'}, user=self.admin).status_code, 400)
         booking = self.booking(status='confirmed', start_time=time(14, 0), end_time=time(15, 0))
         url = f'{ADMIN_BOOKING_URL}{booking.id}/record_payment/'
-        self.assertEqual(self.api_post(url, {'amount': '0'}, user=self.agent).status_code, 400)
-        self.assertEqual(self.api_post(url, {'amount': '5', 'method': 'bitcoin'}, user=self.agent).status_code, 400)
-        self.assertEqual(self.api_post(url, {}, user=self.agent).status_code, 400)
+        self.assertEqual(self.api_post(url, {'amount': '0'}, user=self.admin).status_code, 400)
+        self.assertEqual(self.api_post(url, {'amount': '5', 'method': 'bitcoin'}, user=self.admin).status_code, 400)
+        self.assertEqual(self.api_post(url, {}, user=self.admin).status_code, 400)
 
     def test_recorded_cash_counts_as_revenue(self):
         booking = self.booking(status='confirmed', date=date.today())
-        self.api_post(f'{ADMIN_BOOKING_URL}{booking.id}/record_payment/', {'amount': '80'}, user=self.agent)
+        self.api_post(f'{ADMIN_BOOKING_URL}{booking.id}/record_payment/', {'amount': '80'}, user=self.admin)
         resp = self.api_get(ADMIN_DASHBOARD_URL, user=self.agent)
         self.assertEqual(resp.data['overall']['total_revenue'], 80.0)
 
@@ -391,6 +391,19 @@ class TestBookingLists(HardeningBase):
         self.assertEqual([b['id'] for b in self.get_results(resp)], [theirs.id])
         resp = self.api_get(f'{ADMIN_BOOKING_URL}?date_to={self.day.isoformat()}', user=self.agent)
         self.assertEqual([b['id'] for b in self.get_results(resp)], [mine.id])
+
+    def test_search_by_phone(self):
+        nino = self.create_client(first_name='Nino', last_name='K', phone='+995599123456')
+        gio = self.create_client(first_name='Gio', last_name='M', phone='+995555777888')
+        by_phone = self.booking(client=nino, start_time=time(9, 0), end_time=time(10, 0))
+        other = self.booking(client=gio, start_time=time(11, 0), end_time=time(12, 0))
+        resp = self.api_get(f'{ADMIN_BOOKING_URL}?search=599123', user=self.agent)
+        self.assertEqual([b['id'] for b in self.get_results(resp)], [by_phone.id])
+        resp = self.api_get(f'{ADMIN_BOOKING_URL}rows/?search=555777888', user=self.agent)
+        self.assertEqual([b['id'] for b in self.get_results(resp)], [other.id])
+        # Name search still works
+        resp = self.api_get(f'{ADMIN_BOOKING_URL}?search=Nino', user=self.agent)
+        self.assertEqual([b['id'] for b in self.get_results(resp)], [by_phone.id])
 
     def test_lite_rows(self):
         booking = self.booking()
@@ -497,12 +510,25 @@ class TestCatalogAndRecurring(HardeningBase):
         self.assertEqual(resp.data['user']['id'], user.id)
         self.assertEqual(resp.data['services_count'], 1)
 
+    def test_staff_create_without_user_is_400(self):
+        before = BookingStaff.objects.count()
+        resp = self.api_post(ADMIN_STAFF_URL, {'bio': 'No user', 'service_ids': [self.service.id]}, user=self.admin)
+        self.assertEqual(resp.status_code, 400, resp.data)
+        self.assertIn('user_id', resp.data)
+        resp = self.api_post(ADMIN_STAFF_URL, {'user_id': None, 'bio': 'No user'}, user=self.admin)
+        self.assertEqual(resp.status_code, 400, resp.data)
+        self.assertEqual(BookingStaff.objects.count(), before)
+        # Updates don't need it (the user can't change)
+        resp = self.api_patch(f'{ADMIN_STAFF_URL}{self.staff.id}/', {'bio': 'Updated'}, user=self.admin)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data['bio'], 'Updated')
+
     def test_recurring_create(self):
         client = self.create_client(is_booking_enabled=False)
         resp = self.api_post(ADMIN_RECURRING_URL, {
             'client_id': client.id, 'service_id': self.service.id, 'staff_id': self.staff.id,
             'frequency': 'weekly', 'preferred_day_of_week': 0, 'preferred_time': '10:00',
-        }, user=self.agent)
+        }, user=self.admin)
         self.assertEqual(resp.status_code, 201, resp.data)
         recurring = RecurringBooking.objects.get(id=resp.data['id'])
         self.assertEqual(recurring.client, client)
@@ -515,12 +541,12 @@ class TestCatalogAndRecurring(HardeningBase):
     def test_recurring_create_validation(self):
         base = {'client_id': self.create_client().id, 'service_id': self.service.id,
                 'frequency': 'weekly', 'preferred_day_of_week': 0, 'preferred_time': '10:00'}
-        self.assertEqual(self.api_post(ADMIN_RECURRING_URL, dict(base, client_id=999999), user=self.agent).status_code, 400)
-        self.assertEqual(self.api_post(ADMIN_RECURRING_URL, dict(base, service_id=999999), user=self.agent).status_code, 400)
+        self.assertEqual(self.api_post(ADMIN_RECURRING_URL, dict(base, client_id=999999), user=self.admin).status_code, 400)
+        self.assertEqual(self.api_post(ADMIN_RECURRING_URL, dict(base, service_id=999999), user=self.admin).status_code, 400)
         other = self.create_staff()
-        self.assertEqual(self.api_post(ADMIN_RECURRING_URL, dict(base, staff_id=other.id), user=self.agent).status_code, 400)
-        self.assertEqual(self.api_post(ADMIN_RECURRING_URL, dict(base, preferred_day_of_week=9), user=self.agent).status_code, 400)
-        self.assertEqual(self.api_post(ADMIN_RECURRING_URL, dict(base, end_date='2000-01-01'), user=self.agent).status_code, 400)
+        self.assertEqual(self.api_post(ADMIN_RECURRING_URL, dict(base, staff_id=other.id), user=self.admin).status_code, 400)
+        self.assertEqual(self.api_post(ADMIN_RECURRING_URL, dict(base, preferred_day_of_week=9), user=self.admin).status_code, 400)
+        self.assertEqual(self.api_post(ADMIN_RECURRING_URL, dict(base, end_date='2000-01-01'), user=self.admin).status_code, 400)
 
     def test_admin_create_by_client_id_enables_booking_client(self):
         client = self.create_client(is_booking_enabled=False)
