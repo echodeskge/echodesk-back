@@ -23,6 +23,7 @@ from email.header import decode_header as email_decode_header
 from datetime import datetime, timedelta
 from typing import Tuple, Optional, List, Dict, Any
 
+from celery.exceptions import SoftTimeLimitExceeded
 from django.utils import timezone
 from django.conf import settings
 from django.core.files.base import ContentFile
@@ -487,6 +488,11 @@ def extract_attachments(email_message, connection) -> List[Dict[str, Any]]:
                     'url': url,
                     'size': len(payload)
                 })
+        except SoftTimeLimitExceeded:
+            # Celery's soft limit fired mid-upload: it must reach the task so
+            # the sync stops now instead of running into the hard limit, where
+            # the worker is SIGKILLed with no chance to log or clean up.
+            raise
         except Exception as e:
             logger.error(f"Failed to save attachment {filename}: {e}")
             continue
@@ -1476,7 +1482,7 @@ def _sync_folder(imap, connection, imap_folder_name: str, db_folder_name: str, m
             logger.warning(f"[EMAIL_SYNC] Failed to select folder '{db_folder_name}'")
             return 0
         logger.info(f"[EMAIL_SYNC] Selected folder '{db_folder_name}' - {exists} total messages on server")
-    except (imaplib.IMAP4.abort, OSError):
+    except (imaplib.IMAP4.abort, OSError, SoftTimeLimitExceeded):
         raise
     except Exception as e:
         logger.warning(f"[EMAIL_SYNC] Error selecting folder '{db_folder_name}': {e}")
@@ -1614,7 +1620,7 @@ def _sync_folder(imap, connection, imap_folder_name: str, db_folder_name: str, m
     for chunk in mailbox._chunks(new_uids, SYNC_BODY_BATCH):
         try:
             result, data = imap.uid('FETCH', ','.join(chunk), '(UID FLAGS BODY.PEEK[])')
-        except (imaplib.IMAP4.abort, OSError):
+        except (imaplib.IMAP4.abort, OSError, SoftTimeLimitExceeded):
             raise
         except Exception as e:
             logger.warning(f"[EMAIL_SYNC] Body FETCH failed in '{db_folder_name}': {e}")
@@ -1630,6 +1636,8 @@ def _sync_folder(imap, connection, imap_folder_name: str, db_folder_name: str, m
                     connection, entry['body'], header['message_id'], db_folder_name,
                     entry['uid'], uidvalidity, entry['flags'] or header['flags'],
                 ))
+            except SoftTimeLimitExceeded:
+                raise
             except Exception as e:
                 logger.warning(f"[EMAIL_SYNC] Failed to process UID {entry['uid']} in '{db_folder_name}': {e}")
 
@@ -1908,6 +1916,7 @@ def sync_imap_messages(connection, max_messages: int = 500) -> int:
 def _sync_imap_messages_locked(connection, max_messages: int) -> int:
     from . import email_mailbox as mailbox
 
+    imap = None
     try:
         # Connect to IMAP
         imap = _connect_imap(connection)
@@ -1969,12 +1978,16 @@ def _sync_imap_messages_locked(connection, max_messages: int) -> int:
                         else:
                             logger.warning(f"Failed to sync folder {display_folder_name}: {e}")
                             break  # Non-connection error or exhausted retries, skip folder
+                    except SoftTimeLimitExceeded:
+                        raise
                     except Exception as e:
                         logger.warning(f"Failed to sync folder {display_folder_name}: {e}")
                         break  # Unknown error, skip folder
 
             try:
                 _reconcile_synced_folders(connection, states)
+            except SoftTimeLimitExceeded:
+                raise
             except Exception as e:
                 logger.error(f"[EMAIL_SYNC] Reconciliation failed for {connection.email_address}: {e}")
 
@@ -1992,6 +2005,18 @@ def _sync_imap_messages_locked(connection, max_messages: int) -> int:
         logger.info(f"Synced {total_new_count} total new emails for {connection.email_address}")
         return total_new_count
 
+    except SoftTimeLimitExceeded:
+        # Celery's soft time limit, not a mailbox failure: don't count it
+        # against the connection, and let the task stop cleanly (the next
+        # beat run resumes, already-stored messages are skipped). Swallowing
+        # it here kept the sync going until the hard limit SIGKILLed the
+        # worker (ECHODESK-BACKEND-80/81/82).
+        if imap is not None:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+        raise
     except Exception as e:
         if _is_imap_auth_error(e):
             # Wrong credentials: disable immediately. The user must fix the
