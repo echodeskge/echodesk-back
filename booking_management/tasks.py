@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 from celery import shared_task
 from django.utils import timezone
@@ -37,11 +38,42 @@ def create_recurring_bookings():
     return total_created
 
 
+def _advance_recurring_schedule(recurring, booking=None):
+    """Move the series to its next date; count the occurrence when a booking was made."""
+    if booking is not None:
+        recurring.last_created_booking = booking
+        recurring.current_occurrences += 1
+    recurring.next_booking_date = recurring.calculate_next_date()
+
+    # Mark completed if max occurrences reached
+    if recurring.max_occurrences and recurring.current_occurrences >= recurring.max_occurrences:
+        recurring.status = 'completed'
+
+    # Mark completed if past end date
+    if recurring.end_date and recurring.next_booking_date > recurring.end_date:
+        recurring.status = 'completed'
+
+    recurring.save(update_fields=[
+        'last_created_booking',
+        'current_occurrences',
+        'next_booking_date',
+        'status',
+        'updated_at',
+    ])
+
+
 def _create_recurring_bookings_for_tenant(schema_name):
     """Create recurring bookings within a single tenant schema context."""
     from booking_management.models import Booking, RecurringBooking
+    from booking_management.serializers import _business_language
+    from booking_management.staff_notifications import notify_assigned_staff
+    from booking_management.utils import (
+        available_payment_options, get_booking_settings, is_slot_booked, tenant_now,
+    )
 
-    today = timezone.now().date()
+    booking_settings = get_booking_settings()
+    # The business's own calendar day: Tbilisi is already on tomorrow from 20:00 UTC.
+    today = tenant_now(booking_settings).date()
     recurring_qs = RecurringBooking.objects.filter(
         status='active',
         next_booking_date__lte=today,
@@ -54,53 +86,52 @@ def _create_recurring_bookings_for_tenant(schema_name):
                 continue
 
             service = recurring.service
+            booking_date = recurring.next_booking_date
             start_time = recurring.preferred_time
 
-            # Calculate end_time from service duration
-            start_dt = datetime.combine(recurring.next_booking_date, start_time)
-            end_dt = start_dt + timedelta(minutes=service.duration_minutes)
-            end_time = end_dt.time()
+            # The slot is service + buffer, as in every other create path (the
+            # slot checks count the buffer, so the stored end_time must too).
+            total_minutes = service.total_duration_minutes
+            end_time = (datetime.combine(booking_date, start_time) + timedelta(minutes=total_minutes)).time()
+
+            if recurring.staff_id and is_slot_booked(recurring.staff, booking_date, start_time, total_minutes):
+                logger.warning(
+                    'Recurring #%d for tenant %s: %s %s is already booked for staff %s, skipped',
+                    recurring.id, schema_name, booking_date, start_time, recurring.staff_id,
+                )
+                _advance_recurring_schedule(recurring)
+                continue
+
+            # Pay at the venue, like bookings staff make by hand, unless the
+            # business requires an online deposit: then the booking waits for
+            # payment like a customer's would (confirmed by the payment webhook).
+            options = available_payment_options(booking_settings, service)
+            if 'cash' in options:
+                booking_status, payment_method, deposit = 'confirmed', 'cash', Decimal('0')
+            else:
+                booking_status, payment_method = 'pending', 'card'
+                deposit = service.calculate_deposit_amount() if 'deposit' in options else service.base_price
 
             booking = Booking.objects.create(
                 client=recurring.client,
                 service=service,
                 staff=recurring.staff,
-                date=recurring.next_booking_date,
+                date=booking_date,
                 start_time=start_time,
                 end_time=end_time,
-                status='confirmed',
+                status=booking_status,
+                confirmed_at=timezone.now() if booking_status == 'confirmed' else None,
                 payment_status='pending',
+                payment_method=payment_method,
                 total_amount=service.base_price,
-                deposit_amount=service.calculate_deposit_amount(),
+                deposit_amount=deposit,
                 client_notes=f'Auto-created from recurring booking #{recurring.id}',
+                contact_email=recurring.client.email or '',
+                contact_language=_business_language(),
             )
 
-            from booking_management.staff_notifications import notify_assigned_staff
             notify_assigned_staff(booking, 'created')
-
-            # Advance the recurring booking schedule
-            recurring.last_created_booking = booking
-            recurring.current_occurrences += 1
-            recurring.next_booking_date = recurring.calculate_next_date()
-
-            # Mark completed if max occurrences reached
-            if (
-                recurring.max_occurrences
-                and recurring.current_occurrences >= recurring.max_occurrences
-            ):
-                recurring.status = 'completed'
-
-            # Mark completed if past end date
-            if recurring.end_date and recurring.next_booking_date > recurring.end_date:
-                recurring.status = 'completed'
-
-            recurring.save(update_fields=[
-                'last_created_booking',
-                'current_occurrences',
-                'next_booking_date',
-                'status',
-                'updated_at',
-            ])
+            _advance_recurring_schedule(recurring, booking)
 
             created += 1
             logger.info(

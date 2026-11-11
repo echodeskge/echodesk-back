@@ -524,16 +524,17 @@ class RecurringBooking(models.Model):
         return f"{self.client.full_name} - {self.service} ({self.frequency})"
 
     def should_create_booking(self):
-        """Check if it's time to create next booking"""
+        """Check if it's time to create next booking (on the business's own calendar day)"""
+        from .utils import get_booking_settings, tenant_now
+
         if self.status != 'active':
             return False
-        if self.end_date and timezone.now().date() > self.end_date:
+        today = tenant_now(get_booking_settings()).date()
+        if self.end_date and today > self.end_date:
             return False
         if self.max_occurrences and self.current_occurrences >= self.max_occurrences:
             return False
-        if timezone.now().date() >= self.next_booking_date:
-            return True
-        return False
+        return today >= self.next_booking_date
 
     def calculate_next_date(self):
         """Calculate next booking date based on frequency"""
