@@ -29,7 +29,7 @@ import logging
 from typing import TYPE_CHECKING, Dict, Optional
 
 from django.conf import settings
-from django.db import transaction
+from django.db import InterfaceError, OperationalError, transaction
 
 from crm.asterisk_db import get_active_pbx_for_current_tenant, register_pbx_alias
 
@@ -38,6 +38,19 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _is_db_unreachable(exc: BaseException) -> bool:
+    """True for a connection-level failure of the realtime DB.
+
+    psycopg2 raises those (DNS, refused, timeout, server closed the
+    connection) as ``OperationalError``/``InterfaceError`` **without** a
+    SQLSTATE, whereas deadlocks and serialization failures carry one
+    (``40P01``/``40001``) and still deserve a traceback.
+    """
+    if not isinstance(exc, (OperationalError, InterfaceError)):
+        return False
+    return getattr(exc.__cause__, "pgcode", None) is None
 
 
 # WebRTC extension defaults. Mirror the working static config on pbx2 for
@@ -229,7 +242,18 @@ class AsteriskStateSync:
         """Execute ``func`` guarded by try/except + log, return None on error."""
         try:
             return func(*args, **kwargs)
-        except Exception:  # noqa: BLE001 — we genuinely want to swallow everything
+        except Exception as exc:  # noqa: BLE001 — we genuinely want to swallow everything
+            if _is_db_unreachable(exc):
+                # The realtime DB lives on another host; a DNS blip, failover
+                # or pooler restart is infrastructure, not an application
+                # fault. The product write already succeeded — the tenant's
+                # Asterisk state just needs a resync to catch up.
+                logger.warning(
+                    "AsteriskStateSync.%s skipped for tenant=%s: realtime DB unreachable "
+                    "(%s). Run `manage.py sync_tenant_asterisk %s` to catch up.",
+                    op_name, self.tenant_schema, exc, self.tenant_schema,
+                )
+                return None
             logger.exception(
                 "AsteriskStateSync.%s failed for tenant=%s", op_name, self.tenant_schema
             )
