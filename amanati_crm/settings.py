@@ -201,6 +201,16 @@ TEMPLATES = [
 WSGI_APPLICATION = 'amanati_crm.wsgi.application'
 
 # Database
+#
+# In production DB_HOST is the PgBouncer in echodesk-infra/docker-compose.yml
+# (POOL_MODE=session: django-tenant-schemas sets search_path per connection,
+# which transaction pooling would leak between clients). PgBouncer owns the
+# pooling, so Django must NOT keep persistent connections: CONN_MAX_AGE stays
+# 0 (close after every request) — a persistent connection per worker thread
+# would pin a pooled server connection for the worker's lifetime, and with
+# transaction pooling a persistent connection is wrong outright. Should the
+# pool ever move to transaction mode, also set DISABLE_SERVER_SIDE_CURSORS
+# (queryset .iterator() uses named cursors that need one server connection).
 DATABASES = {
     'default': {
         'ENGINE': 'tenant_schemas.postgresql_backend',
@@ -209,6 +219,7 @@ DATABASES = {
         'PASSWORD': config('DB_PASSWORD', default='password'),
         'HOST': config('DB_HOST', default='localhost'),
         'PORT': config('DB_PORT', default='5432'),
+        'CONN_MAX_AGE': 0,
         'OPTIONS': {
             'sslmode': config('DB_SSLMODE', default='require'),
         } if config('DB_SSLMODE', default=None) else {},

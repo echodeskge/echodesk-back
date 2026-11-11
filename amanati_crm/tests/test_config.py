@@ -333,3 +333,13 @@ class TestStorageConfig(SimpleTestCase):
             settings.STATICFILES_STORAGE,
             'whitenoise.storage.CompressedManifestStaticFilesStorage',
         )
+
+
+class TestDatabasePooling(SimpleTestCase):
+    """Production connects through PgBouncer (echodesk-infra docker-compose,
+    POOL_MODE=session); Django must not hold persistent connections on top
+    of it (Sentry ECHODESK-BACKEND-75 / 77 "too many clients")."""
+
+    def test_no_persistent_connections_on_top_of_pgbouncer(self):
+        self.assertEqual(settings.DATABASES['default']['CONN_MAX_AGE'], 0)
+        self.assertFalse(settings.DATABASES['default'].get('CONN_HEALTH_CHECKS', False))
