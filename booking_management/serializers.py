@@ -546,6 +546,72 @@ class BookingRowSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+# ----------------------------------------------------------------------------
+# Admin: calendar range (admin/calendar/)
+# ----------------------------------------------------------------------------
+
+class CalendarServiceSerializer(BookingRowServiceSerializer):
+    class Meta(BookingRowServiceSerializer.Meta):
+        fields = BookingRowServiceSerializer.Meta.fields + ['buffer_time_minutes']
+        read_only_fields = fields
+
+
+class CalendarBookingSerializer(serializers.ModelSerializer):
+    """One booking on the calendar: the BookingRow fields, with the staff
+    member as `staff_id` (the roster comes once per response) plus staff notes."""
+    client = BookingRowClientSerializer(read_only=True)
+    service = CalendarServiceSerializer(read_only=True)
+    staff_id = serializers.IntegerField(read_only=True, allow_null=True)
+
+    class Meta:
+        model = Booking
+        fields = [
+            'id', 'booking_number', 'client', 'service', 'staff_id', 'date', 'start_time', 'end_time',
+            'status', 'payment_status', 'payment_method', 'total_amount', 'deposit_amount', 'paid_amount',
+            'client_notes', 'staff_notes', 'created_at',
+        ]
+        read_only_fields = fields
+
+
+class CalendarAvailabilitySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StaffAvailability
+        fields = ['id', 'day_of_week', 'start_time', 'end_time', 'is_available', 'break_start', 'break_end']
+        read_only_fields = fields
+
+
+class CalendarExceptionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StaffException
+        fields = ['id', 'date', 'start_time', 'end_time', 'is_available', 'reason']
+        read_only_fields = fields
+
+
+class CalendarStaffSerializer(serializers.ModelSerializer):
+    user_id = serializers.IntegerField(read_only=True)
+    full_name = serializers.SerializerMethodField()
+    availability = CalendarAvailabilitySerializer(many=True, read_only=True, help_text='Weekly hours (0 = Monday)')
+    exceptions = CalendarExceptionSerializer(
+        many=True, read_only=True, help_text='Only days inside the requested range',
+    )
+
+    class Meta:
+        model = BookingStaff
+        fields = ['id', 'user_id', 'full_name', 'profile_image', 'is_active_for_bookings', 'availability', 'exceptions']
+        read_only_fields = fields
+
+    def get_full_name(self, obj) -> str:
+        return obj.user.get_full_name() or obj.user.email
+
+
+class CalendarRangeSerializer(serializers.Serializer):
+    date_from = serializers.DateField()
+    date_to = serializers.DateField()
+    timezone = serializers.CharField(help_text='IANA zone the dates and times are in')
+    staff = CalendarStaffSerializer(many=True)
+    bookings = CalendarBookingSerializer(many=True, help_text='Every status; ordered by date, start_time')
+
+
 class AdminBookingUpdateSerializer(serializers.ModelSerializer):
     """PATCH/PUT /admin/bookings/{id}/: notes and price only.
 

@@ -28,13 +28,14 @@ from .serializers import (
     BookingRescheduleRequestSerializer, BookingRecordPaymentRequestSerializer, BookingErrorSerializer,
     AdminSlotsResponseSerializer, BookingDashboardSerializer, StaffScheduleSerializer,
     AvailableUserSerializer, BookingClientStatsSerializer,
+    CalendarRangeSerializer, CalendarStaffSerializer, CalendarBookingSerializer,
 )
 from .permissions import (
     HasBookingManagementFeature, IsBookingAdmin, IsBookingAdminForDestroy, IsBookingAdminForWrites,
 )
 from .staff_notifications import notify_assigned_staff
 from .utils import (
-    generate_available_slots, can_cancel_booking, flag_manual_refund, get_booking_settings,
+    DEFAULT_TIMEZONE, generate_available_slots, can_cancel_booking, flag_manual_refund, get_booking_settings,
     get_or_create_booking_settings, tenant_now,
 )
 from .payment_service import get_booking_payment_service
@@ -235,6 +236,86 @@ def staff_schedule(request):
     return Response({
         'date': date_str or str(date_obj),
         'schedule': schedule
+    })
+
+
+CALENDAR_MAX_DAYS = 62
+
+
+@extend_schema(
+    tags=['Booking Admin - Dashboard'],
+    summary='Calendar data for a date range',
+    description=(
+        'Everything the calendar views need for a range of days in one call: every staff '
+        'member with their weekly hours and the exceptions that fall inside the range, and '
+        'every booking of the range in any status (the client filters), ordered by date and '
+        'start time. The range is inclusive and at most 62 days (400 otherwise).'
+    ),
+    parameters=[
+        OpenApiParameter('date_from', OpenApiTypes.DATE, required=True, description='First day (YYYY-MM-DD)'),
+        OpenApiParameter('date_to', OpenApiTypes.DATE, required=True,
+                         description='Last day, inclusive (YYYY-MM-DD); at most 62 days from date_from'),
+        OpenApiParameter('staff', OpenApiTypes.STR, required=False,
+                         description='Comma-separated staff ids (e.g. `3,7`); default every staff member. '
+                                     'Bookings without a staff member are left out when given.'),
+        LANG_PARAM,
+    ],
+    responses={200: CalendarRangeSerializer, 400: BOOKING_ERROR},
+)
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated, HasBookingManagementFeature])
+def admin_calendar(request):
+    """Staff roster + hours + bookings for a date range (constant query count)."""
+    params = request.query_params
+    dates = {}
+    for name in ('date_from', 'date_to'):
+        value = params.get(name)
+        if not value:
+            return Response({'error': f'{name} is required (YYYY-MM-DD)'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            dates[name] = _parse_date(value)
+        except ValueError:
+            return Response({'error': f'Invalid {name}. Use YYYY-MM-DD'}, status=status.HTTP_400_BAD_REQUEST)
+    date_from, date_to = dates['date_from'], dates['date_to']
+    if date_to < date_from:
+        return Response({'error': 'date_to must not be before date_from'}, status=status.HTTP_400_BAD_REQUEST)
+    if (date_to - date_from).days + 1 > CALENDAR_MAX_DAYS:
+        return Response(
+            {'error': f'The range must be at most {CALENDAR_MAX_DAYS} days'}, status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    staff_ids = None
+    raw_staff = (params.get('staff') or '').strip()
+    if raw_staff:
+        parts = [p.strip() for p in raw_staff.split(',') if p.strip()]
+        if not parts or not all(p.isdigit() for p in parts):
+            return Response(
+                {'error': 'staff must be a comma-separated list of staff ids'}, status=status.HTTP_400_BAD_REQUEST,
+            )
+        staff_ids = [int(p) for p in parts]
+
+    staff_qs = BookingStaff.objects.select_related('user').prefetch_related(
+        Prefetch('availability', queryset=StaffAvailability.objects.order_by('day_of_week', 'start_time', 'id')),
+        Prefetch(
+            'exceptions',
+            queryset=StaffException.objects.filter(date__gte=date_from, date__lte=date_to).order_by('date', 'id'),
+        ),
+    ).order_by('user__first_name', 'user__last_name', 'id')
+    bookings_qs = Booking.objects.filter(
+        date__gte=date_from, date__lte=date_to,
+    ).select_related('client', 'service').order_by('date', 'start_time', 'id')
+    if staff_ids is not None:
+        staff_qs = staff_qs.filter(id__in=staff_ids)
+        bookings_qs = bookings_qs.filter(staff_id__in=staff_ids)
+
+    booking_settings = get_booking_settings()
+    context = {'request': request, 'language': _language(request)}
+    return Response({
+        'date_from': date_from.isoformat(),
+        'date_to': date_to.isoformat(),
+        'timezone': getattr(booking_settings, 'timezone', None) or DEFAULT_TIMEZONE,
+        'staff': CalendarStaffSerializer(staff_qs, many=True, context=context).data,
+        'bookings': CalendarBookingSerializer(bookings_qs, many=True, context=context).data,
     })
 
 
