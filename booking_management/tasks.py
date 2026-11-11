@@ -279,22 +279,25 @@ def send_staff_booking_reminders():
     for tenant in Tenant.objects.exclude(schema_name='public'):
         try:
             with schema_context(tenant.schema_name):
-                total += _send_staff_reminders_for_tenant()
+                total += _send_staff_reminders_for_tenant(tenant=tenant)
         except Exception:
             logger.exception('Error sending staff booking reminders for tenant %s', tenant.schema_name)
     return total
 
 
-def _send_staff_reminders_for_tenant(minutes=STAFF_REMINDER_MINUTES):
+def _send_staff_reminders_for_tenant(minutes=STAFF_REMINDER_MINUTES, tenant=None):
     """Notify each assigned staff member once about a booking starting within
-    `minutes` (on the business's clock). Returns how many were notified."""
+    `minutes` (on the business's clock). Returns how many were notified.
+
+    ``tenant`` (the Tenant row the caller is iterating) saves re-reading it
+    by schema name for every tenant (flagged as N+1, ECHODESK-BACKEND-88)."""
     from booking_management.models import Booking
     from booking_management.staff_notifications import notify_assigned_staff
     from booking_management.utils import get_booking_settings, tenant_now
 
     from django.db.models import Q
 
-    now = tenant_now(get_booking_settings())
+    now = tenant_now(get_booking_settings(tenant))
     horizon = now + timedelta(minutes=minutes)
     # (now, horizon] as a datetime window: just before midnight it also
     # covers bookings early the next day.
