@@ -68,8 +68,14 @@ class Command(BaseCommand):
         # to advance next_billing_date (belt-and-braces — the webhook now
         # always advances, but the guard protects against future regressions).
         recent_bill_cutoff = timezone.now() - timedelta(days=25)
+        # Free trials are billed for the first time by process_trial_expirations
+        # on trial_ends_at (which flips is_trial off and sets last_billed_at).
+        # A trial has next_billing_date = trial_ends_at and last_billed_at None,
+        # so without this exclusion the 3-day look-ahead would charge the saved
+        # card before the trial ends and the trial job would charge it again.
         subscriptions_to_renew = TenantSubscription.objects.filter(
             is_active=True,
+            is_trial=False,
             next_billing_date__lte=cutoff_date,
             tenant__is_active=True,
             tenant__payment_provider='bog',

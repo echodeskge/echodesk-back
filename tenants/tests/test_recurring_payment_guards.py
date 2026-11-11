@@ -110,3 +110,18 @@ class RecurringPaymentGuardTests(EchoDeskTenantTestCase):
     def test_lock_released_after_run(self):
         self._run()
         self.assertIsNone(cache.get(RUN_LOCK_KEY))
+
+    def test_free_trial_with_card_is_left_to_the_trial_job(self):
+        # A no-card signup that added a card: next_billing_date = trial_ends_at,
+        # last_billed_at None. The recurring job must not charge it (3 days
+        # early, and again at trial end by process_trial_expirations).
+        self.sub.is_trial = True
+        self.sub.trial_ends_at = timezone.now() + timedelta(days=2)
+        self.sub.next_billing_date = self.sub.trial_ends_at
+        self.sub.last_billed_at = None
+        self.sub.save()
+        mock_bog, _ = self._run()
+        mock_bog.charge_subscription.assert_not_called()
+        self.assertFalse(
+            PaymentOrder.objects.filter(tenant=self.tenant, order_id__startswith='REC-').exists()
+        )
