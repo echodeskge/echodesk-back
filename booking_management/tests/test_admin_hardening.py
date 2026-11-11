@@ -392,6 +392,19 @@ class TestBookingLists(HardeningBase):
         resp = self.api_get(f'{ADMIN_BOOKING_URL}?date_to={self.day.isoformat()}', user=self.agent)
         self.assertEqual([b['id'] for b in self.get_results(resp)], [mine.id])
 
+    def test_search_by_phone(self):
+        nino = self.create_client(first_name='Nino', last_name='K', phone='+995599123456')
+        gio = self.create_client(first_name='Gio', last_name='M', phone='+995555777888')
+        by_phone = self.booking(client=nino, start_time=time(9, 0), end_time=time(10, 0))
+        other = self.booking(client=gio, start_time=time(11, 0), end_time=time(12, 0))
+        resp = self.api_get(f'{ADMIN_BOOKING_URL}?search=599123', user=self.agent)
+        self.assertEqual([b['id'] for b in self.get_results(resp)], [by_phone.id])
+        resp = self.api_get(f'{ADMIN_BOOKING_URL}rows/?search=555777888', user=self.agent)
+        self.assertEqual([b['id'] for b in self.get_results(resp)], [other.id])
+        # Name search still works
+        resp = self.api_get(f'{ADMIN_BOOKING_URL}?search=Nino', user=self.agent)
+        self.assertEqual([b['id'] for b in self.get_results(resp)], [by_phone.id])
+
     def test_lite_rows(self):
         booking = self.booking()
         full = self.get_results(self.api_get(ADMIN_BOOKING_URL, user=self.agent))[0]
@@ -496,6 +509,19 @@ class TestCatalogAndRecurring(HardeningBase):
         self.assertEqual(resp.data['id'], BookingStaff.objects.get(user=user).id)
         self.assertEqual(resp.data['user']['id'], user.id)
         self.assertEqual(resp.data['services_count'], 1)
+
+    def test_staff_create_without_user_is_400(self):
+        before = BookingStaff.objects.count()
+        resp = self.api_post(ADMIN_STAFF_URL, {'bio': 'No user', 'service_ids': [self.service.id]}, user=self.admin)
+        self.assertEqual(resp.status_code, 400, resp.data)
+        self.assertIn('user_id', resp.data)
+        resp = self.api_post(ADMIN_STAFF_URL, {'user_id': None, 'bio': 'No user'}, user=self.admin)
+        self.assertEqual(resp.status_code, 400, resp.data)
+        self.assertEqual(BookingStaff.objects.count(), before)
+        # Updates don't need it (the user can't change)
+        resp = self.api_patch(f'{ADMIN_STAFF_URL}{self.staff.id}/', {'bio': 'Updated'}, user=self.admin)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data['bio'], 'Updated')
 
     def test_recurring_create(self):
         client = self.create_client(is_booking_enabled=False)

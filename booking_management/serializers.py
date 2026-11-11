@@ -272,6 +272,13 @@ class BookingStaffCreateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(f"Services not found: {invalid_ids}")
         return value
 
+    def validate(self, attrs):
+        # user_id is optional on update (the user can't change) but a new
+        # staff profile is nothing without one: a 400, not a KeyError 500.
+        if self.instance is None and attrs.get('user_id') is None:
+            raise serializers.ValidationError({'user_id': 'This field is required.'})
+        return attrs
+
     def create(self, validated_data):
         user_id = validated_data.pop('user_id')
         service_ids = validated_data.pop('service_ids', [])

@@ -791,7 +791,7 @@ class AdminBookingViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated, HasBookingManagementFeature, IsBookingAdminForDestroy]
     feature_required = 'booking_management'
     filterset_fields = ['status', 'payment_status', 'service', 'staff', 'client']
-    search_fields = ['booking_number', 'client__email', 'client__first_name', 'client__last_name']
+    search_fields = ['booking_number', 'client__email', 'client__first_name', 'client__last_name', 'client__phone']
 
     def _lite(self):
         return self.action in ('list', 'rows') and (self.action == 'rows' or _wants_lite(self.request))
