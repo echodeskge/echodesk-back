@@ -8387,7 +8387,11 @@ def whatsapp_send_message(request):
 
         if response.status_code != 200 or 'error' in response_data:
             error_msg = response_data.get('error', {}).get('message', 'Unknown error')
-            logger.error(f"Failed to send WhatsApp message: {error_msg}")
+            # Meta rejected the send (expired/placeholder token, number not
+            # opted in, template issue): the tenant's configuration, not a
+            # code bug — surfaced to the user as a 400, logged as a warning
+            # (ECHODESK-BACKEND-87).
+            logger.warning(f"Failed to send WhatsApp message: {error_msg}")
             return Response({
                 'error': f'Failed to send message: {error_msg}'
             }, status=status.HTTP_400_BAD_REQUEST)
