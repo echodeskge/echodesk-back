@@ -597,11 +597,33 @@ class VercelDeploymentService:
             }
         else:
             error_data = response.json() if response.text else {}
+            error = error_data.get("error", {}) if isinstance(error_data, dict) else {}
+            message = error.get("message", "Unknown error") if isinstance(error, dict) else "Unknown error"
+            if self._is_project_not_found(response.status_code, error):
+                # The stored project id no longer exists on Vercel (project
+                # deleted or moved to another team). Expected, not a fault:
+                # the caller resets the stale id and tells the UI.
+                logger.warning(
+                    "Vercel project %s not found while listing domains: %s", project_id, message
+                )
+                return {"success": False, "error": message, "code": self.PROJECT_NOT_FOUND}
             logger.error(f"Failed to get domains: {error_data}")
             return {
                 "success": False,
-                "error": error_data.get("error", {}).get("message", "Unknown error")
+                "error": message
             }
+
+    # ``code`` returned by get_domains() when the project no longer exists.
+    PROJECT_NOT_FOUND = "project_not_found"
+
+    @staticmethod
+    def _is_project_not_found(status_code: int, error) -> bool:
+        """True for Vercel's 404 'Project not found' (``code: not_found``)."""
+        if status_code != 404 or not isinstance(error, dict):
+            return False
+        code = str(error.get("code", "")).lower()
+        message = str(error.get("message", "")).lower()
+        return code == "not_found" or "not found" in message
 
     def verify_domain(self, project_id: str, domain: str) -> Dict[str, Any]:
         """
