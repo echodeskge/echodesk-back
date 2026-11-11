@@ -1,6 +1,8 @@
+from django.apps import apps
+from django.conf import settings
 from django.core.management.base import BaseCommand
-from django.db import connection
-from tenants.models import Tenant
+from django.db import connection, transaction
+from tenants.models import PendingRegistration, Tenant
 
 
 class Command(BaseCommand):
@@ -57,8 +59,12 @@ class Command(BaseCommand):
         if hasattr(tenant, 'subscription'):
             subscription = tenant.subscription
             self.stdout.write(f'  Has subscription: Yes')
-            if subscription.package:
-                self.stdout.write(f'  Package: {subscription.package.name}')
+            self.stdout.write(
+                f'  Plan: {subscription.agent_count} users, '
+                f'{subscription.selected_features.count()} features, '
+                f'{subscription.monthly_cost} GEL/month'
+                f'{" (trial)" if subscription.is_trial else ""}'
+            )
 
         if not options['confirm']:
             self.stdout.write(
@@ -82,14 +88,34 @@ class Command(BaseCommand):
                 cursor.execute(f'DROP SCHEMA IF EXISTS "{tenant.schema_name}" CASCADE')
                 self.stdout.write(self.style.SUCCESS(f'  Schema dropped successfully'))
 
-            # Delete the tenant record from public schema using raw SQL
-            # This bypasses Django's ORM cascade checking which can fail when looking for tenant-specific tables
-            self.stdout.write(f'  Deleting tenant record from public schema...')
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    'DELETE FROM tenants_tenant WHERE id = %s',
-                    [tenant.id]
-                )
+            # Delete the public-schema rows that point at the tenant
+            # (subscription, orders, invoices, saved cards, events, domains,
+            # feature/permission rows, ...) through the ORM, model by model,
+            # then the tenant row itself with raw SQL. tenant.delete() cannot
+            # be used: models in TENANT_APPS (bookings, leave, e-commerce
+            # settings) also have FKs to Tenant and their tables live in the
+            # schema just dropped, and the FK constraints have no ON DELETE
+            # CASCADE, so a bare DELETE on tenants_tenant is rejected.
+            self.stdout.write(f'  Deleting public-schema records of the tenant...')
+            shared_app_names = set(settings.SHARED_APPS)
+            with transaction.atomic():
+                for rel in Tenant._meta.related_objects:
+                    model = rel.related_model
+                    if apps.get_app_config(model._meta.app_label).name not in shared_app_names:
+                        continue
+                    deleted, _ = model._default_manager.filter(**{rel.field.name: tenant}).delete()
+                    if deleted:
+                        self.stdout.write(f'    {model._meta.label}: {deleted} row(s)')
+                # Registration bookkeeping is keyed by schema name, not FK;
+                # register_tenant refuses a domain with a pending row.
+                pending, _ = PendingRegistration.objects.filter(schema_name=tenant.schema_name).delete()
+                if pending:
+                    self.stdout.write(f'    tenants.PendingRegistration: {pending} row(s)')
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        'DELETE FROM tenants_tenant WHERE id = %s',
+                        [tenant.id]
+                    )
             self.stdout.write(self.style.SUCCESS(f'  Tenant record deleted'))
 
             self.stdout.write(
