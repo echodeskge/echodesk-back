@@ -387,6 +387,25 @@ def _safe_response_json(response):
         return {}
 
 
+def _upstream_unreachable(view_name, service, exc):
+    """503 for a send whose connection to Meta never opened.
+
+    ``http_retry.post`` already retried the connect; if it still failed the
+    host's outbound network was down for the moment (``[Errno 101] Network is
+    unreachable``, DNS). Nothing reached Meta, so the agent can simply resend.
+    Infrastructure, not an application fault: a warning, and no traceback or
+    URL (the Graph URL carries the page token) in the log line.
+    """
+    logger.warning(
+        "%s: could not reach %s after %s connect retries (%s); the agent can resend",
+        view_name, service, http_retry.CONNECT_RETRIES, type(exc).__name__,
+    )
+    return Response({
+        'error': f'Could not reach {service}. Please try again in a moment.',
+        'error_code': 'upstream_unreachable',
+    }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
 def meta_error_details(error_data):
     """Normalised {code, error_subcode, message} from a Graph API error body."""
     err = (error_data or {}).get('error') or {}
@@ -2102,6 +2121,8 @@ def facebook_send_message(request):
             }, status=status.HTTP_400_BAD_REQUEST)
 
     except Exception as e:
+        if http_retry.is_connect_failure(e):
+            return _upstream_unreachable('facebook_send_message', 'Facebook', e)
         logger.error(f"Exception in facebook_send_message: {e}")
         return Response({
             'error': f'Failed to send message: {str(e)}'
@@ -3783,7 +3804,11 @@ def instagram_send_message(request):
             return Response(body, status=status.HTTP_400_BAD_REQUEST)
 
     except Exception as e:
-        print(f"❌ Exception in instagram_send_message: {e}")
+        if http_retry.is_connect_failure(e):
+            return _upstream_unreachable('instagram_send_message', 'Instagram', e)
+        # Was a print(): an Instagram send failure never reached the log or
+        # Sentry at all.
+        logger.error(f"Exception in instagram_send_message: {e}")
         return Response({
             'error': f'Failed to send message: {str(e)}'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -8487,6 +8512,8 @@ def whatsapp_send_message(request):
         })
 
     except Exception as e:
+        if http_retry.is_connect_failure(e):
+            return _upstream_unreachable('whatsapp_send_message', 'WhatsApp', e)
         logger.error(f"Failed to send WhatsApp message: {e}")
         return Response({
             'error': f'Failed to send message: {str(e)}'

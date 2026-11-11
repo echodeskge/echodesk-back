@@ -18,7 +18,10 @@ CONNECT_RETRIES = 2
 BACKOFF_SECONDS = (0.5, 1.5)
 
 
-def _is_connect_failure(exc: Exception) -> bool:
+def is_connect_failure(exc: Exception) -> bool:
+    """True when ``exc`` means the connection was never opened (so nothing
+    reached the remote side): ``[Errno 101] Network is unreachable``, DNS
+    failures, connect timeouts. Read timeouts / SSL / HTTP errors are not."""
     if isinstance(exc, requests.exceptions.ConnectTimeout):
         return True
     if isinstance(exc, (requests.exceptions.ReadTimeout, requests.exceptions.SSLError)):
@@ -34,6 +37,9 @@ def _is_connect_failure(exc: Exception) -> bool:
     return False
 
 
+_is_connect_failure = is_connect_failure
+
+
 def post(url, **kwargs):
     """``requests.post`` with up to ``CONNECT_RETRIES`` retries on
     connection-establishment failures."""
@@ -42,7 +48,7 @@ def post(url, **kwargs):
         try:
             return requests.post(url, **kwargs)
         except requests.exceptions.RequestException as exc:
-            if attempt >= CONNECT_RETRIES or not _is_connect_failure(exc):
+            if attempt >= CONNECT_RETRIES or not is_connect_failure(exc):
                 raise
             delay = BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)]
             attempt += 1
