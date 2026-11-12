@@ -46,7 +46,7 @@ from onboarding.common import UserIdsField, i18n, tenant_language, users_context
 from onboarding.registry import register
 from users.models import TenantGroup
 
-from .models import Board, BoardTelegramConnection, Tag, TicketColumn, TicketForm
+from .models import Board, BoardTelegramConnection, Tag, Ticket, TicketColumn, TicketForm
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -337,17 +337,37 @@ class TicketsStep(OnboardingStep):
                 return owner
         return None
 
-    @staticmethod
-    def _ensure_board(name, user):
+    @classmethod
+    def _ensure_board(cls, name, user):
         board = Board.objects.filter(name__iexact=name).order_by('id').first()
         if board is not None:
             return board, False
+        seeded = cls._untouched_seed_board()
+        if seeded is not None:
+            # Adopt the board seeded at provisioning instead of adding a second
+            # one: rename it and let the purpose preset replace its columns.
+            seeded.name = name
+            seeded.save()   # full save: Board.save() re-asserts is_default
+            seeded.columns.all().delete()
+            return seeded, True
         board = Board.objects.create(
             name=name,
             is_default=not Board.objects.filter(is_default=True).exists(),
             created_by=user,
         )
         return board, True
+
+    @staticmethod
+    def _untouched_seed_board():
+        """The board ``seed_defaults`` created, if nothing has been put on it yet."""
+        names = [n.lower() for n in SEED_BOARD_NAME.values()]
+        for board in Board.objects.filter(is_default=True).order_by('id'):
+            if board.name.lower() not in names:
+                continue
+            if Ticket.objects.filter(column__board=board).exists():
+                continue
+            return board
+        return None
 
     @staticmethod
     def _ensure_columns(board, preset, language, user):

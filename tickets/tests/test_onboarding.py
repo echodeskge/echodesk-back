@@ -254,6 +254,26 @@ class TicketsStepTests(EchoDeskTenantTestCase):
         step.seed_defaults(self.tenant)
         self.assertEqual(Board.objects.count(), 1)
 
+    def test_apply_adopts_the_untouched_seeded_board(self):
+        step = TicketsStep()
+        step.seed_defaults(self.tenant)
+        resp = self._apply({'purpose': 'support'})
+        self.assertEqual(resp.status_code, 200, resp.data)
+        board = Board.objects.get()            # one board, not Main + Support
+        self.assertEqual(board.name, 'Support')
+        self.assertTrue(board.is_default)
+        self.assertEqual(
+            [c.name for c in board.columns.order_by('position')],
+            ['New', 'In progress', 'Waiting for customer', 'Resolved'],
+        )
+        # A seeded board that already holds tickets is left alone.
+        board.delete()
+        step.seed_defaults(self.tenant)
+        Ticket.objects.create(title='t', created_by=self.owner)
+        resp = self._apply({'purpose': 'tasks'})
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(sorted(Board.objects.values_list('name', flat=True)), ['Main', 'Tasks'])
+
     def test_seed_defaults_without_users_does_nothing(self):
         from django.contrib.auth import get_user_model
         get_user_model().objects.all().delete()
