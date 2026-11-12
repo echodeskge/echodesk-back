@@ -351,9 +351,11 @@ class Ticket(models.Model):
             # then fall back to any default column.
             default_board = Board.objects.filter(is_default=True).first()
             if default_board:
-                default_column = TicketColumn.objects.filter(
-                    board=default_board, is_default=True
-                ).first()
+                default_column = (
+                    TicketColumn.objects.filter(board=default_board, is_default=True).first()
+                    # A default board without a default column: its first column.
+                    or TicketColumn.objects.filter(board=default_board).order_by('position', 'created_at').first()
+                )
             else:
                 default_column = TicketColumn.objects.filter(is_default=True).first()
             if default_column:

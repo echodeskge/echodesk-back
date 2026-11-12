@@ -70,3 +70,13 @@ module apps and filtered by the tenant's enabled subscription features.
    feature for the test tenant by creating a `Feature` + `TenantSubscription`
    (see `onboarding/tests/helpers.py`). Run
    `python3 -m pytest onboarding <your app> tenants -q -p no:cacheprovider --reuse-db`.
+9. Shared answer types live in `onboarding/common.py`: `I18nSerializer`
+   (`{"ka", "en"}`, at least one non-empty unless `require_text=False`) and
+   `pick_text(i18n, language)`, `HoursSerializer` (`Hours`: one entry per
+   `mon`..`sun`, `null` = closed) with `parse_clock` / `clock_str`,
+   `hours_to_away_schedule` (the inbox away-hours grid), `tenant_language`
+   (`"ka"` or `"en"`), `users_context()` (the people-picker shape) and
+   `UserIdsField` (`[UserId]`, validated against existing users). Steps
+   apply only the answer keys present, so declare optional keys with
+   `required=False` and **no** default. Treat a top-level `null` object
+   (`hours: null`, `telegram: null`) as "not answered".

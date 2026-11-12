@@ -1154,7 +1154,7 @@ def facebook_oauth_callback(request):
         # Enhanced debugging for no pages scenario
         if not pages:
             logger.warning("User has no Facebook pages to connect")
-            if oauth_state.get('return_to') == 'app':
+            if oauth_state.get('return_to') in ('app', 'onboarding'):
                 return _fb_redirect(False, 'No Facebook pages found for this account.')
 
             # Also try to get user info to see what we can access

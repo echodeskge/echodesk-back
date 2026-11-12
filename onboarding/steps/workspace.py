@@ -132,8 +132,15 @@ class WorkspaceStep(OnboardingStep):
             }
             for u in User.objects.order_by('email').only('id', 'email', 'first_name', 'last_name', 'role', 'is_active')
         ]
+        logo_url = None
+        if tenant is not None and tenant.logo:
+            try:
+                logo_url = request.build_absolute_uri(tenant.logo.url) if request is not None else tenant.logo.url
+            except Exception:   # noqa: BLE001 — a missing file must not break the wizard
+                logo_url = None
         return {
             'users': users,
+            'logo_url': logo_url,
             'departments': [{'id': d.id, 'name': d.name} for d in Department.objects.order_by('name')],
             'industries': industry_choices(),
             'languages': [{'key': key, 'label': label} for key, label in LANGUAGES],

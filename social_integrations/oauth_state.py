@@ -6,8 +6,9 @@ that says which tenant the authorisation belongs to. It used to be a plain
 ``tenant=<schema>`` string, which let anyone craft a callback that attached
 their pages / WABA to another tenant. It is now a ``django.core.signing``
 token carrying the tenant schema, a random nonce, the initiating user and
-(optionally) ``return_to=app`` for the mobile app. Each state is accepted
-once and expires after ``STATE_MAX_AGE`` seconds.
+(optionally) ``return_to=app`` for the mobile app or ``return_to=onboarding``
+for the setup wizard. Each state is accepted once and expires after
+``STATE_MAX_AGE`` seconds.
 """
 import logging
 import secrets
@@ -25,15 +26,18 @@ STATE_MAX_AGE = 60 * 60  # 1 hour to finish the Meta / TikTok dialog
 USED_STATE_CACHE_KEY = 'social_oauth_state_used:{nonce}'
 
 APP_RETURN = 'app'
+ONBOARDING_RETURN = 'onboarding'
+RETURN_TARGETS = (APP_RETURN, ONBOARDING_RETURN)
 APP_CONNECTIONS_URL = 'echodesk://social/connections'
+ONBOARDING_PATH = '/onboarding?step=social_integrations'
 
 
 def make_oauth_state(tenant_schema, *, user_id=None, return_to=None, publishing=False):
     payload = {'t': tenant_schema, 'n': secrets.token_urlsafe(16)}
     if user_id:
         payload['u'] = user_id
-    if return_to == APP_RETURN:
-        payload['r'] = APP_RETURN
+    if return_to in RETURN_TARGETS:
+        payload['r'] = return_to
     if publishing:
         payload['p'] = 1
     return signing.dumps(payload, salt=STATE_SALT, compress=True)
@@ -70,10 +74,12 @@ def read_oauth_state(state, *, consume=True):
 
 
 def return_to_from_request(request):
-    """``app`` when the caller asked to come back to the mobile app."""
+    """``app`` (mobile app) or ``onboarding`` (setup wizard) when the caller
+    asked to come back there; ``None`` for the dashboard connections page."""
     value = (request.query_params.get('return_to') if hasattr(request, 'query_params')
              else request.GET.get('return_to'))
-    return APP_RETURN if (value or '').strip().lower() == APP_RETURN else None
+    value = (value or '').strip().lower()
+    return value if value in RETURN_TARGETS else None
 
 
 class AppSchemeRedirect(HttpResponseRedirect):
@@ -85,6 +91,8 @@ def oauth_result_redirect(*, platform, ok, message='', state=None, tenant_schema
 
     - return_to=app → ``echodesk://social/connections?platform=<p>&status=<ok|error>&message=…``
       so ``WebBrowser.openAuthSessionAsync`` closes and reports the result.
+    - return_to=onboarding → the tenant dashboard's ``/onboarding?step=social_integrations``
+      with the same ``<platform>_status`` query as below.
     - otherwise the tenant dashboard's ``/social/connections`` page with the
       legacy ``<platform>_status=connected|error`` query (unchanged).
     """
@@ -103,4 +111,6 @@ def oauth_result_redirect(*, platform, ok, message='', state=None, tenant_schema
         query += f'&{key}={quote_plus(str(value))}'
     if message:
         query += f'&message={quote_plus(message)}'
+    if state and state.get('return_to') == ONBOARDING_RETURN:
+        return HttpResponseRedirect(f'{base}{ONBOARDING_PATH}&{query}')
     return HttpResponseRedirect(f'{base}/social/connections?{query}')

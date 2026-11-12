@@ -190,6 +190,8 @@ class WorkspaceStepTests(EchoDeskTenantTestCase):
         self.assertEqual(step['context']['departments'], [{'id': Department.objects.get(name='Support').id, 'name': 'Support'}])
         self.assertEqual(step['context']['roles'], ['admin', 'manager', 'agent'])
         self.assertEqual([lang['key'] for lang in step['context']['languages']], ['ka', 'en', 'ru'])
+        self.assertIn('logo_url', step['context'])
+        self.assertIsNone(step['context']['logo_url'])   # no logo uploaded yet
         self.assertEqual(step['prefill'], {
             'company_name': self.tenant.name,
             'preferred_language': self.tenant.preferred_language,
