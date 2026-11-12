@@ -33,7 +33,7 @@ class TicketsStepTests(EchoDeskTenantTestCase):
 
     def setUp(self):
         super().setUp()
-        enable_features(self.tenant, 'tickets')
+        enable_features(self.tenant, 'ticket_management')
         self.owner = self.create_user(
             email='owner@test.com', role='admin', is_staff=True, is_superuser=True,
             first_name='Owner', last_name='One',
@@ -60,7 +60,7 @@ class TicketsStepTests(EchoDeskTenantTestCase):
 
     def test_context_and_prefill_shapes(self):
         step = self._step()
-        self.assertEqual(step['feature_key'], 'tickets')
+        self.assertEqual(step['feature_key'], 'ticket_management')
         self.assertEqual(step['order'], 10)
         ctx = step['context']
         self.assertEqual(set(ctx['users'][0].keys()), {'id', 'email', 'name', 'role', 'is_active'})
@@ -120,7 +120,7 @@ class TicketsStepTests(EchoDeskTenantTestCase):
         group = TenantGroup.objects.get(name='Customer Support')
         self.assertEqual(set(group.members.values_list('id', flat=True)), {self.agent.id, self.owner.id})
         self.assertIn(group, board.board_groups.all())
-        self.assertTrue(group.features.filter(key='tickets').exists())
+        self.assertTrue(group.features.filter(key='ticket_management').exists())
 
         form = TicketForm.objects.get(title='Customer Support')
         self.assertTrue(form.is_default)

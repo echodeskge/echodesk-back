@@ -34,7 +34,7 @@ module apps and filtered by the tenant's enabled subscription features.
    @register
    class TicketsStep(OnboardingStep):
        key = 'tickets'               # step key; feature key of the module
-       feature_key = 'tickets'       # None = always shown (only workspace)
+       feature_key = 'ticket_management'   # the module's Feature.key; None = always shown (only workspace)
        order = 10                    # workspace 0, tickets 10, social 20, bookings 30,
                                      # shop 40, invoices 50, leave 60, calls 70
        serializer_class = TicketsAnswersSerializer

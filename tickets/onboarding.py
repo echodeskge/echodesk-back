@@ -226,7 +226,7 @@ class TicketsAnswersSerializer(serializers.Serializer):
 @register
 class TicketsStep(OnboardingStep):
     key = 'tickets'
-    feature_key = 'tickets'
+    feature_key = 'ticket_management'
     order = 10
     serializer_class = TicketsAnswersSerializer
 
@@ -410,7 +410,7 @@ class TicketsStep(OnboardingStep):
             group.members.add(*User.objects.filter(id__in=user_ids))
         try:
             from tenants.models import Feature
-            feature = Feature.objects.filter(key='tickets', is_active=True).first()
+            feature = Feature.objects.filter(key='ticket_management', is_active=True).first()
             if feature is not None:
                 group.features.add(feature)
         except Exception:   # noqa: BLE001 — the group is still usable without the feature link
