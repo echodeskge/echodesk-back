@@ -91,6 +91,10 @@ class Command(BaseCommand):
             self.stdout.write(f'  Syncing features...')
             self.sync_features(tenant)
 
+            # Step 4b: Onboarding row + module defaults (never fails provisioning)
+            self.stdout.write('  Setting up onboarding...')
+            self.setup_onboarding(tenant)
+
             # Step 5: Setup frontend
             self.stdout.write(f'  Setting up frontend...')
             self.setup_frontend(tenant)
@@ -204,6 +208,25 @@ class Command(BaseCommand):
         except Exception as e:
             logger.warning(f'Could not sync features for {tenant.schema_name}: {e}')
             # Don't fail deployment if feature sync fails
+
+    def setup_onboarding(self, tenant):
+        """Create the TenantOnboarding row, mark every shown step pending and
+        seed each enabled module's defaults (onboarding.services). Never
+        fails the deployment."""
+        from django.apps import apps
+        if not apps.is_installed('onboarding'):
+            return
+        try:
+            from onboarding.services import initialize_for_tenant
+            summary = initialize_for_tenant(tenant)
+            self.stdout.write(
+                f'    Onboarding: {len(summary["pending"])} step(s) pending, '
+                f'seeded {", ".join(summary["seeded"]) or "nothing"}'
+                + (f', failed seeds: {", ".join(summary["errors"])}' if summary['errors'] else '')
+            )
+        except Exception as e:
+            logger.warning(f'Could not set up onboarding for {tenant.schema_name}: {e}', exc_info=True)
+            self.stdout.write(self.style.WARNING(f'    Onboarding setup skipped: {e}'))
 
     def setup_frontend(self, tenant):
         """Setup frontend access for the tenant"""

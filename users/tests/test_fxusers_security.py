@@ -97,7 +97,7 @@ class TestTenantGroupIdsNeedManageGroups(GuardTestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(self.group_ids(self.agent), set())
 
-    @patch('users.views.send_user_invitation_email_task')
+    @patch('users.invitations.send_user_invitation_email_task')
     def test_create_with_groups_needs_manage_groups(self, mock_invite):
         resp = self.api_post(USERS_URL, {
             'email': 'new-grp@test.com', 'first_name': 'N', 'last_name': 'G',
@@ -441,7 +441,7 @@ class TestRoleChangeTakeover(GuardTestCase):
         self.agent.refresh_from_db()
         self.assertEqual(self.agent.role, 'agent')
 
-    @patch('users.views.send_user_invitation_email_task')
+    @patch('users.invitations.send_user_invitation_email_task')
     def test_cannot_create_a_user_above_your_own_role(self, mock_invite):
         resp = self.api_post(USERS_URL, {
             'email': 'fx-new-mgr@test.com', 'first_name': 'N', 'last_name': 'M', 'role': 'manager',

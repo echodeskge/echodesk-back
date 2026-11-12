@@ -76,7 +76,7 @@ class TestUserCreate(EchoDeskTenantTestCase):
         self.admin = self.create_admin()
         self.agent = self.create_user(email='agent1@test.com')
 
-    @patch('users.views.send_user_invitation_email_task')
+    @patch('users.invitations.send_user_invitation_email_task')
     def test_create_user_as_admin(self, mock_email):
         resp = self.api_post(USERS_URL, {
             'email': 'newuser@test.com',
@@ -87,7 +87,7 @@ class TestUserCreate(EchoDeskTenantTestCase):
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
         self.assertTrue(User.objects.filter(email='newuser@test.com').exists())
 
-    @patch('users.views.send_user_invitation_email_task')
+    @patch('users.invitations.send_user_invitation_email_task')
     def test_create_user_as_agent_denied(self, mock_email):
         """BUG 1 regression: permission check uses 'manage_users' not 'can_manage_users'."""
         resp = self.api_post(USERS_URL, {
@@ -97,7 +97,7 @@ class TestUserCreate(EchoDeskTenantTestCase):
         }, user=self.agent)
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
 
-    @patch('users.views.send_user_invitation_email_task')
+    @patch('users.invitations.send_user_invitation_email_task')
     def test_create_user_generates_temp_password(self, mock_email):
         resp = self.api_post(USERS_URL, {
             'email': 'temppass@test.com',
@@ -108,7 +108,7 @@ class TestUserCreate(EchoDeskTenantTestCase):
         self.assertIsNotNone(user.temporary_password)
         self.assertTrue(len(user.temporary_password) >= 12)
 
-    @patch('users.views.send_user_invitation_email_task')
+    @patch('users.invitations.send_user_invitation_email_task')
     def test_create_user_sets_password_change_required(self, mock_email):
         resp = self.api_post(USERS_URL, {
             'email': 'pcrequired@test.com',
@@ -118,7 +118,7 @@ class TestUserCreate(EchoDeskTenantTestCase):
         user = User.objects.get(email='pcrequired@test.com')
         self.assertTrue(user.password_change_required)
 
-    @patch('users.views.send_user_invitation_email_task')
+    @patch('users.invitations.send_user_invitation_email_task')
     def test_create_user_with_manager(self, mock_email):
         resp = self.api_post(USERS_URL, {
             'email': 'managed@test.com',
@@ -129,7 +129,7 @@ class TestUserCreate(EchoDeskTenantTestCase):
         user = User.objects.get(email='managed@test.com')
         self.assertEqual(user.manager, self.agent)
 
-    @patch('users.views.send_user_invitation_email_task')
+    @patch('users.invitations.send_user_invitation_email_task')
     def test_create_user_with_unknown_manager_rejected(self, mock_email):
         resp = self.api_post(USERS_URL, {
             'email': 'orphan@test.com',

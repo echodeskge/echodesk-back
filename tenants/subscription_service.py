@@ -44,6 +44,8 @@ class SubscriptionService:
 
             enabled_features = []
             disabled_features = []
+            enabled_keys = []   # feature keys newly enabled (created or reactivated)
+            disabled_keys = []  # feature keys disabled this sync
             permissions_granted = 0
 
             # Enable features from subscription
@@ -64,9 +66,11 @@ class SubscriptionService:
                     tenant_feature.disabled_at = None
                     tenant_feature.save()
                     enabled_features.append(feature.name)
+                    enabled_keys.append(feature.key)
 
                 if created:
                     enabled_features.append(feature.name)
+                    enabled_keys.append(feature.key)
 
                 # Grant permissions for this feature
                 permissions_granted += SubscriptionService._sync_feature_permissions(
@@ -85,6 +89,7 @@ class SubscriptionService:
                 tf.disabled_at = timezone.now()
                 tf.save()
                 disabled_features.append(tf.feature.name)
+                disabled_keys.append(tf.feature.key)
 
                 # Revoke permissions for disabled features
                 SubscriptionService._revoke_feature_permissions(tenant, tf.feature)
@@ -95,11 +100,33 @@ class SubscriptionService:
                 f"permissions={permissions_granted}"
             )
 
-            return {
+            summary = {
                 'enabled_features': enabled_features,
                 'disabled_features': disabled_features,
+                'enabled_feature_keys': enabled_keys,
+                'disabled_feature_keys': disabled_keys,
                 'permissions_granted': permissions_granted
             }
+
+        # Outside the atomic block: onboarding keeps its own savepoint and
+        # never raises, so a missing tenant schema can't poison the feature sync.
+        SubscriptionService._notify_onboarding(tenant, enabled_keys, disabled_keys)
+        return summary
+
+    @staticmethod
+    def _notify_onboarding(tenant, enabled_keys, disabled_keys):
+        """Mark newly enabled modules' onboarding steps pending and drop the
+        entries of disabled ones (no-op without the onboarding app)."""
+        if not enabled_keys and not disabled_keys:
+            return
+        from django.apps import apps
+        if not apps.is_installed('onboarding'):
+            return
+        try:
+            from onboarding.services import on_features_changed
+            on_features_changed(tenant, enabled_keys, disabled_keys)
+        except Exception as e:  # noqa: BLE001 - never break feature sync
+            logger.warning(f'Onboarding feature-change hook failed for {tenant.schema_name}: {e}')
 
     @staticmethod
     def _sync_feature_permissions(tenant, feature):

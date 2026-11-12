@@ -110,7 +110,7 @@ class TestRoleEscalation(GuardTestCase):
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
-    @patch('users.views.send_user_invitation_email_task')
+    @patch('users.invitations.send_user_invitation_email_task')
     def test_non_superuser_cannot_create_admin(self, _mock):
         resp = self.api_post(USERS_URL, {
             'email': 'newadmin@test.com', 'first_name': 'N', 'last_name': 'A', 'role': 'admin',
@@ -118,7 +118,7 @@ class TestRoleEscalation(GuardTestCase):
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
         self.assertFalse(User.objects.filter(email='newadmin@test.com').exists())
 
-    @patch('users.views.send_user_invitation_email_task')
+    @patch('users.invitations.send_user_invitation_email_task')
     def test_superuser_can_create_admin(self, _mock):
         resp = self.api_post(USERS_URL, {
             'email': 'newadmin2@test.com', 'first_name': 'N', 'last_name': 'A', 'role': 'admin',
@@ -324,7 +324,7 @@ class TestIsStaffAndDepartment(GuardTestCase):
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn('department_id', resp.data)
 
-    @patch('users.views.send_user_invitation_email_task')
+    @patch('users.invitations.send_user_invitation_email_task')
     def test_create_accepts_job_title(self, _mock):
         resp = self.api_post(USERS_URL, {
             'email': 'jt@test.com', 'first_name': 'J', 'last_name': 'T', 'job_title': 'Cashier',

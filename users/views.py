@@ -18,7 +18,8 @@ import secrets
 import string
 import logging
 from rest_framework.authtoken.models import Token
-from .tasks import send_user_invitation_email_task, send_new_password_email_task
+from .tasks import send_new_password_email_task
+from .invitations import invite_user
 from .team_chat import (
     broadcast_read_receipt as broadcast_team_chat_read_receipt,
     get_or_create_pair_conversation,
@@ -495,43 +496,15 @@ class UserViewSet(viewsets.ModelViewSet):
         if serializer.validated_data.get('tenant_group_ids') and not _can_manage_groups(self.request.user):
             raise PermissionDenied(GROUPS_FORBIDDEN)
 
-        # Generate temporary password (12 characters: letters, digits, special chars)
-        alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
-        temporary_password = ''.join(secrets.choice(alphabet) for _ in range(12))
-
-        # Save user with temporary password and require password change on first login
-        user = serializer.save(
+        # Temporary password + forced change + invitation e-mail: shared with
+        # the onboarding workspace step (users.invitations.invite_user).
+        user = serializer.save()
+        invite_user(
+            user,
             invited_by=self.request.user,
-            invitation_sent_at=timezone.now(),
-            temporary_password=temporary_password,
-            password_change_required=True
+            tenant=self.request.tenant if hasattr(self.request, 'tenant') else None,
         )
 
-        # Set the password (hashed)
-        user.set_password(temporary_password)
-        user.save()
-
-        # Send invitation email off the request cycle (SendGrid can take
-        # seconds / time out) — queued to Celery with retries.
-        try:
-            tenant = self.request.tenant if hasattr(self.request, 'tenant') else None
-            tenant_name = tenant.name if tenant else "EchoDesk"
-            frontend_url = tenant.frontend_url if tenant else settings.MAIN_DOMAIN
-            language = tenant.preferred_language if tenant else 'en'
-
-            send_user_invitation_email_task.delay(
-                user_email=user.email,
-                user_name=user.get_full_name(),
-                tenant_name=tenant_name,
-                temporary_password=temporary_password,
-                frontend_url=frontend_url,
-                invited_by=self.request.user.get_full_name(),
-                language=language,
-            )
-            logger.info(f'Queued invitation email to {user.email}')
-        except Exception as e:
-            logger.error(f'Error queuing invitation email to {user.email}: {str(e)}')
-    
     def _reset_password_and_notify(self, user):
         """Generate a fresh temporary password for ``user``, store it, require a
         change on next login, and email it to the user's current address.

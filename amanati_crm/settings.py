@@ -141,6 +141,7 @@ TENANT_APPS = [
     'booking_management',  # Booking management for service-based businesses
     'leave_management',  # Employee leave and absence management
     'invoices',  # Invoice management and generation
+    'onboarding',  # Per-module setup wizard state + step registry
 ]
 
 INSTALLED_APPS = list(SHARED_APPS) + [app for app in TENANT_APPS if app not in SHARED_APPS]
