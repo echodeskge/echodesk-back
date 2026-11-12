@@ -104,6 +104,43 @@ def notify_subscription_created(subscription):
     send_telegram_message(message.strip())
 
 
+def notify_pbx_hosting_request(tenant, admin_email='', requested_server=None, agent_count=None):
+    """
+    Notify the EchoDesk team that a tenant asked for a hosted PBX (Calls
+    onboarding step, "EchoDesk hosts the PBX"). Returns ``True`` when the
+    Telegram message went out.
+
+    Args:
+        tenant: Tenant instance
+        admin_email: e-mail of the admin who asked
+        requested_server: optional dict with the server details they typed
+            (name / fqdn / public_ip / ami_port)
+        agent_count: how many users they picked as call agents
+    """
+    requested_server = requested_server or {}
+    server_lines = [
+        f"🖥 <b>Requested server:</b> {requested_server.get('name') or '—'}",
+    ]
+    if requested_server.get('fqdn'):
+        server_lines.append(f"🌐 <b>Domain:</b> {requested_server['fqdn']}")
+    if requested_server.get('public_ip'):
+        server_lines.append(f"📍 <b>Public IP:</b> {requested_server['public_ip']}")
+
+    message = f"""
+📞 <b>Hosted PBX requested</b>
+
+👤 <b>Tenant:</b> {tenant.name}
+🏷 <b>Schema:</b> {tenant.schema_name}
+📧 <b>Admin:</b> {admin_email or tenant.admin_email}
+{chr(10).join(server_lines)}
+{f'👥 <b>Agents:</b> {agent_count}' if agent_count is not None else ''}
+
+⏰ <b>Requested:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+
+    return send_telegram_message(message.strip())
+
+
 def notify_payment_success(payment_attempt, subscription=None):
     """
     Notify when a payment succeeds
