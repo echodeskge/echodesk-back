@@ -721,6 +721,12 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'leave_management.tasks.generate_georgian_holidays',
         'schedule': crontab(day_of_month=1, month_of_year='1,12', hour=4, minute=10),
     },
+    # Monthly accrual for accrual-based leave types (process_accrual was
+    # never scheduled before; idempotent via LeaveBalance.last_accrual_date).
+    'leave-process-accruals': {
+        'task': 'leave_management.tasks.process_leave_accruals',
+        'schedule': crontab(day_of_month=1, hour=4, minute=30),
+    },
     # Payment tasks — owned by Celery beat again since 2026-08-12. They were
     # previously removed in favor of DO Functions cron triggers (to prevent
     # double-charging while both existed); those Functions died with the
