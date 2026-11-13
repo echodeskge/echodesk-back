@@ -391,12 +391,12 @@ def bog_webhook(request):
         }
     }
     """
-    # Optional: Verify webhook signature
+    # Signature on the raw bytes, before DRF parses the body (BOG docs:
+    # SHA256withRSA over the request body, key on the callback docs page).
     signature = request.headers.get('Callback-Signature', '')
-    if signature:
-        # TODO: Implement signature verification when BOG provides public key
-        # bog_service.verify_webhook_signature(request.body, signature)
-        logger.info('Webhook signature received (verification not implemented)')
+    if signature and bog_service.verify_callback_signature(request.body, signature) is False:
+        logger.warning('BOG callback with an invalid Callback-Signature rejected')
+        return Response({'error': 'Invalid signature'}, status=status.HTTP_400_BAD_REQUEST)
 
     # Process payment event
     event_type = request.data.get('event')
@@ -413,8 +413,8 @@ def bog_webhook(request):
     bog_status = order_status_obj.get('key', '')
 
     # Get response code from payment_detail
-    payment_detail = body.get('payment_detail', {})
-    response_code = payment_detail.get('code', '')
+    payment_detail = body.get('payment_detail') or {}
+    response_code = str(payment_detail.get('code') or '')
     transaction_id = payment_detail.get('transaction_id', '')
 
     logger.info(f'BOG webhook received: bog_order_id={bog_order_id}, external_order_id={external_order_id}, status={bog_status}, code={response_code}')

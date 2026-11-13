@@ -128,8 +128,8 @@ class BOGPaymentProvider(PaymentProvider):
         )
 
     def verify_webhook(self, headers: Dict[str, str], body: bytes) -> bool:
-        # BOG webhook verification is not yet implemented in the existing service
-        return True
+        signature = headers.get('Callback-Signature') or headers.get('callback-signature') or ''
+        return self._service.verify_callback_signature(body, signature) is not False
 
     def charge_recurring(
         self,

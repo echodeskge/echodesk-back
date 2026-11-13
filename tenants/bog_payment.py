@@ -263,15 +263,31 @@ class BOGPaymentService:
 
                 internal_status = status_mapping.get(status_key, 'unknown')
 
+                # Field layout per https://api.bog.ge/docs/en/payments/standard-process/get-payment-details:
+                # the response code, transaction id and card details sit under
+                # ``payment_detail``, amounts under ``purchase_units``. (They were
+                # read from the top level before, so ``response_code`` was always
+                # None and every callback re-query failed to confirm a payment.)
+                payment_detail = data.get('payment_detail') or {}
+                purchase = data.get('purchase_units') or {}
+                code = payment_detail.get('code', data.get('code'))
+                transfer_method = payment_detail.get('transfer_method', data.get('transfer_method'))
+                if isinstance(transfer_method, dict):
+                    transfer_method = transfer_method.get('key')
+
                 return {
                     'order_id': order_id,
                     'status': internal_status,
                     'bog_status': status_key,
-                    'transaction_id': data.get('transaction_id'),
-                    'amount': data.get('transfer_amount'),
-                    'currency': data.get('currency'),
-                    'transfer_method': data.get('transfer_method'),
-                    'response_code': data.get('code'),
+                    'external_order_id': data.get('external_order_id'),
+                    'transaction_id': payment_detail.get('transaction_id') or data.get('transaction_id'),
+                    'amount': (purchase.get('transfer_amount') or purchase.get('request_amount')
+                               or data.get('transfer_amount')),
+                    'currency': purchase.get('currency_code') or data.get('currency'),
+                    'transfer_method': transfer_method,
+                    'response_code': str(code) if code not in (None, '') else None,
+                    'code_description': payment_detail.get('code_description'),
+                    'reject_reason': data.get('reject_reason'),
                     'raw_data': data
                 }
             else:
@@ -343,34 +359,37 @@ class BOGPaymentService:
         logger.error(error_msg)
         raise ValueError(error_msg)
 
-    def verify_webhook_signature(self, payload: str, signature: str, public_key: str = None) -> bool:
+    def verify_callback_signature(self, raw_body, signature: str, public_key: str = None):
+        """Check BOG's ``Callback-Signature`` header against the raw request body.
+
+        BOG signs the exact bytes it POSTs with SHA256withRSA (PKCS#1 v1.5)
+        and sends the signature base64-encoded; the public key is published
+        on the callback docs page (settings.BOG_CALLBACK_PUBLIC_KEY).
+
+        Returns True / False, or None when it cannot be checked (no signature
+        header, no key configured). Callers reject on False and may let None
+        through because the webhook re-queries BOG before trusting anything.
         """
-        Verify webhook signature from BOG callback
-
-        Note: BOG uses SHA256withRSA signature verification with a public key.
-        This is optional but recommended for production.
-
-        Args:
-            payload: Raw request body as string
-            signature: Signature from Callback-Signature header
-            public_key: Public key provided by BOG
-
-        Returns:
-            True if signature is valid or if signature verification is not configured
-        """
+        public_key = public_key or getattr(settings, 'BOG_CALLBACK_PUBLIC_KEY', '')
         if not signature or not public_key:
-            logger.warning('Webhook signature verification skipped (no signature or public key)')
-            return True
-
+            return None
         try:
-            # TODO: Implement RSA signature verification when public key is available
-            # This requires cryptography library and proper RSA verification
-            logger.warning('Webhook signature verification not implemented yet')
-            return True
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import padding
 
-        except Exception as e:
-            logger.error(f'Webhook signature verification error: {e}')
+            if isinstance(raw_body, str):
+                raw_body = raw_body.encode('utf-8')
+            key = serialization.load_pem_public_key(public_key.encode('utf-8'))
+            key.verify(base64.b64decode(signature.strip()), raw_body, padding.PKCS1v15(), hashes.SHA256())
+            return True
+        except Exception as e:  # bad base64, wrong key, tampered body
+            logger.warning(f'BOG callback signature rejected: {type(e).__name__}: {e}')
             return False
+
+    def verify_webhook_signature(self, payload: str, signature: str, public_key: str = None) -> bool:
+        """Back-compat wrapper: an unverifiable callback counts as accepted
+        (the webhooks confirm the payment with BOG directly anyway)."""
+        return self.verify_callback_signature(payload, signature, public_key) is not False
 
     def enable_card_saving(self, order_id: str) -> bool:
         """

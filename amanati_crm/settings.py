@@ -839,6 +839,17 @@ BOG_CLIENT_ID = config('BOG_CLIENT_ID', default='')
 BOG_CLIENT_SECRET = config('BOG_CLIENT_SECRET', default='')
 BOG_AUTH_URL = config('BOG_AUTH_URL', default='https://oauth2.bog.ge/auth/realms/bog/protocol/openid-connect/token')
 BOG_API_BASE_URL = config('BOG_API_BASE_URL', default='https://api.bog.ge/payments/v1')
+# RSA public key BOG signs callbacks with (Callback-Signature, SHA256withRSA).
+# Published at https://api.bog.ge/docs/en/payments/standard-process/callback;
+# override via env if the bank rotates it.
+BOG_CALLBACK_PUBLIC_KEY = config('BOG_CALLBACK_PUBLIC_KEY', default=(
+    '-----BEGIN PUBLIC KEY-----\n'
+    'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu4RUyAw3+CdkS3ZNILQhzHI9Hemo+vKB9U2BSabppkKjzjjkf+0Sm76hSMiu'
+    '/HFtYhqWOESryoCDJoqffY0Q1VNt25aTxbj068QNUtnxQ7KQVLA+pG0smf+EBWlS1vBEAFbIas9d8c9b9sSEkTrrTYQ90WIM8bGB6S'
+    '/KLVoT1a7SnzabjoLc5Qf/SLDG5fu8dH8zckyeYKdRKSBJKvhxtcBuHV4f7qsynQT+f2UYbESX/TLHwT5qFWZDHZ0YUOUIvb8n7Juj'
+    'VSGZO9/+ll/g4ZIWhC1MlJgPObDwRkRd8NFOopgxMcMsDIZIoLbWKhHVq67hdbwpAq9K9WMmEhPnPwIDAQAB\n'
+    '-----END PUBLIC KEY-----'
+))
 
 # Cron Job Security Token (for scheduled task HTTP endpoints)
 CRON_SECRET_TOKEN = config('CRON_SECRET_TOKEN', default='')

@@ -3341,9 +3341,17 @@ def ecommerce_payment_webhook(request):
     """
     import logging
     from django.utils import timezone
-    
+
     logger = logging.getLogger(__name__)
-    
+
+    # Signature first, on the raw bytes, before DRF parses the body.
+    signature = request.headers.get('Callback-Signature', '')
+    if signature:
+        from tenants.bog_payment import BOGPaymentService
+        if BOGPaymentService().verify_callback_signature(request.body, signature) is False:
+            logger.warning('BOG ecommerce callback with an invalid Callback-Signature rejected')
+            return Response({'error': 'Invalid signature'}, status=status.HTTP_400_BAD_REQUEST)
+
     # Process payment event
     event_type = request.data.get('event')
     body = request.data.get('body', {})
@@ -3359,8 +3367,10 @@ def ecommerce_payment_webhook(request):
     bog_status = order_status_obj.get('key', '')
     
     # Get response code from payment_detail
-    payment_detail = body.get('payment_detail', {})
-    response_code = payment_detail.get('code', '')
+    payment_detail = body.get('payment_detail') or {}
+    # BOG's examples send the code as a string; str() keeps an integer 100
+    # from failing the comparison below.
+    response_code = str(payment_detail.get('code') or '')
     transaction_id = payment_detail.get('transaction_id', '')
     
     logger.info(f'Ecommerce payment webhook: bog_order_id={bog_order_id}, order_number={external_order_id}, status={bog_status}, code={response_code}')
@@ -3497,8 +3507,8 @@ def ecommerce_payment_webhook(request):
                     order.payment_provider = 'bog'
                 order.payment_metadata.update({
                     'bog_order_id': bog_order_id,
-                    'transaction_id': transaction_id,
-                    'response_code': response_code,
+                    'transaction_id': transaction_id or confirmation.get('transaction_id') or '',
+                    'response_code': response_code or confirmation.get('response_code') or '',
                     'paid_at': timezone.now().isoformat()
                 })
                 order.save()
