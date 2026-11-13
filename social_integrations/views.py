@@ -76,7 +76,7 @@ from .services.profile_pic_cache import get_facebook_profile_pic, get_instagram_
 from .services import ai_companion as ai_companion_service
 from .pagination import SocialMessagePagination
 from .conversation_keys import (
-    assignment_conversation_id, assignment_lookup_ids, session_conversation_id,
+    assignment_conversation_id, assignment_lookup_ids, session_conversation_id, wa_number,
 )
 from .schema_serializers import *  # noqa: F401,F403 — documentation shapes for extend_schema
 from .ai_errors import AI_NOT_CONFIGURED_RESPONSE
@@ -5509,8 +5509,8 @@ def send_rating_request_whatsapp(conversation_id, waba_id, message):
                 wa_message = WhatsAppMessage.objects.create(
                     business_account=account,
                     message_id=message_id or f"rating_{timestamp.timestamp()}",
-                    from_number=account.display_phone_number or account.phone_number_id,
-                    to_number=to_number,
+                    from_number=account.phone_number or account.display_phone_number or account.phone_number_id,
+                    to_number=wa_number(to_number),
                     message_text=message,
                     message_type='text',
                     timestamp=timestamp,
@@ -5522,14 +5522,14 @@ def send_rating_request_whatsapp(conversation_id, waba_id, message):
                     'id': wa_message.id,
                     'message_id': wa_message.message_id,
                     'platform': 'whatsapp',
-                    'from_number': account.display_phone_number or account.phone_number_id,
-                    'to_number': to_number,
+                    'from_number': wa_message.from_number,
+                    'to_number': wa_message.to_number,
                     'message_text': message,
                     'timestamp': timestamp.isoformat(),
                     'is_from_business': True,
                     'waba_id': waba_id,
                 }
-                async_to_sync(send_new_message_notification)(tenant_schema, to_number, message_data)
+                async_to_sync(send_new_message_notification)(tenant_schema, wa_message.to_number, message_data)
             except Exception as e:
                 logger.warning(f"Failed to save/broadcast rating message: {e}")
             return message_id
@@ -6800,8 +6800,8 @@ def mark_conversation_read(request):
         # exist on two pages). Without it every account is affected.
         account_id = request.data.get('account_id') or None
         acct = _account_scope(platform, account_id)
-        if platform == 'widget' and conversation_id:
-            conversation_id = session_conversation_id('widget', conversation_id, account_id)
+        if platform in ('widget', 'whatsapp') and conversation_id:
+            conversation_id = session_conversation_id(platform, conversation_id, account_id)
 
         if not platform or not conversation_id:
             return Response({
@@ -6972,8 +6972,8 @@ def mark_conversation_unread(request):
         # exist on two pages). Without it every account is affected.
         account_id = request.data.get('account_id') or None
         acct = _account_scope(platform, account_id)
-        if platform == 'widget' and conversation_id:
-            conversation_id = session_conversation_id('widget', conversation_id, account_id)
+        if platform in ('widget', 'whatsapp') and conversation_id:
+            conversation_id = session_conversation_id(platform, conversation_id, account_id)
 
         if not platform or not conversation_id:
             return Response({
@@ -7150,6 +7150,8 @@ def delete_conversation(request):
     try:
         platform = request.data.get('platform') or request.query_params.get('platform')
         conversation_id = request.data.get('conversation_id') or request.query_params.get('conversation_id')
+        if platform == 'whatsapp' and conversation_id:
+            conversation_id = wa_number(conversation_id)
 
         if not platform or not conversation_id:
             return Response({
@@ -7605,7 +7607,7 @@ class WhatsAppMessageViewSet(viewsets.ReadOnlyModelViewSet):
                 )
 
         # Filter by from_number (bi-directional: both incoming and outgoing messages)
-        from_number = self.request.query_params.get('from_number')
+        from_number = wa_number(self.request.query_params.get('from_number'))
         if from_number:
             base_queryset = base_queryset.filter(
                 Q(from_number=from_number) | Q(to_number=from_number)
@@ -13032,6 +13034,8 @@ def archive_conversation(request):
                 continue
 
             raw_conversation_id = conversation_id
+            if platform == 'whatsapp':
+                conversation_id = wa_number(conversation_id)
             if platform == 'widget':
                 # Archive rows must use the session id the list checks against
                 session_ids = widget_session_ids(conversation_id)
@@ -13230,11 +13234,17 @@ def unarchive_conversation(request):
                 })
                 continue
 
+            if platform == 'whatsapp':
+                conversation_id = wa_number(conversation_id)
             # Delete the archive record (a widget chat may be named by visitor
             # or composite id; its archive rows are keyed by session id)
-            conversation_ids = widget_session_ids(conversation_id) if platform == 'widget' else [conversation_id]
             if platform == 'widget':
+                conversation_ids = widget_session_ids(conversation_id)
                 account_id = re.sub(r'^widget_', '', str(account_id))
+            elif platform == 'whatsapp':
+                conversation_ids = assignment_lookup_ids(platform, conversation_id)
+            else:
+                conversation_ids = [conversation_id]
             deleted_count, _ = ConversationArchive.objects.filter(
                 platform=platform,
                 conversation_id__in=conversation_ids,

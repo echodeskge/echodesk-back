@@ -47,7 +47,7 @@ class TestConversationTickets(SocialIntegrationTestCase):
         self.assertNotIn('Checking now', ticket.description)  # only customer messages
         self.assertEqual(ticket.created_by, self.agent)
         link = ConversationTicket.objects.get(ticket=ticket)
-        self.assertEqual((link.platform, link.conversation_id, link.account_id), ('whatsapp', self.number, 'waba-1'))
+        self.assertEqual((link.platform, link.conversation_id, link.account_id), ('whatsapp', self.number.lstrip('+'), 'waba-1'))
 
     def test_second_call_returns_existing_even_with_other_key_form(self, _f):
         first = self.api_post(CREATE_URL, self.payload(), user=self.agent).json()['ticket']

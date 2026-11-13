@@ -20,6 +20,20 @@ from django.db.models import Q
 WIDGET_PREFIX_RE = re.compile(r'^widget_(\d+)_(.+)$')
 
 
+def wa_number(raw):
+    """Canonical WhatsApp number: digits only.
+
+    Meta sends ``995577603228``; our own senders used to store the same
+    customer as ``+995577603228`` and the business line as
+    ``+995 579 37 03 74``. The inbox groups a chat by this string, so one
+    customer written two ways showed up as two rows, and an archive or
+    read-state row keyed by the '+' form never matched the list. Every
+    ``WhatsAppMessage`` is saved through this and every endpoint that takes a
+    WhatsApp conversation id runs it through here.
+    """
+    return re.sub(r'\D', '', str(raw or ''))
+
+
 def _strip_widget_prefix(raw):
     raw = str(raw or '').strip()
     match = WIDGET_PREFIX_RE.match(raw)
@@ -82,6 +96,8 @@ def assignment_conversation_id(platform, conversation_id, account_id=None):
     """Key a ChatAssignment row is stored under for this chat."""
     if platform == 'widget':
         return widget_visitor_id(conversation_id, account_id)
+    if platform == 'whatsapp':
+        return wa_number(conversation_id)
     return str(conversation_id or '').strip()
 
 
@@ -92,8 +108,9 @@ def assignment_lookup_ids(platform, conversation_id, account_id=None):
     raw = str(conversation_id or '').strip()
     keys = {raw}
     if platform == 'whatsapp' and raw:
-        # The inbox list keys WhatsApp chats by the number without '+'.
-        keys.add(raw.lstrip('+'))
+        # Rows written before the digits-only rule may still carry a '+'.
+        keys.add(wa_number(raw))
+        keys.add('+' + wa_number(raw))
     return sorted(k for k in keys if k)
 
 
@@ -101,4 +118,6 @@ def session_conversation_id(platform, conversation_id, account_id=None):
     """Key used for messages / archive / AI state rows of this chat."""
     if platform == 'widget':
         return widget_session_id(conversation_id, account_id)
+    if platform == 'whatsapp':
+        return wa_number(conversation_id)
     return str(conversation_id or '').strip()

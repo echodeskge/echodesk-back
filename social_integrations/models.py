@@ -672,6 +672,14 @@ class WhatsAppMessage(models.Model):
         help_text='Staff member who deleted this message'
     )
 
+    def save(self, *args, **kwargs):
+        # Digits only, whatever the sender formatted (see conversation_keys.wa_number):
+        # the inbox groups a chat by these columns.
+        from .conversation_keys import wa_number
+        self.from_number = wa_number(self.from_number) or self.from_number
+        self.to_number = wa_number(self.to_number) or self.to_number
+        super().save(*args, **kwargs)
+
     class Meta:
         ordering = ['-timestamp']
         indexes = [
