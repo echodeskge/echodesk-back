@@ -4,7 +4,7 @@ from django.contrib.auth import get_user_model, authenticate
 from rest_framework.authtoken.models import Token
 from .models import Tenant, SavedCard, TenantSubscription, DashboardAppearanceSettings, SecurityLog, TenantIPWhitelist
 from .pricing_rules import (
-    AGENT_COUNT_ERROR, AGENT_COUNT_STEP, MIN_AGENT_COUNT, is_valid_agent_count,
+    AGENT_COUNT_ERROR, MIN_AGENT_COUNT, is_valid_agent_count,
 )
 import re
 from drf_spectacular.utils import extend_schema_field
@@ -101,8 +101,8 @@ class TenantRegistrationSerializer(serializers.Serializer):
         default=MIN_AGENT_COUNT,
         min_value=MIN_AGENT_COUNT,
         help_text=(
-            f"Number of agents (minimum {MIN_AGENT_COUNT}, in increments of "
-            f"{AGENT_COUNT_STEP}; required for agent-based pricing)"
+            f"Number of employees (seats): any whole number from {MIN_AGENT_COUNT}, "
+            "no upper limit; required for agent-based pricing"
         ),
     )
     
@@ -138,7 +138,7 @@ class TenantRegistrationSerializer(serializers.Serializer):
                     'feature_ids': 'One or more invalid or inactive features selected'
                 })
 
-        # agent_count (min 5, increments of 5) is checked in validate_agent_count
+        # agent_count (any whole number >= 1) is checked in validate_agent_count
 
         # For CRM-based pricing, agent_count is not used
         if pricing_model == 'crm':
@@ -147,7 +147,7 @@ class TenantRegistrationSerializer(serializers.Serializer):
         return attrs
 
     def validate_agent_count(self, value):
-        """Minimum 5 employees, sold in increments of 5 (5, 10, 15, ...)."""
+        """Any whole number of employees from 1 (no upper cap)."""
         if not is_valid_agent_count(value):
             raise serializers.ValidationError(AGENT_COUNT_ERROR)
         return value

@@ -164,8 +164,8 @@ class TenantSubscription(models.Model):
         help_text="Features selected for this subscription"
     )
     agent_count = models.IntegerField(
-        default=10,
-        help_text="Number of agents (in increments of 10: 10, 20, 30... 200)"
+        default=1,
+        help_text="Number of employees (seats), any whole number >= 1"
     )
 
     # Subscription status
@@ -583,7 +583,7 @@ class PendingRegistration(models.Model):
 
     # Feature-based pricing
     selected_features = models.ManyToManyField(Feature, blank=True, help_text='Selected features for feature-based pricing')
-    agent_count = models.IntegerField(default=10, help_text='Number of agents (10-200 in increments of 10)')
+    agent_count = models.IntegerField(default=1, help_text='Number of employees (seats), any whole number >= 1')
     order_id = models.CharField(max_length=100, unique=True, db_index=True, blank=True, default='')
 
     # Payment provider

@@ -995,7 +995,7 @@ def register_tenant_with_payment(request):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Feature-based pricing (serializer enforces min 5, steps of 5)
+            # Feature-based pricing (serializer enforces a whole number >= MIN_AGENT_COUNT, no cap)
             agent_count = validated_data.get('agent_count', MIN_AGENT_COUNT)
             feature_ids = validated_data.get('feature_ids', [])
             selected_features = Feature.objects.filter(id__in=feature_ids, is_active=True)

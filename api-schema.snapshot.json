@@ -41604,6 +41604,291 @@
                 }
             }
         },
+        "/api/onboarding/": {
+            "get": {
+                "operationId": "onboarding_retrieve",
+                "description": "The workspace step plus one step per enabled subscription feature that has a registered onboarding step, ordered by `order`, each with its status, last answers, prefill and read context.",
+                "summary": "Onboarding state",
+                "tags": [
+                    "Onboarding"
+                ],
+                "security": [
+                    {
+                        "jwtAuth": []
+                    },
+                    {
+                        "cookieAuth": []
+                    },
+                    {
+                        "tokenAuth": []
+                    },
+                    {
+                        "tokenAuth": []
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/OnboardingState"
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "403": {
+                        "description": "Not a tenant admin"
+                    }
+                }
+            }
+        },
+        "/api/onboarding/{key}/apply/": {
+            "post": {
+                "operationId": "onboarding_apply_create",
+                "description": "``apply`` / ``skip`` / ``reset`` one step (chosen with ``as_view(action=...)``).",
+                "summary": "Apply / skip / reset an onboarding step",
+                "parameters": [
+                    {
+                        "in": "path",
+                        "name": "key",
+                        "schema": {
+                            "type": "string"
+                        },
+                        "required": true
+                    }
+                ],
+                "tags": [
+                    "Onboarding"
+                ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ApplyRequestRequest"
+                            }
+                        },
+                        "application/x-www-form-urlencoded": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ApplyRequestRequest"
+                            }
+                        },
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ApplyRequestRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "security": [
+                    {
+                        "jwtAuth": []
+                    },
+                    {
+                        "cookieAuth": []
+                    },
+                    {
+                        "tokenAuth": []
+                    },
+                    {
+                        "tokenAuth": []
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApplyResponse"
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Errors"
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "403": {
+                        "description": "Not a tenant admin"
+                    },
+                    "404": {
+                        "description": "Unknown step or feature not enabled"
+                    }
+                }
+            }
+        },
+        "/api/onboarding/{key}/reset/": {
+            "post": {
+                "operationId": "onboarding_reset_create",
+                "description": "``apply`` / ``skip`` / ``reset`` one step (chosen with ``as_view(action=...)``).",
+                "summary": "Apply / skip / reset an onboarding step",
+                "parameters": [
+                    {
+                        "in": "path",
+                        "name": "key",
+                        "schema": {
+                            "type": "string"
+                        },
+                        "required": true
+                    }
+                ],
+                "tags": [
+                    "Onboarding"
+                ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ApplyRequestRequest"
+                            }
+                        },
+                        "application/x-www-form-urlencoded": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ApplyRequestRequest"
+                            }
+                        },
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ApplyRequestRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "security": [
+                    {
+                        "jwtAuth": []
+                    },
+                    {
+                        "cookieAuth": []
+                    },
+                    {
+                        "tokenAuth": []
+                    },
+                    {
+                        "tokenAuth": []
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApplyResponse"
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Errors"
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "403": {
+                        "description": "Not a tenant admin"
+                    },
+                    "404": {
+                        "description": "Unknown step or feature not enabled"
+                    }
+                }
+            }
+        },
+        "/api/onboarding/{key}/skip/": {
+            "post": {
+                "operationId": "onboarding_skip_create",
+                "description": "``apply`` / ``skip`` / ``reset`` one step (chosen with ``as_view(action=...)``).",
+                "summary": "Apply / skip / reset an onboarding step",
+                "parameters": [
+                    {
+                        "in": "path",
+                        "name": "key",
+                        "schema": {
+                            "type": "string"
+                        },
+                        "required": true
+                    }
+                ],
+                "tags": [
+                    "Onboarding"
+                ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ApplyRequestRequest"
+                            }
+                        },
+                        "application/x-www-form-urlencoded": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ApplyRequestRequest"
+                            }
+                        },
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ApplyRequestRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "security": [
+                    {
+                        "jwtAuth": []
+                    },
+                    {
+                        "cookieAuth": []
+                    },
+                    {
+                        "tokenAuth": []
+                    },
+                    {
+                        "tokenAuth": []
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApplyResponse"
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/Errors"
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "403": {
+                        "description": "Not a tenant admin"
+                    },
+                    "404": {
+                        "description": "Unknown step or feature not enabled"
+                    }
+                }
+            }
+        },
         "/api/payments/": {
             "get": {
                 "operationId": "payments_list",
@@ -57628,7 +57913,7 @@
         "/api/subscription/agent-count/": {
             "put": {
                 "operationId": "subscription_agent_count_update",
-                "description": "Staff or superuser only. Minimum 5 agents, in increments of 5.",
+                "description": "Staff or superuser only. Any whole number of employees from 1, no upper limit. While the subscription is on the free trial the change is free: `charged` is false and no proration or payment is created. On a paid subscription the response carries the prorated difference.",
                 "summary": "Change the subscription agent count",
                 "tags": [
                     "Subscription"
@@ -67809,6 +68094,58 @@
                 ],
                 "type": "string",
                 "description": "* `announcement` - Play announcement\n* `voicemail` - Voicemail\n* `forward` - Forward to number"
+            },
+            "ApplyRequestRequest": {
+                "type": "object",
+                "properties": {
+                    "answers": {
+                        "description": "The step's answers (see the step's answers schema)."
+                    }
+                },
+                "required": [
+                    "answers"
+                ]
+            },
+            "ApplyResponse": {
+                "type": "object",
+                "properties": {
+                    "step": {
+                        "$ref": "#/components/schemas/OnboardingStep"
+                    },
+                    "result": {
+                        "$ref": "#/components/schemas/ApplyResult"
+                    }
+                },
+                "required": [
+                    "result",
+                    "step"
+                ]
+            },
+            "ApplyResult": {
+                "type": "object",
+                "properties": {
+                    "created": {
+                        "description": "Counts / ids of rows created."
+                    },
+                    "updated": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Field names updated."
+                    },
+                    "notes": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        }
+                    }
+                },
+                "required": [
+                    "created",
+                    "notes",
+                    "updated"
+                ]
             },
             "ApproverRoleEnum": {
                 "enum": [
@@ -79023,6 +79360,17 @@
                     "error"
                 ]
             },
+            "Errors": {
+                "type": "object",
+                "properties": {
+                    "errors": {
+                        "description": "DRF field errors: {\"<field>\": [\"message\"]}."
+                    }
+                },
+                "required": [
+                    "errors"
+                ]
+            },
             "EventTypeEnum": {
                 "enum": [
                     "initiated",
@@ -81495,6 +81843,20 @@
                 "required": [
                     "did"
                 ]
+            },
+            "IndustryEnum": {
+                "enum": [
+                    "salon",
+                    "clinic",
+                    "real_estate",
+                    "shop",
+                    "call_centre",
+                    "logistics",
+                    "services",
+                    "other"
+                ],
+                "type": "string",
+                "description": "* `salon` - salon\n* `clinic` - clinic\n* `real_estate` - real_estate\n* `shop` - shop\n* `call_centre` - call_centre\n* `logistics` - logistics\n* `services` - services\n* `other` - other"
             },
             "InitializeUserRequestRequest": {
                 "type": "object",
@@ -87357,6 +87719,103 @@
                 "required": [
                     "oauth_url"
                 ]
+            },
+            "OnboardingState": {
+                "type": "object",
+                "properties": {
+                    "industry": {
+                        "nullable": true,
+                        "oneOf": [
+                            {
+                                "$ref": "#/components/schemas/IndustryEnum"
+                            },
+                            {
+                                "$ref": "#/components/schemas/NullEnum"
+                            }
+                        ]
+                    },
+                    "started_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "nullable": true
+                    },
+                    "finished_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "nullable": true
+                    },
+                    "pending_count": {
+                        "type": "integer"
+                    },
+                    "total": {
+                        "type": "integer"
+                    },
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/components/schemas/OnboardingStep"
+                        }
+                    }
+                },
+                "required": [
+                    "finished_at",
+                    "industry",
+                    "pending_count",
+                    "started_at",
+                    "steps",
+                    "total"
+                ]
+            },
+            "OnboardingStep": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string"
+                    },
+                    "feature_key": {
+                        "type": "string",
+                        "nullable": true
+                    },
+                    "order": {
+                        "type": "integer"
+                    },
+                    "status": {
+                        "$ref": "#/components/schemas/OnboardingStepStatusEnum"
+                    },
+                    "answers": {
+                        "description": "Last applied answers ({} if none)."
+                    },
+                    "prefill": {
+                        "description": "Suggested answers computed from existing data."
+                    },
+                    "context": {
+                        "description": "Step-specific read data the wizard page needs."
+                    },
+                    "completed_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "nullable": true
+                    }
+                },
+                "required": [
+                    "answers",
+                    "completed_at",
+                    "context",
+                    "feature_key",
+                    "key",
+                    "order",
+                    "prefill",
+                    "status"
+                ]
+            },
+            "OnboardingStepStatusEnum": {
+                "enum": [
+                    "pending",
+                    "done",
+                    "skipped"
+                ],
+                "type": "string",
+                "description": "* `pending` - pending\n* `done` - done\n* `skipped` - skipped"
             },
             "Order": {
                 "type": "object",
@@ -107096,9 +107555,9 @@
                     },
                     "agent_count": {
                         "type": "integer",
-                        "minimum": 5,
-                        "default": 5,
-                        "description": "Number of agents (minimum 5, in increments of 5; required for agent-based pricing)"
+                        "minimum": 1,
+                        "default": 1,
+                        "description": "Number of employees (seats): any whole number from 1, no upper limit; required for agent-based pricing"
                     },
                     "admin_email": {
                         "type": "string",
@@ -110476,7 +110935,7 @@
                 "properties": {
                     "agent_count": {
                         "type": "integer",
-                        "minimum": 5
+                        "minimum": 1
                     }
                 },
                 "required": [
@@ -110491,6 +110950,19 @@
                     },
                     "message": {
                         "type": "string"
+                    },
+                    "agent_count": {
+                        "type": "integer"
+                    },
+                    "monthly_cost": {
+                        "type": "number",
+                        "format": "double"
+                    },
+                    "charged": {
+                        "type": "boolean"
+                    },
+                    "is_trial": {
+                        "type": "boolean"
                     },
                     "old_agent_count": {
                         "type": "integer"
@@ -110515,13 +110987,15 @@
                     }
                 },
                 "required": [
-                    "days_remaining",
+                    "agent_count",
+                    "charged",
+                    "is_trial",
                     "message",
+                    "monthly_cost",
                     "new_agent_count",
                     "new_monthly_cost",
                     "old_agent_count",
                     "old_monthly_cost",
-                    "prorated_difference",
                     "success"
                 ]
             },

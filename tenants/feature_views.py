@@ -509,7 +509,12 @@ def remove_feature_from_subscription(request):
 @extend_schema(
     operation_id='subscription_agent_count_update',
     summary='Change the subscription agent count',
-    description='Staff or superuser only. Minimum 5 agents, in increments of 5.',
+    description=(
+        'Staff or superuser only. Any whole number of employees from 1, no upper '
+        'limit. While the subscription is on the free trial the change is free: '
+        '`charged` is false and no proration or payment is created. On a paid '
+        'subscription the response carries the prorated difference.'
+    ),
     request=inline_serializer(
         name='UpdateAgentCount',
         fields={'agent_count': serializers.IntegerField(min_value=MIN_AGENT_COUNT)},
@@ -520,12 +525,16 @@ def remove_feature_from_subscription(request):
             fields={
                 'success': serializers.BooleanField(),
                 'message': serializers.CharField(),
+                'agent_count': serializers.IntegerField(),
+                'monthly_cost': serializers.FloatField(),
+                'charged': serializers.BooleanField(),
+                'is_trial': serializers.BooleanField(),
                 'old_agent_count': serializers.IntegerField(),
                 'new_agent_count': serializers.IntegerField(),
                 'old_monthly_cost': serializers.FloatField(),
                 'new_monthly_cost': serializers.FloatField(),
-                'prorated_difference': serializers.FloatField(),
-                'days_remaining': serializers.IntegerField(),
+                'prorated_difference': serializers.FloatField(required=False),
+                'days_remaining': serializers.IntegerField(required=False),
             },
         ),
         400: _ERROR, 403: _FORBIDDEN,
@@ -577,6 +586,28 @@ def update_agent_count(request):
     )
     new_monthly_cost = total_feature_cost * new_agent_count
 
+    # Free trial: the count changes free of charge — no proration, no BOG
+    # order. The new monthly cost only tells the tenant what they will pay
+    # once the trial converts.
+    if subscription.is_trial:
+        subscription.agent_count = new_agent_count
+        subscription.save()
+        return Response({
+            'success': True,
+            'message': (
+                f'Employee count updated from {old_agent_count} to {new_agent_count}. '
+                'Changes are free during the trial.'
+            ),
+            'agent_count': new_agent_count,
+            'monthly_cost': float(new_monthly_cost),
+            'charged': False,
+            'is_trial': True,
+            'old_agent_count': old_agent_count,
+            'new_agent_count': new_agent_count,
+            'old_monthly_cost': float(old_monthly_cost),
+            'new_monthly_cost': float(new_monthly_cost),
+        })
+
     # Calculate prorated difference
     today = timezone.now().date()
     if subscription.next_billing_date:
@@ -594,6 +625,10 @@ def update_agent_count(request):
     return Response({
         'success': True,
         'message': f'Agent count updated from {old_agent_count} to {new_agent_count}',
+        'agent_count': new_agent_count,
+        'monthly_cost': float(new_monthly_cost),
+        'charged': True,
+        'is_trial': False,
         'old_agent_count': old_agent_count,
         'new_agent_count': new_agent_count,
         'old_monthly_cost': float(old_monthly_cost),

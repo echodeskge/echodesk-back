@@ -252,11 +252,19 @@ class TestRegisterTrial(TrialMixin, EchoDeskTenantTestCase):
         self.assertEqual(Tenant.objects.filter(schema_name='trial_co').count(), 1)
 
     def test_agent_count_rule_still_applies(self):
+        # Any whole number from 1 is accepted (7 is no longer rejected) ...
         response, trigger = self._register(agent_count=7)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        tenant = Tenant.objects.get(schema_name='trial_co')
+        self.assertEqual(TenantSubscription.objects.get(tenant=tenant).agent_count, 7)
+        trigger.assert_called_once_with('trial_co')
+
+    def test_agent_count_zero_rejected(self):
+        response, trigger = self._register(agent_count=0, domain='trial-zero')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn('agent_count', response.data)
         trigger.assert_not_called()
-        self.assertFalse(Tenant.objects.filter(schema_name='trial_co').exists())
+        self.assertFalse(Tenant.objects.filter(schema_name='trial_zero').exists())
 
 
 # ============================================================================
