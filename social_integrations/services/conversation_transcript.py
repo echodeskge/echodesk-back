@@ -16,6 +16,8 @@ from typing import Callable, Optional
 
 from django.db.models import Q
 
+from social_integrations.conversation_keys import wa_number
+
 logger = logging.getLogger(__name__)
 
 
@@ -107,9 +109,11 @@ PLATFORM_MESSAGE_CONFIG = {
         account_q=lambda account_id: Q(business_account__waba_id=account_id),
         # Inbound rows carry the customer in from_number, outbound in
         # to_number — a conversation is the union of both directions.
+        # Rows are stored digits-only (conversation_keys.wa_number); callers
+        # may still pass the '+' form.
         conversation_q=lambda conversation_id: (
-            Q(from_number=conversation_id, is_from_business=False)
-            | Q(to_number=conversation_id, is_from_business=True)
+            Q(from_number=wa_number(conversation_id), is_from_business=False)
+            | Q(to_number=wa_number(conversation_id), is_from_business=True)
         ),
         outbound_field='is_from_business',
         outbound_when=True,

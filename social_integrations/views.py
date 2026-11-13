@@ -1677,6 +1677,8 @@ def check_messaging_window(request):
     """
     platform = request.query_params.get('platform', '').lower()
     conversation_id = request.query_params.get('conversation_id', '')
+    if platform == 'whatsapp':
+        conversation_id = wa_number(conversation_id)
     account_id = request.query_params.get('account_id', '')
 
     if not all([platform, conversation_id, account_id]):
