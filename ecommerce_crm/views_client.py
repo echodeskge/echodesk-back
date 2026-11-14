@@ -2022,6 +2022,49 @@ def get_order_by_public_token(request):
     return Response(OrderSerializer(order).data)
 
 
+def _find_or_create_guest_client(email, phone, data):
+    """Return the EcommerceClient a guest order belongs to.
+
+    Both ``email`` and ``phone_number`` are unique on EcommerceClient, so a
+    returning customer who types a different email than last time (but the
+    same phone) must be matched by phone, not created again — that create
+    used to raise IntegrityError and the shop answered 500 (Sentry
+    ECHODESK-BACKEND-8D, 17 failed checkouts on 2026-11-14). The order
+    itself keeps the contact details typed at checkout, so matching an
+    older client record changes nothing the customer sees.
+    """
+    import uuid
+    from django.db import IntegrityError, transaction
+
+    client = EcommerceClient.objects.filter(email=email).first()
+    if client is None and phone:
+        client = EcommerceClient.objects.filter(phone_number=phone).first()
+    if client is not None:
+        return client
+    try:
+        with transaction.atomic():
+            client = EcommerceClient.objects.create(
+                email=email,
+                first_name=str(data['first_name']).strip()[:150],
+                last_name=str(data['last_name']).strip()[:150],
+                phone_number=phone[:20],
+                password='',
+                is_verified=True,
+            )
+            client.set_password(uuid.uuid4().hex)
+            client.save(update_fields=['password'])
+            return client
+    except IntegrityError:
+        # Lost a race with a concurrent checkout for the same person.
+        client = (
+            EcommerceClient.objects.filter(email=email).first()
+            or EcommerceClient.objects.filter(phone_number=phone).first()
+        )
+        if client is None:
+            raise
+        return client
+
+
 @extend_schema(
     tags=['Ecommerce Client - Guest Checkout'],
     summary='Guest checkout',
@@ -2134,19 +2177,8 @@ def guest_checkout(request):
 
     # --- Find or create EcommerceClient ---
     email = data['email'].strip().lower()
-    client, created = EcommerceClient.objects.get_or_create(
-        email=email,
-        defaults={
-            'first_name': data['first_name'],
-            'last_name': data['last_name'],
-            'phone_number': data['phone'],
-            'password': '',
-            'is_verified': True,
-        },
-    )
-    if created:
-        client.set_password(uuid.uuid4().hex)
-        client.save(update_fields=['password'])
+    phone = str(data['phone']).strip()
+    client = _find_or_create_guest_client(email, phone, data)
 
     # --- Create ClientAddress ---
     delivery_address = ClientAddress.objects.create(

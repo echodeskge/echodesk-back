@@ -166,6 +166,49 @@ class TestGuestBackwardCompat(GuestCheckoutTestMixin, EchoDeskTenantTestCase):
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
 
+class TestGuestReturningPhone(GuestCheckoutTestMixin, EchoDeskTenantTestCase):
+    """A returning customer who types a new email but the same phone number
+    is matched to their existing record instead of crashing on the unique
+    phone constraint (Sentry ECHODESK-BACKEND-8D, 2026-11-14)."""
+
+    def setUp(self):
+        super().setUp()
+        self._settings(allow_pickup=True)
+        self.earlier = EcommerceClient.objects.create(
+            email='inafxikidze@test.com', first_name='Ina', last_name='P',
+            phone_number='+995558400936', password='', is_verified=True,
+        )
+
+    def _place(self, **overrides):
+        payload = self._payload(
+            email='Pkhikidzeina@test.com', first_name='ინა', last_name='ფხიკიძე',
+            phone='+995558400936', payment_method='cash_on_delivery',
+            delivery_method='pickup',
+        )
+        payload.update(overrides)
+        with patch('ecommerce_crm.tasks.send_order_email.delay'):
+            resp = self.api_post(GUEST_URL, payload)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        return Order.objects.get(order_number=resp.data['order_number'])
+
+    def test_same_phone_new_email_reuses_the_client(self):
+        order = self._place()
+        self.assertEqual(order.client_id, self.earlier.id)
+        self.assertEqual(order.contact_email, 'pkhikidzeina@test.com')
+        self.assertEqual(order.contact_phone, '+995558400936')
+        self.assertEqual(EcommerceClient.objects.count(), 1)
+        self.earlier.refresh_from_db()
+        self.assertEqual(self.earlier.email, 'inafxikidze@test.com')
+
+    def test_new_customer_is_still_created(self):
+        order = self._place(email='someone-new@test.com', phone='+995500000001')
+        self.assertNotEqual(order.client_id, self.earlier.id)
+        self.assertEqual(order.client.email, 'someone-new@test.com')
+        self.assertEqual(order.client.phone_number, '+995500000001')
+        self.assertTrue(order.client.password.startswith('pbkdf2_'))
+        self.assertEqual(EcommerceClient.objects.count(), 2)
+
+
 class TestGuestContactDetails(GuestCheckoutTestMixin, EchoDeskTenantTestCase):
     """A guest order under an email someone used before keeps the contact
     details typed at checkout instead of showing the earlier customer's."""
