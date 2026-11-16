@@ -8168,6 +8168,77 @@ def whatsapp_disconnect(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+def _fetch_whatsapp_media_url(account, media_id):
+    """Fresh lookaside download URL for a Cloud API media id ('' when unavailable).
+
+    The URL expires within minutes; the inbox renders through
+    ``whatsapp_media_proxy`` by ``media_id`` anyway, so a miss here is not fatal.
+    """
+    if not media_id or not account.access_token:
+        return ''
+    try:
+        resp = requests.get(
+            f"https://graph.facebook.com/v23.0/{media_id}",
+            headers={'Authorization': f'Bearer {account.access_token}'},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return resp.json().get('url', '') or ''
+        logger.warning("WhatsApp media URL fetch failed: media_id=%s http=%s", media_id, resp.status_code)
+    except Exception as e:
+        logger.error(f"Failed to fetch WhatsApp media URL: {e}")
+    return ''
+
+
+_WHATSAPP_ECHO_MEDIA_TYPES = ('image', 'video', 'document', 'audio', 'sticker')
+
+
+def _whatsapp_echo_content(account, echo_msg, echo_type):
+    """(text, media_url, mime_type, attachments) for an ``smb_message_echoes`` entry.
+
+    Echoes of messages sent from the WhatsApp Business app carry the same
+    ``image`` / ``video`` / ``document`` / ``audio`` / ``sticker`` / ``location``
+    objects as customer messages (plus a short-lived ``url``). Before 2026-11-16
+    only the caption was kept, so a photo sent from the phone showed up in the
+    inbox as an empty bubble.
+    """
+    text = ''
+    media_url = ''
+    mime_type = ''
+    attachments = []
+
+    if echo_type == 'text':
+        text = (echo_msg.get('text') or {}).get('body', '') or ''
+    elif echo_type in _WHATSAPP_ECHO_MEDIA_TYPES:
+        media = echo_msg.get(echo_type) or {}
+        media_id = media.get('id', '') or ''
+        mime_type = media.get('mime_type', '') or ('image/webp' if echo_type == 'sticker' else '')
+        media_url = media.get('url', '') or _fetch_whatsapp_media_url(account, media_id)
+        if echo_type in ('image', 'video'):
+            text = media.get('caption', '') or ''
+        elif echo_type == 'document':
+            text = media.get('filename', '') or ''
+        attachment = {
+            'type': echo_type,
+            'media_id': media_id,
+            'url': media_url,
+            'mime_type': mime_type,
+        }
+        if echo_type == 'document':
+            attachment['filename'] = media.get('filename', '') or ''
+        attachments.append(attachment)
+    elif echo_type == 'location':
+        loc = echo_msg.get('location') or {}
+        lat, lng = loc.get('latitude'), loc.get('longitude')
+        maps_url = f"https://www.google.com/maps?q={lat},{lng}" if lat is not None and lng is not None else ''
+        text = loc.get('name', '') or loc.get('address', '') or maps_url
+        attachments.append({
+            'type': 'location', 'latitude': lat, 'longitude': lng,
+            'name': loc.get('name', '') or '', 'address': loc.get('address', '') or '', 'url': maps_url,
+        })
+    return text, media_url, mime_type, attachments
+
+
 @extend_schema(
     request=WhatsAppSendMessageSerializer,
     responses={
@@ -9081,20 +9152,8 @@ def whatsapp_webhook(request):
                         echo_to = echo_msg.get('to', '')
                         echo_timestamp = echo_msg.get('timestamp', '')
                         echo_type = echo_msg.get('type', 'text')
-                        echo_text = ''
-
-                        if echo_type == 'text':
-                            echo_text = echo_msg.get('text', {}).get('body', '')
-                        elif echo_type == 'image':
-                            echo_text = echo_msg.get('image', {}).get('caption', '')
-                        elif echo_type == 'video':
-                            echo_text = echo_msg.get('video', {}).get('caption', '')
-                        elif echo_type == 'document':
-                            echo_text = echo_msg.get('document', {}).get('filename', '')
-                        elif echo_type == 'audio':
-                            echo_text = '[Audio]'
-                        elif echo_type == 'sticker':
-                            echo_text = '[Sticker]'
+                        echo_text, echo_media_url, echo_mime, echo_attachments = \
+                            _whatsapp_echo_content(account, echo_msg, echo_type)
 
                         message_timestamp = datetime.fromtimestamp(int(echo_timestamp), tz=timezone.utc) if echo_timestamp else timezone.now()
 
@@ -9105,6 +9164,9 @@ def whatsapp_webhook(request):
                             to_number=echo_to,
                             message_text=echo_text,
                             message_type=echo_type,
+                            media_url=echo_media_url,
+                            media_mime_type=echo_mime,
+                            attachments=echo_attachments,
                             timestamp=message_timestamp,
                             is_from_business=True,
                             source='business_app',
@@ -9113,20 +9175,47 @@ def whatsapp_webhook(request):
                         )
                         logger.info(f"📤 Received SMB echo message: {echo_msg_id} to {echo_to}: {echo_text[:50] if echo_text else f'[{echo_type}]'}")
 
-                        # Send WebSocket notification for echo
+                        # Live update for the inbox. The payload must carry the
+                        # same routing keys as a customer message (platform,
+                        # waba_id, to_number, attachments) — the web inbox drops
+                        # frames without `platform`, which is why messages typed
+                        # in the WhatsApp Business app only showed up on reload.
+                        customer_number = echo_message_obj.to_number
+                        contact_name = (
+                            WhatsAppMessage.objects.filter(
+                                business_account=account, from_number=customer_number,
+                                is_from_business=False,
+                            ).exclude(contact_name='').order_by('-timestamp')
+                            .values_list('contact_name', flat=True).first() or ''
+                        )
                         ws_echo_data = {
                             'id': echo_message_obj.id,
                             'message_id': echo_message_obj.message_id,
                             'from_number': echo_message_obj.from_number,
-                            'to_number': echo_message_obj.to_number,
+                            'to_number': customer_number,
+                            'recipient_id': customer_number,
+                            'contact_name': contact_name,
+                            'recipient_name': contact_name,
                             'message_text': echo_message_obj.message_text,
                             'message_type': echo_message_obj.message_type,
+                            'media_url': echo_message_obj.media_url,
+                            'attachments': echo_message_obj.attachments,
                             'timestamp': echo_message_obj.timestamp.isoformat(),
                             'is_from_business': True,
                             'is_echo': True,
                             'source': 'business_app',
+                            'status': 'sent',
+                            'platform': 'whatsapp',
+                            'account_id': account.waba_id,
+                            'waba_id': account.waba_id,
+                            'chat_id': f'wa_{account.waba_id}_{customer_number}',
                         }
-                        send_websocket_notification(tenant_schema, ws_echo_data, echo_to)
+                        assigned_user_id = get_assignment_for_conversation(
+                            platform='whatsapp',
+                            conversation_id=customer_number,
+                            account_id=account.waba_id,
+                        )
+                        send_websocket_notification(tenant_schema, ws_echo_data, customer_number, assigned_user_id)
 
                 # Handle account_update webhook (coexistence account status changes)
                 if webhook_field == 'account_update':
