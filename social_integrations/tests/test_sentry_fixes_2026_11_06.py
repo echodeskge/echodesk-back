@@ -114,19 +114,32 @@ class TestEmailAttachmentNames(SocialIntegrationTestCase):
 class TestEmailSyncLock(SocialIntegrationTestCase):
 
     def test_second_sync_of_same_mailbox_is_skipped(self):
+        """One lock per mailbox, taken inside sync_imap_messages. The task
+        wrapper must not take a second lock under the same key first: it did
+        from 2026-11-06 to 2026-11-21, so the real sync always saw the key
+        taken and every mailbox stopped syncing (amanati had 10 unsynced
+        mails while its IMAP server answered fine)."""
         from django.core.cache import cache
         from social_integrations import tasks
 
         connection = self.create_email_connection()
         key = f'email-sync-lock:{self.tenant.schema_name}:{connection.id}'
         cache.delete(key)
-        with patch('social_integrations.email_utils.sync_imap_messages', return_value=4) as sync:
+        with patch('social_integrations.email_utils._sync_imap_messages_locked', return_value=4) as work:
             cache.add(key, '1', 60)  # another worker holds the mailbox
             self.assertEqual(tasks._sync_connection_locked(self.tenant.schema_name, connection), 0)
-            sync.assert_not_called()
+            work.assert_not_called()
             cache.delete(key)
             self.assertEqual(tasks._sync_connection_locked(self.tenant.schema_name, connection), 4)
-            sync.assert_called_once()
+            work.assert_called_once()
         # Lock released after the run.
         self.assertTrue(cache.add(key, '1', 1))
         cache.delete(key)
+
+    def test_beat_task_really_syncs_each_active_mailbox(self):
+        from social_integrations import tasks
+
+        connection = self.create_email_connection()
+        with patch('social_integrations.email_utils._sync_imap_messages_locked', return_value=2) as work:
+            tasks.sync_all_tenant_emails()
+        self.assertEqual([c.args[0].pk for c in work.call_args_list], [connection.pk])

@@ -4691,6 +4691,33 @@ def _broadcast_assignment_change(request, assignment, archived_change_to_unarchi
             logger.warning('archive_update broadcast failed: %s', exc)
 
 
+def _mark_conversation_read_by_staff(platform, conversation_id, now=None):
+    """Mark every customer message of one conversation read by staff.
+
+    Used when a chat is moved to History (archive view, end-session): a chat
+    in History must not carry an unread badge. Returns the number of rows
+    updated. WhatsApp ids are digits-only, widget ids may have legacy twins.
+    """
+    now = now or timezone.now()
+    if platform == 'facebook':
+        qs = FacebookMessage.objects.filter(sender_id=conversation_id, is_from_page=False)
+    elif platform == 'instagram':
+        qs = InstagramMessage.objects.filter(sender_id=conversation_id, is_from_business=False)
+    elif platform == 'whatsapp':
+        qs = WhatsAppMessage.objects.filter(from_number=wa_number(conversation_id), is_from_business=False)
+    elif platform == 'email':
+        qs = EmailMessage.objects.filter(thread_id=conversation_id, is_from_business=False)
+    elif platform == 'telegram':
+        qs = TelegramMessage.objects.filter(peer_id=conversation_id, is_from_business=False)
+    elif platform == 'widget':
+        qs = WidgetMessage.objects.filter(
+            session__session_id__in=widget_session_ids(conversation_id), is_from_visitor=True,
+        )
+    else:
+        return 0
+    return qs.filter(is_read_by_staff=False).update(is_read_by_staff=True, read_by_staff_at=now)
+
+
 def _broadcast_read_state(request, *, platform, conversation_id, account_id, unread_count, last_read_at=None):
     """Emit a `read_state_update` WS frame after a mark-read/unread mutation."""
     from django.db import connection
@@ -5149,6 +5176,15 @@ def end_session(request):
         conversation_id=conversation_id,
         account_id=account_id,
         defaults={'archived_by': request.user}
+    )
+    # A chat in History is a finished chat: mark the customer's messages
+    # read like the archive view does, and tell the inbox so the unread
+    # badge on the row goes away (user report 2026-11-21: "unread chats in
+    # History").
+    _mark_conversation_read_by_staff(platform, conversation_id)
+    _broadcast_read_state(
+        request, platform=platform, conversation_id=conversation_id,
+        account_id=account_id, unread_count=0, last_read_at=timezone.now(),
     )
     # Broadcast archive_update so /messages-beta clients move the chat into
     # History. Without this the only frame end_session emitted was the
@@ -13246,6 +13282,12 @@ def archive_conversation(request):
                 open_assignment.save()
                 _broadcast_assignment_change(request, open_assignment)
 
+            # The messages were just marked read above; tell every open inbox
+            # so the row carries no unread badge once it sits in History.
+            _broadcast_read_state(
+                request, platform=platform, conversation_id=conversation_id,
+                account_id=account_id, unread_count=0, last_read_at=now,
+            )
             # Cross-user reactivity: beta clients move the row from active
             # inbox into the Archive tab on this frame, no list refetch.
             _broadcast_archive_change(

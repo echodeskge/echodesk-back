@@ -67,33 +67,19 @@ def send_auto_reply_task(self, schema_name, platform, recipient_id, message_text
         return sender(recipient_id, message_text, conn)
 
 
-# One mailbox can take minutes (first sync of a big folder, slow attachment
-# uploads). The beat fires every 5 minutes, so without a lock the next run
-# synced the same mailbox in parallel and the hard limit killed the worker.
-EMAIL_SYNC_LOCK_SECONDS = 15 * 60
-
-
 def _sync_connection_locked(schema_name, connection):
     """Sync one mailbox unless another worker is already on it. Returns the
-    number of new messages (0 when skipped)."""
-    from django.core.cache import cache
+    number of new messages (0 when skipped).
+
+    The per-mailbox lock lives inside ``sync_imap_messages`` (email_utils,
+    ``_sync_lock_key`` / 30 min). This wrapper used to take a second lock
+    under the *same* key first, so the inner ``cache.add`` always failed and
+    every beat run logged "Sync already running… skipping" — no tenant
+    mailbox synced between 2026-11-06 and 2026-11-21. Only one lock now.
+    """
     from social_integrations.email_utils import sync_imap_messages
 
-    lock_key = f'email-sync-lock:{schema_name}:{connection.id}'
-    try:
-        acquired = cache.add(lock_key, '1', EMAIL_SYNC_LOCK_SECONDS)
-    except Exception:  # cache down: sync anyway rather than never
-        acquired = True
-    if not acquired:
-        logger.info(f"Email sync {schema_name}/{connection.email_address}: already running, skipped")
-        return 0
-    try:
-        return sync_imap_messages(connection)
-    finally:
-        try:
-            cache.delete(lock_key)
-        except Exception:
-            pass
+    return sync_imap_messages(connection)
 
 
 @shared_task(soft_time_limit=540, time_limit=600)

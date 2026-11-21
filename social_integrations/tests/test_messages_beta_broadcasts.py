@@ -10,6 +10,7 @@ The legacy /messages page ignores these unknown event types, so adding them
 is purely additive and these tests guard us from regressing that promise.
 """
 from unittest.mock import AsyncMock, patch
+from django.utils import timezone
 from rest_framework import status
 
 from social_integrations.tests.conftest import SocialIntegrationTestCase
@@ -205,6 +206,65 @@ class TestArchiveBroadcasts(SocialIntegrationTestCase):
         ]
         self.assertTrue(frames, "expected an archive_update frame on unarchive")
         self.assertFalse(frames[0]["archived"])
+
+
+class TestHistoryIsRead(SocialIntegrationTestCase):
+    """A chat moved to History carries no unread badge (user report
+    2026-11-21): both the archive view and end-session mark the customer's
+    messages read by staff and broadcast read_state_update(unread_count=0)."""
+
+    def setUp(self):
+        super().setUp()
+        self.agent = self.create_user(email="histread@test.com")
+        self.conn = self.create_fb_connection()
+        for _ in range(2):
+            self.create_fb_message(page_connection=self.conn, sender_id="sender_hist",
+                                   is_from_page=False, is_read_by_staff=False)
+
+    def _unread(self):
+        from social_integrations.models import FacebookMessage
+        return FacebookMessage.objects.filter(sender_id="sender_hist", is_read_by_staff=False).count()
+
+    def _frames(self, channel_layer, frame_type):
+        return [c.args[1] for c in channel_layer.group_send.call_args_list if c.args[1].get("type") == frame_type]
+
+    def test_archive_marks_read_and_broadcasts_read_state(self):
+        self.assertEqual(self._unread(), 2)
+        channel_layer = _make_async_channel_layer()
+        with patch("social_integrations.consumers.get_channel_layer", return_value=channel_layer):
+            resp = self.api_post(
+                "/api/social/conversations/archive/",
+                {"conversations": [{"platform": "facebook", "conversation_id": "sender_hist",
+                                    "account_id": self.conn.page_id}]},
+                user=self.agent,
+            )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(self._unread(), 0)
+        read = self._frames(channel_layer, "read_state_update")
+        self.assertTrue(read, "expected a read_state_update frame")
+        self.assertEqual(read[0]["conversation_id"], "sender_hist")
+        self.assertEqual(read[0]["unread_count"], 0)
+        self.assertTrue(self._frames(channel_layer, "archive_update"))
+
+    def test_end_session_marks_read_and_broadcasts_read_state(self):
+        self.create_settings(chat_assignment_enabled=True, session_management_enabled=True)
+        self.create_chat_assignment(user=self.agent, platform="facebook", conversation_id="sender_hist",
+                                    account_id=self.conn.page_id, status="in_session",
+                                    session_started_at=timezone.now())
+        channel_layer = _make_async_channel_layer()
+        with patch("social_integrations.consumers.get_channel_layer", return_value=channel_layer), \
+                patch("social_integrations.views.send_rating_request_facebook", return_value=None):
+            resp = self.api_post(
+                "/api/social/assignments/end-session/",
+                {"platform": "facebook", "conversation_id": "sender_hist", "account_id": self.conn.page_id},
+                user=self.agent,
+            )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(self._unread(), 0)
+        read = self._frames(channel_layer, "read_state_update")
+        self.assertTrue(read, "expected a read_state_update frame")
+        self.assertEqual(read[0]["unread_count"], 0)
+        self.assertTrue(self._frames(channel_layer, "archive_update"))
 
 
 class TestBroadcastsAreBestEffort(SocialIntegrationTestCase):
