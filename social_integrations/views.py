@@ -1088,8 +1088,12 @@ def facebook_oauth_callback(request):
         # Handle Facebook errors (user denied, etc.)
         if error:
             error_msg = f"Facebook OAuth failed: {error_description or error}"
-            logger.error(f"Facebook OAuth error: {error} - {error_description}")
-            from urllib.parse import quote_plus
+            if error == 'access_denied' or request.GET.get('error_reason') == 'user_denied':
+                # The user closed or declined the Facebook dialog: nothing is
+                # broken on our side, so don't page Sentry for it.
+                logger.warning(f"Facebook OAuth cancelled by the user: {error} - {error_description}")
+            else:
+                logger.error(f"Facebook OAuth error: {error} - {error_description}")
             return _fb_redirect(False, error_msg)
         
         # Handle missing code

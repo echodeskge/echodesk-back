@@ -98,7 +98,7 @@ class FacebookMessage(models.Model):
     message_id = models.CharField(max_length=100, unique=True)
     sender_id = models.CharField(max_length=100)
     sender_name = models.CharField(max_length=200, blank=True)
-    profile_pic_url = models.URLField(max_length=500, blank=True, null=True)  # User's profile picture
+    profile_pic_url = models.URLField(max_length=2048, blank=True, null=True)  # User's profile picture
     message_text = models.TextField(blank=True)  # Can be empty for attachment-only messages
     # Attachment fields
     attachment_type = models.CharField(max_length=20, choices=ATTACHMENT_TYPE_CHOICES, blank=True)
@@ -237,7 +237,7 @@ class InstagramAccountConnection(models.Model):
 
     instagram_account_id = models.CharField(max_length=100, unique=True)
     username = models.CharField(max_length=200)
-    profile_picture_url = models.URLField(max_length=500, blank=True, null=True)
+    profile_picture_url = models.URLField(max_length=2048, blank=True, null=True)
     access_token = models.TextField()
     # Instagram accounts are connected through Facebook Pages
     facebook_page = models.ForeignKey(
@@ -316,7 +316,7 @@ class InstagramMessage(models.Model):
     sender_id = models.CharField(max_length=100)
     sender_name = models.CharField(max_length=200, blank=True)  # Display name
     sender_username = models.CharField(max_length=200, blank=True)  # @username
-    sender_profile_pic = models.URLField(max_length=500, blank=True, null=True)
+    sender_profile_pic = models.URLField(max_length=2048, blank=True, null=True)
     message_text = models.TextField(blank=True)  # Can be empty for media-only messages
     # Attachment fields
     attachment_type = models.CharField(max_length=20, choices=ATTACHMENT_TYPE_CHOICES, blank=True)
@@ -551,7 +551,7 @@ class WhatsAppMessage(models.Model):
     from_number = models.CharField(max_length=20)  # Sender's phone number
     to_number = models.CharField(max_length=20)  # Recipient's phone number
     contact_name = models.CharField(max_length=200, blank=True)  # Contact name if available
-    profile_pic_url = models.URLField(max_length=500, blank=True, null=True)  # Contact's profile picture
+    profile_pic_url = models.URLField(max_length=2048, blank=True, null=True)  # Contact's profile picture
     message_text = models.TextField(blank=True)  # Message text content
     message_type = models.CharField(max_length=20, choices=MESSAGE_TYPE_CHOICES, default='text')
     media_url = models.URLField(max_length=1000, blank=True, null=True)  # URL for media messages
@@ -1881,7 +1881,7 @@ class Client(models.Model):
     notes = models.TextField(blank=True, help_text="Internal notes about this client")
     tags = models.JSONField(default=list, blank=True, help_text="Free-form labels shown on the client (list of strings)")
     profile_picture = models.URLField(
-        max_length=500,
+        max_length=2048,
         blank=True,
         null=True,
         help_text="URL to profile picture (auto-populated from linked accounts)"
@@ -2096,7 +2096,7 @@ class SocialAccount(models.Model):
         blank=True,
         help_text="Username if available (e.g., @instagram_handle)"
     )
-    profile_pic_url = models.URLField(max_length=500, blank=True, null=True)
+    profile_pic_url = models.URLField(max_length=2048, blank=True, null=True)
 
     # Metadata
     first_seen_at = models.DateTimeField(auto_now_add=True)
@@ -2176,7 +2176,7 @@ class TelegramAccount(models.Model):
     first_name = models.CharField(max_length=128, blank=True)
     last_name = models.CharField(max_length=128, blank=True)
     username = models.CharField(max_length=128, blank=True)
-    profile_pic_url = models.URLField(max_length=500, blank=True, null=True)
+    profile_pic_url = models.URLField(max_length=2048, blank=True, null=True)
 
     # MTProto StringSession, Fernet-encrypted at rest.
     session_string = EncryptedCharField()
@@ -2257,7 +2257,7 @@ class TelegramMessage(models.Model):
     )
     peer_name = models.CharField(max_length=255, blank=True)
     peer_username = models.CharField(max_length=128, blank=True)
-    profile_pic_url = models.URLField(max_length=500, blank=True, null=True)
+    profile_pic_url = models.URLField(max_length=2048, blank=True, null=True)
 
     message_text = models.TextField(blank=True)
     message_type = models.CharField(max_length=20, choices=MESSAGE_TYPE_CHOICES, default='text')
