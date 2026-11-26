@@ -71,3 +71,25 @@ class TestInstagramLongProfilePicture(SocialIntegrationTestCase):
         self.assertIn('facebook_status=error', resp['Location'])
         self.assertFalse([r for r in logs.records if r.levelname == 'ERROR'], logs.output)
         self.assertTrue(any('cancelled by the user' in r.getMessage() for r in logs.records))
+
+
+class TestExpiredStateCancel(SocialIntegrationTestCase):
+    """ECHODESK-BACKEND-8R: cancelling an expired dialog is not an error either."""
+
+    CANCEL = {'error': 'access_denied', 'error_code': '200', 'error_description': 'Permissions error',
+              'error_reason': 'user_denied', 'action': 'cancel'}
+
+    def test_cancel_with_expired_state_logs_a_warning(self):
+        with self.assertLogs('social_integrations.views', level='WARNING') as logs:
+            resp = self.client.get('/api/social/facebook/oauth/callback/',
+                                   {**self.CANCEL, 'state': 'expired-or-forged'}, HTTP_HOST='tenant.test.com')
+        self.assertEqual(resp.status_code, 302)
+        self.assertFalse([r for r in logs.records if r.levelname == 'ERROR'], logs.output)
+        self.assertTrue(any('expired state' in r.getMessage() for r in logs.records))
+
+    def test_forged_state_without_a_cancel_is_still_an_error(self):
+        with self.assertLogs('social_integrations.views', level='ERROR') as logs:
+            resp = self.client.get('/api/social/facebook/oauth/callback/',
+                                   {'code': 'c', 'state': 'forged'}, HTTP_HOST='tenant.test.com')
+        self.assertEqual(resp.status_code, 302)
+        self.assertTrue(any('invalid state' in r.getMessage() for r in logs.records))

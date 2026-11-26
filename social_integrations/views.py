@@ -1025,7 +1025,12 @@ def facebook_oauth_callback(request):
         # else (forged, expired, replayed, legacy "tenant=x") is rejected.
         oauth_state = read_oauth_state(state)
         if not oauth_state:
-            logger.error("Facebook OAuth callback with an invalid state")
+            if request.GET.get('error') == 'access_denied' or request.GET.get('error_reason') == 'user_denied':
+                # The user left the Facebook dialog open until the signed
+                # state expired and then cancelled it; nothing to alert on.
+                logger.warning("Facebook OAuth cancelled by the user with an expired state")
+            else:
+                logger.error("Facebook OAuth callback with an invalid state")
             return oauth_result_redirect(
                 platform='facebook', ok=False,
                 message='Invalid or expired connection request. Please start again.',
