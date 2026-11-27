@@ -23,6 +23,19 @@ from social_integrations import consumers
 from users import consumers as users_consumers
 from amanati_crm.websocket_auth import JWTAuthMiddlewareStack
 
+
+async def close_unknown_websocket(scope, receive, send):
+    """Catch-all for WebSocket paths no consumer owns.
+
+    Without it ``URLRouter`` raises ``ValueError("No route found ...")``,
+    Daphne logs "Exception inside application" at ERROR level and every
+    scanner probing ``wss://api.../websocket`` lands in Sentry. Closing the
+    handshake instead makes Daphne answer 403 and log nothing.
+    """
+    await receive()  # websocket.connect
+    await send({"type": "websocket.close", "code": 4404})
+
+
 application = ProtocolTypeRouter({
     "http": django_asgi_app,
     "websocket": URLRouter([
@@ -38,5 +51,7 @@ application = ProtocolTypeRouter({
             r'^ws/widget/(?P<token>[\w\-]+)/(?P<session_id>\w+)/$',
             consumers.WidgetVisitorConsumer.as_asgi(),
         ),
+        # Must stay last: any path not matched above is closed quietly.
+        re_path(r'^.*$', close_unknown_websocket),
     ]),
 })
